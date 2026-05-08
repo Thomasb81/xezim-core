@@ -114,6 +114,39 @@ impl Value {
         }
     }
 
+    /// Construct a Value from a u128, populating up to 128 bits at the given width.
+    /// Bits beyond 128 are zero-filled.
+    #[inline]
+    pub fn from_u128(val: u128, width: u32) -> Self {
+        if width <= 64 {
+            let mask = Self::mask(width);
+            Self { storage: ValueStorage::Inline { val_bits: (val as u64) & mask, xz_bits: 0 }, width, is_signed: false, is_real: false }
+        } else {
+            let mut bits = vec![LogicBit::Zero; width as usize];
+            let lim = 128.min(width as usize);
+            for i in 0..lim {
+                if (val >> i) & 1 == 1 { bits[i] = LogicBit::One; }
+            }
+            Self { storage: ValueStorage::Wide(bits), width, is_signed: false, is_real: false }
+        }
+    }
+
+    /// Extract value as u128. Returns low 128 bits, treating X/Z as 0.
+    #[inline]
+    pub fn to_u128(&self) -> u128 {
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => (*val_bits & !*xz_bits) as u128,
+            ValueStorage::Wide(bits) => {
+                let mut result: u128 = 0;
+                for (i, bit) in bits.iter().enumerate() {
+                    if i >= 128 { break; }
+                    if *bit == LogicBit::One { result |= 1u128 << i; }
+                }
+                result
+            }
+        }
+    }
+
     /// Create a Value from pre-computed inline bits (for cached number literals).
     #[inline]
     pub fn from_inline(val_bits: u64, xz_bits: u64, width: u32) -> Self {
@@ -487,9 +520,15 @@ impl Value {
         }
         let w = self.width.max(other.width);
         let result_signed = self.is_signed && other.is_signed;
-        let a = self.to_u64().unwrap_or(0);
-        let b = other.to_u64().unwrap_or(0);
-        let mut v = Value::from_u64(a.wrapping_add(b), w);
+        let mut v = if w <= 64 {
+            let a = self.to_u64().unwrap_or(0);
+            let b = other.to_u64().unwrap_or(0);
+            Value::from_u64(a.wrapping_add(b), w)
+        } else {
+            let a = self.to_u128();
+            let b = other.to_u128();
+            Value::from_u128(a.wrapping_add(b), w)
+        };
         v.is_signed = result_signed;
         v
     }
@@ -504,9 +543,15 @@ impl Value {
         }
         let w = self.width.max(other.width);
         let result_signed = self.is_signed && other.is_signed;
-        let a = self.to_u64().unwrap_or(0);
-        let b = other.to_u64().unwrap_or(0);
-        let mut v = Value::from_u64(a.wrapping_sub(b), w);
+        let mut v = if w <= 64 {
+            let a = self.to_u64().unwrap_or(0);
+            let b = other.to_u64().unwrap_or(0);
+            Value::from_u64(a.wrapping_sub(b), w)
+        } else {
+            let a = self.to_u128();
+            let b = other.to_u128();
+            Value::from_u128(a.wrapping_sub(b), w)
+        };
         v.is_signed = result_signed;
         v
     }
@@ -518,9 +563,15 @@ impl Value {
         if self.has_xz() || other.has_xz() { return Value::new(self.width.max(other.width)); }
         let w = self.width.max(other.width);
         let result_signed = self.is_signed && other.is_signed;
-        let a = self.to_u64().unwrap_or(0);
-        let b = other.to_u64().unwrap_or(0);
-        let mut v = Value::from_u64(a.wrapping_mul(b), w);
+        let mut v = if w <= 64 {
+            let a = self.to_u64().unwrap_or(0);
+            let b = other.to_u64().unwrap_or(0);
+            Value::from_u64(a.wrapping_mul(b), w)
+        } else {
+            let a = self.to_u128();
+            let b = other.to_u128();
+            Value::from_u128(a.wrapping_mul(b), w)
+        };
         v.is_signed = result_signed;
         v
     }
