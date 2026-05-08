@@ -582,16 +582,23 @@ impl Value {
         }
         if self.has_xz() || other.has_xz() { return Value::new(self.width.max(other.width)); }
         let w = self.width.max(other.width);
-        let a = self.to_u64().unwrap_or(0);
-        let b = other.to_u64().unwrap_or(0);
-        if b == 0 { return Value::new(w); } // X for divide by zero
-        if self.is_signed || other.is_signed {
-            let sa = self.to_i64().unwrap_or(0);
-            let sb = other.to_i64().unwrap_or(0);
-            if sb == 0 { return Value::new(w); }
-            Value::from_u64(sa.wrapping_div(sb) as u64, w)
+        if w <= 64 {
+            let a = self.to_u64().unwrap_or(0);
+            let b = other.to_u64().unwrap_or(0);
+            if b == 0 { return Value::new(w); }
+            if self.is_signed || other.is_signed {
+                let sa = self.to_i64().unwrap_or(0);
+                let sb = other.to_i64().unwrap_or(0);
+                if sb == 0 { return Value::new(w); }
+                Value::from_u64(sa.wrapping_div(sb) as u64, w)
+            } else {
+                Value::from_u64(a / b, w)
+            }
         } else {
-            Value::from_u64(a / b, w)
+            let a = self.to_u128();
+            let b = other.to_u128();
+            if b == 0 { return Value::new(w); }
+            Value::from_u128(a / b, w)
         }
     }
 
@@ -601,16 +608,23 @@ impl Value {
         }
         if self.has_xz() || other.has_xz() { return Value::new(self.width.max(other.width)); }
         let w = self.width.max(other.width);
-        let b = other.to_u64().unwrap_or(0);
-        if b == 0 { return Value::new(w); }
-        if self.is_signed || other.is_signed {
-            let sa = self.to_i64().unwrap_or(0);
-            let sb = other.to_i64().unwrap_or(0);
-            if sb == 0 { return Value::new(w); }
-            Value::from_u64(sa.wrapping_rem(sb) as u64, w)
+        if w <= 64 {
+            let b = other.to_u64().unwrap_or(0);
+            if b == 0 { return Value::new(w); }
+            if self.is_signed || other.is_signed {
+                let sa = self.to_i64().unwrap_or(0);
+                let sb = other.to_i64().unwrap_or(0);
+                if sb == 0 { return Value::new(w); }
+                Value::from_u64(sa.wrapping_rem(sb) as u64, w)
+            } else {
+                let a = self.to_u64().unwrap_or(0);
+                Value::from_u64(a % b, w)
+            }
         } else {
-            let a = self.to_u64().unwrap_or(0);
-            Value::from_u64(a % b, w)
+            let a = self.to_u128();
+            let b = other.to_u128();
+            if b == 0 { return Value::new(w); }
+            Value::from_u128(a % b, w)
         }
     }
 
