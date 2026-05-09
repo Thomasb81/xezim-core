@@ -1362,11 +1362,38 @@ impl Value {
     pub fn from_str_radix(s: &str, radix: u32, width: u32) -> Self {
         let s = s.trim().replace("_", "");
         if s.contains('x') || s.contains('X') || s.contains('z') || s.contains('Z') || s.contains('?') {
+            // XEZIM_X_LITERAL_TO_ZERO=1: coerce X/Z literals in source to 0,
+            // matching Verilator's 2-state behavior. Useful for designs that
+            // use `{N{1'bx}}` as a "don't care" assertion in case-mux defaults
+            // (e.g. XuanTie c910's ct_iu_rbus.v) where the don't-care actually
+            // gets sampled and poisons downstream registers in 4-state sims.
+            // Cached on first call — env lookup is too slow for the hot path.
+            use std::sync::OnceLock;
+            static X_TO_ZERO: OnceLock<bool> = OnceLock::new();
+            let x_to_zero = *X_TO_ZERO.get_or_init(|| {
+                std::env::var("XEZIM_X_LITERAL_TO_ZERO")
+                    .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+                    .unwrap_or(false)
+            });
+            if x_to_zero {
+                // Coerce X only (not Z or ?) — Z and ? are kept because:
+                //  - ? is the wildcard syntax for casez/casex case labels
+                //  - Z is high-impedance, semantically distinct from X
+                // Coercing them would break wildcard pattern matching in case
+                // statements that use `?` as "don't care" bits.
+                let cleaned: String = s.chars()
+                    .map(|c| match c { 'x'|'X' => '0', _ => c })
+                    .collect();
+                if !cleaned.contains('z') && !cleaned.contains('Z') && !cleaned.contains('?') {
+                    return Self::from_str_radix(&cleaned, radix, width);
+                }
+                // Continue with normal parsing — Z/? bits preserved.
+            }
             // Parse with unknown bits
             let mut val = Self::zero(width);
             let bits_per_digit = match radix {
                 2 => 1, 8 => 3, 16 => 4,
-                _ => { 
+                _ => {
                     // For decimal, can't have x/z
                     return Self::new(width);
                 }
