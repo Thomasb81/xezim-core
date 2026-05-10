@@ -354,7 +354,18 @@ impl Value {
         }
     }
 
-    /// Convert to u64, treating X/Z as 0.
+    /// Convert to `u64`, treating X/Z as 0.
+    ///
+    /// **Returns the LOW 64 bits for wide values**: any bits at positions
+    /// ≥ 64 are silently dropped. The return type is `Option` for symmetry
+    /// with potential X/Z failure paths but in practice always returns
+    /// `Some(_)` for both inline and wide storage.
+    ///
+    /// Use this only when the value is known to fit in 64 bits —
+    /// typically array indices, bit positions, loop counters, or shift
+    /// amounts. For signal values that may exceed 64 bits (Verilog supports
+    /// arbitrary widths), prefer `to_u128()`, `get_bits()`, or
+    /// Value-aware comparisons.
     #[inline(always)]
     pub fn to_u64(&self) -> Option<u64> {
         match &self.storage {
