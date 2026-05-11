@@ -1,8 +1,8 @@
 //! Elaborator: converts parsed AST into a flat simulation model.
 //! Resolves net/variable declarations, continuous assigns, always blocks.
 
-use ahash::AHashMap as HashMap;
-use ahash::AHashSet as HashSet;
+use crate::hasher::HashMap;
+use crate::hasher::HashSet;
 use std::collections::BTreeMap;
 use std::rc::Rc;
 use crate::ast::{Identifier, Span};
@@ -221,11 +221,11 @@ pub struct DpiImportSpec {
 }
 
 pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
-    let mut properties = HashMap::new();
-    let mut methods = HashMap::new();
-    let mut random_properties = HashSet::new();
-    let mut randc_properties = HashSet::new();
-    let mut constraints = HashMap::new();
+    let mut properties = HashMap::default();
+    let mut methods = HashMap::default();
+    let mut random_properties = HashSet::default();
+    let mut randc_properties = HashSet::default();
+    let mut constraints = HashMap::default();
     for item in &c.items {
         match item {
             ClassItem::Property(p) => {
@@ -237,7 +237,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 let is_real = is_type_real(&p.data_type);
                 for decl in &p.declarators {
                     let mut v = if let Some(init) = &decl.init {
-                        let mut val = eval_init_for_width(init, &HashMap::new(), width);
+                        let mut val = eval_init_for_width(init, &HashMap::default(), width);
                         if is_real { val = Value::from_f64(val.to_f64()); }
                         val
                     } else if is_real {
@@ -402,39 +402,39 @@ impl ElaboratedModule {
     pub fn new(name: String) -> Self {
         Self {
             name,
-            signals: HashMap::new(),
+            signals: HashMap::default(),
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
             always_blocks: Vec::new(),
             initial_blocks: Vec::new(),
-            parameters: HashMap::new(),
-            typedefs: HashMap::new(),
-            typedef_types: HashMap::new(),
-            arrays: HashMap::new(),
-            associative_arrays: HashMap::new(),
-            classes: HashMap::new(),
-            covergroups: HashMap::new(),
-            functions: HashMap::new(),
-            tasks: HashMap::new(),
-            dpi_imports: HashMap::new(),
-            clocking_blocks: HashMap::new(),
-            lets: HashMap::new(),
-            modport_views: HashMap::new(),
-            clocking_signal_dirs: HashMap::new(),
-            specify_delays: HashMap::new(),
-            assoc_defaults: HashMap::new(),
-            dynamic_arrays: HashSet::new(),
-            descending_arrays: HashSet::new(),
-            queue_max_sizes: HashMap::new(),
-            arrays_2d: HashMap::new(),
-            packages: HashSet::new(),
-            sequences: HashSet::new(),
-            packed_struct_fields: HashMap::new(),
-            class_type_args: HashMap::new(),
-            arrays_nd: HashMap::new(),
+            parameters: HashMap::default(),
+            typedefs: HashMap::default(),
+            typedef_types: HashMap::default(),
+            arrays: HashMap::default(),
+            associative_arrays: HashMap::default(),
+            classes: HashMap::default(),
+            covergroups: HashMap::default(),
+            functions: HashMap::default(),
+            tasks: HashMap::default(),
+            dpi_imports: HashMap::default(),
+            clocking_blocks: HashMap::default(),
+            lets: HashMap::default(),
+            modport_views: HashMap::default(),
+            clocking_signal_dirs: HashMap::default(),
+            specify_delays: HashMap::default(),
+            assoc_defaults: HashMap::default(),
+            dynamic_arrays: HashSet::default(),
+            descending_arrays: HashSet::default(),
+            queue_max_sizes: HashMap::default(),
+            arrays_2d: HashMap::default(),
+            packages: HashSet::default(),
+            sequences: HashSet::default(),
+            packed_struct_fields: HashMap::default(),
+            class_type_args: HashMap::default(),
+            arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
-            nets: HashSet::new(),
-            out_of_class_constraints: HashSet::new(),
+            nets: HashSet::default(),
+            out_of_class_constraints: HashSet::default(),
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
@@ -649,7 +649,7 @@ fn resolve_interface_modport_view(
         if let ModuleItem::ModportDeclaration(md) = item {
             for mp in &md.items {
                 if mp.name.name == modport_name {
-                    let mut dirs = HashMap::new();
+                    let mut dirs = HashMap::default();
                     for p in &mp.ports {
                         dirs.insert(p.name.name.clone(), p.direction);
                     }
@@ -859,8 +859,8 @@ fn validate_class_constraints(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
 ) -> Result<(), String> {
-    let mut allowed = HashSet::new();
-    let mut seen = HashSet::new();
+    let mut allowed = HashSet::default();
+    let mut seen = HashSet::default();
     collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
     for item in &c.items {
         if let ClassItem::Constraint(con) = item {
@@ -1054,7 +1054,7 @@ pub fn elaborate_module_with_defs(
     // those types can be classified as nets (§6.6.7 — nettype resolution permits
     // multiple continuous drivers). Also register each nettype's width as a
     // typedef so TypeReference lookups resolve correctly.
-    let mut user_nettypes: HashSet<String> = HashSet::new();
+    let mut user_nettypes: HashSet<String> = HashSet::default();
     for item in module.items() {
         if let ModuleItem::NettypeDeclaration(nd) = item {
             user_nettypes.insert(nd.name.name.clone());
@@ -1627,7 +1627,7 @@ pub fn elaborate_module_with_defs(
                 elab.covergroups.insert(cg.name.name.clone(), cg.clone());
             }
             ModuleItem::ClockingDeclaration(cd) => {
-                let mut dirs = HashMap::new();
+                let mut dirs = HashMap::default();
                 for s in &cd.signals {
                     dirs.insert(s.name.name.clone(), s.direction);
                 }
@@ -1691,14 +1691,14 @@ pub fn elaborate_module_with_defs(
     // approximates the common `resolve_or` resolver; other resolvers are not
     // modeled, so last-driver-wins behavior applies via the final `|` fold.
     {
-        let mut nettype_vars: HashSet<String> = HashSet::new();
+        let mut nettype_vars: HashSet<String> = HashSet::default();
         for (name, sig) in &elab.signals {
             if let Some(tn) = &sig.type_name {
                 if user_nettypes.contains(tn) { nettype_vars.insert(name.clone()); }
             }
         }
         if !nettype_vars.is_empty() {
-            let mut grouped: HashMap<String, Vec<Expression>> = HashMap::new();
+            let mut grouped: HashMap<String, Vec<Expression>> = HashMap::default();
             let mut kept: Vec<ContinuousAssignment> = Vec::new();
             for ca in elab.continuous_assigns.drain(..) {
                 if let Some(n) = simple_lhs_name(&ca.lhs) {
@@ -1734,11 +1734,11 @@ pub fn elaborate_module_with_defs(
     create_implicit_nets(&mut elab);
 
     // Validate that all identifiers in procedural blocks are declared.
-    for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::new())?; }
-    for ab in &elab.always_blocks { validate_stmt_idents(&ab.stmt, &elab, &mut HashSet::new())?; }
+    for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::default())?; }
+    for ab in &elab.always_blocks { validate_stmt_idents(&ab.stmt, &elab, &mut HashSet::default())?; }
     for ca in &elab.continuous_assigns {
-        validate_expr_idents(&ca.lhs, &elab, &HashSet::new())?;
-        validate_expr_idents(&ca.rhs, &elab, &HashSet::new())?;
+        validate_expr_idents(&ca.lhs, &elab, &HashSet::default())?;
+        validate_expr_idents(&ca.rhs, &elab, &HashSet::default())?;
     }
 
     // IEEE 1800-2017 §6.5: a variable cannot have multiple continuous drivers,
@@ -1832,7 +1832,7 @@ fn validate_class_usage(elab: &ElaboratedModule) -> Result<(), String> {
     // single concrete method.
     for cls in elab.classes.values() {
         if cls.implements.len() < 2 { continue; }
-        let mut seen: HashMap<String, String> = HashMap::new();
+        let mut seen: HashMap<String, String> = HashMap::default();
         for iname in &cls.implements {
             let iface = match elab.classes.get(iname) { Some(c) => c, None => continue };
             for (mname, m) in &iface.methods {
@@ -1861,7 +1861,7 @@ fn validate_class_usage(elab: &ElaboratedModule) -> Result<(), String> {
     for cls in elab.classes.values() {
         if cls.implements.is_empty() { continue; }
         // Gather typedef names contributed only by implemented interfaces.
-        let mut iface_only_typedefs: HashSet<String> = HashSet::new();
+        let mut iface_only_typedefs: HashSet<String> = HashSet::default();
         for iname in &cls.implements {
             if let Some(iface) = elab.classes.get(iname) {
                 for t in &iface.typedef_names { iface_only_typedefs.insert(t.clone()); }
@@ -1984,7 +1984,7 @@ fn check_randc_restrictions(item: &ConstraintItem, randc: &HashSet<String>, cls:
 
 fn collect_soft_randc(item: &ConstraintItem, randc: &HashSet<String>, cls: &str) -> Result<(), String> {
     // Any randc variable referenced inside a soft constraint is illegal.
-    let mut names: HashSet<String> = HashSet::new();
+    let mut names: HashSet<String> = HashSet::default();
     collect_constraint_idents(item, &mut names);
     for n in &names {
         if randc.contains(n) {
@@ -2096,7 +2096,7 @@ fn collect_written_idents(stmt: &Statement, out: &mut HashSet<String>) {
 }
 
 fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
-    let mut ca_lhs: HashMap<String, u32> = HashMap::new();
+    let mut ca_lhs: HashMap<String, u32> = HashMap::default();
     for ca in &elab.continuous_assigns {
         if let Some(n) = simple_lhs_name(&ca.lhs) {
             if elab.signals.contains_key(&n) && !elab.nets.contains(&n) {
@@ -2108,7 +2108,7 @@ fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
             }
         }
     }
-    let mut proc_written: HashSet<String> = HashSet::new();
+    let mut proc_written: HashSet<String> = HashSet::default();
     for ab in &elab.always_blocks { collect_written_idents(&ab.stmt, &mut proc_written); }
     for ib in &elab.initial_blocks { collect_written_idents(&ib.stmt, &mut proc_written); }
     for ca in &elab.continuous_assigns {
@@ -2668,7 +2668,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
             }
             ModuleItem::ClockingDeclaration(cd) => {
-                let mut dirs = HashMap::new();
+                let mut dirs = HashMap::default();
                 for s in &cd.signals {
                     dirs.insert(s.name.name.clone(), s.direction);
                 }
@@ -3311,14 +3311,14 @@ pub fn inline_instantiations(
     };
     // Recursively inline starting from the top module's items
     let top_params = elab.parameters.clone();
-    let mut cache = HashMap::new();
-    inline_module_items(elab, top_def, "", definitions, &mut HashMap::new(), &top_params, &mut cache)?;
+    let mut cache = HashMap::default();
+    inline_module_items(elab, top_def, "", definitions, &mut HashMap::default(), &top_params, &mut cache)?;
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }
 
     // Identify interface instances at top level
-    let mut top_interface_names = HashSet::new();
+    let mut top_interface_names = HashSet::default();
     for item in top_def.items() {
         if let ModuleItem::ModuleInstantiation(inst) = item {
             if definitions.get(&inst.module_name.name).map_or(false, |d| matches!(d, Definition::Interface(_))) {
@@ -3349,8 +3349,8 @@ pub fn inline_instantiations(
     }
 
     let local_names = elab.signals.keys().cloned().collect::<std::collections::HashSet<_>>();
-    let port_map = HashMap::new();
-    let mut interface_map = HashMap::new();
+    let port_map = HashMap::default();
+    let mut interface_map = HashMap::default();
     for name in top_interface_names {
         interface_map.insert(name.clone(), name);
     }
@@ -3395,7 +3395,7 @@ fn genvar_const_expr(value: i64) -> Expression {
 fn substitute_genvar_in_items(items: &[ModuleItem], var: &str, value: i64) -> Vec<ModuleItem> {
     let mut port_map: HashMap<String, Expression> = HashMap::default();
     port_map.insert(var.to_string(), genvar_const_expr(value));
-    let local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let local_names: std::collections::HashSet<String> = std::collections::HashSet::default();
     let interface_map: HashMap<String, String> = HashMap::default();
     items.iter().map(|item| substitute_in_module_item(item, &port_map, &local_names, &interface_map)).collect()
 }
@@ -3465,7 +3465,7 @@ fn rename_decls_in_iter(items: &[ModuleItem], suffix: &str) -> Vec<ModuleItem> {
         };
         port_map.insert(n.clone(), Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 }));
     }
-    let local_names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let local_names: std::collections::HashSet<String> = std::collections::HashSet::default();
     let interface_map: HashMap<String, String> = HashMap::default();
     items.iter().map(|item| rename_item_decls(item, suffix, &rename_set, &port_map, &local_names, &interface_map)).collect()
 }
@@ -3865,14 +3865,14 @@ fn prepare_module_items(
         return Rc::clone(prepared);
     }
 
-    let mut local_typedefs = std::collections::HashSet::new();
+    let mut local_typedefs = std::collections::HashSet::default();
     for item in source_def.items() {
         if let ModuleItem::TypedefDeclaration(td) = item {
             local_typedefs.insert(td.name.name.clone());
         }
     }
 
-    let mut interface_ports = std::collections::HashSet::new();
+    let mut interface_ports = std::collections::HashSet::default();
     if let PortList::Ansi(ports) = source_def.ports() {
         for port in ports {
             if let Some(dt) = &port.data_type {
@@ -3885,7 +3885,7 @@ fn prepare_module_items(
 
     let effective_items = collect_effective_items(source_def.items(), local_params);
 
-    let mut port_directions = HashMap::new();
+    let mut port_directions = HashMap::default();
     match source_def.ports() {
         PortList::Ansi(ports) => {
             for port in ports {
@@ -3906,7 +3906,7 @@ fn prepare_module_items(
         PortList::Empty => {}
     }
 
-    let mut local_names = std::collections::HashSet::new();
+    let mut local_names = std::collections::HashSet::default();
     for p_decl in source_def.params() {
         if let ParameterKind::Data { assignments, .. } = &p_decl.kind {
             for assign in assignments {
@@ -4059,8 +4059,8 @@ fn inline_module_items(
                 let scoped_eval_params: &HashMap<String, Value> = local_params;
 
                 // Build port map and interface map
-                let mut port_map = HashMap::new();
-                let mut sub_interface_map = HashMap::new();
+                let mut port_map = HashMap::default();
+                let mut sub_interface_map = HashMap::default();
 
                 // Local names of the CURRENT (parent) module — bare names of
                 // signals declared in this scope. Used when rewriting port
@@ -4098,7 +4098,7 @@ fn inline_module_items(
                                 match conn {
                                     PortConnection::Named { name, expr } => {
                                         if let Some(e) = expr {
-                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), parent_local_names, interface_map);
+                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
                                             if prepared_source.interface_ports.contains(&name.name) {
                                                 if let ExprKind::Ident(hier) = &rewritten_e.kind {
                                                     let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
@@ -4111,7 +4111,7 @@ fn inline_module_items(
                                     }
                                     PortConnection::Ordered(expr) => {
                                         if let Some(e) = expr {
-                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::new(), parent_local_names, interface_map);
+                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
                                             if let Some(port) = sub_mod.ports().get(i) {
                                                 let port_name = port.name();
                                                 if prepared_source.interface_ports.contains(port_name) {
@@ -4157,7 +4157,7 @@ fn inline_module_items(
                 }
 
                 // Resolve parameters for the sub-module
-                let mut sub_params = HashMap::new();
+                let mut sub_params = HashMap::default();
                 let dbg_param = std::env::var("XEZIM_DBG_PARAM").is_ok()
                     && (sub_mod_name == "ram" || sub_mod_name == "f_spsram_large");
                 // Build the effective declared-parameter list for the

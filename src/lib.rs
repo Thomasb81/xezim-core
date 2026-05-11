@@ -9,7 +9,7 @@ pub mod vcd_sink;
 pub mod stdout_sink;
 
 /// Deterministic hasher for `HashMap`/`HashSet` so iteration order is
-/// reproducible across runs. Both `ahash::AHashMap` (default `RandomState`)
+/// reproducible across runs. Both `crate::hasher::HashMap` (default `RandomState`)
 /// and `std::collections::HashMap` use OS-random seeds, which causes
 /// non-deterministic iteration. For simulator correctness debugging
 /// (and to make c910 memcpy reproducible at the same cycle each run),
@@ -198,7 +198,7 @@ pub fn parse_and_elaborate_multi(
     include_dirs: &[String],
     source_files: &[String],
     defines: &[(String, Option<String>)],
-) -> Result<(ahash::AHashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
+) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
     let mut all_descriptions = Vec::new();
     let mut pp = preprocessor::Preprocessor::new();
     for dir in include_dirs { pp.add_include_dir(std::path::PathBuf::from(dir)); }
@@ -236,8 +236,8 @@ fn parse_and_elaborate(
     top_module_name: Option<&str>,
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
-) -> Result<(ahash::AHashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
-    let mut definitions: ahash::AHashMap<String, SourceDefinition> = ahash::AHashMap::new();
+) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
+    let mut definitions: crate::hasher::HashMap<String, SourceDefinition> = crate::hasher::HashMap::default();
     let mut top_module = None;
     let mut top_level_imports = Vec::new();
     let mut top_level_lets = Vec::new();
@@ -358,9 +358,9 @@ fn parse_and_elaborate(
 
     let top_name = top_module.ok_or("No module found")?;
     let top_def = definitions.get(&top_name).ok_or_else(|| format!("Module '{}' not found", top_name))?;
-    let params = ahash::AHashMap::new();
+    let params = crate::hasher::HashMap::default();
 
-    let def_refs: ahash::AHashMap<String, elaborate::Definition> =
+    let def_refs: crate::hasher::HashMap<String, elaborate::Definition> =
         definitions.iter().filter_map(|(k, v)| {
             let def = match v {
                 SourceDefinition::Module(m) => elaborate::Definition::Module(&**m),
@@ -449,7 +449,7 @@ fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::
 }
 
 fn resolve_library_modules(
-    definitions: &mut ahash::AHashMap<String, SourceDefinition>,
+    definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
 ) -> Result<(), String> {
