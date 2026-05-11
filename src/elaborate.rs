@@ -2399,6 +2399,59 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
     Ok(())
 }
 
+/// Scan pending_cont_assign for implicit-net candidates after sub-module
+/// inlining. For each pending cont-assign with LHS = bare identifier X
+/// (no prior `wire X` declaration), construct the prefixed name
+/// `<ctx.prefix>X` and add it as a 1-bit wire to elab.signals.
+///
+/// Why this matters: `assign undeclared_wire = expr;` implicitly creates
+/// a 1-bit wire per IEEE 1800-2017 §6.10. The initial pass in
+/// `create_implicit_nets` only sees the top-level `continuous_assigns`
+/// vec, missing sub-module bodies still in pending. Without this
+/// follow-up pass, the cont-assign can't resolve its LHS signal_id and
+/// gets dropped silently — symptom: c910 wid_for_axi4's `create_en`
+/// stayed X forever, freezing the wid-tracking FIFO.
+fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
+    let mut names_to_add: Vec<String> = Vec::new();
+    for pending in &elab.pending_cont_assign {
+        let prefix = &pending.ctx.prefix;
+        let mut bare = Vec::new();
+        collect_ident_names(&pending.lhs_source, &mut bare);
+        collect_ident_names(&pending.rhs_source, &mut bare);
+        for name in bare {
+            // If the bare name is a port (in port_map), it gets rewritten
+            // to the parent's signal — don't create an implicit net here.
+            if pending.ctx.port_map.contains_key(&name) { continue; }
+            // If it's a parameter, no implicit net needed.
+            if elab.parameters.contains_key(&name) { continue; }
+            // The bare name is a sub-module-local identifier; after rewrite
+            // it becomes `<prefix>name`.
+            let prefixed = format!("{}{}", prefix, name);
+            if !elab.signals.contains_key(&prefixed)
+                && !elab.parameters.contains_key(&prefixed)
+                && !elab.nets.contains(&prefixed)
+            {
+                names_to_add.push(prefixed);
+            }
+        }
+    }
+    names_to_add.sort();
+    names_to_add.dedup();
+    for name in names_to_add {
+        eprintln!(
+            "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+             (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.",
+            name
+        );
+        elab.signals.insert(name.clone(), Signal { is_const: false,
+            name: name.clone(), width: 1, is_signed: false,
+            direction: None, value: Value::new(1),
+            is_real: false, type_name: None,
+        });
+        elab.nets.insert(name);
+    }
+}
+
 /// Create implicit 1-bit wire signals for identifiers referenced in continuous assigns
 /// but not declared anywhere (IEEE 1800-2017 §6.10).
 fn create_implicit_nets(elab: &mut ElaboratedModule) {
@@ -2411,6 +2464,11 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) {
     implicit_names.dedup();
     for name in implicit_names {
         if !elab.signals.contains_key(&name) && !elab.parameters.contains_key(&name) {
+            eprintln!(
+                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                 (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
+                name
+            );
             elab.signals.insert(name.clone(), Signal { is_const: false,
                 name: name.clone(), width: 1, is_signed: false,
                 direction: None, value: Value::new(1),
@@ -3317,6 +3375,19 @@ pub fn inline_instantiations(
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }
 
+    // IEEE 1800-2017 §6.10: Implicit nets for cont-assigns that came in via
+    // pending sub-module bodies. The initial create_implicit_nets (in
+    // elaborate_module_with_defs) only scanned the top-level
+    // continuous_assigns vec. Sub-module bodies are deferred into
+    // pending_cont_assign and didn't get their implicit nets created —
+    // c910's wid_for_axi4 has `assign create_en = a && b;` with no
+    // `wire create_en` declaration; the cont-assign got dropped at
+    // compile time because xezim couldn't resolve `create_en` to a
+    // signal_id, so create_en stayed X and the wid-tracking FIFO froze
+    // → c910 memcpy hang. Scan pending_cont_assign now and create
+    // implicit 1-bit wires for any prefixed names that don't yet exist.
+    create_implicit_nets_for_pending(elab);
+
     // Identify interface instances at top level
     let mut top_interface_names = HashSet::default();
     for item in top_def.items() {
@@ -3965,6 +4036,35 @@ fn prepare_module_items(
                 }
             }
             _ => {}
+        }
+    }
+
+    // IEEE 1800-2017 §6.10: a bare identifier on the LHS of a continuous
+    // assign (or gate output) that has no explicit net declaration
+    // implicitly declares a 1-bit net in this scope. Register such names in
+    // local_names so rewrite_expr prefixes them with the instance path;
+    // the matching signal is created later by create_implicit_nets_for_pending.
+    {
+        let mut implicit: Vec<String> = Vec::new();
+        for item in &effective_items {
+            match item {
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (lhs, _) in &ca.assignments {
+                        collect_ident_names(lhs, &mut implicit);
+                    }
+                }
+                ModuleItem::GateInstantiation(gi) => {
+                    for (lhs, _) in gate_inst_to_assign_pairs(gi) {
+                        collect_ident_names(&lhs, &mut implicit);
+                    }
+                }
+                _ => {}
+            }
+        }
+        for name in implicit {
+            if !local_names.contains(&name) {
+                local_names.insert(name);
+            }
         }
     }
 
