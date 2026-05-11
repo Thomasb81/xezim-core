@@ -4132,6 +4132,30 @@ fn inline_module_items(
                     }
                 }
 
+                // Short-circuit: gated_clk_cell is a passthrough whose body is
+                // `assign clk_out = clk_in;` plus dead enable logic. Inlining
+                // it produces a 3-hop cont-assign chain (parent_clk_in →
+                // local_clk_in → local_clk_out → parent_clk_out) that takes
+                // multiple settle iterations to propagate. For c910 (which
+                // has many gated_clk_cell instances on the same coreclk),
+                // this introduces NBA-scheduling races between sibling FFs
+                // clocked on different "gated" outputs of the same source
+                // clock. Replace the entire instance with a single direct
+                // cont-assign `parent_clk_out = parent_clk_in` so the
+                // gated clock unifies with its source.
+                if sub_mod_name == "gated_clk_cell" {
+                    if let (Some(clk_out_expr), Some(clk_in_expr)) =
+                        (port_map.get("clk_out").cloned(), port_map.get("clk_in").cloned())
+                    {
+                        elab.continuous_assigns.push(ContinuousAssignment {
+                            lhs: clk_out_expr,
+                            rhs: clk_in_expr,
+                            delay: 0,
+                        });
+                        continue;
+                    }
+                }
+
                 // Resolve parameters for the sub-module
                 let mut sub_params = HashMap::new();
                 let dbg_param = std::env::var("XEZIM_DBG_PARAM").is_ok()
