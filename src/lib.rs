@@ -8,6 +8,38 @@ pub mod sdf;
 pub mod vcd_sink;
 pub mod stdout_sink;
 
+/// Deterministic hasher for `HashMap`/`HashSet` so iteration order is
+/// reproducible across runs. Both `ahash::AHashMap` (default `RandomState`)
+/// and `std::collections::HashMap` use OS-random seeds, which causes
+/// non-deterministic iteration. For simulator correctness debugging
+/// (and to make c910 memcpy reproducible at the same cycle each run),
+/// we use a fixed-seeded ahash state.
+pub mod hasher {
+    #[derive(Clone, Debug)]
+    pub struct DeterministicState(ahash::RandomState);
+
+    impl Default for DeterministicState {
+        fn default() -> Self {
+            DeterministicState(ahash::RandomState::with_seeds(
+                0xdead_beef_cafe_babe,
+                0xfeed_face_0123_4567,
+                0xbada_55_b01d_face,
+                0x0123_4567_89ab_cdef,
+            ))
+        }
+    }
+
+    impl std::hash::BuildHasher for DeterministicState {
+        type Hasher = ahash::AHasher;
+        fn build_hasher(&self) -> Self::Hasher {
+            <ahash::RandomState as std::hash::BuildHasher>::build_hasher(&self.0)
+        }
+    }
+
+    pub type HashMap<K, V> = std::collections::HashMap<K, V, DeterministicState>;
+    pub type HashSet<T> = std::collections::HashSet<T, DeterministicState>;
+}
+
 pub use sv_parser::{self, parse, lexer, preprocessor, diagnostics, ParseResult, ast};
 pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};
