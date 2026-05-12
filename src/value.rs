@@ -1334,6 +1334,92 @@ mod tests {
         assert!(x.add(&one).has_xz());
         assert!(x.is_equal(&one).has_xz());
     }
+
+    fn bit(b: LogicBit) -> Value {
+        let mut v = Value::zero(1);
+        v.set_bit(0, b);
+        v
+    }
+
+    #[test]
+    fn test_logic_impl() {
+        let z = Value::from_u64(0, 1);
+        let o = Value::from_u64(1, 1);
+        let x = Value::new(1);
+        // truth table
+        assert_eq!(z.logic_impl(&z).get_bit(0), LogicBit::One);
+        assert_eq!(z.logic_impl(&o).get_bit(0), LogicBit::One);
+        assert_eq!(o.logic_impl(&z).get_bit(0), LogicBit::Zero);
+        assert_eq!(o.logic_impl(&o).get_bit(0), LogicBit::One);
+        // X-propagation: 0 -> x = 1, x -> 1 = 1, 1 -> x = x, x -> 0 = x
+        assert_eq!(z.logic_impl(&x).get_bit(0), LogicBit::One);
+        assert_eq!(x.logic_impl(&o).get_bit(0), LogicBit::One);
+        assert_eq!(o.logic_impl(&x).get_bit(0), LogicBit::X);
+        assert_eq!(x.logic_impl(&z).get_bit(0), LogicBit::X);
+        assert_eq!(x.logic_impl(&x).get_bit(0), LogicBit::X);
+    }
+
+    #[test]
+    fn test_logic_equiv() {
+        let z = Value::from_u64(0, 1);
+        let o = Value::from_u64(1, 1);
+        let x = Value::new(1);
+        assert_eq!(z.logic_equiv(&z).get_bit(0), LogicBit::One);
+        assert_eq!(o.logic_equiv(&o).get_bit(0), LogicBit::One);
+        assert_eq!(z.logic_equiv(&o).get_bit(0), LogicBit::Zero);
+        assert_eq!(o.logic_equiv(&z).get_bit(0), LogicBit::Zero);
+        assert_eq!(x.logic_equiv(&o).get_bit(0), LogicBit::X);
+        assert_eq!(z.logic_equiv(&x).get_bit(0), LogicBit::X);
+        // non-1-bit reduce-to-bool: 4'b0010 <-> 1 == 1
+        assert_eq!(Value::from_u64(2, 4).logic_equiv(&o).get_bit(0), LogicBit::One);
+    }
+
+    #[test]
+    fn test_wildcard_eq_ne() {
+        // 4'b1010 ==? 4'b1010 = 1
+        assert_eq!(Value::from_u64(0b1010, 4).wildcard_eq(&Value::from_u64(0b1010, 4)).get_bit(0), LogicBit::One);
+        // 4'b1010 ==? 4'b1011 = 0
+        assert_eq!(Value::from_u64(0b1010, 4).wildcard_eq(&Value::from_u64(0b1011, 4)).get_bit(0), LogicBit::Zero);
+        // 4'b1011 ==? 4'b1x1x  (x in rhs = wildcard) = 1
+        let mut rhs = Value::from_u64(0b1010, 4);
+        rhs.set_bit(0, LogicBit::X); // ...1x1x
+        rhs.set_bit(2, LogicBit::X);
+        assert_eq!(Value::from_u64(0b1011, 4).wildcard_eq(&rhs).get_bit(0), LogicBit::One);
+        // 4'b0011 ==? 4'b1x1x = 0  (bit3: 0 vs 1, hard mismatch)
+        assert_eq!(Value::from_u64(0b0011, 4).wildcard_eq(&rhs).get_bit(0), LogicBit::Zero);
+        // x in lhs (rhs binary) => result x
+        let mut lhs = Value::from_u64(0b1010, 4);
+        lhs.set_bit(2, LogicBit::X);
+        assert_eq!(lhs.wildcard_eq(&Value::from_u64(0b1010, 4)).get_bit(0), LogicBit::X);
+        // !=? is the inverse; x stays x
+        assert_eq!(Value::from_u64(0b1010, 4).wildcard_ne(&Value::from_u64(0b1011, 4)).get_bit(0), LogicBit::One);
+        assert_eq!(Value::from_u64(0b1011, 4).wildcard_ne(&rhs).get_bit(0), LogicBit::Zero);
+        assert_eq!(lhs.wildcard_ne(&Value::from_u64(0b1010, 4)).get_bit(0), LogicBit::X);
+    }
+
+    #[test]
+    fn test_is_nonzero_definite_one() {
+        // all-X => unknown
+        assert_eq!(Value::new(4).is_nonzero(), None);
+        // pure zero => false
+        assert_eq!(Value::from_u64(0, 4).is_nonzero(), Some(false));
+        // pure binary nonzero => true
+        assert_eq!(Value::from_u64(2, 4).is_nonzero(), Some(true));
+        // a definite 1 with X elsewhere => true (the fix)
+        let mut v = Value::new(4); // all X
+        v.set_bit(1, LogicBit::One);
+        assert_eq!(v.is_nonzero(), Some(true));
+        // X bits but no definite 1 => unknown
+        let mut v2 = Value::from_u64(0, 4);
+        v2.set_bit(0, LogicBit::X);
+        assert_eq!(v2.is_nonzero(), None);
+        // consequence: `1xxx && 1` is true, not X
+        let mut v3 = Value::new(4);
+        v3.set_bit(3, LogicBit::One);
+        assert_eq!(v3.logic_and(&Value::from_u64(1, 1)).get_bit(0), LogicBit::One);
+        // sanity: bit() helper round-trips
+        assert_eq!(bit(LogicBit::X).get_bit(0), LogicBit::X);
+    }
 }
 
 // Compatibility shims for the simulator
