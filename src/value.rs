@@ -1108,15 +1108,23 @@ impl Value {
         if self.is_real {
             return Some(self.to_f64() != 0.0);
         }
+        // Matches iverilog's reduce-to-bool (NetEBLogic, eval_tree.cc):
+        // a *definite* 1 anywhere makes the value truthy even if other
+        // bits are X/Z. Only return None (unknown) when there are X/Z
+        // bits and no definite 1 — i.e. the truth could still go either
+        // way. Returning None on *any* X/Z over-propagates X through
+        // `&&` / `||` / `!` / `->` / `<->`.
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
-                if *xz_bits != 0 { None }
-                else { Some(*val_bits != 0) }
+                // A bit is a definite 1 where val=1 and xz=0.
+                if *val_bits & !*xz_bits != 0 { Some(true) }
+                else if *xz_bits != 0 { None }
+                else { Some(false) }
             }
             ValueStorage::Wide(bits) => {
-                let has_xz = bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z));
-                if has_xz { None }
-                else { Some(bits.iter().any(|b| *b == LogicBit::One)) }
+                if bits.iter().any(|b| *b == LogicBit::One) { Some(true) }
+                else if bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)) { None }
+                else { Some(false) }
             }
         }
     }
