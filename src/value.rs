@@ -1050,6 +1050,27 @@ impl Value {
         }
     }
 
+    /// Logical implication `->` (IEEE 1800-2017 §11.4.7). `a -> b` is
+    /// `!a || b`: definite-false left or definite-true right yields 1;
+    /// true-left & false-right yields 0; otherwise X.
+    pub fn logic_impl(&self, other: &Value) -> Value {
+        match (self.is_nonzero(), other.is_nonzero()) {
+            (Some(false), _) | (_, Some(true)) => Value::from_u64(1, 1),
+            (Some(true), Some(false)) => Value::from_u64(0, 1),
+            _ => Value::new(1),
+        }
+    }
+
+    /// Logical equivalence `<->` (IEEE 1800-2017 §11.4.7). 1 when both
+    /// sides reduce to the same bool, 0 when they disagree, X if either
+    /// side is unknown.
+    pub fn logic_equiv(&self, other: &Value) -> Value {
+        match (self.is_nonzero(), other.is_nonzero()) {
+            (Some(x), Some(y)) => Value::from_u64((x == y) as u64, 1),
+            _ => Value::new(1),
+        }
+    }
+
     /// Returns Some(true) if nonzero, Some(false) if zero, None if contains X/Z.
     pub fn is_nonzero(&self) -> Option<bool> {
         if self.is_real {

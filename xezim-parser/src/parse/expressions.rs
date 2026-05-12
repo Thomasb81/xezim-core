@@ -884,6 +884,11 @@ impl Parser {
             TokenKind::OrFatArrow => Some((BinaryOp::OrFatArrow, 1, 2)),
             TokenKind::HashHash => Some((BinaryOp::HashHash, 28, 27)), // High precedence
             TokenKind::KwIff => Some((BinaryOp::Iff, 1, 2)),
+            // Logical implication / equivalence (IEEE 1800-2017 Table
+            // 11-2): lowest-precedence binary ops, below `||`, above the
+            // ternary. `->` is right-associative.
+            TokenKind::Arrow => Some((BinaryOp::LogImplies, 2, 1)),
+            TokenKind::LogEquiv => Some((BinaryOp::LogEquiv, 1, 2)),
             TokenKind::LogOr => Some((BinaryOp::LogOr, 3, 4)),
             TokenKind::LogAnd => Some((BinaryOp::LogAnd, 5, 6)),
             TokenKind::BitOr => Some((BinaryOp::BitOr, 7, 8)),
