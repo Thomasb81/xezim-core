@@ -982,6 +982,38 @@ impl Value {
         Value::from_u64(1, 1)
     }
 
+    /// SV §11.4.6 wildcard equality (`==?`). X/Z bits *on the right*
+    /// operand are wildcards (always match). X/Z bits on the left
+    /// (where the right is 0/1) make the result X — unless a hard
+    /// mismatch already forced it to 0. Returns a 3-state 1-bit value.
+    pub fn wildcard_eq(&self, other: &Value) -> Value {
+        let w = self.width.max(other.width) as usize;
+        let mut eq = LogicBit::One;
+        for i in 0..w {
+            let l = self.get_bit(i);
+            let r = other.get_bit(i);
+            if matches!(r, LogicBit::X | LogicBit::Z) { continue; }
+            if matches!(l, LogicBit::X | LogicBit::Z) {
+                if eq == LogicBit::One { eq = LogicBit::X; }
+                continue;
+            }
+            if l != r { return Value::from_u64(0, 1); }
+        }
+        let mut v = Value::zero(1);
+        v.set_bit(0, eq);
+        v
+    }
+
+    /// SV §11.4.6 wildcard inequality (`!=?`) — `wildcard_eq` inverted;
+    /// X stays X.
+    pub fn wildcard_ne(&self, other: &Value) -> Value {
+        match self.wildcard_eq(other).get_bit(0) {
+            LogicBit::Zero => Value::from_u64(1, 1),
+            LogicBit::One => Value::from_u64(0, 1),
+            _ => Value::new(1),
+        }
+    }
+
     #[inline]
     pub fn less_than(&self, other: &Value) -> Value {
         if self.has_xz() || other.has_xz() { return Value::new(1); }
