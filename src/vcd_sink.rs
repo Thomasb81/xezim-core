@@ -17,6 +17,11 @@
 //!
 //! `VcdSink` implements `std::io::Write` so existing `writeln!(w, ...)` call
 //! sites keep working unchanged.
+//!
+//! The underlying byte stream is a boxed `Write` ([`DumpWriter`]). For plain
+//! dumps that is the file itself; for `.zst` dumps it is a streaming zstd
+//! encoder (`auto_finish`, so the frame footer is written on drop — whether
+//! that drop happens on the caller thread (inline) or the writer thread).
 
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
@@ -24,6 +29,9 @@ use std::sync::mpsc::{self, Sender};
 use std::thread::JoinHandle;
 
 use super::value::{LogicBit, Value};
+
+/// Owned byte sink behind a `VcdSink`. `Send` so the threaded writer can own it.
+pub type DumpWriter = Box<dyn Write + Send>;
 
 const CHUNK_CAPACITY: usize = 64 * 1024;
 /// Minimum buffered bytes before `commit()` hands a byte chunk to the worker.
@@ -44,7 +52,7 @@ enum WorkerMsg {
 }
 
 enum Mode {
-    Inline(BufWriter<File>),
+    Inline(BufWriter<DumpWriter>),
     Threaded {
         buf: Vec<u8>,
         pending: Vec<VcdTimestep>,
@@ -58,33 +66,35 @@ pub struct VcdSink {
 }
 
 impl VcdSink {
-    pub fn inline(file: File) -> Self {
-        VcdSink { mode: Mode::Inline(BufWriter::new(file)) }
+    pub fn inline(w: DumpWriter) -> Self {
+        VcdSink { mode: Mode::Inline(BufWriter::new(w)) }
     }
 
-    pub fn threaded(file: File) -> Self {
+    pub fn threaded(w: DumpWriter) -> Self {
         let (tx, rx) = mpsc::channel::<WorkerMsg>();
         let handle = std::thread::Builder::new()
             .name("xezim-vcd".to_string())
             .spawn(move || {
-                let mut w = BufWriter::with_capacity(256 * 1024, file);
+                let mut bw = BufWriter::with_capacity(256 * 1024, w);
                 while let Ok(msg) = rx.recv() {
                     match msg {
-                        WorkerMsg::Chunk(bytes) => { let _ = w.write_all(&bytes); }
+                        WorkerMsg::Chunk(bytes) => { let _ = bw.write_all(&bytes); }
                         WorkerMsg::VcdBatch(batch) => {
                             for ts in &batch {
                                 if let Some(t) = ts.time {
-                                    let _ = writeln!(w, "#{}", t);
+                                    let _ = writeln!(bw, "#{}", t);
                                 }
                                 for (id, val) in &ts.changes {
-                                    write_vcd_value(&mut w, val, id);
+                                    write_vcd_value(&mut bw, val, id);
                                 }
                             }
                         }
                         WorkerMsg::Shutdown => break,
                     }
                 }
-                let _ = w.flush();
+                let _ = bw.flush();
+                // `bw` drops here → flushes, then drops the inner `DumpWriter`.
+                // For a zstd `auto_finish` encoder that drop writes the frame footer.
             })
             .expect("spawn xezim-vcd writer thread");
         VcdSink {
@@ -95,6 +105,19 @@ impl VcdSink {
                 handle: Some(handle),
             },
         }
+    }
+
+    /// Open a dump sink writing to `file`.
+    ///
+    /// * `threaded` — route formatting/IO through a background writer thread.
+    /// * `zstd_level` — `Some(level)` to zstd-compress the byte stream (the
+    ///   produced file is a single `.zst` frame); `None` for a plain stream.
+    pub fn open_file(file: File, threaded: bool, zstd_level: Option<i32>) -> io::Result<Self> {
+        let w: DumpWriter = match zstd_level {
+            Some(level) => Box::new(zstd::stream::Encoder::new(file, level)?.auto_finish()),
+            None => Box::new(file),
+        };
+        Ok(if threaded { Self::threaded(w) } else { Self::inline(w) })
     }
 
     /// In threaded mode: push a timestep's value changes into the pending
