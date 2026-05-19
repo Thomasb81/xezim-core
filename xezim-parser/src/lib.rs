@@ -25,6 +25,58 @@ pub mod lexer;
 pub mod parse;
 pub mod preprocessor;
 
+use std::sync::atomic::{AtomicBool, Ordering};
+
+/// Process-wide gate for IEEE 1800-2023 syntax extensions. Off by default.
+/// Enabled by the `--sv2023` CLI flag; tests opt in via `set_sv2023`.
+static SV2023_ENABLED: AtomicBool = AtomicBool::new(false);
+
+/// Enable or disable IEEE 1800-2023 syntax extensions for subsequent
+/// lex/parse/simulate calls in this process.
+pub fn set_sv2023(enabled: bool) {
+    SV2023_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether IEEE 1800-2023 syntax extensions are currently enabled.
+pub fn is_sv2023() -> bool {
+    SV2023_ENABLED.load(Ordering::Relaxed)
+}
+
+thread_local! {
+    /// Stack of enclosing class names, maintained by the parser while
+    /// parsing class bodies. Used to resolve `type(this)` (IEEE
+    /// 1800-2023 §6.20.2.1) to the current class at parse time.
+    static CLASS_CONTEXT: std::cell::RefCell<Vec<String>> =
+        std::cell::RefCell::new(Vec::new());
+
+    /// Sticky flag set by the preprocessor when it sees
+    /// `` `default_nettype none ``. The elaborator's implicit-net
+    /// auto-creation pass consults it to reject implicit-net
+    /// usage inside the `none` region.
+    static DEFAULT_NETTYPE_NONE_SEEN: std::cell::Cell<bool> =
+        std::cell::Cell::new(false);
+}
+
+pub(crate) fn push_class_context(name: String) {
+    CLASS_CONTEXT.with(|s| s.borrow_mut().push(name));
+}
+
+pub(crate) fn pop_class_context() {
+    CLASS_CONTEXT.with(|s| { s.borrow_mut().pop(); });
+}
+
+pub(crate) fn current_class_name() -> Option<String> {
+    CLASS_CONTEXT.with(|s| s.borrow().last().cloned())
+}
+
+pub fn set_default_nettype_none_seen(v: bool) {
+    DEFAULT_NETTYPE_NONE_SEEN.with(|c| c.set(v));
+}
+
+pub fn default_nettype_none_seen() -> bool {
+    DEFAULT_NETTYPE_NONE_SEEN.with(|c| c.get())
+}
+
 #[cfg(feature = "serde")]
 pub mod serde;
 

@@ -20,6 +20,10 @@ impl Statement {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum StatementKind {
     Null,
+    /// IEEE 1800-2017 §9.6.3: `disable fork` aborts all currently
+    /// active child processes of the enclosing scope's most-recent
+    /// fork that haven't yet completed.
+    DisableFork,
     Expr(Expression),
     BlockingAssign { lvalue: Expression, rvalue: Expression },
     NonblockingAssign { lvalue: Expression, delay: Option<Expression>, rvalue: Expression },

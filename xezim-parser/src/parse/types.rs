@@ -64,6 +64,43 @@ impl Parser {
                 DataType::Interface { name, modport, span: self.span_from(start) }
             }
             TokenKind::KwVoid => { self.bump(); DataType::Void(self.span_from(start)) }
+            // IEEE 1800-2023 §6.20.2.1: `type(expr)` typeof operator in
+            // type position. We special-case `type(this)` to resolve to
+            // the enclosing class name captured at parse time. Other
+            // forms fall back to an Implicit type.
+            TokenKind::KwType if crate::is_sv2023()
+                && self.peek_kind() == TokenKind::LParen =>
+            {
+                self.bump(); // 'type'
+                self.bump(); // '('
+                let is_this = matches!(
+                    self.current_kind(),
+                    TokenKind::KwThis | TokenKind::Identifier
+                ) && self.current().text == "this";
+                if is_this {
+                    self.bump();
+                    self.expect(TokenKind::RParen);
+                    if let Some(cls) = crate::current_class_name() {
+                        let span = self.span_from(start);
+                        let name = TypeName {
+                            scope: None,
+                            name: crate::ast::Identifier { name: cls, span },
+                            span,
+                        };
+                        return DataType::TypeReference {
+                            name,
+                            dimensions: Vec::new(),
+                            type_args: Vec::new(),
+                            span,
+                        };
+                    }
+                }
+                // Fallback: consume the inner expression and produce an
+                // Implicit type. Keeps subsequent declarators parseable.
+                let _ = self.parse_expression();
+                self.expect(TokenKind::RParen);
+                DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+            }
             TokenKind::KwEnum => self.parse_enum_type(),
             TokenKind::KwStruct | TokenKind::KwUnion => self.parse_struct_type(),
             TokenKind::KwSigned | TokenKind::KwUnsigned => {
@@ -388,7 +425,16 @@ fn parse_enum_type(&mut self) -> DataType {
             TokenKind::KwInput => { self.bump(); Some(PortDirection::Input) }
             TokenKind::KwOutput => { self.bump(); Some(PortDirection::Output) }
             TokenKind::KwInout => { self.bump(); Some(PortDirection::Inout) }
-            TokenKind::KwRef => { self.bump(); Some(PortDirection::Ref) }
+            TokenKind::KwRef => {
+                self.bump();
+                // IEEE 1800-2023 §13.5.2: `ref static` is a lifetime-pinned ref.
+                // We accept the syntax and treat it as a normal ref; the static
+                // guarantee is trivially satisfied for module-scope referents.
+                if crate::is_sv2023() && self.current_kind() == TokenKind::KwStatic {
+                    self.bump();
+                }
+                Some(PortDirection::Ref)
+            }
             _ => None,
         }
     }

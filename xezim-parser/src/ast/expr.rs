@@ -63,6 +63,9 @@ pub enum AssignmentPatternItem {
     Typed(super::types::DataType, Expression),
     /// Default: `'{default: expr}`
     Default(Expression),
+    /// Indexed/keyed: `'{<expr>: <expr>, ...}` — used for associative
+    /// arrays and dictionary-style aggregates (IEEE 1800-2023 §10.10).
+    Keyed(Expression, Expression),
 }
 
 impl AssignmentPatternItem {
@@ -72,6 +75,7 @@ impl AssignmentPatternItem {
             Self::Named(_, e) => e,
             Self::Typed(_, e) => e,
             Self::Default(e) => e,
+            Self::Keyed(_, e) => e,
         }
     }
 }

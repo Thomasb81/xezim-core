@@ -96,6 +96,26 @@ impl Parser {
                 self.bump();
                 self.parse_description()
             }
+            TokenKind::KwBind => {
+                // IEEE 1800-2017 §23.11: `bind <target> <module> inst(...);`
+                // Parse-and-discard for now — the monitor/checker isn't
+                // instantiated, but accepting the syntax lets designs
+                // that use bind compile and run their primary logic.
+                self.bump();
+                let mut depth_paren = 0i32;
+                while !self.at(TokenKind::Eof) {
+                    match self.current_kind() {
+                        TokenKind::LParen => { depth_paren += 1; self.bump(); }
+                        TokenKind::RParen => { depth_paren -= 1; self.bump(); }
+                        TokenKind::Semicolon if depth_paren <= 0 => {
+                            self.bump();
+                            break;
+                        }
+                        _ => { self.bump(); }
+                    }
+                }
+                self.parse_description()
+            }
             TokenKind::KwConstraint => {
                 // Out-of-class constraint definition at $unit scope:
                 // `constraint ClassName::name { ... }[;]`. Parse and discard.

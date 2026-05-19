@@ -198,6 +198,9 @@ pub struct ElaboratedClass {
     /// directly.
     #[serde(default)]
     pub is_virtual: bool,
+    /// IEEE 1800-2023 §8.20.5: `class :final` — class cannot be extended.
+    #[serde(default)]
+    pub is_final: bool,
     /// Has at least one `pure virtual` method prototype.
     #[serde(default)]
     pub has_pure_virtual: bool,
@@ -306,6 +309,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         param_defaults,
         is_interface: c.is_interface,
         is_virtual: c.virtual_kw,
+        is_final: c.is_final,
         has_pure_virtual,
         implements: c.implements.iter().map(|i| i.name.clone()).collect(),
         type_param_names,
@@ -384,6 +388,22 @@ pub struct ElaboratedModule {
     /// Out-of-class constraint definitions: `(class_name, constraint_name)`.
     #[serde(default)]
     pub out_of_class_constraints: HashSet<(String, String)>,
+    /// IEEE 1800-2023 §20.3: $timeunit / $timeprecision encoded as the
+    /// power-of-10 exponent in seconds (e.g. 10ns → -8). Defaults to -9.
+    #[serde(default = "default_timeunit_exp")]
+    pub timeunit_exp: i32,
+    #[serde(default = "default_timeunit_exp")]
+    pub timeprecision_exp: i32,
+    /// IEEE 1800-2017 §6.19: enum typedef members in declaration order.
+    /// Keyed by typedef name; each entry is `(member_name, value)`.
+    /// Used to resolve `.name()` / `.next()` / `.first()` etc.
+    #[serde(default)]
+    pub enum_members: HashMap<String, Vec<(String, u64)>>,
+    /// IEEE 1800-2017 §6.2: names of 2-state-typed signals (bit, byte,
+    /// shortint, int, longint). Assignments to these coerce X/Z
+    /// source bits to 0.
+    #[serde(default)]
+    pub two_state_signals: HashSet<String>,
     /// Deferred-rewrite buffers (fix #7). Populated by `inline_module_items`
     /// instead of eagerly producing rewritten ASTs in `always_blocks` /
     /// `initial_blocks` / `continuous_assigns`. Drained by callers via
@@ -435,6 +455,10 @@ impl ElaboratedModule {
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
             out_of_class_constraints: HashSet::default(),
+            timeunit_exp: default_timeunit_exp(),
+            timeprecision_exp: default_timeunit_exp(),
+            enum_members: HashMap::default(),
+            two_state_signals: HashSet::default(),
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
@@ -608,6 +632,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
             .unwrap_or(32);
         let mut next_val: u64 = 0;
+        let mut members_ordered: Vec<(String, u64)> = Vec::new();
         for member in &et.members {
             let val = if let Some(init) = &member.init {
                 eval_const_expr(init, &elab.parameters)
@@ -622,11 +647,13 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                 is_real: false,
                 direction: None,
                 value: v,
-                type_name: None,
+                type_name: Some(td.name.name.clone()),
             });
+            members_ordered.push((member.name.name.clone(), val));
         }
         // Register the typedef width
         elab.typedefs.insert(td.name.name.clone(), base_width);
+        elab.enum_members.insert(td.name.name.clone(), members_ordered);
     } else {
         // Non-enum typedef: resolve width from the underlying type
         let w = resolve_type_width(&td.data_type, Some(&elab.parameters), Some(&elab.typedefs));
@@ -929,6 +956,46 @@ pub fn elaborate_module_with_defs(
     for param in module.params() {
         if let ParameterKind::Data { data_type, assignments } = &param.kind {
             for assign in assignments {
+                // IEEE 1800-2023: keyed assignment-pattern parameter
+                // (associative array literal). Materialize the entries
+                // as `<param>["key"]` signals before falling into the
+                // scalar parameter path.
+                if let Some(init) = &assign.init {
+                    if let ExprKind::AssignmentPattern(items) = &init.kind {
+                        let all_keyed = !items.is_empty()
+                            && items.iter().all(|it| matches!(it, AssignmentPatternItem::Keyed(_, _)));
+                        eprintln!("[X-MP] AP {} items, all_keyed={}", items.len(), all_keyed);
+                        if all_keyed {
+                            let elem_w = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                            elab.associative_arrays
+                                .insert(assign.name.name.clone(), true);
+                            for it in items {
+                                if let AssignmentPatternItem::Keyed(k, v) = it {
+                                    let key_str = match &k.kind {
+                                        ExprKind::StringLiteral(s) => s.clone(),
+                                        _ => eval_const_expr_val(k, &elab.parameters).to_dec_string(),
+                                    };
+                                    let val_v = eval_init_for_width(v, &elab.parameters, elem_w);
+                                    let signal_name = format!("{}[{}]", assign.name.name, key_str);
+                                    elab.signals.insert(
+                                        signal_name.clone(),
+                                        Signal {
+                                            is_const: true,
+                                            name: signal_name,
+                                            width: elem_w,
+                                            is_signed: is_type_signed(data_type),
+                                            is_real: false,
+                                            direction: None,
+                                            value: val_v,
+                                            type_name: None,
+                                        },
+                                    );
+                                }
+                            }
+                            continue;
+                        }
+                    }
+                }
                 let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let mut signed = is_type_signed(data_type);
                 let mut is_real = is_type_real(data_type);
@@ -1258,6 +1325,34 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // If the element type is a packed struct (directly
+                        // or via a typedef), register the element-type
+                        // layout under the array name so `arr[i].field`
+                        // can be sliced from the indexed element.
+                        let elem_resolved: &DataType =
+                            if let DataType::TypeReference { name, .. } = &dd.data_type {
+                                elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
+                            } else { &dd.data_type };
+                        if let DataType::Struct(su) = elem_resolved {
+                            let is_union = matches!(su.kind, StructUnionKind::Union);
+                            let mut fields: Vec<(String, u32, u32)> = Vec::new();
+                            let raw: Vec<(String, u32)> = su.members.iter().flat_map(|m| {
+                                let mw = resolve_type_width(&m.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                m.declarators.iter().map(move |d| (d.name.name.clone(), mw))
+                            }).collect();
+                            if is_union {
+                                for (mn, mw) in &raw { fields.push((mn.clone(), 0, *mw)); }
+                            } else {
+                                let mut offset: u32 = 0;
+                                for (mn, mw) in raw.iter().rev() {
+                                    fields.push((mn.clone(), offset, *mw));
+                                    offset += mw;
+                                }
+                            }
+                            if !fields.is_empty() {
+                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                            }
+                        }
                         // Track descending arrays (left > right in the declaration)
                         if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
@@ -1329,6 +1424,9 @@ pub fn elaborate_module_with_defs(
                             type_name: get_type_name(&dd.data_type),
                         };
                         elab.signals.insert(decl.name.name.clone(), sig);
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                         if let Some(view) = &data_modport_view {
                             elab.modport_views.insert(decl.name.name.clone(), view.clone());
                         }
@@ -1462,6 +1560,43 @@ pub fn elaborate_module_with_defs(
                         if elab.signals.contains_key(&assign.name.name) || elab.parameters.contains_key(&assign.name.name) {
                             return Err(format!("Duplicate declaration of '{}'", assign.name.name));
                         }
+                        // IEEE 1800-2023: keyed assignment-pattern init for
+                        // associative-array typed parameters. Materialize
+                        // `'{ "K": V, ... }` as `<param>["K"]` signals so
+                        // `WEIGHT["HIGH"]` reads back the supplied value.
+                        if let Some(init) = &assign.init {
+                            if let ExprKind::AssignmentPattern(items) = &init.kind {
+                                let all_keyed = !items.is_empty()
+                                    && items.iter().all(|it| matches!(it, AssignmentPatternItem::Keyed(_, _)));
+                                if all_keyed {
+                                    elab.associative_arrays
+                                        .insert(assign.name.name.clone(), true);
+                                    for it in items {
+                                        if let AssignmentPatternItem::Keyed(k, v) = it {
+                                            let key_str = match &k.kind {
+                                                ExprKind::StringLiteral(s) => s.clone(),
+                                                _ => eval_const_expr_val(k, &elab.parameters).to_dec_string(),
+                                            };
+                                            let val_v = eval_init_for_width(v, &elab.parameters, width);
+                                            elab.signals.insert(
+                                                format!("{}[{}]", assign.name.name, key_str),
+                                                Signal {
+                                                    is_const: true,
+                                                    name: format!("{}[{}]", assign.name.name, key_str),
+                                                    width,
+                                                    is_signed: signed,
+                                                    is_real: false,
+                                                    direction: None,
+                                                    value: val_v,
+                                                    type_name: None,
+                                                },
+                                            );
+                                        }
+                                    }
+                                    continue;
+                                }
+                            }
+                        }
                         let mut current_width = width;
                         let mut current_is_real = is_real;
                         let mut current_signed = signed;
@@ -1522,6 +1657,14 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::TypedefDeclaration(td) => {
                 process_typedef(td, &mut elab);
+            }
+            ModuleItem::TimeunitsDecl(td) => {
+                if let Some(u) = &td.unit {
+                    elab.timeunit_exp = time_literal_to_exp(u);
+                }
+                if let Some(p) = &td.precision {
+                    elab.timeprecision_exp = time_literal_to_exp(p);
+                }
             }
             ModuleItem::FunctionDeclaration(fd) => {
                 if matches!(fd.return_type, DataType::Void(_)) {
@@ -1600,6 +1743,13 @@ pub fn elaborate_module_with_defs(
                 for (lhs, rhs) in &ca.assignments {
                     elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
                 }
+            }
+            ModuleItem::GateInstantiation(gi) => {
+                // Synthesise a continuous-assign equivalent for each gate
+                // (and/or/xor/nand/nor/xnor/buf/not). The top items loop
+                // dropped these on the floor previously, which left every
+                // gate output stuck at its X default.
+                gate_inst_to_assigns(gi, &mut elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
@@ -1731,7 +1881,7 @@ pub fn elaborate_module_with_defs(
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
     // or port connections that are not explicitly declared become implicit 1-bit wires.
-    create_implicit_nets(&mut elab);
+    create_implicit_nets(&mut elab)?;
 
     // Validate that all identifiers in procedural blocks are declared.
     for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::default())?; }
@@ -1748,7 +1898,316 @@ pub fn elaborate_module_with_defs(
     // IEEE 1800-2017 §8.21/§8.26: class instantiation legality.
     validate_class_usage(&elab)?;
 
+    // IEEE 1800-2023 §8.20.5: a derived class may not override a `final`
+    // method of any ancestor class.
+    if sv_parser::is_sv2023() {
+        validate_final_method_overrides(&elab)?;
+    }
+
+    // IEEE 1800-2017 §9.2.2.4: `always_ff` admits exactly one event
+    // control, applied at the outermost level. Nested event/timing
+    // control in the body is illegal.
+    validate_always_ff_event_controls(&elab)?;
+
+    // IEEE 1800-2017 §13.5.2: arguments to `ref` formals must be
+    // variables (i.e. assignable lvalues), not arbitrary expressions.
+    validate_ref_arg_lvalues(&elab)?;
+
+    // IEEE 1800-2017 §6.19.3: an assignment to an enum-typed variable
+    // requires the RHS value (when constant) to be one of the typedef's
+    // declared members. Casts bypass the check.
+    validate_enum_assignments(&elab)?;
+
     Ok(elab)
+}
+
+fn validate_enum_assignments(elab: &ElaboratedModule) -> Result<(), String> {
+    use crate::ast::expr::{Expression, ExprKind};
+    use crate::ast::stmt::{Statement, StatementKind};
+    fn try_const_u64(e: &Expression, elab: &ElaboratedModule) -> Option<u64> {
+        // Only fold pure constant rvalues. Anything with an Ident or
+        // function call is conservatively skipped.
+        match &e.kind {
+            ExprKind::Number(_) => Some(eval_const_expr(e, &elab.parameters)),
+            ExprKind::Paren(inner) => try_const_u64(inner, elab),
+            _ => None,
+        }
+    }
+    fn check_assign(
+        lvalue: &Expression,
+        rvalue: &Expression,
+        elab: &ElaboratedModule,
+    ) -> Result<(), String> {
+        if let ExprKind::Ident(h) = &lvalue.kind {
+            if h.path.len() == 1 {
+                let name = &h.path[0].name.name;
+                if let Some(sig) = elab.signals.get(name) {
+                    if let Some(tname) = &sig.type_name {
+                        if let Some(members) = elab.enum_members.get(tname) {
+                            if let Some(v) = try_const_u64(rvalue, elab) {
+                                if !members.iter().any(|(_, mv)| *mv == v) {
+                                    return Err(format!(
+                                        "Assignment of {} to enum '{}' variable '{}' is not a declared member (IEEE 1800-2017 §6.19.3)",
+                                        v, tname, name
+                                    ));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn walk_stmt(s: &Statement, elab: &ElaboratedModule) -> Result<(), String> {
+        match &s.kind {
+            StatementKind::BlockingAssign { lvalue, rvalue }
+            | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
+                check_assign(lvalue, rvalue, elab)?;
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for s in stmts { walk_stmt(s, elab)?; }
+            }
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                walk_stmt(then_stmt, elab)?;
+                if let Some(e) = else_stmt { walk_stmt(e, elab)?; }
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Foreach { body, .. } => walk_stmt(body, elab)?,
+            StatementKind::Case { items, .. } => {
+                for it in items { walk_stmt(&it.stmt, elab)?; }
+            }
+            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, elab)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    for ib in &elab.initial_blocks { walk_stmt(&ib.stmt, elab)?; }
+    for ab in &elab.always_blocks { walk_stmt(&ab.stmt, elab)?; }
+    for f in elab.functions.values() {
+        for s in &f.items { walk_stmt(s, elab)?; }
+    }
+    for t in elab.tasks.values() {
+        for s in &t.items { walk_stmt(s, elab)?; }
+    }
+    Ok(())
+}
+
+fn is_lvalue_expr(e: &crate::ast::expr::Expression) -> bool {
+    use crate::ast::expr::ExprKind;
+    matches!(
+        &e.kind,
+        ExprKind::Ident(_)
+            | ExprKind::Index { .. }
+            | ExprKind::RangeSelect { .. }
+            | ExprKind::MemberAccess { .. }
+            | ExprKind::Concatenation(_)
+    )
+}
+
+fn validate_ref_arg_lvalues(elab: &ElaboratedModule) -> Result<(), String> {
+    use crate::ast::expr::{Expression, ExprKind};
+    use crate::ast::stmt::{Statement, StatementKind};
+    fn check_call(
+        callee_name: &str,
+        args: &[Expression],
+        elab: &ElaboratedModule,
+    ) -> Result<(), String> {
+        let formals: Option<&[crate::ast::decl::FunctionPort]> = if let Some(t) = elab.tasks.get(callee_name) {
+            Some(t.ports.as_slice())
+        } else if let Some(f) = elab.functions.get(callee_name) {
+            Some(f.ports.as_slice())
+        } else { None };
+        if let Some(ports) = formals {
+            for (i, p) in ports.iter().enumerate() {
+                if matches!(p.direction, crate::ast::types::PortDirection::Ref) {
+                    if let Some(a) = args.get(i) {
+                        if !is_lvalue_expr(a) {
+                            return Err(format!(
+                                "Argument to `ref` formal '{}' of '{}' must be a variable (IEEE 1800-2017 §13.5.2)",
+                                p.name.name, callee_name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+    fn walk_expr(e: &Expression, elab: &ElaboratedModule) -> Result<(), String> {
+        if let ExprKind::Call { func, args } = &e.kind {
+            if let ExprKind::Ident(h) = &func.kind {
+                if let Some(seg) = h.path.last() {
+                    check_call(&seg.name.name, args, elab)?;
+                }
+            }
+            for a in args { walk_expr(a, elab)?; }
+            return Ok(());
+        }
+        Ok(())
+    }
+    fn walk_stmt(s: &Statement, elab: &ElaboratedModule) -> Result<(), String> {
+        match &s.kind {
+            StatementKind::Expr(e) => walk_expr(e, elab)?,
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for s in stmts { walk_stmt(s, elab)?; }
+            }
+            StatementKind::If { then_stmt, else_stmt, condition: _, .. } => {
+                walk_stmt(then_stmt, elab)?;
+                if let Some(e) = else_stmt { walk_stmt(e, elab)?; }
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Foreach { body, .. } => walk_stmt(body, elab)?,
+            StatementKind::Case { items, .. } => {
+                for it in items { walk_stmt(&it.stmt, elab)?; }
+            }
+            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, elab)?,
+            _ => {}
+        }
+        Ok(())
+    }
+    for ib in &elab.initial_blocks {
+        walk_stmt(&ib.stmt, elab)?;
+    }
+    for ab in &elab.always_blocks {
+        walk_stmt(&ab.stmt, elab)?;
+    }
+    for f in elab.functions.values() {
+        for s in &f.items { walk_stmt(s, elab)?; }
+    }
+    for t in elab.tasks.values() {
+        for s in &t.items { walk_stmt(s, elab)?; }
+    }
+    Ok(())
+}
+
+fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), String> {
+    use crate::ast::decl::AlwaysKind;
+    use crate::ast::stmt::{Statement, StatementKind};
+    fn walk_no_timing(s: &Statement) -> Result<(), String> {
+        match &s.kind {
+            StatementKind::TimingControl { .. } => {
+                Err("`always_ff` body must not contain a nested event/timing control \
+                     (IEEE 1800-2017 §9.2.2.4)".into())
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for s in stmts { walk_no_timing(s)?; }
+                Ok(())
+            }
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                walk_no_timing(then_stmt)?;
+                if let Some(e) = else_stmt { walk_no_timing(e)?; }
+                Ok(())
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items { walk_no_timing(&it.stmt)?; }
+                Ok(())
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Foreach { body, .. } => walk_no_timing(body),
+            _ => Ok(()),
+        }
+    }
+    for ab in &elab.always_blocks {
+        if !matches!(ab.kind, AlwaysKind::AlwaysFf) { continue; }
+        // The outermost statement is allowed to be the single event
+        // control; descend through it once before enforcing.
+        let body = match &ab.stmt.kind {
+            StatementKind::TimingControl { stmt, .. } => stmt.as_ref(),
+            _ => &ab.stmt,
+        };
+        walk_no_timing(body)?;
+    }
+    Ok(())
+}
+
+/// IEEE 1800-2023 §8.20.5: enforcement of the `:final` specifier.
+///
+/// Two checks:
+///   1. `class :final X` — no class may declare `extends X`.
+///   2. `function :final foo` — no derived class may declare a method
+///      named `foo` anywhere in its ancestor chain.
+fn validate_final_method_overrides(elab: &ElaboratedModule) -> Result<(), String> {
+    for (cname, cdef) in &elab.classes {
+        // Direct-parent class-level :final check.
+        if let Some(parent_name) = &cdef.extends {
+            if let Some(parent) = elab.classes.get(parent_name) {
+                if parent.is_final {
+                    return Err(format!(
+                        "Class '{}' extends `final` class '{}' (IEEE 1800-2023 §8.20.5)",
+                        cname, parent_name
+                    ));
+                }
+            }
+        }
+        // Walk every strict ancestor for `:final` methods.
+        let mut cur = cdef.extends.clone();
+        while let Some(parent_name) = cur {
+            let Some(parent) = elab.classes.get(&parent_name) else { break; };
+            for (mname, pmethod) in &parent.methods {
+                if method_is_final(pmethod) && cdef.methods.contains_key(mname) {
+                    return Err(format!(
+                        "Class '{}' overrides `:final` method '{}' from ancestor '{}' (IEEE 1800-2023 §8.20.5)",
+                        cname, mname, parent_name
+                    ));
+                }
+            }
+            cur = parent.extends.clone();
+        }
+    }
+    Ok(())
+}
+
+fn default_timeunit_exp() -> i32 { -9 }
+
+/// Decode a SystemVerilog time literal (e.g. "10ns", "100ps") into a
+/// log10-second exponent. Returns -9 (1ns) on unparseable input.
+pub fn time_literal_to_exp(s: &str) -> i32 {
+    let s = s.trim();
+    let split = s
+        .find(|c: char| c.is_alphabetic())
+        .unwrap_or(s.len());
+    let (digits, unit) = s.split_at(split);
+    let mantissa: u32 = digits.trim().parse().unwrap_or(1);
+    let mantissa_exp = match mantissa {
+        1 => 0,
+        10 => 1,
+        100 => 2,
+        _ => 0,
+    };
+    let unit_exp: i32 = match unit.trim() {
+        "s" => 0,
+        "ms" => -3,
+        "us" => -6,
+        "ns" => -9,
+        "ps" => -12,
+        "fs" => -15,
+        _ => -9,
+    };
+    mantissa_exp + unit_exp
+}
+
+fn method_is_final(m: &crate::ast::decl::ClassMethod) -> bool {
+    use crate::ast::decl::{ClassMethodKind, MethodSpecifier};
+    let spec = match &m.kind {
+        ClassMethodKind::Function(f) => f.specifier,
+        ClassMethodKind::Task(t) => t.specifier,
+        ClassMethodKind::PureVirtual(f) => f.specifier,
+        ClassMethodKind::Extern(f) => f.specifier,
+    };
+    spec == Some(MethodSpecifier::Final)
 }
 
 fn expr_is_new(expr: &Expression) -> bool {
@@ -2358,9 +2817,28 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
             }
         }
         ExprKind::WithClause { expr, filter } => {
-            validate_expr_idents(expr, elab, locals)?;
+            // The Call's args inside an array-method `with` clause are
+            // iterator-name bindings (e.g. `find(item, idx)` introduces
+            // `item` and `idx`), not value references. Validate the
+            // method receiver but skip the iterator-name args, and add
+            // those names to the filter's scope.
             let mut with_locals = locals.clone();
             with_locals.insert("item".to_string());
+            match &expr.kind {
+                ExprKind::Call { func, args } => {
+                    validate_expr_idents(func, elab, locals)?;
+                    for a in args {
+                        if let ExprKind::Ident(h) = &a.kind {
+                            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                                with_locals.insert(h.path[0].name.name.clone());
+                                continue;
+                            }
+                        }
+                        validate_expr_idents(a, elab, locals)?;
+                    }
+                }
+                _ => validate_expr_idents(expr, elab, locals)?,
+            }
             validate_expr_idents(filter, elab, &with_locals)?;
         }
         _ => {}
@@ -2454,7 +2932,7 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
 
 /// Create implicit 1-bit wire signals for identifiers referenced in continuous assigns
 /// but not declared anywhere (IEEE 1800-2017 §6.10).
-fn create_implicit_nets(elab: &mut ElaboratedModule) {
+fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
     let mut implicit_names = Vec::new();
     for ca in &elab.continuous_assigns {
         collect_ident_names(&ca.lhs, &mut implicit_names);
@@ -2462,8 +2940,15 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) {
     }
     implicit_names.sort();
     implicit_names.dedup();
+    let none_active = sv_parser::default_nettype_none_seen();
     for name in implicit_names {
         if !elab.signals.contains_key(&name) && !elab.parameters.contains_key(&name) {
+            if none_active {
+                return Err(format!(
+                    "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
+                    name
+                ));
+            }
             eprintln!(
                 "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
                  (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
@@ -2477,6 +2962,7 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) {
             elab.nets.insert(name);
         }
     }
+    Ok(())
 }
 
 /// Collect all plain identifier names from an expression tree.
@@ -4374,6 +4860,53 @@ fn inline_module_items(
                         for assign in assignments {
                             if !sub_local_params.contains_key(&assign.name.name) {
                                 if let Some(init) = &assign.init {
+                                    // IEEE 1800-2023: associative-array
+                                    // parameter literal `'{"k": v, ...}`.
+                                    // Materialise as `<prefix><param>[key]`
+                                    // signals and register the array.
+                                    if let ExprKind::AssignmentPattern(items) = &init.kind {
+                                        let all_keyed = !items.is_empty()
+                                            && items.iter().all(|it|
+                                                matches!(it, AssignmentPatternItem::Keyed(_, _)));
+                                        if all_keyed {
+                                            let elem_w = resolve_type_width(
+                                                data_type,
+                                                Some(&sub_local_params),
+                                                Some(&elab.typedefs),
+                                            );
+                                            let arr_full = format!("{}{}", inst_prefix, assign.name.name);
+                                            elab.associative_arrays.insert(arr_full.clone(), true);
+                                            for it in items {
+                                                if let AssignmentPatternItem::Keyed(k, v) = it {
+                                                    let key_str = match &k.kind {
+                                                        ExprKind::StringLiteral(s) => s.clone(),
+                                                        _ => eval_const_expr_val(k, &sub_local_params)
+                                                            .to_dec_string(),
+                                                    };
+                                                    let val_v = eval_init_for_width(
+                                                        v,
+                                                        &sub_local_params,
+                                                        elem_w,
+                                                    );
+                                                    let sname = format!("{}[{}]", arr_full, key_str);
+                                                    elab.signals.insert(
+                                                        sname.clone(),
+                                                        Signal {
+                                                            is_const: true,
+                                                            name: sname,
+                                                            width: elem_w,
+                                                            is_signed: is_type_signed(data_type),
+                                                            is_real: false,
+                                                            direction: None,
+                                                            value: val_v,
+                                                            type_name: None,
+                                                        },
+                                                    );
+                                                }
+                                            }
+                                            continue;
+                                        }
+                                    }
                                     let mut val = eval_const_expr_val(init, &sub_local_params);
                                     if is_type_real(data_type) {
                                         val = Value::from_f64(val.to_f64());
@@ -4744,9 +5277,46 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                 }
                 pairs.push((out, rhs));
             }
+            GateType::Xor => {
+                let mut rhs = in1;
+                for i in 2..inst.terminals.len() {
+                    rhs = Expression::new(ExprKind::Binary { op: BinaryOp::BitXor, left: Box::new(rhs), right: Box::new(inst.terminals[i].clone()) }, out.span);
+                }
+                pairs.push((out, rhs));
+            }
+            GateType::Nand => {
+                let mut rhs = in1;
+                for i in 2..inst.terminals.len() {
+                    rhs = Expression::new(ExprKind::Binary { op: BinaryOp::BitAnd, left: Box::new(rhs), right: Box::new(inst.terminals[i].clone()) }, out.span);
+                }
+                rhs = Expression::new(ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(rhs) }, out.span);
+                pairs.push((out, rhs));
+            }
+            GateType::Nor => {
+                let mut rhs = in1;
+                for i in 2..inst.terminals.len() {
+                    rhs = Expression::new(ExprKind::Binary { op: BinaryOp::BitOr, left: Box::new(rhs), right: Box::new(inst.terminals[i].clone()) }, out.span);
+                }
+                rhs = Expression::new(ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(rhs) }, out.span);
+                pairs.push((out, rhs));
+            }
+            GateType::Xnor => {
+                let mut rhs = in1;
+                for i in 2..inst.terminals.len() {
+                    rhs = Expression::new(ExprKind::Binary { op: BinaryOp::BitXor, left: Box::new(rhs), right: Box::new(inst.terminals[i].clone()) }, out.span);
+                }
+                rhs = Expression::new(ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(rhs) }, out.span);
+                pairs.push((out, rhs));
+            }
             GateType::Not => {
                 let rhs = Expression::new(ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(in1) }, out.span);
                 pairs.push((out, rhs));
+            }
+            GateType::Buf => {
+                // Single-input buffer: out = in. Multi-output `buf` with
+                // (out1, out2, ..., in) is rare; for now only the
+                // two-terminal form is supported.
+                pairs.push((out, in1));
             }
             _ => {}
         }

@@ -99,6 +99,46 @@ impl Parser {
         } else { None }
     }
 
+    /// IEEE 1800-2023 §8.20.5: optional `:final` / `:extends` / `:initial`
+    /// specifier on a method/class. Consumes the colon and keyword together
+    /// only when (a) SV-2023 is enabled and (b) the next two tokens form a
+    /// valid specifier; otherwise leaves the cursor untouched.
+    pub(super) fn parse_optional_method_specifier(
+        &mut self,
+    ) -> Option<crate::ast::decl::MethodSpecifier> {
+        use crate::ast::decl::MethodSpecifier;
+        if !crate::is_sv2023() { return None; }
+        if !self.at(TokenKind::Colon) { return None; }
+        let next = self.peek_kind();
+        let spec = match next {
+            TokenKind::KwFinal => MethodSpecifier::Final,
+            TokenKind::KwExtends => MethodSpecifier::Extends,
+            TokenKind::KwInitial => MethodSpecifier::Initial,
+            _ => return None,
+        };
+        self.bump(); // ':'
+        self.bump(); // keyword
+        Some(spec)
+    }
+
+    /// Parse an optional `: <name>` end-label and, when SV-2023 is enabled,
+    /// emit a diagnostic if the label disagrees with the enclosing decl's
+    /// name (IEEE 1800-2023 §27.2.1).
+    pub(super) fn parse_end_label_checked(&mut self, expected: &str) -> Option<Identifier> {
+        let label = self.parse_end_label();
+        if crate::is_sv2023() {
+            if let Some(ref l) = label {
+                if l.name != expected && l.name != "<e>" {
+                    self.error(format!(
+                        "end-label '{}' does not match declared name '{}' (IEEE 1800-2023 §27.2.1)",
+                        l.name, expected
+                    ));
+                }
+            }
+        }
+        label
+    }
+
     /// Check if the current identifier is followed by #(...) :: or just ::
     /// which indicates a class scope (expression) rather than a type declaration.
     pub(super) fn peek_is_class_scope(&self) -> bool {

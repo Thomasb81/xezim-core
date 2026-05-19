@@ -316,6 +316,33 @@ impl<'a> Lexer<'a> {
     }
 
     fn scan_string(&mut self, start: usize) -> Token {
+        // IEEE 1800-2023 §5.9: triple-quoted string literal (""" ... """).
+        // Newlines are preserved and a lone `"` (or `""`) inside does not
+        // terminate the literal — only `"""` does. Gated on the SV-2023
+        // mode flag; in 2017 mode `"""x"""` lexes as two empty strings.
+        if crate::is_sv2023()
+            && self.input.get(self.pos + 1) == Some(&b'"')
+            && self.input.get(self.pos + 2) == Some(&b'"')
+        {
+            self.pos += 3; // skip opening """
+            while self.pos < self.input.len() {
+                if self.input[self.pos] == b'\\' && self.pos + 1 < self.input.len() {
+                    self.pos += 2;
+                    continue;
+                }
+                if self.input[self.pos] == b'"'
+                    && self.input.get(self.pos + 1) == Some(&b'"')
+                    && self.input.get(self.pos + 2) == Some(&b'"')
+                {
+                    self.pos += 3;
+                    break;
+                }
+                self.pos += 1;
+            }
+            let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+            return Token::new(TokenKind::TripleStringLiteral, text, Span::new(start, self.pos));
+        }
+
         self.pos += 1; // skip opening "
         while self.pos < self.input.len() {
             if self.input[self.pos] == b'\\' { self.pos += 2; continue; }
@@ -396,6 +423,20 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
                 if self.pos < self.input.len() && matches!(self.input[self.pos], b'+' | b'-') { self.pos += 1; }
                 while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') { self.pos += 1; }
+            }
+            // Time-unit suffix on a real (1800-2017 §3.14.2): treat
+            // `1.250ns` as a single TimeLiteral, not Real + Ident.
+            if self.pos + 1 < self.input.len() {
+                let rest = &self.input[self.pos..];
+                for suffix in &[b"ns" as &[u8], b"us", b"ms", b"ps", b"fs", b"s"] {
+                    if rest.starts_with(suffix)
+                        && !rest.get(suffix.len()).map_or(false, |c| c.is_ascii_alphanumeric())
+                    {
+                        self.pos += suffix.len();
+                        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+                        return Token::new(TokenKind::TimeLiteral, text, Span::new(start, self.pos));
+                    }
+                }
             }
             let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
             return Token::new(TokenKind::RealLiteral, text, Span::new(start, self.pos));

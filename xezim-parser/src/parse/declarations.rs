@@ -32,10 +32,18 @@ impl Parser {
             self.bump();
             let mut assignments = Vec::new();
             let name = self.parse_identifier();
+            // IEEE 1800-2023 §6.20.2.1: `type T extends Base` constrains the
+            // type argument to a class derived from `Base`. Gated on --sv2023;
+            // in 2017 mode an `extends` token here is a parse error as before.
+            let extends = if crate::is_sv2023() && self.eat(TokenKind::KwExtends).is_some() {
+                Some(self.parse_identifier())
+            } else {
+                None
+            };
             let init = if self.eat(TokenKind::Assign).is_some() {
                 Some(self.parse_data_type())
             } else { None };
-            assignments.push(TypeParamAssignment { name, init, span: self.span_from(start) });
+            assignments.push(TypeParamAssignment { name, extends, init, span: self.span_from(start) });
             return ParameterDeclaration { local, kind: ParameterKind::Type { assignments }, span: self.span_from(start) };
         }
         // Check if there's an explicit data type keyword or just an implicit type
@@ -215,6 +223,7 @@ impl Parser {
         let start = self.current().span.start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwFunction);
+        let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
         let return_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) ||
                             (self.at(TokenKind::Identifier) && (
@@ -243,14 +252,15 @@ impl Parser {
             items.push(self.parse_statement());
         }
         self.expect(TokenKind::KwEndfunction);
-        let endlabel = self.parse_end_label();
-        FunctionDeclaration { lifetime, return_type, name, ports, items, endlabel, span: self.span_from(start) }
+        let endlabel = self.parse_end_label_checked(&name.name.name);
+        FunctionDeclaration { lifetime, specifier, return_type, name, ports, items, endlabel, span: self.span_from(start) }
     }
 
     pub(super) fn parse_task_declaration(&mut self) -> TaskDeclaration {
         let start = self.current().span.start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwTask);
+        let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
@@ -262,7 +272,7 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
-        TaskDeclaration { lifetime, name, ports, items, endlabel, span: self.span_from(start) }
+        TaskDeclaration { lifetime, specifier, name, ports, items, endlabel, span: self.span_from(start) }
     }
 
     /// Parse a method name: handles 'new', regular identifiers, and class_scope::name.
@@ -294,6 +304,7 @@ impl Parser {
         let start = self.current().span.start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwFunction);
+        let specifier = self.parse_optional_method_specifier();
 
         let lifetime = self.parse_optional_lifetime();
         let return_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) ||
@@ -309,17 +320,18 @@ impl Parser {
         let name = self.parse_method_name();
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
-        FunctionDeclaration { lifetime, return_type, name, ports, items: Vec::new(), endlabel: None, span: self.span_from(start) }
+        FunctionDeclaration { lifetime, specifier, return_type, name, ports, items: Vec::new(), endlabel: None, span: self.span_from(start) }
     }
 
     pub(super) fn parse_task_prototype(&mut self) -> TaskDeclaration {
         let start = self.current().span.start;
         self.expect(TokenKind::KwTask);
+        let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_method_name();
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
-        TaskDeclaration { lifetime, name, ports, items: Vec::new(), endlabel: None, span: self.span_from(start) }
+        TaskDeclaration { lifetime, specifier, name, ports, items: Vec::new(), endlabel: None, span: self.span_from(start) }
     }
 
     pub(super) fn parse_param_value(&mut self) -> ParamValue {

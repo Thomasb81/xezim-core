@@ -248,6 +248,12 @@ fn parse_and_elaborate(
         match desc {
             ast::Description::Module(m) => {
                 let name = m.name.name.clone();
+                if definitions.contains_key(&name) {
+                    return Err(format!(
+                        "Duplicate module definition '{}' (IEEE 1800-2017 §3.3)",
+                        name
+                    ));
+                }
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Module(Rc::new(m)));
             }

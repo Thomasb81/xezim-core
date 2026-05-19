@@ -24,6 +24,7 @@ pub enum TokenKind {
     TimeLiteral,
     UnbasedUnsizedLiteral,
     StringLiteral,
+    TripleStringLiteral,
 
     // Identifiers
     Identifier,

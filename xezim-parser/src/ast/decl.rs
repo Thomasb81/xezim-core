@@ -34,6 +34,7 @@ pub enum ModuleItem {
     FunctionDeclaration(FunctionDeclaration),
     TaskDeclaration(TaskDeclaration),
     ImportDeclaration(ImportDeclaration),
+    TimeunitsDecl(TimeunitsDeclaration),
     ClassDeclaration(ClassDeclaration),
     AssertionItem(super::stmt::AssertionStatement),
     ModportDeclaration(ModportDeclaration),
@@ -316,6 +317,9 @@ pub struct ParamAssignment {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TypeParamAssignment {
     pub name: Identifier,
+    /// IEEE 1800-2023 §6.20.2.1: optional `extends <Base>` constraint
+    /// that restricts the type argument to a class derived from `Base`.
+    pub extends: Option<Identifier>,
     pub init: Option<DataType>,
     pub span: Span,
 }
@@ -468,6 +472,9 @@ pub struct GenvarDeclaration {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct FunctionDeclaration {
     pub lifetime: Option<Lifetime>,
+    /// IEEE 1800-2023 §8.20.5: `function :final/:extends/:initial`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub specifier: Option<MethodSpecifier>,
     pub return_type: DataType,
     pub name: TypeName,
     pub ports: Vec<FunctionPort>,
@@ -480,6 +487,9 @@ pub struct FunctionDeclaration {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct TaskDeclaration {
     pub lifetime: Option<Lifetime>,
+    /// IEEE 1800-2023 §8.20.5: `task :final/:extends/:initial`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub specifier: Option<MethodSpecifier>,
     pub name: TypeName,
     pub ports: Vec<FunctionPort>,
     pub items: Vec<super::stmt::Statement>,
@@ -528,6 +538,10 @@ pub struct ClassDeclaration {
     pub virtual_kw: bool,
     #[cfg_attr(feature = "serde", serde(default))]
     pub is_interface: bool,
+    /// IEEE 1800-2023 §8.20.5: `class :final <name>` — class cannot
+    /// be extended.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_final: bool,
     pub name: Identifier,
     pub params: Vec<ParameterDeclaration>,
     pub extends: Option<ClassExtends>,
@@ -647,6 +661,19 @@ pub enum ClassQualifier {
     Pure,
     Extern,
     Const,
+}
+
+/// IEEE 1800-2023 §8.20.5: colon-prefixed method specifier on
+/// `function` / `task`. Three variants:
+/// - `:final`   — locks the method against further override.
+/// - `:extends` — explicit override marker (must be overriding).
+/// - `:initial` — explicit non-override marker (must not be overriding).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum MethodSpecifier {
+    Final,
+    Extends,
+    Initial,
 }
 
 #[derive(Debug, Clone)]

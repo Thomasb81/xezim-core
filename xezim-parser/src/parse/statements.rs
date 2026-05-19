@@ -107,7 +107,7 @@ impl Parser {
                 self.bump();
                 if self.eat(TokenKind::KwFork).is_some() {
                     self.expect(TokenKind::Semicolon);
-                    Statement::new(StatementKind::Null, self.span_from(start))
+                    Statement::new(StatementKind::DisableFork, self.span_from(start))
                 } else {
                     let name = self.parse_identifier();
                     self.expect(TokenKind::Semicolon);

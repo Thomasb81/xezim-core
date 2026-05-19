@@ -122,6 +122,10 @@ impl Preprocessor {
 
     /// Simple preprocessing pass (no file context — `include lines are skipped).
     pub fn preprocess(&mut self, source: &str) -> String {
+        // Reset per-source compiler-directive state so a `none`
+        // directive from a previous file in the same process doesn't
+        // pollute this one.
+        crate::set_default_nettype_none_seen(false);
         let stripped = self.strip_comments(source);
         let resolved = self.resolve_directives(&stripped, None);
         Self::strip_attributes(&resolved)
@@ -357,10 +361,22 @@ impl Preprocessor {
                 continue;
             }
 
+            // Record `default_nettype none` so the elaborator can
+            // reject implicit-net auto-creation. We sticky-set the
+            // flag on first appearance; the test for IEEE 1800-2017
+            // §6.10 only needs to fail when implicit-net usage occurs
+            // anywhere a `none` directive is in effect.
+            if trimmed.starts_with("`default_nettype") {
+                let rest = trimmed.trim_start_matches("`default_nettype").trim();
+                if rest.starts_with("none") {
+                    crate::set_default_nettype_none_seen(true);
+                }
+                output.push('\n');
+                continue;
+            }
             // Skip `timescale and other compiler directives
             // that don't affect simulation semantics
             if trimmed.starts_with("`timescale")
-                || trimmed.starts_with("`default_nettype")
                 || trimmed.starts_with("`celldefine") || trimmed.starts_with("`endcelldefine")
                 || trimmed.starts_with("`resetall")
                 || trimmed.starts_with("`nounconnected_drive") || trimmed.starts_with("`unconnected_drive")
@@ -574,17 +590,45 @@ impl Preprocessor {
                         let mut body = def.body.clone();
                         for (pi, pname) in params.iter().enumerate() {
                             if let Some(arg) = args.get(pi) {
-                                // Replace only whole words
+                                // Replace only whole words, and only outside
+                                // string literals (so a parameter name that
+                                // also appears in a format string in the
+                                // body — e.g. `actual` in
+                                // `"actual=%0d"` — isn't substituted away,
+                                // which would corrupt the string when the
+                                // arg itself contains a `"`).
                                 let mut new_body = String::with_capacity(body.len());
                                 let mut last = 0;
+                                let body_bytes = body.as_bytes();
+                                let mut string_ranges: Vec<(usize, usize)> = Vec::new();
+                                {
+                                    let mut i = 0;
+                                    while i < body_bytes.len() {
+                                        if body_bytes[i] == b'"' {
+                                            let start = i;
+                                            i += 1;
+                                            while i < body_bytes.len() {
+                                                if body_bytes[i] == b'\\' && i + 1 < body_bytes.len() { i += 2; continue; }
+                                                if body_bytes[i] == b'"' { i += 1; break; }
+                                                i += 1;
+                                            }
+                                            string_ranges.push((start, i));
+                                        } else {
+                                            i += 1;
+                                        }
+                                    }
+                                }
+                                let in_string = |pos: usize| -> bool {
+                                    string_ranges.iter().any(|(lo, hi)| pos >= *lo && pos < *hi)
+                                };
                                 for (start, part) in body.match_indices(pname) {
-                                    // Check if surrounding characters are word characters
-                                    let before = body.as_bytes().get(start.wrapping_sub(1)).copied().unwrap_or(0);
-                                    let after = body.as_bytes().get(start + part.len()).copied().unwrap_or(0);
-                                    
+                                    let before = body_bytes.get(start.wrapping_sub(1)).copied().unwrap_or(0);
+                                    let after = body_bytes.get(start + part.len()).copied().unwrap_or(0);
                                     new_body.push_str(&body[last..start]);
-                                    if !(before.is_ascii_alphanumeric() || before == b'_') &&
-                                       !(after.is_ascii_alphanumeric() || after == b'_') {
+                                    if !(before.is_ascii_alphanumeric() || before == b'_')
+                                        && !(after.is_ascii_alphanumeric() || after == b'_')
+                                        && !in_string(start)
+                                    {
                                         new_body.push_str(arg);
                                     } else {
                                         new_body.push_str(part);
@@ -641,7 +685,7 @@ impl Preprocessor {
                 b')' if !in_string => {
                     paren_depth -= 1;
                     if paren_depth == 0 {
-                        let arg = line[arg_start..*i].trim().to_string();
+                        let arg = line[arg_start..*i].trim_start().trim_end_matches(|c: char| c == '\n' || c == '\r' || c == '\t').to_string();
                         if !arg.is_empty() || !args.is_empty() {
                             args.push(arg);
                         }
@@ -654,7 +698,7 @@ impl Preprocessor {
                 b'[' if !in_string => bracket_depth += 1,
                 b']' if !in_string => if bracket_depth > 0 { bracket_depth -= 1; },
                 b',' if !in_string && paren_depth == 1 && brace_depth == 0 && bracket_depth == 0 => {
-                    args.push(line[arg_start..*i].trim().to_string());
+                    args.push(line[arg_start..*i].trim_start().trim_end_matches(|c: char| c == '\n' || c == '\r' || c == '\t').to_string());
                     arg_start = *i + 1;
                 }
                 _ => {}

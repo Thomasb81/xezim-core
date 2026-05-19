@@ -114,11 +114,84 @@ impl Parser {
                     // Handle [lo:hi] ranges
                     if self.at(TokenKind::LBracket) {
                         self.bump();
-                        let lo = self.parse_expression();
-                        self.expect(TokenKind::Colon);
-                        let hi = self.parse_expression();
-                        self.expect(TokenKind::RBracket);
-                        ranges.push(Expression::new(ExprKind::Range(Box::new(lo), Box::new(hi)), self.span_from(start)));
+                        // Parse the lower/centre expression with a binding
+                        // power that excludes `+`/`-`/`%`, so `+/-` and `+%-`
+                        // tokens stay available for tolerance detection.
+                        // Simple operands or parenthesised expressions
+                        // remain supported.
+                        let center = if crate::is_sv2023() {
+                            self.parse_expr_bp(21)
+                        } else {
+                            self.parse_expression()
+                        };
+                        // IEEE 1800-2023 §11.4.13: tolerance ranges
+                        // `[A +/- B]` → `[A-B : A+B]`
+                        // `[A +%- B]` → `[A*(100-B)/100 : A*(100+B)/100]`
+                        // `+/-` and `+%-` lex as three separate tokens
+                        // (Plus, Slash|Percent, Minus); we detect the triple.
+                        let is_tol_abs = crate::is_sv2023()
+                            && self.at(TokenKind::Plus)
+                            && self.peek_kind() == TokenKind::Slash
+                            && self.peek_kind_n(2) == TokenKind::Minus;
+                        let is_tol_pct = crate::is_sv2023()
+                            && self.at(TokenKind::Plus)
+                            && self.peek_kind() == TokenKind::Percent
+                            && self.peek_kind_n(2) == TokenKind::Minus;
+                        if is_tol_abs || is_tol_pct {
+                            self.bump(); self.bump(); self.bump();
+                            let delta = self.parse_expression();
+                            self.expect(TokenKind::RBracket);
+                            let (lo, hi) = if is_tol_abs {
+                                let lo = Expression::new(ExprKind::Binary {
+                                    op: BinaryOp::Sub,
+                                    left: Box::new(center.clone()),
+                                    right: Box::new(delta.clone()),
+                                }, self.span_from(start));
+                                let hi = Expression::new(ExprKind::Binary {
+                                    op: BinaryOp::Add,
+                                    left: Box::new(center),
+                                    right: Box::new(delta),
+                                }, self.span_from(start));
+                                (lo, hi)
+                            } else {
+                                let hundred = || Expression::new(
+                                    ExprKind::Number(NumberLiteral::Integer {
+                                        signed: false,
+                                        size: None,
+                                        base: NumberBase::Decimal,
+                                        value: "100".into(),
+                                        cached_val: Cell::new(None),
+                                    }),
+                                    self.span_from(start),
+                                );
+                                let make = |sign_neg: bool, c: Expression, d: Expression| {
+                                    let op = if sign_neg { BinaryOp::Sub } else { BinaryOp::Add };
+                                    let pm = Expression::new(ExprKind::Binary {
+                                        op,
+                                        left: Box::new(hundred()),
+                                        right: Box::new(d),
+                                    }, c.span);
+                                    let mul = Expression::new(ExprKind::Binary {
+                                        op: BinaryOp::Mul,
+                                        left: Box::new(c),
+                                        right: Box::new(pm),
+                                    }, self.span_from(start));
+                                    Expression::new(ExprKind::Binary {
+                                        op: BinaryOp::Div,
+                                        left: Box::new(mul),
+                                        right: Box::new(hundred()),
+                                    }, self.span_from(start))
+                                };
+                                (make(true, center.clone(), delta.clone()),
+                                 make(false, center, delta))
+                            };
+                            ranges.push(Expression::new(ExprKind::Range(Box::new(lo), Box::new(hi)), self.span_from(start)));
+                        } else {
+                            self.expect(TokenKind::Colon);
+                            let hi = self.parse_expression();
+                            self.expect(TokenKind::RBracket);
+                            ranges.push(Expression::new(ExprKind::Range(Box::new(center), Box::new(hi)), self.span_from(start)));
+                        }
                     } else {
                         ranges.push(self.parse_expression());
                     }
@@ -458,6 +531,13 @@ impl Parser {
                         self.expect(TokenKind::Colon);
                         let expr = self.parse_expression();
                         items.push(AssignmentPatternItem::Named(name, expr));
+                    } else if self.at(TokenKind::StringLiteral) && self.peek_kind() == TokenKind::Colon {
+                        // IEEE 1800-2023 §10.10: associative-array literal
+                        // with a string key — `'{"key": value, ...}`.
+                        let key = self.parse_expression();
+                        self.expect(TokenKind::Colon);
+                        let val = self.parse_expression();
+                        items.push(AssignmentPatternItem::Keyed(key, val));
                     } else {
                         let count_expr = self.parse_expression();
                         if first && self.at(TokenKind::LBrace) {
@@ -512,7 +592,14 @@ impl Parser {
             // String literal
             TokenKind::StringLiteral => {
                 let tok = self.bump();
-                let s = tok.text[1..tok.text.len()-1].to_string();
+                let s = decode_string_escapes(&tok.text[1..tok.text.len()-1]);
+                Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
+            }
+
+            // IEEE 1800-2023 §5.9: triple-quoted string literal.
+            TokenKind::TripleStringLiteral => {
+                let tok = self.bump();
+                let s = decode_string_escapes(&tok.text[3..tok.text.len()-3]);
                 Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
             }
 
@@ -926,6 +1013,25 @@ fn ternary_bp() -> (u8, u8) { (1, 1) }
 
 /// Parse a number literal string into our AST representation.
 fn parse_number_literal(text: &str) -> NumberLiteral {
+    // Time literal: <number><suffix> where suffix is one of
+    // fs/ps/ns/us/ms/s. Scale the mantissa to seconds and produce a
+    // Real. Downstream code (e.g. the simulator's delay handler)
+    // converts to time units using the active timeprecision.
+    let time_suffixes: &[(&str, f64)] = &[
+        ("fs", 1e-15), ("ps", 1e-12), ("ns", 1e-9),
+        ("us", 1e-6),  ("ms", 1e-3),  ("s",  1.0),
+    ];
+    for (suf, scale) in time_suffixes {
+        if text.ends_with(suf)
+            && text.len() > suf.len()
+            && text.as_bytes()[text.len() - suf.len() - 1].is_ascii_digit()
+        {
+            let mantissa = &text[..text.len() - suf.len()];
+            if let Ok(v) = mantissa.replace('_', "").parse::<f64>() {
+                return NumberLiteral::Real(v * *scale);
+            }
+        }
+    }
     // Try to parse as real
     if text.contains('.') || (text.contains('e') && !text.contains('\'')) || (text.contains('E') && !text.contains('\'')) {
         if let Ok(v) = text.replace('_', "").parse::<f64>() {
@@ -962,4 +1068,69 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
         value: text.replace('_', ""),
         cached_val: Cell::new(None),
     }
+}
+
+/// Decode SystemVerilog string-literal escape sequences (IEEE 1800-2017 §5.9).
+/// Input is the *interior* of the literal (no surrounding quotes).
+fn decode_string_escapes(raw: &str) -> String {
+    let bytes = raw.as_bytes();
+    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] != b'\\' || i + 1 >= bytes.len() {
+            out.push(bytes[i]);
+            i += 1;
+            continue;
+        }
+        match bytes[i + 1] {
+            b'n' => { out.push(b'\n'); i += 2; }
+            b't' => { out.push(b'\t'); i += 2; }
+            b'r' => { out.push(b'\r'); i += 2; }
+            b'\\' => { out.push(b'\\'); i += 2; }
+            b'"' => { out.push(b'"'); i += 2; }
+            b'\'' => { out.push(b'\''); i += 2; }
+            b'a' => { out.push(0x07); i += 2; }
+            b'b' => { out.push(0x08); i += 2; }
+            b'f' => { out.push(0x0c); i += 2; }
+            b'v' => { out.push(0x0b); i += 2; }
+            b'0' | b'1' | b'2' | b'3' | b'4' | b'5' | b'6' | b'7' => {
+                // 1-3 octal digits
+                let mut j = i + 1;
+                let mut val: u32 = 0;
+                let mut digits = 0;
+                while j < bytes.len() && digits < 3 && (b'0'..=b'7').contains(&bytes[j]) {
+                    val = val * 8 + (bytes[j] - b'0') as u32;
+                    j += 1;
+                    digits += 1;
+                }
+                out.push((val & 0xff) as u8);
+                i = j;
+            }
+            b'x' => {
+                let mut j = i + 2;
+                let mut val: u32 = 0;
+                let mut digits = 0;
+                while j < bytes.len() && digits < 2 {
+                    let c = bytes[j];
+                    let d = if c.is_ascii_digit() { c - b'0' }
+                            else if (b'a'..=b'f').contains(&c) { c - b'a' + 10 }
+                            else if (b'A'..=b'F').contains(&c) { c - b'A' + 10 }
+                            else { break };
+                    val = val * 16 + d as u32;
+                    j += 1;
+                    digits += 1;
+                }
+                out.push((val & 0xff) as u8);
+                i = j;
+            }
+            _ => {
+                // Unknown escape: per §5.9, the backslash is preserved and a
+                // warning is recommended. We drop the backslash to follow what
+                // most simulators do in practice.
+                out.push(bytes[i + 1]);
+                i += 2;
+            }
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }

@@ -28,7 +28,7 @@ impl Parser {
         }
 
         self.expect(TokenKind::KwEndmodule);
-        let endlabel = self.parse_end_label();
+        let endlabel = self.parse_end_label_checked(&name.name);
 
         ModuleDeclaration {
             attrs: Vec::new(),
@@ -233,8 +233,7 @@ impl Parser {
             // already parsed at top-level via Description::TimeunitsDecl;
             // accept and discard inside modules too (LRM allows both).
             TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
-                let _ = self.parse_timeunits_declaration();
-                Some(ModuleItem::Null)
+                Some(ModuleItem::TimeunitsDecl(self.parse_timeunits_declaration()))
             }
             // Elaboration-time system tasks at module-item level: $error, $warning,
             // $info, $fatal — typically inside a `STATIC_ASSERT` macro expansion
@@ -924,6 +923,18 @@ impl Parser {
         let start = self.current().span.start;
         let virt = self.eat(TokenKind::KwVirtual).is_some();
         self.expect(TokenKind::KwClass);
+        // IEEE 1800-2023 §8.20.5: `class :final <name>` — only `:final` is
+        // legal on a class declaration. Gated on --sv2023.
+        let is_final = if crate::is_sv2023()
+            && self.at(TokenKind::Colon)
+            && self.peek_kind() == TokenKind::KwFinal
+        {
+            self.bump(); // ':'
+            self.bump(); // 'final'
+            true
+        } else {
+            false
+        };
         let _lifetime = self.parse_optional_lifetime();
         let name = self.parse_identifier();
         let params = self.parse_parameter_port_list();
@@ -940,11 +951,15 @@ impl Parser {
             loop { implements.push(self.parse_identifier()); if self.eat(TokenKind::Comma).is_none() { break; } }
         }
         self.expect(TokenKind::Semicolon);
+        // Push the class name onto the parser's class-context stack so
+        // `type(this)` references resolve to this class (§6.20.2.1).
+        crate::push_class_context(name.name.clone());
         let mut items = Vec::new();
         while !self.at(TokenKind::KwEndclass) && !self.at(TokenKind::Eof) { items.push(self.parse_class_item()); }
+        crate::pop_class_context();
         self.expect(TokenKind::KwEndclass);
         let endlabel = self.parse_end_label();
-        ClassDeclaration { virtual_kw: virt, is_interface: false, name, params, extends, implements, items, endlabel, span: self.span_from(start) }
+        ClassDeclaration { virtual_kw: virt, is_interface: false, is_final, name, params, extends, implements, items, endlabel, span: self.span_from(start) }
     }
 
     fn parse_class_item(&mut self) -> ClassItem {
@@ -1031,7 +1046,13 @@ impl Parser {
             TokenKind::KwClass => ClassItem::Class(self.parse_class_declaration()),
             TokenKind::KwCovergroup => ClassItem::Covergroup(self.parse_covergroup_declaration()),
             TokenKind::KwImport => ClassItem::Import(self.parse_import_declaration()),
-            _ if self.is_data_type_keyword() || self.at(TokenKind::Identifier) || self.at(TokenKind::KwVar) => {
+            _ if self.is_data_type_keyword()
+                || self.at(TokenKind::Identifier)
+                || self.at(TokenKind::KwVar)
+                || (crate::is_sv2023()
+                    && self.at(TokenKind::KwType)
+                    && self.peek_kind() == TokenKind::LParen) =>
+            {
                 let dt = if self.at(TokenKind::KwVar) {
                     self.bump();
                     if self.is_data_type_keyword() || self.at(TokenKind::Identifier) { self.parse_data_type() }
