@@ -213,6 +213,14 @@ pub struct ElaboratedClass {
     /// Typedef names declared in the class body.
     #[serde(default)]
     pub typedef_names: Vec<String>,
+    /// Properties declared with the `static` qualifier — shared across all
+    /// instances of the class (one storage cell per class).
+    #[serde(default)]
+    pub static_properties: HashSet<String>,
+    /// Methods declared with the `static` qualifier — callable as
+    /// `ClassName::method(...)` without an instance handle.
+    #[serde(default)]
+    pub static_methods: HashSet<String>,
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -228,6 +236,8 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut methods = HashMap::default();
     let mut random_properties = HashSet::default();
     let mut randc_properties = HashSet::default();
+    let mut static_properties = HashSet::default();
+    let mut static_methods = HashSet::default();
     let mut constraints = HashMap::default();
     for item in &c.items {
         match item {
@@ -236,8 +246,12 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 let is_signed = is_type_signed(&p.data_type);
                 let is_rand = p.qualifiers.contains(&ClassQualifier::Rand) || p.qualifiers.contains(&ClassQualifier::Randc);
                 let is_randc = p.qualifiers.contains(&ClassQualifier::Randc);
+                let is_static = p.qualifiers.contains(&ClassQualifier::Static);
                 let _is_const = p.qualifiers.contains(&ClassQualifier::Const);
                 let is_real = is_type_real(&p.data_type);
+                // Named types (class handles, enums, typedefs) default to
+                // 0 — a class handle's default is `null`.
+                let is_named_type = get_type_name(&p.data_type).is_some();
                 for decl in &p.declarators {
                     let mut v = if let Some(init) = &decl.init {
                         let mut val = eval_init_for_width(init, &HashMap::default(), width);
@@ -245,8 +259,10 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                         val
                     } else if is_real {
                         Value::from_f64(0.0)
+                    } else if is_named_type {
+                        Value::zero(width)
                     } else {
-                        Value::new(width)
+                        default_value_for_type(&p.data_type, width)
                     };
                     if is_signed { v.is_signed = true; }
                     properties.insert(decl.name.name.clone(), Signal { is_const: false,
@@ -264,6 +280,9 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     if is_randc {
                         randc_properties.insert(decl.name.name.clone());
                     }
+                    if is_static {
+                        static_properties.insert(decl.name.name.clone());
+                    }
                 }
             }
             ClassItem::Method(m) => {
@@ -273,6 +292,9 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     ClassMethodKind::PureVirtual(f) => f.name.name.name.clone(),
                     ClassMethodKind::Extern(f) => f.name.name.name.clone(),
                 };
+                if m.qualifiers.contains(&ClassQualifier::Static) {
+                    static_methods.insert(name.clone());
+                }
                 methods.insert(name, m.clone());
             }
             ClassItem::Constraint(con) => {
@@ -317,6 +339,8 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
             ClassItem::Typedef(td) => Some(td.name.name.clone()),
             _ => None,
         }).collect(),
+        static_properties,
+        static_methods,
     }
 }
 
@@ -920,19 +944,17 @@ pub fn elaborate_module_with_defs(
                 Definition::Covergroup(cg) => { elab.covergroups.insert(cg.name.name.clone(), (*cg).clone()); }
                 Definition::Package(p) => {
                     elab.packages.insert(p.name.name.clone());
-                    // Hoist package functions/tasks for `pkg::f(...)` resolution.
-                    // Skip framework packages with very large APIs.
-                    if p.name.name != "uvm_pkg" {
-                        for item in &p.items {
-                            match item {
-                                crate::ast::decl::PackageItem::Function(f) => {
-                                    elab.functions.entry(f.name.name.name.clone()).or_insert_with(|| f.clone());
-                                }
-                                crate::ast::decl::PackageItem::Task(t) => {
-                                    elab.tasks.entry(t.name.name.name.clone()).or_insert_with(|| t.clone());
-                                }
-                                _ => {}
+                    // Hoist package-scope functions/tasks for `pkg::f(...)`
+                    // and bare-name resolution after `import pkg::*`.
+                    for item in &p.items {
+                        match item {
+                            crate::ast::decl::PackageItem::Function(f) => {
+                                elab.functions.entry(f.name.name.name.clone()).or_insert_with(|| f.clone());
                             }
+                            crate::ast::decl::PackageItem::Task(t) => {
+                                elab.tasks.entry(t.name.name.name.clone()).or_insert_with(|| t.clone());
+                            }
+                            _ => {}
                         }
                     }
                 }
@@ -964,7 +986,6 @@ pub fn elaborate_module_with_defs(
                     if let ExprKind::AssignmentPattern(items) = &init.kind {
                         let all_keyed = !items.is_empty()
                             && items.iter().all(|it| matches!(it, AssignmentPatternItem::Keyed(_, _)));
-                        eprintln!("[X-MP] AP {} items, all_keyed={}", items.len(), all_keyed);
                         if all_keyed {
                             let elem_w = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                             elab.associative_arrays
