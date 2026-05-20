@@ -221,6 +221,10 @@ pub struct ElaboratedClass {
     /// `ClassName::method(...)` without an instance handle.
     #[serde(default)]
     pub static_methods: HashSet<String>,
+    /// Properties declared as associative arrays (`T m[KEY];`) — name
+    /// mapped to whether the key type is `string`. Stored per-instance.
+    #[serde(default)]
+    pub assoc_properties: HashMap<String, bool>,
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -238,6 +242,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut randc_properties = HashSet::default();
     let mut static_properties = HashSet::default();
     let mut static_methods = HashSet::default();
+    let mut assoc_properties: HashMap<String, bool> = HashMap::default();
     let mut constraints = HashMap::default();
     for item in &c.items {
         match item {
@@ -253,6 +258,15 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 // 0 — a class handle's default is `null`.
                 let is_named_type = get_type_name(&p.data_type).is_some();
                 for decl in &p.declarators {
+                    if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) =
+                        decl.dimensions.first()
+                    {
+                        let is_string_key = key_dt.as_ref().map_or(false, |dt| {
+                            matches!(dt.as_ref(),
+                                DataType::Simple { kind: SimpleType::String, .. })
+                        });
+                        assoc_properties.insert(decl.name.name.clone(), is_string_key);
+                    }
                     let mut v = if let Some(init) = &decl.init {
                         let mut val = eval_init_for_width(init, &HashMap::default(), width);
                         if is_real { val = Value::from_f64(val.to_f64()); }
@@ -341,6 +355,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         }).collect(),
         static_properties,
         static_methods,
+        assoc_properties,
     }
 }
 
