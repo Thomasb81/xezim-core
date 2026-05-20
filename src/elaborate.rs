@@ -945,13 +945,15 @@ pub fn elaborate_module_with_defs(
                 Definition::Package(p) => {
                     elab.packages.insert(p.name.name.clone());
                     // Hoist package-scope functions/tasks for `pkg::f(...)`
-                    // and bare-name resolution after `import pkg::*`.
+                    // and bare-name resolution after `import pkg::*`. A
+                    // scoped name (`ClassName::m`) is an out-of-class method
+                    // body — `link_extern_methods` handles those.
                     for item in &p.items {
                         match item {
-                            crate::ast::decl::PackageItem::Function(f) => {
+                            crate::ast::decl::PackageItem::Function(f) if f.name.scope.is_none() => {
                                 elab.functions.entry(f.name.name.name.clone()).or_insert_with(|| f.clone());
                             }
-                            crate::ast::decl::PackageItem::Task(t) => {
+                            crate::ast::decl::PackageItem::Task(t) if t.name.scope.is_none() => {
                                 elab.tasks.entry(t.name.name.name.clone()).or_insert_with(|| t.clone());
                             }
                             _ => {}
@@ -1940,6 +1942,56 @@ pub fn elaborate_module_with_defs(
     validate_enum_assignments(&elab)?;
 
     Ok(elab)
+}
+
+/// Link out-of-class method bodies (`function ClassName::m(); ... endfunction`)
+/// into their classes, replacing the `extern` prototype with the real body.
+/// Run after `inline_instantiations`, which (re)populates `elab.classes` from
+/// the AST and would otherwise clobber any earlier linking.
+pub fn link_extern_methods(
+    elab: &mut ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+) {
+    use crate::ast::decl::{ClassMethod, ClassMethodKind, PackageItem};
+    for def in definitions.values() {
+        let items: &[PackageItem] = match def {
+            Definition::Package(p) => &p.items,
+            _ => continue,
+        };
+        for item in items {
+            let (class_name, method_name, kind, span) = match item {
+                PackageItem::Function(f) => match &f.name.scope {
+                    Some(scope) => (
+                        scope.name.clone(),
+                        f.name.name.name.clone(),
+                        ClassMethodKind::Function(f.clone()),
+                        f.span,
+                    ),
+                    None => continue,
+                },
+                PackageItem::Task(t) => match &t.name.scope {
+                    Some(scope) => (
+                        scope.name.clone(),
+                        t.name.name.name.clone(),
+                        ClassMethodKind::Task(t.clone()),
+                        t.span,
+                    ),
+                    None => continue,
+                },
+                _ => continue,
+            };
+            if let Some(cls) = elab.classes.get_mut(&class_name) {
+                if let Some(existing) = cls.methods.get_mut(&method_name) {
+                    existing.kind = kind;
+                } else {
+                    cls.methods.insert(
+                        method_name,
+                        ClassMethod { qualifiers: Vec::new(), kind, span },
+                    );
+                }
+            }
+        }
+    }
 }
 
 fn validate_enum_assignments(elab: &ElaboratedModule) -> Result<(), String> {

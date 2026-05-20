@@ -396,6 +396,9 @@ fn parse_and_elaborate(
     )?;
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
+    // Link `function ClassName::m(); ...` out-of-class bodies into their
+    // classes — must run after inline_instantiations repopulates classes.
+    elaborate::link_extern_methods(&mut elab, &def_refs);
     if std::env::var("XEZIM_ELAB_STATS").is_ok() {
         eprintln!("[elab-stats] always_blocks={} initial_blocks={} cont_assigns={} pending_always={} pending_initial={} pending_cont_assign={} signals={} parameters={} arrays={} arrays_2d={} arrays_nd={} packed_struct_fields={}",
             elab.always_blocks.len(),
