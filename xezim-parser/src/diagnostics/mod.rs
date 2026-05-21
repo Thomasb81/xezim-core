@@ -4,6 +4,7 @@ use crate::ast::Span;
 use std::fmt;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum Severity {
     Error,
     Warning,
@@ -11,6 +12,7 @@ pub enum Severity {
 }
 
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Diagnostic {
     pub severity: Severity,
     pub message: String,

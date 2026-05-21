@@ -4,7 +4,9 @@
 //!
 //! Options:
 //!   --dump-tokens   Print token stream
-//!   --dump-ast      Print parsed AST
+//!   --dump-ast      Print parsed AST (Rust Debug format)
+//!   --dump-json     Print parsed AST as JSON — one object per file
+//!                   (fields: file, source_text, ast, errors, warnings)
 //!   --check         Parse only, report errors (default)
 //!   -I <dir>        Add include directory
 //!   -D <name=val>   Define preprocessor macro
@@ -24,7 +26,8 @@ fn main() {
         eprintln!();
         eprintln!("Options:");
         eprintln!("  --dump-tokens   Print token stream");
-        eprintln!("  --dump-ast      Print parsed AST");
+        eprintln!("  --dump-ast      Print parsed AST (Rust Debug format)");
+        eprintln!("  --dump-json     Print parsed AST as JSON");
         eprintln!("  --check         Parse and report errors (default)");
         eprintln!("  -I <dir>        Add include directory");
         eprintln!("  -D <name=val>   Define preprocessor macro");
@@ -37,12 +40,14 @@ fn main() {
     let mut defines = Vec::new();
     let mut dump_tokens = false;
     let mut dump_ast = false;
+    let mut dump_json = false;
 
     let mut i = 1;
     while i < args.len() {
         match args[i].as_str() {
             "--dump-tokens" => dump_tokens = true,
             "--dump-ast" => dump_ast = true,
+            "--dump-json" => dump_json = true,
             "--check" => {}
             "-I" => {
                 i += 1;
@@ -120,6 +125,26 @@ fn main() {
 
         if dump_ast {
             println!("{:#?}", result.source);
+        }
+
+        #[cfg(feature = "json-cli")]
+        if dump_json {
+            let envelope = serde_json::json!({
+                "file": file,
+                "source_text": result.source_text,
+                "ast": result.source,
+                "errors": result.errors,
+                "warnings": result.warnings,
+            });
+            // JSONL: one object per file, single line — ready for
+            // line-buffered consumers (xevdb's sv.py reads one per file).
+            println!("{}", serde_json::to_string(&envelope).expect("ast serialization"));
+        }
+
+        #[cfg(not(feature = "json-cli"))]
+        if dump_json {
+            eprintln!("--dump-json requires the `json-cli` cargo feature");
+            process::exit(2);
         }
     }
 
