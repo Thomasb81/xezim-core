@@ -1065,13 +1065,42 @@ impl Parser {
         }
     }
 
+    /// Consume a balanced `( ... )` group, including nested parens. Assumes the
+    /// current token is `(`. Used to skip clauses whose contents we don't model
+    /// (covergroup formals, `with function sample` port lists, `iff` guards).
+    fn skip_balanced_parens(&mut self) {
+        if !self.at(TokenKind::LParen) { return; }
+        self.bump();
+        let mut depth = 1;
+        while depth > 0 && !self.at(TokenKind::Eof) {
+            if self.at(TokenKind::LParen) { depth += 1; }
+            else if self.at(TokenKind::RParen) { depth -= 1; }
+            self.bump();
+        }
+    }
+
     fn parse_covergroup_declaration(&mut self) -> CovergroupDeclaration {
         let start = self.current().span.start;
         self.bump();
         let name = self.parse_identifier();
+        // Optional formal argument list: `covergroup cg (ref int x, ...) ...`
+        if self.at(TokenKind::LParen) {
+            self.skip_balanced_parens();
+        }
+        // Optional coverage event: either `@(event)` / `@@(block_event)` or a
+        // `with function sample(tf_port_list)` clause (SV 19.4). The sample
+        // function turns the covergroup into one sampled explicitly by call.
         let event = if self.at(TokenKind::At) {
             Some(self.parse_event_control())
         } else { None };
+        if self.at(TokenKind::KwWith) {
+            self.bump();
+            self.expect(TokenKind::KwFunction);
+            let _ = self.parse_identifier(); // `sample`
+            if self.at(TokenKind::LParen) {
+                self.skip_balanced_parens();
+            }
+        }
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
         while !self.at(TokenKind::KwEndgroup) && !self.at(TokenKind::Eof) {
@@ -1094,6 +1123,11 @@ impl Parser {
             TokenKind::KwCoverpoint => {
                 self.bump();
                 let expr = self.parse_expression();
+                // Optional `iff (guard)` enable condition on the coverpoint.
+                if self.at(TokenKind::KwIff) {
+                    self.bump();
+                    self.skip_balanced_parens();
+                }
                 // Handle optional bins etc (simplified: skip for now)
                 if self.at(TokenKind::LBrace) {
                     self.bump();
@@ -1115,6 +1149,10 @@ impl Parser {
                     ids.push(self.parse_identifier());
                     if !self.at(TokenKind::Comma) { break; }
                     self.bump();
+                }
+                if self.at(TokenKind::KwIff) {
+                    self.bump();
+                    self.skip_balanced_parens();
                 }
                 if self.at(TokenKind::LBrace) {
                     self.bump();
@@ -1148,21 +1186,43 @@ impl Parser {
         }
     }
 
-    fn parse_constraint_item(&mut self) -> ConstraintItem {
+    /// Parse a single term of a `solve ... before ...` list. SV allows the
+    /// solve/before operands to be member-select and index-select lvalues
+    /// (e.g. `mseccfg.mml`, `pmp_cfg[i].w`), not just bare identifiers. We
+    /// consume the whole postfix chain but only retain the root identifier,
+    /// which is all the elaborator's solve-ordering checks consult.
+    fn parse_solve_term(&mut self) -> Identifier {
+        let root = self.parse_identifier();
+        loop {
+            if self.at(TokenKind::Dot) {
+                self.bump();
+                let _ = self.parse_identifier();
+            } else if self.at(TokenKind::LBracket) {
+                self.bump();
+                let _ = self.parse_expression();
+                self.expect(TokenKind::RBracket);
+            } else {
+                break;
+            }
+        }
+        root
+    }
+
+    pub(crate) fn parse_constraint_item(&mut self) -> ConstraintItem {
         let start = self.current().span.start;
         match self.current_kind() {
             TokenKind::KwSolve => {
                 self.bump();
                 let mut before = Vec::new();
                 loop {
-                    before.push(self.parse_identifier());
+                    before.push(self.parse_solve_term());
                     if !self.at(TokenKind::Comma) { break; }
                     self.bump();
                 }
                 self.expect(TokenKind::KwBefore);
                 let mut after = Vec::new();
                 loop {
-                    after.push(self.parse_identifier());
+                    after.push(self.parse_solve_term());
                     if !self.at(TokenKind::Comma) { break; }
                     self.bump();
                 }

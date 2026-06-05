@@ -321,14 +321,19 @@ impl Parser {
                             filter: Box::new(filter),
                         }, self.span_from(start));
                     }
-                    // Optional constraint block after `with` or `with (...)`
+                    // Inline constraint block `with { ... }` (randomize-with).
+                    // Parse it into constraint items so the simulator can honor
+                    // it (instruction selection relies on `inside` here).
                     if self.eat(TokenKind::LBrace).is_some() {
-                        let mut depth = 1;
-                        while depth > 0 && !self.at(TokenKind::Eof) {
-                            if self.at(TokenKind::LBrace) { depth += 1; }
-                            else if self.at(TokenKind::RBrace) { depth -= 1; }
-                            self.bump();
+                        let mut constraints = Vec::new();
+                        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                            constraints.push(self.parse_constraint_item());
                         }
+                        self.expect(TokenKind::RBrace);
+                        call_expr = Expression::new(ExprKind::RandomizeWith {
+                            call: Box::new(call_expr),
+                            constraints,
+                        }, self.span_from(start));
                     }
                 }
                 lhs = call_expr;
@@ -732,7 +737,24 @@ impl Parser {
                     cached_signal_id: std::cell::Cell::new(None),
                     cached_resolved_name: std::cell::OnceCell::new(),
                 };
-                Expression::new(ExprKind::Ident(hier), self.span_from(start))
+                let new_expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
+                // `new <expr>` shallow-copy constructor (SV 8.13): `obj = new src;`
+                // copies `src` into a fresh object. The `()` / `[size]` forms are
+                // left to the postfix parser (call / array-new); a bare expression
+                // operand here is a copy source, which we model as a call to `new`
+                // with the source as its sole argument.
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::Identifier | TokenKind::KwThis | TokenKind::KwSuper
+                ) {
+                    let src = self.parse_expr_bp(30);
+                    Expression::new(
+                        ExprKind::Call { func: Box::new(new_expr), args: vec![src] },
+                        self.span_from(start),
+                    )
+                } else {
+                    new_expr
+                }
             }
 
             // Data type keywords used as expressions (e.g. $bits(int))

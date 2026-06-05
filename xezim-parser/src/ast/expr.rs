@@ -42,6 +42,9 @@ pub enum ExprKind {
     Empty,
     /// Array method with `with` clause: `expr.method with (filter)`
     WithClause { expr: Box<Expression>, filter: Box<Expression> },
+    /// `<call> with { constraints }` — randomize (incl. `std::randomize`) with
+    /// an inline constraint block. `call` is the underlying randomize call.
+    RandomizeWith { call: Box<Expression>, constraints: Vec<super::decl::ConstraintItem> },
     /// Assignment as an expression: `(a = b)` or `(a += 1)`. Returns the
     /// assigned value (after any compound-op evaluation).
     AssignExpr { lvalue: Box<Expression>, rvalue: Box<Expression> },

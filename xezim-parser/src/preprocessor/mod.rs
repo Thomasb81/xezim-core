@@ -9,7 +9,10 @@ use std::path::{Path, PathBuf};
 #[derive(Debug, Clone)]
 pub struct MacroDef {
     pub name: String,
-    pub params: Option<Vec<String>>,
+    /// Formal parameters as (name, default) pairs. `default` is `Some` when the
+    /// macro declares a default value (`P=`, `P=expr`); an empty default is
+    /// `Some("")`. Actual args that are missing or blank fall back to it.
+    pub params: Option<Vec<(String, Option<String>)>>,
     pub body: String,
 }
 
@@ -505,9 +508,17 @@ impl Preprocessor {
             
             if let Some(close) = close_pos {
                 let param_str = &rest[name_end + 1..close];
-                let params: Vec<String> = param_str.split(',')
+                let params: Vec<(String, Option<String>)> = Self::split_top_level_commas(param_str)
+                    .into_iter()
                     .map(|s| s.trim().to_string())
                     .filter(|s| !s.is_empty())
+                    .map(|s| match s.find('=') {
+                        Some(eq) => (
+                            s[..eq].trim().to_string(),
+                            Some(s[eq + 1..].trim().to_string()),
+                        ),
+                        None => (s, None),
+                    })
                     .collect();
                 let body = rest[close + 1..].to_string();
                 (Some(params), body)
@@ -588,8 +599,21 @@ impl Preprocessor {
                         let args = Self::extract_macro_args(line, &mut i);
                         let params = def.params.as_ref().unwrap();
                         let mut body = def.body.clone();
-                        for (pi, pname) in params.iter().enumerate() {
-                            if let Some(arg) = args.get(pi) {
+                        for (pi, (pname, default)) in params.iter().enumerate() {
+                            // An actual arg that is missing or blank falls back
+                            // to the formal's default (SV LRM 22.5.1). e.g.
+                            // `DV_CHECK(expr)` leaves the optional trailing
+                            // `WITH_C_=` constraint empty.
+                            let arg_owned: String;
+                            let arg: Option<&String> = match args.get(pi) {
+                                Some(a) if !a.trim().is_empty() => Some(a),
+                                _ => match default {
+                                    Some(d) => { arg_owned = d.clone(); Some(&arg_owned) }
+                                    None => None,
+                                },
+                            };
+                            {
+                            if let Some(arg) = arg {
                                 // Replace only whole words, and only outside
                                 // string literals (so a parameter name that
                                 // also appears in a format string in the
@@ -638,6 +662,7 @@ impl Preprocessor {
                                 new_body.push_str(&body[last..]);
                                 body = new_body;
                             }
+                            }
                         }
                         result.push_str(&body);
                     } else {
@@ -667,6 +692,43 @@ impl Preprocessor {
     /// Strip (* ... *) Verilog attributes from a line
     /// Extract parenthesized macro arguments, handling nested parens.
     /// `i` should point at the opening '('. After return, `i` is past the closing ')'.
+    /// Split a macro formal-parameter list on commas that are not nested inside
+    /// parens/brackets/braces or string literals, so a default value like
+    /// `ID_=`gfn` (or one containing brackets) stays intact.
+    fn split_top_level_commas(s: &str) -> Vec<String> {
+        let bytes = s.as_bytes();
+        let mut parts = Vec::new();
+        let (mut paren, mut brace, mut bracket) = (0i32, 0i32, 0i32);
+        let mut in_string = false;
+        let mut start = 0;
+        let mut i = 0;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if in_string {
+                if c == b'\\' { i += 2; continue; }
+                if c == b'"' { in_string = false; }
+            } else {
+                match c {
+                    b'"' => in_string = true,
+                    b'(' => paren += 1,
+                    b')' => paren -= 1,
+                    b'{' => brace += 1,
+                    b'}' => brace -= 1,
+                    b'[' => bracket += 1,
+                    b']' => bracket -= 1,
+                    b',' if paren == 0 && brace == 0 && bracket == 0 => {
+                        parts.push(s[start..i].to_string());
+                        start = i + 1;
+                    }
+                    _ => {}
+                }
+            }
+            i += 1;
+        }
+        parts.push(s[start..].to_string());
+        parts
+    }
+
     fn extract_macro_args(line: &str, i: &mut usize) -> Vec<String> {
         let bytes = line.as_bytes();
         *i += 1; // skip '('

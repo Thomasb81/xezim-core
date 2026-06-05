@@ -225,6 +225,32 @@ pub struct ElaboratedClass {
     /// mapped to whether the key type is `string`. Stored per-instance.
     #[serde(default)]
     pub assoc_properties: HashMap<String, bool>,
+    /// Properties declared as queues / dynamic arrays (`T m[$];`, `T m[];`) —
+    /// name mapped to (element width, optional bounded-queue max+1). Stored
+    /// per-instance like associative arrays, so each object's queue is
+    /// independent.
+    #[serde(default)]
+    pub queue_properties: HashMap<String, (u32, Option<u32>)>,
+    /// Initializer expressions for scalar properties (`int x = EXPR;`). Held so
+    /// they can be re-evaluated at instantiation against the live parameter
+    /// table — `elaborate_class` runs before package params are bound, so a
+    /// default like `= NUM_HARTS` would otherwise resolve to 0.
+    #[serde(default)]
+    pub property_inits: HashMap<String, crate::ast::expr::Expression>,
+    /// Static member collections (`static T m[$]`, `static T m[]`, `static T
+    /// m[KEY]`): name -> (is_associative, element width). They share a single
+    /// global store (one copy per class, not per-instance) and are registered
+    /// under their bare name at simulator startup.
+    #[serde(default)]
+    pub static_collections: Vec<(String, bool, u32)>,
+    /// Fixed-size unpacked-array members with a compile-time-constant size
+    /// (`rand reg_t gpr[4]`, `int m[2:0]`): name -> (lo, hi, element width).
+    /// Stored per-instance as `<handle>#<member>` registered in `module.arrays`
+    /// so index access and `foreach` see a real fixed range (and rand elements
+    /// can be randomized). Non-constant sizes (`m[NUM_HARTS]`) stay in
+    /// `queue_properties` since the size isn't known at class-elaboration time.
+    #[serde(default)]
+    pub array_properties: HashMap<String, (i64, i64, u32)>,
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -243,6 +269,10 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut static_properties = HashSet::default();
     let mut static_methods = HashSet::default();
     let mut assoc_properties: HashMap<String, bool> = HashMap::default();
+    let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
+    let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
+    let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
+    let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
     for item in &c.items {
         match item {
@@ -258,6 +288,22 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 // 0 — a class handle's default is `null`.
                 let is_named_type = get_type_name(&p.data_type).is_some();
                 for decl in &p.declarators {
+                    // Static member collections share one global store; route
+                    // them out of the per-instance maps.
+                    if is_static {
+                        // Second field is `is_associative` (NOT key-is-string).
+                        match decl.dimensions.first() {
+                            Some(UnpackedDimension::Associative { .. }) => {
+                                static_collections.push((decl.name.name.clone(), true, width.max(1)));
+                            }
+                            Some(UnpackedDimension::Queue { .. })
+                            | Some(UnpackedDimension::Unsized(_)) => {
+                                static_collections.push((decl.name.name.clone(), false, width.max(1)));
+                            }
+                            _ => {}
+                        }
+                    }
+                    if !is_static {
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) =
                         decl.dimensions.first()
                     {
@@ -266,6 +312,63 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                                 DataType::Simple { kind: SimpleType::String, .. })
                         });
                         assoc_properties.insert(decl.name.name.clone(), is_string_key);
+                    }
+                    // Queue (`m[$]`) / dynamic-array (`m[]`) member — track so
+                    // it gets independent per-instance storage. Bounded queues
+                    // (`m[$:N]`) record their cap.
+                    match decl.dimensions.first() {
+                        Some(UnpackedDimension::Queue { max_size, .. }) => {
+                            let cap = max_size.as_ref().and_then(|e|
+                                const_eval_i64_with_params(e, None)).map(|n| (n + 1).max(1) as u32);
+                            queue_properties.insert(decl.name.name.clone(), (width.max(1), cap));
+                        }
+                        Some(UnpackedDimension::Unsized(_)) => {
+                            queue_properties.insert(decl.name.name.clone(), (width.max(1), None));
+                        }
+                        // A member array sized by an expression (e.g.
+                        // `seq m[NUM_HARTS]`) cannot be sized here — class
+                        // elaboration has no parameter table, so the dimension
+                        // would resolve to 0 and indexing would be out of
+                        // bounds. Give it independent per-instance storage like
+                        // a queue (indexed writes land in the 0..63 buffer).
+                        // A *constant*-sized `[N]` IS resolvable, so register it
+                        // as a real fixed array (so `gpr[0]` defaults to its
+                        // element value, not an empty-queue read of 0).
+                        Some(UnpackedDimension::Expression { expr, .. }) => {
+                            match const_eval_i64_with_params(expr, None) {
+                                Some(n) if n > 0 => {
+                                    array_properties.insert(
+                                        decl.name.name.clone(),
+                                        (0, n - 1, width.max(1)),
+                                    );
+                                }
+                                _ => {
+                                    queue_properties
+                                        .insert(decl.name.name.clone(), (width.max(1), None));
+                                }
+                            }
+                        }
+                        // `m[lo:hi]` fixed unpacked array with constant bounds.
+                        Some(UnpackedDimension::Range { left, right, .. }) => {
+                            if let (Some(l), Some(r)) = (
+                                const_eval_i64_with_params(left, None),
+                                const_eval_i64_with_params(right, None),
+                            ) {
+                                array_properties.insert(
+                                    decl.name.name.clone(),
+                                    (l.min(r), l.max(r), width.max(1)),
+                                );
+                            }
+                        }
+                        _ => {}
+                    }
+                    } // end `if !is_static`
+                    // Remember scalar initializers so instantiation can re-eval
+                    // them with the live parameter table (e.g. `= NUM_HARTS`).
+                    if decl.dimensions.is_empty() {
+                        if let Some(init) = &decl.init {
+                            property_inits.insert(decl.name.name.clone(), init.clone());
+                        }
                     }
                     let mut v = if let Some(init) = &decl.init {
                         let mut val = eval_init_for_width(init, &HashMap::default(), width);
@@ -356,6 +459,10 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         static_properties,
         static_methods,
         assoc_properties,
+        queue_properties,
+        property_inits,
+        static_collections,
+        array_properties,
     }
 }
 
@@ -368,6 +475,11 @@ pub struct ElaboratedModule {
     pub continuous_assigns: Vec<ContinuousAssignment>,
     pub always_blocks: Vec<AlwaysBlock>,
     pub initial_blocks: Vec<InitialBlock>,
+    /// Static/package-scope variable initializers. Scheduled at time 0 ahead of
+    /// any `initial` block (and the lazy-prefix `pending_initial`), so package
+    /// globals (e.g. riscv-dv's `supported_isa[$] = {...}`) are populated before
+    /// user code that reads them.
+    pub static_init_blocks: Vec<InitialBlock>,
     pub parameters: HashMap<String, Value>,
     /// Typedef name -> width mapping for user-defined types.
     pub typedefs: HashMap<String, u32>,
@@ -466,6 +578,7 @@ impl ElaboratedModule {
             continuous_assigns: Vec::new(),
             always_blocks: Vec::new(),
             initial_blocks: Vec::new(),
+            static_init_blocks: Vec::new(),
             parameters: HashMap::default(),
             typedefs: HashMap::default(),
             typedef_types: HashMap::default(),
@@ -894,6 +1007,11 @@ fn collect_class_member_names(
             }
             ClassItem::Typedef(td) => {
                 allowed.insert(td.name.name.clone());
+                if let DataType::Enum(et) = &td.data_type {
+                    for m in &et.members {
+                        allowed.insert(m.name.name.clone());
+                    }
+                }
             }
             _ => {}
         }
@@ -921,6 +1039,54 @@ fn collect_class_member_names(
     }
 }
 
+/// Add the enum constant names introduced by an enum typedef to `allowed`.
+fn collect_enum_member_names(td: &TypedefDeclaration, allowed: &mut HashSet<String>) {
+    if let DataType::Enum(et) = &td.data_type {
+        for m in &et.members {
+            allowed.insert(m.name.name.clone());
+        }
+    }
+}
+
+/// Collect identifier names that are legal to reference from any class
+/// constraint regardless of class membership: package- and top-level enum
+/// constants, parameters/localparams, and `const` data declarations. Without
+/// these, a constraint such as `reg != ZERO` (where `ZERO` is a package enum
+/// literal) is wrongly rejected as an undeclared identifier.
+fn collect_global_constraint_names(
+    all_defs: &HashMap<String, Definition>,
+    allowed: &mut HashSet<String>,
+) {
+    for def in all_defs.values() {
+        // Package and class names are legal roots of scoped constraint
+        // references (`pkg::CONST`, `ClassName::STATIC`).
+        allowed.insert(def.name().to_string());
+        match def {
+            Definition::Typedef(td) => collect_enum_member_names(td, allowed),
+            Definition::Package(p) => {
+                for item in &p.items {
+                    match item {
+                        crate::ast::decl::PackageItem::Typedef(td) => {
+                            allowed.insert(td.name.name.clone());
+                            collect_enum_member_names(td, allowed);
+                        }
+                        crate::ast::decl::PackageItem::Parameter(pd) => {
+                            if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                                for a in assignments { allowed.insert(a.name.name.clone()); }
+                            }
+                        }
+                        crate::ast::decl::PackageItem::Data(d) => {
+                            for decl in &d.declarators { allowed.insert(decl.name.name.clone()); }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn validate_class_constraints(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
@@ -928,6 +1094,9 @@ fn validate_class_constraints(
     let mut allowed = HashSet::default();
     let mut seen = HashSet::default();
     collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
+    if let Some(defs) = all_defs {
+        collect_global_constraint_names(defs, &mut allowed);
+    }
     for item in &c.items {
         if let ClassItem::Constraint(con) = item {
             for it in &con.items {
@@ -3922,6 +4091,82 @@ pub fn inline_instantiations(
                                         if is_signed { v.is_signed = true; }
                                         elab.parameters.insert(assign.name.name.clone(), v);
                                     }
+                                }
+                            }
+                        }
+                        // Package-scope variable declarations. riscv-dv's target
+                        // ISA config lives here as dynamic-array / queue globals
+                        // (`supported_isa[$] = {RV32I,...}`); without populating
+                        // them the generator has nothing to emit. Mirror the
+                        // module-scope array-initializer path: register the array
+                        // and emit its element initializers as a synthetic
+                        // initial block so the runtime assignment machinery fills
+                        // it at time 0 (enum members are already in scope, having
+                        // been processed from this same package's typedefs).
+                        crate::ast::decl::PackageItem::Data(dd) => {
+                            let width = resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                            let is_signed = is_type_signed(&dd.data_type);
+                            for decl in &dd.declarators {
+                                let first_dim = decl.dimensions.first();
+                                let is_dynamic_dim = first_dim.map_or(false, |d| matches!(d,
+                                    UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }));
+                                let is_assoc = matches!(first_dim, Some(UnpackedDimension::Associative { .. }));
+                                if is_dynamic_dim {
+                                    elab.dynamic_arrays.insert(decl.name.name.clone());
+                                }
+                                if is_assoc {
+                                    elab.associative_arrays.insert(decl.name.name.clone(), false);
+                                    continue;
+                                }
+                                // Element reads/writes go through `module.arrays`
+                                // (see the Index eval path), so any unpacked array
+                                // must be registered there with a backing range —
+                                // matching the module-scope path's use of
+                                // `extract_array_range` (dynamic/queue → 0..63).
+                                if let Some((lo, hi)) = extract_array_range(&decl.dimensions, &elab.parameters) {
+                                    elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                                    if let Some(UnpackedDimension::Range { left, right, .. }) = first_dim {
+                                        let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
+                                        let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
+                                        if l > r { elab.descending_arrays.insert(decl.name.name.clone()); }
+                                    }
+                                }
+                                let Some(init_expr) = &decl.init else { continue };
+                                let init_items: Vec<&Expression> = match &init_expr.kind {
+                                    ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
+                                    ExprKind::Concatenation(exprs) => exprs.iter().collect(),
+                                    _ => vec![],
+                                };
+                                if !init_items.is_empty() && decl.dimensions.first().is_some() {
+                                    // Emit explicit per-element initializers. The
+                                    // array is registered in `arrays` above, so
+                                    // `name[i] = item` lands where reads look.
+                                    let mut stmts: Vec<Statement> = Vec::new();
+                                    for (i, item_expr) in init_items.iter().enumerate() {
+                                        let lval = Expression::new(ExprKind::Index {
+                                            expr: Box::new(make_ident_expr(&decl.name.name)),
+                                            index: Box::new(Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: i.to_string(), cached_val: std::cell::Cell::new(None) }), Span::dummy())),
+                                        }, Span::dummy());
+                                        stmts.push(Statement::new(StatementKind::BlockingAssign {
+                                            lvalue: lval,
+                                            rvalue: (*item_expr).clone(),
+                                        }, Span::dummy()));
+                                    }
+                                    if is_dynamic_dim {
+                                        let size_name = format!("{}.size", decl.name.name);
+                                        elab.signals.insert(size_name.clone(), Signal { is_const: false, name: size_name, width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None });
+                                    }
+                                    elab.static_init_blocks.push(InitialBlock {
+                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
+                                    });
+                                } else if decl.dimensions.is_empty() {
+                                    let _ = (width, is_signed);
+                                    elab.static_init_blocks.push(InitialBlock {
+                                        stmt: Statement::new(StatementKind::BlockingAssign {
+                                            lvalue: make_ident_expr(&decl.name.name),
+                                            rvalue: init_expr.clone(),
+                                        }, Span::dummy()),
+                                    });
                                 }
                             }
                         }
