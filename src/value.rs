@@ -597,11 +597,15 @@ impl Value {
             let a = self.to_u64().unwrap_or(0);
             let b = other.to_u64().unwrap_or(0);
             if b == 0 { return Value::new(w); }
-            if self.is_signed || other.is_signed {
+            // IEEE 1800 §11.6.1: signed only when BOTH operands are signed;
+            // the result then carries that signedness.
+            if self.is_signed && other.is_signed {
                 let sa = self.to_i64().unwrap_or(0);
                 let sb = other.to_i64().unwrap_or(0);
                 if sb == 0 { return Value::new(w); }
-                Value::from_u64(sa.wrapping_div(sb) as u64, w)
+                let mut r = Value::from_u64(sa.wrapping_div(sb) as u64, w);
+                r.is_signed = true;
+                r
             } else {
                 Value::from_u64(a / b, w)
             }
@@ -622,11 +626,14 @@ impl Value {
         if w <= 64 {
             let b = other.to_u64().unwrap_or(0);
             if b == 0 { return Value::new(w); }
-            if self.is_signed || other.is_signed {
+            // IEEE 1800 §11.6.1: signed only when BOTH operands are signed.
+            if self.is_signed && other.is_signed {
                 let sa = self.to_i64().unwrap_or(0);
                 let sb = other.to_i64().unwrap_or(0);
                 if sb == 0 { return Value::new(w); }
-                Value::from_u64(sa.wrapping_rem(sb) as u64, w)
+                let mut r = Value::from_u64(sa.wrapping_rem(sb) as u64, w);
+                r.is_signed = true;
+                r
             } else {
                 let a = self.to_u64().unwrap_or(0);
                 Value::from_u64(a % b, w)
