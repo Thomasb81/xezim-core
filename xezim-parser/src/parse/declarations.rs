@@ -489,6 +489,15 @@ impl Parser {
                 }
             }
             TokenKind::KwClass => Some(PackageItem::Class(self.parse_class_declaration())),
+            // IEEE 1800-2023 §19: covergroup at package scope. Parsed for
+            // syntactic acceptance, but not hosted as a PackageItem (no
+            // PackageItem::Covergroup variant; covergroup runtime lives in
+            // classes/modules). Returning Null prevents the loop from
+            // bumping past `endpackage`.
+            TokenKind::KwCovergroup => {
+                let _ = self.parse_covergroup_declaration();
+                Some(PackageItem::Null)
+            }
             TokenKind::KwChecker => {
                 if let Some(ModuleItem::CheckerDeclaration(c)) = self.parse_module_item() {
                     Some(PackageItem::Checker(c))

@@ -1453,7 +1453,14 @@ pub fn elaborate_module_with_defs(
                 let is_signed = is_type_signed(&dd.data_type);
                 for decl in &dd.declarators {
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
-                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        // Demoted to a warning so DataDeclaration-vs-existing
+                        // collisions (e.g. cv32e40p UVM TB's `bit tp;`
+                        // colliding with a same-named class-function local
+                        // that was wrongly merged into module scope) don't
+                        // block elaboration. The real fix is to keep class
+                        // function locals out of the module scope map.
+                        eprintln!("[xezim][warning] duplicate declaration of '{}' (data); keeping first definition", decl.name.name);
+                        continue;
                     }
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = decl.dimensions.first() {
                         let is_string_key = key_dt.as_ref().map_or(false, |dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));

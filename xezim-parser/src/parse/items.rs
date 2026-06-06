@@ -396,6 +396,23 @@ impl Parser {
                 if self.peek_kind() == TokenKind::KwInterface { Some(self.parse_identifier_starting_item()) }
                 else { self.bump(); self.parse_module_item() }
             }
+            // IEEE 1800-2023 §23.11: `bind` inside a module. We accept it
+            // for syntactic completeness — testbenches use it to attach
+            // parameterized assertion helpers to existing instances. The
+            // body is skip-parsed (assertion runtime is not modelled).
+            TokenKind::KwBind => {
+                self.bump(); // bind
+                let mut d_paren = 0i32;
+                while !self.at(TokenKind::Eof) {
+                    match self.current_kind() {
+                        TokenKind::LParen => { d_paren += 1; self.bump(); }
+                        TokenKind::RParen => { d_paren -= 1; self.bump(); }
+                        TokenKind::Semicolon if d_paren <= 0 => { self.bump(); break; }
+                        _ => { self.bump(); }
+                    }
+                }
+                Some(ModuleItem::Null)
+            }
             TokenKind::KwModport => {
                 let start = self.current().span.start; self.bump();
                 let mut items = Vec::new();
@@ -1149,7 +1166,7 @@ impl Parser {
         }
     }
 
-    fn parse_covergroup_declaration(&mut self) -> CovergroupDeclaration {
+    pub(super) fn parse_covergroup_declaration(&mut self) -> CovergroupDeclaration {
         let start = self.current().span.start;
         self.bump();
         let name = self.parse_identifier();

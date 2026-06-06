@@ -61,6 +61,15 @@ impl Parser {
             }
             TokenKind::KwClass =>
                 Some(Description::Class(self.parse_class_declaration())),
+            // IEEE 1800-2023 §19: a top-level (\$unit-scope) covergroup is
+            // legal. We parse it for syntax acceptance but don't surface it
+            // as a Description (no covergroup runtime hosted outside a
+            // class/module). The body is fully consumed up through
+            // `endgroup` plus optional label.
+            TokenKind::KwCovergroup => {
+                let _ = self.parse_covergroup_declaration();
+                self.parse_description()
+            }
             TokenKind::KwChecker => {
                 if let Some(ModuleItem::CheckerDeclaration(c)) = self.parse_module_item() {
                     Some(Description::PackageItem(PackageItem::Checker(c)))

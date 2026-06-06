@@ -896,7 +896,12 @@ impl Parser {
     /// Handles internal indices [expr] as well (e.g. successors[s].m_predecessors).
     pub(super) fn parse_hierarchical_identifier(&mut self) -> HierarchicalIdentifier {
         let start = self.current().span.start;
-        let id = if self.at(TokenKind::KwThis) || self.at(TokenKind::KwSuper) {
+        // IEEE 1800-2023 §23.6: `$root`, `$unit`, `local::`-style roots can
+        // start a hierarchical reference. `$root.foo.bar` shows up frequently
+        // in cv32e40p macros expanding to absolute paths.
+        let id = if self.at(TokenKind::KwThis) || self.at(TokenKind::KwSuper)
+            || self.at(TokenKind::SystemIdentifier)
+        {
             let tok = self.bump();
             Identifier { name: tok.text, span: tok.span }
         } else {

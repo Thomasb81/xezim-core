@@ -12,6 +12,31 @@ impl Parser {
     pub(super) fn parse_statement(&mut self) -> Statement {
         let start = self.current().span.start;
 
+        // IEEE 1800-2023 §9.3.1: optional statement label
+        //   <label> : <statement_item> ;
+        // Most common in test/coverage code as a name for assert / cover /
+        // assume sites. We discard the label (no AST node hosts it today)
+        // and parse the underlying statement.
+        if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
+            && self.peek_kind() == TokenKind::Colon
+        {
+            let after_colon = self.peek_kind_n(2);
+            let stmt_starter = matches!(
+                after_colon,
+                TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover
+                    | TokenKind::KwExpect | TokenKind::KwBegin | TokenKind::KwFork
+                    | TokenKind::KwIf | TokenKind::KwCase | TokenKind::KwCasex
+                    | TokenKind::KwCasez | TokenKind::KwFor | TokenKind::KwForeach
+                    | TokenKind::KwWhile | TokenKind::KwDo | TokenKind::KwRepeat
+                    | TokenKind::KwForever
+            );
+            if stmt_starter {
+                let _ = self.parse_identifier();
+                self.expect(TokenKind::Colon);
+                return self.parse_statement();
+            }
+        }
+
         match self.current_kind() {
             TokenKind::Directive => { self.bump(); self.parse_statement() }
             TokenKind::KwBegin => self.parse_seq_block(),
@@ -485,22 +510,29 @@ impl Parser {
         let start = self.current().span.start;
         self.expect(TokenKind::KwFor);
         self.expect(TokenKind::LParen);
-        // Init
+        // Init — IEEE 1800-2023 §12.7.1 allows a comma-separated list, each
+        // entry either a fresh `<type> name = expr` or a bare `lv = rv`.
+        // Used by macros like svlib's `foreach_line` that expand to
+        //   for (int x =(fid), int y=(start), string z="" ; ... ; ...)
         let mut init = Vec::new();
         if !self.at(TokenKind::Semicolon) {
-            if self.is_data_type_keyword() ||
-                (self.at(TokenKind::Identifier) &&
-                    matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)) {
-                let dt = self.parse_data_type();
-                let name = self.parse_identifier();
-                self.expect(TokenKind::Assign);
-                let val = self.parse_expression();
-                init.push(ForInit::VarDecl { data_type: dt, name, init: val });
-            } else {
-                let lv = self.parse_expression();
-                self.expect(TokenKind::Assign);
-                let rv = self.parse_expression();
-                init.push(ForInit::Assign { lvalue: lv, rvalue: rv });
+            loop {
+                if self.is_data_type_keyword() ||
+                    (self.at(TokenKind::Identifier) &&
+                        matches!(self.peek_kind(),
+                            TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)) {
+                    let dt = self.parse_data_type();
+                    let name = self.parse_identifier();
+                    self.expect(TokenKind::Assign);
+                    let val = self.parse_expression();
+                    init.push(ForInit::VarDecl { data_type: dt, name, init: val });
+                } else {
+                    let lv = self.parse_expression();
+                    self.expect(TokenKind::Assign);
+                    let rv = self.parse_expression();
+                    init.push(ForInit::Assign { lvalue: lv, rvalue: rv });
+                }
+                if self.eat(TokenKind::Comma).is_none() { break; }
             }
         }
         self.expect(TokenKind::Semicolon);
