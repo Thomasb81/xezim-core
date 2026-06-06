@@ -407,9 +407,23 @@ impl Parser {
                     loop {
                         if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
                         let pstart = self.current().span.start;
-                        let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
-                        let port_name = self.parse_identifier();
-                        ports.push(ModportPort { direction, name: port_name, span: self.span_from(pstart) });
+                        // IEEE 1800-2023 §25.5: `modport <name> ( clocking <cb> )`
+                        // — a modport_clocking_declaration. We record it as a
+                        // synthetic Input port whose name is the clocking
+                        // block; downstream consumers that don't understand
+                        // clocking still see *something* there.
+                        if self.eat(TokenKind::KwClocking).is_some() {
+                            let cb_name = self.parse_identifier();
+                            ports.push(ModportPort {
+                                direction: PortDirection::Input,
+                                name: cb_name,
+                                span: self.span_from(pstart),
+                            });
+                        } else {
+                            let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
+                            let port_name = self.parse_identifier();
+                            ports.push(ModportPort { direction, name: port_name, span: self.span_from(pstart) });
+                        }
                         if self.eat(TokenKind::Comma).is_none() { break; }
                     }
                     self.expect(TokenKind::RParen);
@@ -418,6 +432,45 @@ impl Parser {
                 }
                 self.expect(TokenKind::Semicolon);
                 Some(ModuleItem::ModportDeclaration(ModportDeclaration { items, span: self.span_from(start) }))
+            }
+            // IEEE 1800-2023 §14.3 — clocking block. Lightweight handling:
+            // parse-and-discard the body (including any default skew or
+            // direction lists) so an interface that *contains* a clocking
+            // block can still be parsed. The body content isn't elaborated
+            // because there is no clocking-runtime yet.
+            TokenKind::KwClocking => {
+                self.bump();
+                // Optional name
+                if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
+                    let _ = self.parse_identifier();
+                }
+                // Optional @(event_expression) clause — balanced skip past it.
+                if self.at(TokenKind::At) {
+                    self.bump();
+                    if self.at(TokenKind::LParen) {
+                        let mut d = 0i32;
+                        while !self.at(TokenKind::Eof) {
+                            match self.current_kind() {
+                                TokenKind::LParen => { d += 1; self.bump(); }
+                                TokenKind::RParen => { d -= 1; self.bump(); if d == 0 { break; } }
+                                _ => { self.bump(); }
+                            }
+                        }
+                    } else if self.at(TokenKind::Identifier) {
+                        let _ = self.parse_identifier();
+                    }
+                }
+                self.expect(TokenKind::Semicolon);
+                // Skip body to the matching endclocking.
+                while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
+                self.expect(TokenKind::KwEndclocking);
+                // Optional `: <label>` trailing.
+                if self.eat(TokenKind::Colon).is_some() {
+                    let _ = self.parse_identifier();
+                }
+                Some(ModuleItem::Null)
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover =>
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement())),

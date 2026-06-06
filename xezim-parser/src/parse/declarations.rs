@@ -355,7 +355,23 @@ impl Parser {
         if self.at(TokenKind::RParen) { self.bump(); return args; }
         loop {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
-            args.push(self.parse_param_value());
+            // IEEE 1800-2023 §8.25.1 — `extends <base>#(.NAME(value), ...)` is
+            // the named form of parameter binding. We accept it here and drop
+            // the name (Elaboration matches positionally for now; recording
+            // the name would require widening `ClassExtends.args`).
+            if self.eat(TokenKind::Dot).is_some() {
+                let _name = self.parse_identifier();
+                self.expect(TokenKind::LParen);
+                if self.at(TokenKind::RParen) {
+                    // `.NAME()` — empty binding; skip without pushing.
+                    self.bump();
+                } else {
+                    args.push(self.parse_param_value());
+                    self.expect(TokenKind::RParen);
+                }
+            } else {
+                args.push(self.parse_param_value());
+            }
             if self.eat(TokenKind::Comma).is_none() { break; }
         }
         self.expect(TokenKind::RParen);
