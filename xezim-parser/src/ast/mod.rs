@@ -65,4 +65,8 @@ pub enum Description {
     PackageItem(decl::PackageItem),
     DPIImport(decl::DPIImport),
     DPIExport(decl::DPIExport),
+    /// Compilation-unit-scope `bind` directive (IEEE 1800-2023 §23.11).
+    /// Resolved during elaboration: the wrapped instantiation is appended
+    /// to the named target module's items.
+    Bind(decl::BindDirective),
 }

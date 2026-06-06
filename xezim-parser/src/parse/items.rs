@@ -887,7 +887,7 @@ impl Parser {
         }
     }
 
-    fn parse_port_connections(&mut self) -> Vec<PortConnection> {
+    pub(super) fn parse_port_connections(&mut self) -> Vec<PortConnection> {
         let mut conns = Vec::new();
         if self.eat(TokenKind::LParen).is_none() { return conns; }
         if self.at(TokenKind::RParen) { self.bump(); return conns; }

@@ -51,7 +51,28 @@ pub enum ModuleItem {
     /// Out-of-class constraint definition: `constraint ClassName::cname { ... }`.
     /// Only the qualified name is tracked; body is not modeled.
     OutOfClassConstraint { class_name: String, constraint_name: String },
+    /// `bind <target> <module> <inst>(<ports>);` appearing as a module item
+    /// (rather than at compilation-unit scope). Treated by elaboration the
+    /// same way as a top-level bind: the wrapped instantiation is appended
+    /// to every instance of `target`.
+    Bind(BindDirective),
     Null,
+}
+
+/// IEEE 1800-2023 §23.11 — `bind` directive. A lightweight, top-level form
+/// is supported: `bind <target_module> <bind_module> <inst_name>(.<port>(<expr>), ...);`
+/// is desugared by elaboration into a `ModuleInstantiation` appended to
+/// `target_module`'s item list, so every instance of `target_module` gets
+/// the bound module attached (typically a covergroup / assertion / monitor
+/// holder).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct BindDirective {
+    /// Identifier of the module type the bind attaches to.
+    pub target_module: Identifier,
+    /// The instantiation appended into every instance of `target_module`.
+    pub instantiation: ModuleInstantiation,
+    pub span: Span,
 }
 
 #[derive(Debug, Clone)]

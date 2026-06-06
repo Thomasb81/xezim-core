@@ -244,6 +244,7 @@ fn parse_and_elaborate(
     let mut top_level_functions: Vec<ast::decl::FunctionDeclaration> = Vec::new();
     let mut top_level_tasks: Vec<ast::decl::TaskDeclaration> = Vec::new();
     let mut top_level_nettypes: Vec<ast::decl::NettypeDeclaration> = Vec::new();
+    let mut top_level_binds: Vec<ast::decl::BindDirective> = Vec::new();
     for desc in all_descriptions {
         match desc {
             ast::Description::Module(m) => {
@@ -308,7 +309,23 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
                 top_level_nettypes.push(n);
             }
+            ast::Description::Bind(b) => {
+                top_level_binds.push(b);
+            }
             _ => {}
+        }
+    }
+
+    // IEEE 1800-2023 §23.11: apply each compilation-unit-scope `bind` by
+    // appending the bound instantiation to its target module's items. This
+    // runs before top_level_functions/tasks/nettypes injection so a bound
+    // monitor module sees the same top-level helpers as native modules.
+    for b in &top_level_binds {
+        let tname = b.target_module.name.clone();
+        let Some(def) = definitions.get_mut(&tname) else { continue };
+        if let SourceDefinition::Module(m) = def {
+            let m = Rc::make_mut(m);
+            m.items.push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
         }
     }
     if !top_level_functions.is_empty() || !top_level_tasks.is_empty() || !top_level_nettypes.is_empty() {

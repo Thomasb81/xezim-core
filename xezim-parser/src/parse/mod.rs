@@ -97,11 +97,51 @@ impl Parser {
                 self.parse_description()
             }
             TokenKind::KwBind => {
-                // IEEE 1800-2017 §23.11: `bind <target> <module> inst(...);`
-                // Parse-and-discard for now — the monitor/checker isn't
-                // instantiated, but accepting the syntax lets designs
-                // that use bind compile and run their primary logic.
+                // IEEE 1800-2023 §23.11: `bind <target> <bind_mod> <inst>(<ports>);`
+                // We parse the simple top-level form (no scope target list,
+                // no instance-name selector) and surface a BindDirective so
+                // elaboration can append the bound instantiation to every
+                // instance of <target>. More elaborate selectors fall back
+                // to parse-and-discard.
+                let bind_start = self.current().span.start;
                 self.bump();
+                // Save position so we can fall back to the legacy skip-form
+                // if the heuristic parse fails.
+                let restart = self.pos;
+                let target = self.parse_identifier();
+                let bind_mod = self.parse_identifier();
+                if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
+                    let inst_start = self.current().span.start;
+                    let iname = self.parse_identifier();
+                    let dims = self.parse_unpacked_dimensions();
+                    let conns = self.parse_port_connections();
+                    if self.at(TokenKind::Semicolon) {
+                        self.bump();
+                        let span = self.span_from(bind_start);
+                        let instance = crate::ast::decl::HierarchicalInstance {
+                            name: iname,
+                            dimensions: dims,
+                            connections: conns,
+                            span: self.span_from(inst_start),
+                        };
+                        let instantiation = crate::ast::decl::ModuleInstantiation {
+                            module_name: bind_mod,
+                            params: None,
+                            instances: vec![instance],
+                            span,
+                        };
+                        return Some(Description::Bind(
+                            crate::ast::decl::BindDirective {
+                                target_module: target,
+                                instantiation,
+                                span,
+                            },
+                        ));
+                    }
+                }
+                // Heuristic parse failed (instance selector, multi-target,
+                // unhandled syntax) — rewind and swallow until the next ';'.
+                self.pos = restart;
                 let mut depth_paren = 0i32;
                 while !self.at(TokenKind::Eof) {
                     match self.current_kind() {
