@@ -23,6 +23,17 @@ pub struct Preprocessor {
     include_dirs: Vec<PathBuf>,
     /// Current include depth (to prevent infinite recursion).
     include_depth: usize,
+    /// Current source file path (for `__FILE__` expansion). Updated on entry
+    /// to `resolve_directives` and across `include nesting.
+    current_file: String,
+    /// 1-based line number within `current_file` of the line being processed
+    /// (for `__LINE__` expansion).
+    current_line: u32,
+    /// Active `begin_keywords` stack — each entry holds the (validated)
+    /// version string that pushed it. End_keywords pops one. Tracked so that
+    /// invalid version strings can be reported and (future) per-region
+    /// keyword sets can be wired in. SV-2023 §22.14.
+    keywords_stack: Vec<String>,
 }
 
 const MAX_INCLUDE_DEPTH: usize = 32;
@@ -35,9 +46,10 @@ struct IfdefState {
 }
 
 impl Preprocessor {
-    pub fn new() -> Self {
-        let mut defines = HashMap::new();
-        // IEEE 1800-2017 §39.6: predefined $coverage_control control constants.
+    /// Seed the predefined `$coverage_control` constants (IEEE 1800-2023
+    /// §39.6). Called by `new()` and again by `undefineall` so the
+    /// predefined names survive a wipe of user-defined macros.
+    fn seed_predefined(defines: &mut HashMap<String, MacroDef>) {
         for (name, val) in [
             ("SV_COV_START", "0"),
             ("SV_COV_STOP", "1"),
@@ -61,10 +73,18 @@ impl Preprocessor {
                 body: val.to_string(),
             });
         }
+    }
+
+    pub fn new() -> Self {
+        let mut defines = HashMap::new();
+        Self::seed_predefined(&mut defines);
         Self {
             defines,
             include_dirs: Vec::new(),
             include_depth: 0,
+            current_file: String::new(),
+            current_line: 0,
+            keywords_stack: Vec::new(),
         }
     }
 
@@ -219,7 +239,17 @@ impl Preprocessor {
         // Directory of the current source file (for relative `include resolution)
         let source_dir = source_path.and_then(|p| p.parent().map(|d| d.to_path_buf()));
 
+        // Save the caller's `__FILE__` / `__LINE__` cursor (so nested
+        // `include returns leave it untouched), then point it at this source.
+        let saved_file = std::mem::take(&mut self.current_file);
+        let saved_line = self.current_line;
+        self.current_file = source_path
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        self.current_line = 0;
+
         while let Some(line) = lines.next() {
+            self.current_line += 1;
             let trimmed = line.trim();
 
             // Strip (* ... *) attributes (IEEE 1800-2017 §5.12)
@@ -261,6 +291,18 @@ impl Preprocessor {
                 for _ in 0..consumed_lines {
                     output.push('\n');
                 }
+                continue;
+            }
+
+            // IEEE 1800-2023 §22.5.2: `undefineall — clear every user-defined
+            // macro. Predefined `SV_COV_*` system constants stay (re-seeded).
+            // Check BEFORE `undef so the longer name wins token match.
+            if trimmed.starts_with("`undefineall") {
+                if ifdef_stack.iter().all(|s| s.active) {
+                    self.defines.clear();
+                    Self::seed_predefined(&mut self.defines);
+                }
+                output.push('\n');
                 continue;
             }
 
@@ -377,6 +419,49 @@ impl Preprocessor {
                 output.push('\n');
                 continue;
             }
+            // IEEE 1800-2023 §22.14: `begin_keywords "<version>" pushes a
+            // keyword-set onto the stack. We validate the version string
+            // (warn on unknown) and track depth so a stray `end_keywords is
+            // visible. Active-set switching for the lexer is future work; for
+            // now this just enforces well-formedness and avoids silently
+            // accepting typos in the version string.
+            if trimmed.starts_with("`begin_keywords") {
+                if ifdef_stack.iter().all(|s| s.active) {
+                    let rest = trimmed.trim_start_matches("`begin_keywords").trim();
+                    let ver = rest.trim_matches(|c: char| c == '"' || c.is_whitespace());
+                    const VALID: &[&str] = &[
+                        "1800-2023", "1800-2017", "1800-2012", "1800-2009", "1800-2005",
+                        "1364-2005", "1364-2001", "1364-2001-noconfig", "1364-1995",
+                    ];
+                    if VALID.contains(&ver) {
+                        self.keywords_stack.push(ver.to_string());
+                    } else {
+                        eprintln!(
+                            "[PP] warning: `begin_keywords \"{}\" — unknown version string \
+                             (IEEE 1800-2023 §22.14); accepted set is {}",
+                            ver,
+                            VALID.join(", ")
+                        );
+                        // Push anyway so end_keywords stays balanced.
+                        self.keywords_stack.push(ver.to_string());
+                    }
+                }
+                output.push('\n');
+                continue;
+            }
+            if trimmed.starts_with("`end_keywords") {
+                if ifdef_stack.iter().all(|s| s.active) {
+                    if self.keywords_stack.pop().is_none() {
+                        eprintln!(
+                            "[PP] warning: `end_keywords without matching `begin_keywords \
+                             (IEEE 1800-2023 §22.14)"
+                        );
+                    }
+                }
+                output.push('\n');
+                continue;
+            }
+
             // Skip `timescale and other compiler directives
             // that don't affect simulation semantics
             if trimmed.starts_with("`timescale")
@@ -384,7 +469,6 @@ impl Preprocessor {
                 || trimmed.starts_with("`resetall")
                 || trimmed.starts_with("`nounconnected_drive") || trimmed.starts_with("`unconnected_drive")
                 || trimmed.starts_with("`pragma")
-                || trimmed.starts_with("`begin_keywords") || trimmed.starts_with("`end_keywords")
                 || trimmed.starts_with("`line")
             {
                 output.push('\n');
@@ -417,7 +501,17 @@ impl Preprocessor {
                 output.push_str(&expanded);
                 output.push('\n');
             }
+            // Account for additional physical lines consumed by paren-spanning
+            // continuations so __LINE__ on subsequent lines stays correct.
+            if consumed_lines > 1 {
+                self.current_line += (consumed_lines - 1) as u32;
+            }
         }
+
+        // Restore caller's cursor (so a returning `include leaves the outer
+        // file's __FILE__/__LINE__ intact).
+        self.current_file = saved_file;
+        self.current_line = saved_line;
 
         output
     }
@@ -582,11 +676,22 @@ impl Preprocessor {
                 }
                 let macro_name = &line[start..i];
                 if macro_name == "__FILE__" {
+                    // IEEE 1800-2023 §22.13: expands to the current source
+                    // file's path as a double-quoted string. We re-quote any
+                    // backslashes/quotes in the path so the resulting token
+                    // is a valid SV string literal.
                     result.push('\"');
-                    result.push_str("file"); // Placeholder
+                    for ch in self.current_file.chars() {
+                        match ch {
+                            '\\' => { result.push('\\'); result.push('\\'); }
+                            '\"' => { result.push('\\'); result.push('\"'); }
+                            _ => result.push(ch),
+                        }
+                    }
                     result.push('\"');
                 } else if macro_name == "__LINE__" {
-                    result.push_str("0"); // Placeholder
+                    // IEEE 1800-2023 §22.13.
+                    result.push_str(&self.current_line.to_string());
                 } else if let Some(def) = self.defines.get(macro_name) {
                     // eprintln!("[PP] expanding macro '{}'", macro_name);
                     let mut p = i;
