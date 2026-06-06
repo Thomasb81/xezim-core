@@ -542,6 +542,23 @@ impl Parser {
                 self.bump();
                 if self.at(TokenKind::KwClocking) {
                     self.parse_module_item() // recurse to handle clocking
+                } else if self.at(TokenKind::KwDisable) {
+                    // IEEE 1800-2023 §16.4.2: `default disable iff <expr>;`
+                    // is a default for all concurrent assertions in scope.
+                    // Skip-parse (we don't model SVA semantics yet).
+                    self.bump(); // disable
+                    let _ = self.eat(TokenKind::KwIff);
+                    // Consume balanced expression up to the next ';' at depth 0.
+                    let mut d = 0i32;
+                    while !self.at(TokenKind::Eof) {
+                        match self.current_kind() {
+                            TokenKind::LParen => { d += 1; self.bump(); }
+                            TokenKind::RParen => { d -= 1; self.bump(); }
+                            TokenKind::Semicolon if d == 0 => { self.bump(); break; }
+                            _ => { self.bump(); }
+                        }
+                    }
+                    Some(ModuleItem::Null)
                 } else {
                     None
                 }
