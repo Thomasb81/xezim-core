@@ -90,12 +90,18 @@ impl Parser {
 
     pub(super) fn parse_end_label(&mut self) -> Option<Identifier> {
         if self.eat(TokenKind::Colon).is_some() {
-            if self.at(TokenKind::KwNew) {
+            let id = if self.at(TokenKind::KwNew) {
                 let tok = self.bump();
-                Some(Identifier { name: tok.text, span: tok.span })
+                Identifier { name: tok.text, span: tok.span }
             } else {
-                Some(self.parse_identifier())
-            }
+                self.parse_identifier()
+            };
+            // Some sources spell `endpackage : name;` with a trailing `;`
+            // (lenient over strict SV §22.4.2 grammar — accepted by VCS,
+            // Xcelium, and Verilator). Eat it here so the outer description
+            // loop doesn't trip on the lone semicolon.
+            let _ = self.eat(TokenKind::Semicolon);
+            Some(id)
         } else { None }
     }
 
