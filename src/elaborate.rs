@@ -524,6 +524,11 @@ pub struct ElaboratedModule {
     /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
     /// Members are stored by bit offset so MemberAccess can slice the container.
     pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
+    /// Packed multi-dimensional signal element width: signal_name -> element_width.
+    /// For `logic [3:0][7:0] words;` stores `"words" -> 8` so that `words[i]`
+    /// resolves to an 8-bit slice rather than a 1-bit select. Also keyed for
+    /// struct fields under `"struct_var.field"` form.
+    pub packed_signal_elem_widths: HashMap<String, u32>,
     /// Class-typed signal parameter overrides captured from `Type #(args) name;`
     /// declarations. Signal name -> positional type_args expressions.
     pub class_type_args: HashMap<String, Vec<Expression>>,
@@ -602,6 +607,7 @@ impl ElaboratedModule {
             packages: HashSet::default(),
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
+            packed_signal_elem_widths: HashMap::default(),
             class_type_args: HashMap::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
@@ -776,6 +782,38 @@ pub fn elaborate_module(
     param_overrides: &HashMap<String, Value>,
 ) -> Result<ElaboratedModule, String> {
     elaborate_module_with_defs(module, param_overrides, None, &[], &[])
+}
+
+/// Register members of an anonymous enum attached to a variable declaration
+/// (`enum logic { A, B } var_name;`) into `elab.parameters` and `elab.signals`.
+/// `typedef enum {...}` already does this via `process_typedef`; this is the
+/// missing path for the bare-variable form. Used by every `DataDeclaration`
+/// arm in the elaborator (top-level, submodule, generate-scope, etc.).
+pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModule) {
+    if let DataType::Enum(et) = dt {
+        let base_width = et.base_type.as_ref()
+            .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
+            .unwrap_or(32);
+        let mut next_val: u64 = 0;
+        for member in &et.members {
+            let val = if let Some(init) = &member.init {
+                eval_const_expr(init, &elab.parameters)
+            } else { next_val };
+            next_val = val.wrapping_add(1);
+            let v = Value::from_u64(val, base_width);
+            elab.parameters.entry(member.name.name.clone()).or_insert_with(|| v.clone());
+            elab.signals.entry(member.name.name.clone()).or_insert_with(|| Signal {
+                is_const: false,
+                name: member.name.name.clone(),
+                width: base_width,
+                is_signed: false,
+                is_real: false,
+                direction: None,
+                value: v,
+                type_name: None,
+            });
+        }
+    }
 }
 
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
@@ -1298,11 +1336,31 @@ pub fn elaborate_module_with_defs(
                 }
                 crate::ast::decl::PackageItem::Parameter(pd) => {
                     if let ParameterKind::Data { data_type, assignments } = &pd.kind {
-                        let width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                        let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                        let is_implicit_no_dims = matches!(
+                            data_type,
+                            DataType::Implicit { dimensions, .. } if dimensions.is_empty()
+                        );
                         let is_signed = is_type_signed(data_type);
                         for assign in assignments {
                             if let Some(init) = &assign.init {
-                                let mut v = eval_init_for_width(init, &elab.parameters, width);
+                                // For implicit-typed parameters, infer width
+                                // from a sized literal initializer so
+                                // `parameter X = 7'h13;` stores Value{width=7}
+                                // instead of being padded to 32. Otherwise
+                                // refs inside concats place the param at the
+                                // wrong bit position, shifting other operands
+                                // off-end. (Surfaced by cv32e40p's
+                                // compressed_decoder: `instr_o = { ...,
+                                // pkg::OPCODE_OPIMM };` was emitting NOP
+                                // because OPCODE_OPIMM took 32 bits.)
+                                let eff_width = if is_implicit_no_dims {
+                                    if let Some(w) = sized_literal_width(init) { w } else { 32 }
+                                } else {
+                                    width
+                                };
+                                width = eff_width;
+                                let mut v = eval_init_for_width(init, &elab.parameters, eff_width);
                                 if is_signed { v.is_signed = true; }
                                 elab.parameters.insert(assign.name.name.clone(), v);
                             }
@@ -1423,6 +1481,22 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                // Anonymous enum on a variable decl
+                // (`enum logic { A, B } var_name;`): the typedef path
+                // registers member constants, but the bare variable form
+                // does not, so the names A/B resolve to implicit nets at
+                // simulation time. Surfaced by cv32e40p_obi_interface.sv's
+                // `state_q FSM`. Helper is also called from the other
+                // DataDeclaration arms (submodule items, generate items).
+                register_anonymous_enum_members(&dd.data_type, &mut elab);
+                // Packed multi-D: `logic [3:0][7:0] words;` — record the
+                // per-element width so `words[i]` resolves to an 8-bit slice
+                // instead of a 1-bit select (LRM §7.4.1).
+                if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs) {
+                    for decl in &dd.declarators {
+                        elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
+                    }
+                }
                 // User-defined nettype → classify as net (allow multiple continuous drivers).
                 if let DataType::TypeReference { name, .. } = &dd.data_type {
                     if user_nettypes.contains(&name.name.name) {
@@ -1483,6 +1557,65 @@ pub fn elaborate_module_with_defs(
                         let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
                         if n >= 0 { elab.queue_max_sizes.insert(decl.name.name.clone(), (n + 1) as u32); }
                     }
+                    // Helper: if the element type resolves to a packed struct,
+                    // register the FLATTENED field layout (including nested
+                    // dotted paths like `outer.inner.leaf`) under the array
+                    // name so `arr[i][j]...[k].outer.inner.leaf` read/write
+                    // paths can splice it. Mirrors the 1-D-array packed-
+                    // struct registration below, but uses the shared
+                    // `flatten_array_elem_fields` helper that produces the
+                    // same dotted-keys layout `flatten_subfields` does for
+                    // standalone struct vars.
+                    let register_packed_for_array = |elab: &mut ElaboratedModule| {
+                        fn flatten_elem(
+                            dt: &DataType,
+                            params: &HashMap<String, Value>,
+                            typedefs: &HashMap<String, u32>,
+                            typedef_types: &HashMap<String, DataType>,
+                        ) -> Option<Vec<(String, u32, u32)>> {
+                            let resolved = if let DataType::TypeReference { name, .. } = dt {
+                                typedef_types.get(&name.name.name).unwrap_or(dt)
+                            } else { dt };
+                            if let DataType::Struct(su) = resolved {
+                                let is_union = matches!(su.kind, StructUnionKind::Union);
+                                let mut raw: Vec<(String, u32, DataType)> = Vec::new();
+                                for member in &su.members {
+                                    let mw = resolve_type_width(&member.data_type, Some(params), Some(typedefs));
+                                    for mdecl in &member.declarators {
+                                        raw.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
+                                    }
+                                }
+                                let mut out: Vec<(String, u32, u32)> = Vec::new();
+                                if is_union {
+                                    for (mn, mw, mdt) in &raw {
+                                        out.push((mn.clone(), 0, *mw));
+                                        if let Some(subs) = flatten_elem(mdt, params, typedefs, typedef_types) {
+                                            for (sn, so, sw) in subs { out.push((format!("{}.{}", mn, sn), so, sw)); }
+                                        }
+                                    }
+                                } else {
+                                    let mut offset: u32 = 0;
+                                    for (mn, mw, mdt) in raw.iter().rev() {
+                                        out.push((mn.clone(), offset, *mw));
+                                        if let Some(subs) = flatten_elem(mdt, params, typedefs, typedef_types) {
+                                            for (sn, so, sw) in subs { out.push((format!("{}.{}", mn, sn), offset + so, sw)); }
+                                        }
+                                        offset += mw;
+                                    }
+                                }
+                                Some(out)
+                            } else { None }
+                        }
+                        let elem_resolved: &DataType =
+                            if let DataType::TypeReference { name, .. } = &dd.data_type {
+                                elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
+                            } else { &dd.data_type };
+                        if let Some(fields) = flatten_elem(elem_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
+                            if !fields.is_empty() {
+                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                            }
+                        }
+                    };
                     // Check for 2D unpacked array (e.g., mem [0:1023][0:3])
                     if decl.dimensions.len() == 2 {
                         let r1 = if let UnpackedDimension::Range { left, right, .. } = &decl.dimensions[0] {
@@ -1497,6 +1630,7 @@ pub fn elaborate_module_with_defs(
                         } else { None };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                            register_packed_for_array(&mut elab);
                             // Per-element Signal entries are synthesized lazily
                             // by Simulator::new from the arrays_2d metadata —
                             // avoids the per-element HashMap entries at
@@ -1528,6 +1662,7 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        register_packed_for_array(&mut elab);
                         // Per-element Signals synthesized by Simulator::new
                         // from arrays_nd — skip the per-element HashMap
                         // inserts here.
@@ -1539,34 +1674,12 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
-                        // If the element type is a packed struct (directly
-                        // or via a typedef), register the element-type
-                        // layout under the array name so `arr[i].field`
-                        // can be sliced from the indexed element.
-                        let elem_resolved: &DataType =
-                            if let DataType::TypeReference { name, .. } = &dd.data_type {
-                                elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
-                            } else { &dd.data_type };
-                        if let DataType::Struct(su) = elem_resolved {
-                            let is_union = matches!(su.kind, StructUnionKind::Union);
-                            let mut fields: Vec<(String, u32, u32)> = Vec::new();
-                            let raw: Vec<(String, u32)> = su.members.iter().flat_map(|m| {
-                                let mw = resolve_type_width(&m.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                                m.declarators.iter().map(move |d| (d.name.name.clone(), mw))
-                            }).collect();
-                            if is_union {
-                                for (mn, mw) in &raw { fields.push((mn.clone(), 0, *mw)); }
-                            } else {
-                                let mut offset: u32 = 0;
-                                for (mn, mw) in raw.iter().rev() {
-                                    fields.push((mn.clone(), offset, *mw));
-                                    offset += mw;
-                                }
-                            }
-                            if !fields.is_empty() {
-                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
-                            }
-                        }
+                        // Register the FLATTENED packed-struct field layout
+                        // (including nested dotted paths) under the array
+                        // name. Same flattening as `flatten_subfields` so
+                        // `arr[i].outer.inner.leaf` chains work identically
+                        // to `var.outer.inner.leaf` on a standalone struct.
+                        register_packed_for_array(&mut elab);
                         // Track descending arrays (left > right in the declaration)
                         if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
@@ -1698,6 +1811,21 @@ pub fn elaborate_module_with_defs(
                         if let Some(fields) = flatten_subfields(dt_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
                             if !fields.is_empty() {
                                 elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                            }
+                        }
+                        // Per-field packed-array element widths so that
+                        // `obj.field[i]` slices instead of bit-selects when
+                        // the field is `logic [3:0][7:0] field;`. Walks
+                        // struct members directly (skipping nested recursion
+                        // for now — covers the most common case).
+                        if let DataType::Struct(su) = dt_resolved {
+                            for m in &su.members {
+                                if let Some(ew) = packed_inner_elem_width(&m.data_type, &elab.parameters, &elab.typedefs) {
+                                    for mdecl in &m.declarators {
+                                        let key = format!("{}.{}", decl.name.name, mdecl.name.name);
+                                        elab.packed_signal_elem_widths.insert(key, ew);
+                                    }
+                                }
                             }
                         }
                         if let DataType::Struct(su) = dt_resolved {
@@ -3310,6 +3438,20 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                register_anonymous_enum_members(&dd.data_type, elab);
+                // Packed multi-D (`logic [N-1:0][W-1:0] mem;`) — record the
+                // per-element width under the bare declarator name so
+                // `mem[i] = v` writes a W-bit slice. Mirrors the same
+                // registration in the top-level module DataDecl arm. Without
+                // this hook the submodule path leaves packed_signal_elem_widths
+                // empty, and the bytecode emitter falls back to a single-bit
+                // write at `mem[i]` — silent data corruption in any packed-2D
+                // FIFO (e.g. cv32e40p_fifo's mem_n).
+                if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs) {
+                    for decl in &dd.declarators {
+                        elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
+                    }
+                }
                 let data_modport_view = match &dd.data_type {
                     DataType::Interface { name, modport: Some(mp), .. } => {
                         resolve_interface_modport_view(&name.name, &mp.name, all_defs)
@@ -3930,6 +4072,66 @@ fn eval_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> u64 {
 /// Handles SystemVerilog unsized fill literals (`'0` / `'1` / `'x` / `'z`)
 /// per IEEE 1800-2017 §11.4.7: they expand to the full target width filled
 /// with the indicated bit, not zero-extended from a 1-bit value.
+/// Compute the per-element width of a multi-dimensional packed IntegerVector
+/// type — `logic [3:0][7:0]` returns `Some(8)`; single-dim or unsupported
+/// shapes return None. Used to register `packed_signal_elem_widths` so that
+/// `var[i]` resolves to an element slice instead of a bit-select.
+pub fn packed_inner_elem_width(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+) -> Option<u32> {
+    // For a typedef-typed signal (`my_t var;`), look through the typedef chain.
+    let resolved: &DataType = if let DataType::TypeReference { name, .. } = dt {
+        // typedef_types isn't passed in here; conservatively return None for
+        // typedef refs so callers can resolve via their own context.
+        return None;
+    } else { dt };
+    if let DataType::IntegerVector { dimensions, .. } = resolved {
+        if dimensions.len() < 2 { return None; }
+        // Total width = product of all dims
+        let mut total = 1u32;
+        for d in dimensions {
+            if let PackedDimension::Range { left, right, .. } = d {
+                let lv = const_eval_i64_with_params(left, Some(params));
+                let rv = const_eval_i64_with_params(right, Some(params));
+                if let (Some(l), Some(r)) = (lv, rv) {
+                    total *= ((l - r).abs() + 1) as u32;
+                } else {
+                    return None;
+                }
+            } else { return None; }
+        }
+        // Outermost (leftmost) dim is the element-array index; element width
+        // is total / outer_count per LRM §7.4.1.
+        if let Some(PackedDimension::Range { left, right, .. }) = dimensions.first() {
+            let lv = const_eval_i64_with_params(left, Some(params));
+            let rv = const_eval_i64_with_params(right, Some(params));
+            if let (Some(l), Some(r)) = (lv, rv) {
+                let outer = ((l - r).abs() + 1) as u32;
+                if outer == 0 { return None; }
+                return Some(total / outer);
+            }
+        }
+    }
+    None
+}
+
+/// Recover the declared width of a sized number literal in `init` (`7'h13`
+/// → Some(7), `32'd5` → Some(32), unsized `5` → None). Used to size
+/// implicit-typed parameters from their initializer so they don't default
+/// to 32-bit and break later concat width math.
+fn sized_literal_width(init: &Expression) -> Option<u32> {
+    let mut cur = init;
+    loop {
+        match &cur.kind {
+            ExprKind::Paren(inner) => cur = inner,
+            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(s), .. }) => return Some(*s),
+            _ => return None,
+        }
+    }
+}
+
 fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width: u32) -> Value {
     if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &expr.kind {
         return match c {
@@ -4086,13 +4288,19 @@ pub fn inline_instantiations(
                         }
                         crate::ast::decl::PackageItem::Parameter(pd) => {
                             if let ParameterKind::Data { data_type, assignments } = &pd.kind {
-                                let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                let base_width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                                 let mut is_signed = is_type_signed(data_type);
-                                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
-                                    width = 32;
-                                    is_signed = true;
-                                }
+                                let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
+                                if is_implicit { is_signed = true; }
                                 for assign in assignments {
+                                    // Implicit-typed param: use the sized-
+                                    // literal width from the initializer when
+                                    // present, instead of defaulting to 32.
+                                    let width = if is_implicit {
+                                        assign.init.as_ref()
+                                            .and_then(|e| sized_literal_width(e))
+                                            .unwrap_or(32)
+                                    } else { base_width };
                                     if let Some(init) = &assign.init {
                                         let mut v = eval_init_for_width(init, &elab.parameters, width);
                                         if is_signed { v.is_signed = true; }
@@ -5385,6 +5593,27 @@ fn inline_module_items(
                                 });                            }
                         }
                         ModuleItem::DataDeclaration(dd) => {
+                            // Anonymous enum on a variable decl in a
+                            // submodule's items (e.g. cv32e40p_obi_interface's
+                            // state_q FSM): mirror the top-level DataDecl
+                            // arm so enum members resolve as constants in
+                            // submodule scopes too.
+                            register_anonymous_enum_members(&dd.data_type, elab);
+                            // Packed multi-D (`logic [N-1:0][W-1:0] x`) — register
+                            // the per-element width under BOTH the bare name and
+                            // the fully-scoped name. Without this hook a
+                            // `mem[i] = data` write inside a parameterised
+                            // submodule like cv32e40p_fifo silently degrades to
+                            // a single-bit write at bit `i`, corrupting all
+                            // prefetch data.
+                            if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &sub_merged_params, &elab.typedefs) {
+                                for decl in &dd.declarators {
+                                    let bare = decl.name.name.clone();
+                                    let scoped = format!("{}{}", inst_prefix, bare);
+                                    elab.packed_signal_elem_widths.insert(bare, elem_w);
+                                    elab.packed_signal_elem_widths.insert(scoped, elem_w);
+                                }
+                            }
                             let width = match &dd.data_type {
                                 DataType::TypeReference { name, .. } => {
                                     elab.typedefs.get(&name.name.name).copied()
@@ -5899,7 +6128,14 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         let mut signed = is_type_signed(data_type);
                                         let is_real = is_type_real(data_type);
                                         if matches!(data_type, DataType::Implicit { .. }) {
-                                            width = 32;
+                                            // Infer width from sized literal
+                                            // initializer (`7'h13` → 7) so the
+                                            // parameter doesn't default to 32
+                                            // and break concat width math
+                                            // (cv32e40p OPCODE_OPIMM = 7'h13).
+                                            width = assign.init.as_ref()
+                                                .and_then(|e| sized_literal_width(e))
+                                                .unwrap_or(32);
                                             signed = true;
                                         }
                                         let v = if let Some(init) = &assign.init {
@@ -5988,14 +6224,21 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                     match pi {
                         PackageItem::Parameter(pd) => {
                             if let ParameterKind::Data { data_type, assignments } = &pd.kind {
-                                let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                let base_width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                                 let mut signed = is_type_signed(data_type);
                                 let is_real = is_type_real(data_type);
-                                if matches!(data_type, DataType::Implicit { .. }) {
-                                    width = 32;
-                                    signed = true;
-                                }
+                                let is_implicit = matches!(data_type, DataType::Implicit { .. });
+                                if is_implicit { signed = true; }
                                 for assign in assignments {
+                                    // Per-assignment width: implicit-typed
+                                    // parameters take the sized-literal
+                                    // initializer width when available
+                                    // (`7'h13` → 7) instead of forcing 32-bit.
+                                    let width = if is_implicit {
+                                        assign.init.as_ref()
+                                            .and_then(|e| sized_literal_width(e))
+                                            .unwrap_or(32)
+                                    } else { base_width };
                                     if let Some(init) = &assign.init {
                                         let mut v = eval_init_for_width(init, &elab.parameters, width);
                                         if signed { v.is_signed = true; }

@@ -277,13 +277,22 @@ impl Parser {
                                 filter: Box::new(filter),
                             }, self.span_from(start));
                         }
+                        // Inline constraint block `with { ... }`
+                        // (randomize-with). Parse it into ConstraintItems so
+                        // the simulator's `solve_forced` honours each. The
+                        // earlier brace-skip dropped these entirely — every
+                        // `obj.randomize() with { ... }` was silently
+                        // unconstrained.
                         if self.eat(TokenKind::LBrace).is_some() {
-                            let mut depth = 1;
-                            while depth > 0 && !self.at(TokenKind::Eof) {
-                                if self.at(TokenKind::LBrace) { depth += 1; }
-                                else if self.at(TokenKind::RBrace) { depth -= 1; }
-                                self.bump();
+                            let mut constraints = Vec::new();
+                            while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                                constraints.push(self.parse_constraint_item());
                             }
+                            self.expect(TokenKind::RBrace);
+                            call_expr = Expression::new(ExprKind::RandomizeWith {
+                                call: Box::new(call_expr),
+                                constraints,
+                            }, self.span_from(start));
                         }
                     }
                     lhs = call_expr;
@@ -647,6 +656,18 @@ impl Parser {
                     cached_signal_id: std::cell::Cell::new(None),
                     cached_resolved_name: std::cell::OnceCell::new(),
                 };
+                Expression::new(ExprKind::Ident(hier), self.span_from(start))
+            }
+
+            // §18.7.1 local::name — qualified reference to a variable in the
+            // owning class of a constraint block (used inside `with { ... }`
+            // to disambiguate from the rand vars of the object being
+            // randomized). Treat the same as `name` — name resolution falls
+            // back to enclosing class fields, which is the desired effect.
+            TokenKind::KwLocal if self.peek_kind() == TokenKind::DoubleColon => {
+                self.bump(); // local
+                self.bump(); // ::
+                let hier = self.parse_hierarchical_identifier();
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
 
