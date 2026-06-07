@@ -5559,12 +5559,38 @@ fn inline_module_items(
                                 } else { next_val };
                                 next_val = val.wrapping_add(1);
                                 let v = Value::from_u64(val, base_width);
-                                elab.parameters.insert(member.name.name.clone(), v.clone());
-                                elab.signals.insert(member.name.name.clone(), Signal { is_const: false,
-                                    name: member.name.name.clone(), width: base_width,
-                                    is_signed: false, direction: None, value: v, type_name: None,
-                                    is_real: false,
-                                });
+                                // Don't clobber an already-registered member
+                                // with a DIFFERENT value: xezim's parameter
+                                // namespace is flat, but per LRM §22.1.4 +
+                                // §23.6 an enum member declared inside a
+                                // submodule's typedef should NOT pollute the
+                                // bare-name lookup used by sibling submodules.
+                                // First-declared wins; a same-name same-value
+                                // re-declaration is a no-op. Without this,
+                                // testbench typedefs like
+                                // `uvmt_cv32e40p_step_compare::state_e`
+                                // (which has INIT=0, IDLE=1, …) overwrite
+                                // `prefetch_state_e::IDLE`=0 / `rvvi_c_e::IDLE`=0,
+                                // and every other module's `case` arm that
+                                // references IDLE matches the wrong arm.
+                                let prior = elab.parameters.get(&member.name.name).cloned();
+                                let should_insert = match &prior {
+                                    None => true,
+                                    Some(p) => p.to_u64() == Some(val),
+                                };
+                                if should_insert {
+                                    elab.parameters.insert(member.name.name.clone(), v.clone());
+                                    elab.signals.insert(member.name.name.clone(), Signal {
+                                        is_const: false,
+                                        name: member.name.name.clone(),
+                                        width: base_width,
+                                        is_signed: false,
+                                        direction: None,
+                                        value: v,
+                                        type_name: None,
+                                        is_real: false,
+                                    });
+                                }
                             }
                             elab.typedefs.insert(td.name.name.clone(), base_width);
                         } else {
