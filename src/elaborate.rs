@@ -285,6 +285,19 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
+    // Class-local typedefs carrying unpacked dimensions
+    // (`typedef bit edges_t[uvm_phase];`). A property `edges_t m;` inherits
+    // these so it's classified as an associative/queue/array member
+    // (IEEE 1800-2017 §6.18). UVM's phase graph (`edges_t m_successors`,
+    // `m_predecessors`) relies on this.
+    let mut local_typedef_dims: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
+    for item in &c.items {
+        if let ClassItem::Typedef(td) = item {
+            if !td.dimensions.is_empty() {
+                local_typedef_dims.insert(td.name.name.clone(), td.dimensions.clone());
+            }
+        }
+    }
     for item in &c.items {
         match item {
             ClassItem::Property(p) => {
@@ -311,6 +324,19 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 // 0 — a class handle's default is `null`.
                 let is_named_type = get_type_name(&p.data_type).is_some();
                 for decl in &p.declarators {
+                    // A property typed by an unpacked-dimension typedef
+                    // (`edges_t m;`) inherits the typedef's dims when it
+                    // declares none of its own. Otherwise this is exactly
+                    // `decl.dimensions`, so behavior is unchanged.
+                    let effective_dims: Vec<UnpackedDimension> = if decl.dimensions.is_empty() {
+                        match &p.data_type {
+                            DataType::TypeReference { name, .. } =>
+                                local_typedef_dims.get(&name.name.name).cloned().unwrap_or_default(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        decl.dimensions.clone()
+                    };
                     // Track virtual-interface properties for L4 binding +
                     // late-dispatch. See the comment on
                     // `ElaboratedClass::virtual_iface_properties`.
@@ -321,7 +347,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     // them out of the per-instance maps.
                     if is_static {
                         // Second field is `is_associative` (NOT key-is-string).
-                        match decl.dimensions.first() {
+                        match effective_dims.first() {
                             Some(UnpackedDimension::Associative { .. }) => {
                                 static_collections.push((decl.name.name.clone(), true, width.max(1)));
                             }
@@ -334,7 +360,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     }
                     if !is_static {
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) =
-                        decl.dimensions.first()
+                        effective_dims.first()
                     {
                         let is_string_key = key_dt.as_ref().map_or(false, |dt| {
                             matches!(dt.as_ref(),
@@ -345,7 +371,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     // Queue (`m[$]`) / dynamic-array (`m[]`) member — track so
                     // it gets independent per-instance storage. Bounded queues
                     // (`m[$:N]`) record their cap.
-                    match decl.dimensions.first() {
+                    match effective_dims.first() {
                         Some(UnpackedDimension::Queue { max_size, .. }) => {
                             let cap = max_size.as_ref().and_then(|e|
                                 const_eval_i64_with_params(e, None)).map(|n| (n + 1).max(1) as u32);
