@@ -42,6 +42,24 @@ pub fn is_sv2023() -> bool {
     SV2023_ENABLED.load(Ordering::Relaxed)
 }
 
+/// Process-wide gate for "strict" negative-test diagnostics — the extra
+/// validation that lets xezim *reject* illegal constructs the LRM forbids
+/// (bad `\`line`/`\`define`/`\`pragma` directives, illegal sized-literal
+/// signs, enum type-checking violations, etc.). ON by default; the
+/// `--no-strict` CLI flag turns it off (lenient: accept and move on).
+static STRICT_CHECKS_ENABLED: AtomicBool = AtomicBool::new(true);
+
+/// Enable or disable strict negative-test diagnostics for subsequent
+/// lex/parse/preprocess/elaborate calls in this process.
+pub fn set_strict_checks(enabled: bool) {
+    STRICT_CHECKS_ENABLED.store(enabled, Ordering::Relaxed);
+}
+
+/// Whether strict negative-test diagnostics are currently enabled (default true).
+pub fn strict_checks() -> bool {
+    STRICT_CHECKS_ENABLED.load(Ordering::Relaxed)
+}
+
 thread_local! {
     /// Stack of enclosing class names, maintained by the parser while
     /// parsing class bodies. Used to resolve `type(this)` (IEEE

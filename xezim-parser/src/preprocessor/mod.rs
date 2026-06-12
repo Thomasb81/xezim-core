@@ -41,6 +41,17 @@ pub struct Preprocessor {
     /// LRM §22.7.
     timescale: Option<(f64, f64)>,
     timescale_warned: std::collections::HashSet<(String, String)>,
+    /// §22 strict-mode directive errors (bad `\`line`/`\`define`/`\`pragma`/
+    /// `\`resetall`). Collected only when `strict_checks()` is on; the driver
+    /// treats a non-empty list as a hard failure (non-zero exit).
+    errors: Vec<String>,
+    /// Nesting depth of open design elements (module/interface/package/…),
+    /// tracked line-by-line so `\`resetall` inside one can be flagged (§22.3).
+    design_element_depth: i32,
+    /// Macro-expansion-time strict errors (bad argument counts). Interior
+    /// mutability because `expand_macros*` run behind `&self`; drained into
+    /// `errors` after each line is expanded.
+    expansion_errors: std::cell::RefCell<Vec<String>>,
 }
 
 const MAX_INCLUDE_DEPTH: usize = 32;
@@ -94,6 +105,75 @@ impl Preprocessor {
             keywords_stack: Vec::new(),
             timescale: None,
             timescale_warned: std::collections::HashSet::new(),
+            errors: Vec::new(),
+            design_element_depth: 0,
+            expansion_errors: std::cell::RefCell::new(Vec::new()),
+        }
+    }
+
+    /// Strict-mode directive errors collected during preprocessing (empty
+    /// unless `strict_checks()` is on and an illegal directive was seen).
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+
+    /// True when `trimmed` is the directive `\`<name>` followed by whitespace
+    /// or end-of-line (so `\`line` matches but `\`linefoo` does not).
+    fn is_directive(trimmed: &str, name: &str) -> bool {
+        let tick = format!("`{}", name);
+        if let Some(rest) = trimmed.strip_prefix(&tick) {
+            rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace())
+        } else {
+            false
+        }
+    }
+
+    /// Update the design-element nesting depth from one source line. Opening
+    /// keywords increment; `end…` keywords decrement (floored at 0).
+    fn update_design_depth(trimmed: &str, depth: &mut i32) {
+        let first = trimmed.split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next().unwrap_or("");
+        match first {
+            "module" | "macromodule" | "interface" | "package" | "program"
+            | "primitive" | "checker" => *depth += 1,
+            "endmodule" | "endinterface" | "endpackage" | "endprogram"
+            | "endprimitive" | "endchecker" => {
+                if *depth > 0 { *depth -= 1; }
+            }
+            _ => {}
+        }
+    }
+
+    /// §22.12: validate `\`line <number> "<filename>" <level>`.
+    fn check_line_directive(&mut self, trimmed: &str) {
+        let rest = trimmed["`line".len()..].trim();
+        // number "filename" level — split into the integer, the quoted string,
+        // and the level. The filename may contain spaces, so parse positionally.
+        let num_tok = rest.split_whitespace().next().unwrap_or("");
+        let after_num = rest[num_tok.len()..].trim_start();
+        let mut bad = false;
+        let mut why = String::new();
+        // number: positive integer
+        if num_tok.parse::<u32>().is_err() {
+            bad = true; why = format!("number `{}` must be a positive integer", num_tok);
+        } else if !after_num.starts_with('"') {
+            bad = true;
+            if after_num.is_empty() {
+                why = "missing filename and level".into();
+            } else {
+                why = "filename must be a string literal".into();
+            }
+        } else if let Some(end) = after_num[1..].find('"') {
+            let level = after_num[1 + end + 1..].trim();
+            if !matches!(level, "0" | "1" | "2") {
+                bad = true; why = format!("level `{}` must be 0, 1, or 2", level);
+            }
+        } else {
+            bad = true; why = "unterminated filename string".into();
+        }
+        if bad {
+            self.errors.push(format!(
+                "illegal `line directive (IEEE 1800-2017 §22.12): {}", why));
         }
     }
 
@@ -416,6 +496,13 @@ impl Preprocessor {
                 continue;
             }
 
+            // Track design-element nesting (for §22.3 `\`resetall` placement).
+            // Heuristic, line-based: a leading module/interface/package/program/
+            // primitive/checker keyword opens one; the matching `end…` closes it.
+            if crate::strict_checks() && !trimmed.starts_with('`') {
+                Self::update_design_depth(trimmed, &mut self.design_element_depth);
+            }
+
             // Handle `include — read and recursively preprocess the included file
             if trimmed.starts_with("`include") {
                 if let Some(inc_file) = Self::parse_include_path(trimmed) {
@@ -535,13 +622,43 @@ impl Preprocessor {
                 continue;
             }
 
+            // §22.12 `line <number> "<filename>" <level>` — strict-mode
+            // validation (number positive int, filename a string literal,
+            // level 0/1/2, all three present). Otherwise skipped.
+            if Self::is_directive(trimmed, "line") {
+                if crate::strict_checks() {
+                    self.check_line_directive(trimmed);
+                }
+                output.push('\n');
+                continue;
+            }
+            // §22.11 `pragma <pragma_name> ...` — the name is required.
+            if Self::is_directive(trimmed, "pragma") {
+                if crate::strict_checks()
+                    && trimmed["`pragma".len()..].trim().is_empty()
+                {
+                    self.errors.push(
+                        "`pragma requires a pragma_name (IEEE 1800-2017 §22.11)".into());
+                }
+                output.push('\n');
+                continue;
+            }
+            // §22.3 `resetall` is illegal inside a design element (module,
+            // interface, package, program, …).
+            if Self::is_directive(trimmed, "resetall") {
+                if crate::strict_checks() && self.design_element_depth > 0 {
+                    self.errors.push(
+                        "`resetall is illegal inside a design element \
+                         (IEEE 1800-2017 §22.3)".into());
+                }
+                output.push('\n');
+                continue;
+            }
+
             // Skip other compiler directives that don't affect simulation
             // semantics (kept silent — no warning).
             if trimmed.starts_with("`celldefine") || trimmed.starts_with("`endcelldefine")
-                || trimmed.starts_with("`resetall")
                 || trimmed.starts_with("`nounconnected_drive") || trimmed.starts_with("`unconnected_drive")
-                || trimmed.starts_with("`pragma")
-                || trimmed.starts_with("`line")
             {
                 output.push('\n');
                 continue;
@@ -560,6 +677,12 @@ impl Preprocessor {
             }
 
             let expanded = self.expand_macros(&logical_line);
+            // Promote any macro-expansion-time strict errors collected behind
+            // `&self` into the main error list.
+            if !self.expansion_errors.borrow().is_empty() {
+                let drained: Vec<String> = self.expansion_errors.borrow_mut().drain(..).collect();
+                self.errors.extend(drained);
+            }
             let expanded = if Self::contains_preprocessor_directive(&expanded) {
                 self.resolve_directives(&expanded, source_path)
             } else {
@@ -696,6 +819,35 @@ impl Preprocessor {
         };
         
         if !name.is_empty() {
+            if crate::strict_checks() {
+                // §22.5.1: a compiler-directive name is a predefined macro and
+                // shall not be redefined as a user macro.
+                const DIRECTIVES: &[&str] = &[
+                    "define", "undef", "undefineall", "ifdef", "ifndef", "elsif",
+                    "else", "endif", "include", "line", "pragma", "resetall",
+                    "timescale", "begin_keywords", "end_keywords",
+                    "default_nettype", "celldefine", "endcelldefine",
+                    "unconnected_drive", "nounconnected_drive",
+                    "__FILE__", "__LINE__",
+                ];
+                if DIRECTIVES.contains(&name.as_str()) {
+                    self.errors.push(format!(
+                        "`{}` is a compiler directive and cannot be redefined as \
+                         a macro (IEEE 1800-2017 §22.5.1)", name));
+                }
+                // §22.5.1: the macro text shall not contain an unterminated
+                // string literal (a `"` opened in the body and never closed).
+                let (mut quotes, mut esc) = (0u32, false);
+                for c in body.chars() {
+                    if esc { esc = false; continue; }
+                    match c { '\\' => esc = true, '"' => quotes += 1, _ => {} }
+                }
+                if quotes % 2 == 1 {
+                    self.errors.push(format!(
+                        "macro `{}` text has an unterminated string literal \
+                         (IEEE 1800-2017 §22.5.1)", name));
+                }
+            }
             // eprintln!("[PP] defining macro '{}'", name);
             self.defines.insert(name.clone(), MacroDef {
                 name,
@@ -775,6 +927,28 @@ impl Preprocessor {
                         // Parameterized macro: find arguments
                         let args = Self::extract_macro_args(line, &mut i);
                         let params = def.params.as_ref().unwrap();
+                        // §22.5.1 strict argument-count validation: too many
+                        // actuals, or a non-defaulted formal left without one.
+                        if crate::strict_checks() {
+                            if args.len() > params.len() {
+                                self.expansion_errors.borrow_mut().push(format!(
+                                    "macro `{}` invoked with {} arguments but only \
+                                     {} are declared (IEEE 1800-2017 §22.5.1)",
+                                    macro_name, args.len(), params.len()));
+                            } else {
+                                // §22.5.1: an actual at a position (even empty,
+                                // via a trailing/leading comma) is legal — only a
+                                // formal *beyond* the supplied positions with no
+                                // default is "fewer actual arguments than formals".
+                                for (pi, (pname, default)) in params.iter().enumerate() {
+                                    if pi >= args.len() && default.is_none() {
+                                        self.expansion_errors.borrow_mut().push(format!(
+                                            "macro `{}` missing required argument `{}` \
+                                             (IEEE 1800-2017 §22.5.1)", macro_name, pname));
+                                    }
+                                }
+                            }
+                        }
                         let mut body = def.body.clone();
                         for (pi, (pname, default)) in params.iter().enumerate() {
                             // An actual arg that is missing or blank falls back
@@ -843,6 +1017,13 @@ impl Preprocessor {
                         }
                         result.push_str(&body);
                     } else {
+                        // §22.5.1: a macro defined with a formal list must be
+                        // invoked with parentheses, even when empty.
+                        if crate::strict_checks() && def.params.is_some() {
+                            self.expansion_errors.borrow_mut().push(format!(
+                                "macro `{}` requires parentheses (it is defined with \
+                                 arguments) (IEEE 1800-2017 §22.5.1)", macro_name));
+                        }
                         result.push_str(&def.body);
                     }
                 } else {
