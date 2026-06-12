@@ -151,6 +151,12 @@ pub enum DPIProperty { Context, Pure }
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClockingDeclaration {
     pub name: Identifier,
+    /// LRM §14.3: clock event (e.g. `@(posedge clk)`). The signal
+    /// expression is captured so the simulator can snapshot input
+    /// signals before each clock edge. None when the clocking block
+    /// was declared without an event — implementation-defined behavior.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub clock_signal: Option<Identifier>,
     pub signals: Vec<ClockingSignal>,
     pub items: Vec<super::stmt::Statement>, // Approximate clocking body as statements
     pub endlabel: Option<Identifier>,
@@ -189,15 +195,88 @@ pub enum CovergroupItem {
 pub struct Coverpoint {
     pub name: Option<Identifier>,
     pub expr: Expression,
+    /// LRM §19.5 `coverpoint x iff (guard)` — sample is skipped when the
+    /// guard evaluates false. `None` means "always sample".
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub iff_guard: Option<Expression>,
+    /// LRM §19.5 explicit bins. Empty when the coverpoint uses the implicit
+    /// "every distinct sampled value is its own bin" model.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub bins: Vec<CoverBin>,
     pub span: Span,
 }
+
+/// LRM §19.5 bin declaration.
+///
+/// Minimum-viable shape: one of
+/// - `bins name = { v1, v2, [lo:hi] };`            → `kind = Bins`
+/// - `ignore_bins name = { ... };`                  → `kind = Ignore`
+/// - `illegal_bins name = { ... };`                 → `kind = Illegal`
+///
+/// Not yet covered: `bins name[N] = …` (auto array of N bins),
+/// `bins name = ( a => b );` transition bins, `default`, `wildcard`.
+/// Those parse-skip and are silently absent from the coverage DB.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CoverBin {
+    pub name: Identifier,
+    pub kind: CoverBinKind,
+    pub values: Vec<ConstraintRange>,
+    /// LRM §19.5 `bins name[]` or `bins name[N]` — the auto-array form
+    /// creates one sub-bin per distinct matched value (or N evenly-spread
+    /// sub-bins). Sampler records hits under `name[<value>]` keys instead
+    /// of one aggregate counter. Today we honor only the `[]` shape;
+    /// `[N]` is treated the same. `None` means scalar (single bin).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub array_form: bool,
+    /// LRM §19.5 `wildcard bins name = { pattern };` — bit-wise match
+    /// where `x`/`z`/`?` bits in `pattern` are don't-cares. Sampler
+    /// switches to per-bit compare honoring the value's xz_bits mask.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_wildcard: bool,
+    /// LRM §19.5 transition bins `bins name = (prev => cur);` or longer
+    /// chains `(a => b => c)`. Each step in the chain may be a single
+    /// value or a range (`[lo:hi]`) — stored as a `ConstraintRange` so
+    /// the chain can encode `([0:3] => [4:7])` etc. Sampler tracks the
+    /// last N samples per coverpoint (N = the longest declared chain)
+    /// and increments this bin when the trailing window membership-
+    /// matches the chain.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub transitions: Vec<Vec<ConstraintRange>>,
+    pub span: Span,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CoverBinKind { Bins, Ignore, Illegal, Default }
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct Cross {
     pub name: Option<Identifier>,
     pub items: Vec<Identifier>,
+    /// LRM §19.6 `cross x, y iff (guard)` — skip the cross sample when
+    /// guard is false. Mirrors `Coverpoint.iff_guard`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub iff_guard: Option<Expression>,
+    /// LRM §19.6 cross body bin filters
+    ///     `bins NAME = binsof(CP) intersect { ranges };`
+    /// Each entry binds a NAME to a coverpoint-reference plus a constant
+    /// range list. At sample time, the cross-tuple's component matching
+    /// the referenced coverpoint is checked against the ranges; in-range
+    /// samples bump that bin's hit count.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub bins: Vec<CrossBin>,
     pub span: Span,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct CrossBin {
+    pub name: Identifier,
+    /// The coverpoint identifier referenced by `binsof(<cp>)`.
+    pub cp_ref: Identifier,
+    pub ranges: Vec<ConstraintRange>,
 }
 
 #[derive(Debug, Clone)]
@@ -205,6 +284,14 @@ pub struct Cross {
 pub struct PropertyDeclaration {
     pub name: Identifier,
     pub items: Vec<super::stmt::Statement>, // Approximate property body as statements for parsing
+    /// LRM §16.6 property body, captured when it matches the common
+    /// `@(clk_event) <expr>` shape. Used by `assert property (p_name)`
+    /// to inline the body without re-parsing. `None` for property
+    /// bodies the parser couldn't structure as a single expression
+    /// (those still parse — the items list is exhausted token-by-
+    /// token — but the inline-substitution path is skipped).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub body: Option<super::expr::Expression>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
 }
@@ -214,6 +301,11 @@ pub struct PropertyDeclaration {
 pub struct SequenceDeclaration {
     pub name: Identifier,
     pub items: Vec<super::stmt::Statement>, // Approximate sequence body as statements
+    /// LRM §16.5 — sequence body when it matches the common
+    /// `@(clk) <expr>` shape (an `SvaClocked` wrapper). Used for
+    /// `assert property (s)` style references.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub body: Option<super::expr::Expression>,
     pub endlabel: Option<Identifier>,
     pub span: Span,
 }
@@ -352,6 +444,11 @@ pub struct TypedefDeclaration {
     pub name: Identifier,
     pub dimensions: Vec<UnpackedDimension>,
     pub span: Span,
+    /// IEEE 1800-2017 §6.18: true for a bare forward type declaration
+    /// `typedef name;` (no type body). Such a name must be resolved by a later
+    /// full typedef in the same scope; elaboration errors otherwise.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub forward: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -653,13 +750,29 @@ pub struct ClassConstraint {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ConstraintItem {
     Expr(Expression),
-    Inside { expr: Expression, range: Vec<ConstraintRange>, #[cfg_attr(feature = "serde", serde(default))] is_dist: bool, span: Span },
+    Inside {
+        expr: Expression,
+        range: Vec<ConstraintRange>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        is_dist: bool,
+        /// Parallel to `range`. Only populated when `is_dist`; absent entries
+        /// (or all-`None` entries) mean "uniform weight 1 per LRM default".
+        #[cfg_attr(feature = "serde", serde(default))]
+        dist_weights: Vec<Option<DistWeight>>,
+        span: Span,
+    },
     Implication { condition: Expression, constraint: Box<ConstraintItem>, span: Span },
     IfElse { condition: Expression, then_item: Box<ConstraintItem>, else_item: Option<Box<ConstraintItem>>, span: Span },
     Foreach { array: Expression, vars: Vec<Option<Identifier>>, item: Box<ConstraintItem>, span: Span },
     Solve { before: Vec<Identifier>, after: Vec<Identifier>, span: Span },
     Soft(Box<ConstraintItem>),
     Block(Vec<ConstraintItem>),
+    /// LRM §18.5.5 `unique {expr_list}` where the list could not be fully
+    /// desugared to pairwise `!=` at parse time — i.e. a single expression
+    /// naming a whole array, whose element count is only known at solve
+    /// time (`unique {gpr}` over `rand reg_t gpr[4]`). Multi-expression
+    /// lists are still desugared by the parser and never reach this variant.
+    Unique { exprs: Vec<Expression>, span: Span },
 }
 
 #[derive(Debug, Clone)]
@@ -667,6 +780,21 @@ pub enum ConstraintItem {
 pub enum ConstraintRange {
     Value(Expression),
     Range { lo: Expression, hi: Expression },
+}
+
+/// LRM §18.5.4 weight specifier in `dist { item := w, item :/ w }`.
+/// `Each` (`:=`) — the weight applies independently to every value in the
+/// range (so a range expands to N items each with weight w).
+/// `Total` (`:/`) — the weight is split evenly across the values in the
+/// range (so each individual value gets w/N).
+/// Stored as a parallel `Vec<DistWeight>` on the `Inside { is_dist: true }`
+/// variant, indexed parallel to `range: Vec<ConstraintRange>`. `None` means
+/// "no explicit weight" (the LRM default of `:= 1`).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DistWeight {
+    Each(Expression),
+    Total(Expression),
 }
 
 /// Qualifiers for class properties and methods.

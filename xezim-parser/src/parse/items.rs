@@ -130,6 +130,10 @@ impl Parser {
         if self.is_port_direction() || self.is_data_type_keyword() || self.at(TokenKind::KwVar)
             || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Dot)
             || (self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash))
+            // LRM §25.9 — `virtual <iface_t> <name>` port form.
+            || (self.at(TokenKind::KwVirtual)
+                && matches!(self.peek_kind(),
+                    TokenKind::KwInterface | TokenKind::Identifier))
         {
             let mut ports = Vec::new();
             let mut last_direction: Option<PortDirection> = None;
@@ -173,7 +177,24 @@ impl Parser {
         let direction = self.parse_optional_direction();
         let net_type = self.parse_optional_net_type();
         let var_kw = self.eat(TokenKind::KwVar).is_some();
-        let data_type = if self.is_data_type_keyword() {
+        // LRM §25.9: `virtual <iface_t> [.<modport>] <name>` — module
+        // port form. Mirror `parse_function_ports` so a child module
+        // can take a virtual interface as a port for vif pass-through.
+        let data_type = if self.at(TokenKind::KwVirtual)
+            && (self.peek_kind() == TokenKind::KwInterface
+                || self.peek_kind() == TokenKind::Identifier)
+        {
+            self.bump(); // virtual
+            if self.at(TokenKind::KwInterface) {
+                self.bump();
+            }
+            let if_name = self.parse_identifier();
+            let modport = if self.at(TokenKind::Dot) {
+                self.bump();
+                Some(self.parse_identifier())
+            } else { None };
+            Some(DataType::Interface { name: if_name, modport, span: self.span_from(start) })
+        } else if self.is_data_type_keyword() {
             Some(self.parse_data_type())
         } else if self.at(TokenKind::LBracket) {
             let dimensions = self.parse_packed_dimensions();
@@ -201,8 +222,16 @@ impl Parser {
         let end_tokens = [TokenKind::KwEndmodule, TokenKind::KwEndinterface, TokenKind::KwEndprogram, TokenKind::Eof];
         let mut items = Vec::new();
         while !self.at_any(&end_tokens) {
+            let before = self.pos;
             if let Some(item) = self.parse_module_item() { items.push(item); }
-            else { self.error(format!("unexpected: {:?}", self.current().text)); self.bump(); }
+            else if self.pos == before {
+                // parse_module_item returned None WITHOUT consuming anything —
+                // genuinely stuck; report and force progress. A None that DID
+                // advance is a deliberate parse-accept/skip (specparam,
+                // interconnect, …) and must not be flagged as an error.
+                self.error(format!("unexpected: {:?}", self.current().text));
+                self.bump();
+            }
         }
         items
     }
@@ -271,6 +300,25 @@ impl Parser {
             TokenKind::KwSupply0 | TokenKind::KwSupply1 | TokenKind::KwTriand | TokenKind::KwTrior |
             TokenKind::KwTri0 | TokenKind::KwTri1 | TokenKind::KwTrireg | TokenKind::KwUwire =>
                 Some(ModuleItem::NetDeclaration(self.parse_net_declaration())),
+            // §14.3: `global clocking …` — consume the `global` qualifier and
+            // reuse the clocking-block parse via the KwClocking arm below.
+            TokenKind::KwGlobal if self.peek_kind() == TokenKind::KwClocking => {
+                self.bump();
+                self.parse_module_item()
+            }
+            // §6.20.5 specparam — parse-accept (xezim doesn't model specify
+            // timing); consume through the terminating ';'.
+            TokenKind::KwSpecparam => {
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                self.expect(TokenKind::Semicolon);
+                None
+            }
+            // §6.6.8 interconnect net — parse-accept; consume to ';'.
+            TokenKind::KwInterconnect => {
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                self.expect(TokenKind::Semicolon);
+                None
+            }
             TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass => {
                 // `interface class Name; ... endclass` — treat as a class decl.
                 self.bump();
@@ -450,44 +498,120 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 Some(ModuleItem::ModportDeclaration(ModportDeclaration { items, span: self.span_from(start) }))
             }
-            // IEEE 1800-2023 §14.3 — clocking block. Lightweight handling:
-            // parse-and-discard the body (including any default skew or
-            // direction lists) so an interface that *contains* a clocking
-            // block can still be parsed. The body content isn't elaborated
-            // because there is no clocking-runtime yet.
+            // IEEE 1800-2023 §14.3 — clocking block. We now capture the
+            // direction-tagged signals into a real ClockingDeclaration so
+            // the elaborator can register `clocking_blocks[<name>]` and the
+            // identifier validator accepts `<cb>.<sig>` references. Body
+            // statements beyond `<dir> [type] <name> (, <name>)*` are
+            // skipped (default skew, etc. — rich grammar not modelled).
             TokenKind::KwClocking => {
-                self.bump();
-                // Optional name
-                if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
-                    let _ = self.parse_identifier();
-                }
-                // Optional @(event_expression) clause — balanced skip past it.
+                let start = self.current().span.start; self.bump();
+                let cb_name = if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
+                    Some(self.parse_identifier())
+                } else { None };
+                // LRM §14.3 clock event: `@(posedge <sig>)` — capture
+                // the signal identifier so the simulator can snapshot
+                // its inputs before each clock edge. Falls back to the
+                // legacy skip path for forms we don't recognise.
+                let mut clock_signal_id: Option<crate::ast::Identifier> = None;
                 if self.at(TokenKind::At) {
                     self.bump();
                     if self.at(TokenKind::LParen) {
-                        let mut d = 0i32;
-                        while !self.at(TokenKind::Eof) {
-                            match self.current_kind() {
-                                TokenKind::LParen => { d += 1; self.bump(); }
-                                TokenKind::RParen => { d -= 1; self.bump(); if d == 0 { break; } }
-                                _ => { self.bump(); }
-                            }
+                        self.bump();
+                        let _ = self.eat(TokenKind::KwPosedge);
+                        let _ = self.eat(TokenKind::KwNegedge);
+                        let _ = self.eat(TokenKind::KwEdge);
+                        if self.at(TokenKind::Identifier) {
+                            clock_signal_id = Some(self.parse_identifier());
                         }
-                    } else if self.at(TokenKind::Identifier) {
-                        let _ = self.parse_identifier();
+                        // Skip to matching close-paren (handles
+                        // `(posedge clk iff cond)` etc.).
+                        let mut d = 1i32;
+                        while !self.at(TokenKind::Eof) && d > 0 {
+                            match self.current_kind() {
+                                TokenKind::LParen => d += 1,
+                                TokenKind::RParen => {
+                                    d -= 1;
+                                    if d == 0 {
+                                        self.bump();
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            self.bump();
+                        }
                     }
                 }
                 self.expect(TokenKind::Semicolon);
-                // Skip body to the matching endclocking.
+                let items: Vec<crate::ast::stmt::Statement> = Vec::new();
+                let mut signals: Vec<ClockingSignal> = Vec::new();
                 while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
-                    self.bump();
+                    // `default input #1step output ...;` and other body
+                    // statements (LRM §14.3) are not captured — skip to the
+                    // matching `;` so the signal-list pass below stays in
+                    // sync.
+                    if self.at(TokenKind::KwDefault) {
+                        while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                        if self.at(TokenKind::Semicolon) { self.bump(); }
+                        continue;
+                    }
+                    match self.current_kind() {
+                        TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef => {
+                            let sstart = self.current().span.start;
+                            let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
+                            // Optional `#delay` skew specifier — skip past
+                            // (parse_optional_direction already left us
+                            // looking at the next token after the dir kw).
+                            if self.at(TokenKind::Hash) {
+                                self.bump();
+                                if self.at(TokenKind::LParen) {
+                                    let mut d = 1i32; self.bump();
+                                    while !self.at(TokenKind::Eof) && d > 0 {
+                                        match self.current_kind() {
+                                            TokenKind::LParen => d += 1,
+                                            TokenKind::RParen => d -= 1,
+                                            _ => {}
+                                        }
+                                        self.bump();
+                                    }
+                                } else {
+                                    self.bump(); // single token (`1step`, identifier, etc.)
+                                }
+                            }
+                            // Optional `negedge`/`posedge`/`edge` skew kw.
+                            if matches!(self.current_kind(),
+                                TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge)
+                            {
+                                self.bump();
+                            }
+                            if self.is_data_type_keyword()
+                                || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::Identifier)
+                            {
+                                let _ = self.parse_data_type();
+                            }
+                            loop {
+                                if self.at(TokenKind::Identifier) {
+                                    let id = self.parse_identifier();
+                                    signals.push(ClockingSignal { direction, name: id, span: self.span_from(sstart) });
+                                }
+                                if self.eat(TokenKind::Comma).is_none() { break; }
+                            }
+                            // Skip anything we don't understand up to `;`.
+                            while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                                self.bump();
+                            }
+                            if self.at(TokenKind::Semicolon) { self.bump(); }
+                        }
+                        _ => { self.bump(); }
+                    }
                 }
                 self.expect(TokenKind::KwEndclocking);
-                // Optional `: <label>` trailing.
-                if self.eat(TokenKind::Colon).is_some() {
-                    let _ = self.parse_identifier();
-                }
-                Some(ModuleItem::Null)
+                let endlabel = if self.eat(TokenKind::Colon).is_some() {
+                    Some(self.parse_identifier())
+                } else { None };
+                let id = cb_name.unwrap_or_else(|| Identifier { name: "default".to_string(), span: self.span_from(start) });
+                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: clock_signal_id, signals, items, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover =>
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement())),
@@ -496,26 +620,109 @@ impl Parser {
                 let name = self.parse_identifier();
                 if self.at(TokenKind::LParen) { self.bump(); while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) { self.bump(); } self.expect(TokenKind::RParen); }
                 self.expect(TokenKind::Semicolon);
-                // Property grammar is rich (disable iff, temporal operators, sequence refs).
-                // Skip body tokens so unsupported constructs do not become parse errors.
-                let items = Vec::new();
+                // LRM §16.6 — capture the property body when it matches
+                // the common `@(<event>) <expr>;` shape. Re-uses the
+                // assertion parser's clock-event capture (an
+                // `SvaClocked { clock, body }` wrapper). Properties
+                // not matching this shape fall back to the legacy
+                // token-skip path so the parser stays resilient.
+                let body_expr = if self.at(TokenKind::At) {
+                    let bstart = self.current().span.start;
+                    self.bump(); // @
+                    let clk = if self.at(TokenKind::LParen) {
+                        self.bump();
+                        let _ = self.eat(TokenKind::KwPosedge);
+                        let _ = self.eat(TokenKind::KwNegedge);
+                        let _ = self.eat(TokenKind::KwEdge);
+                        let e = self.parse_expression();
+                        let _ = self.eat(TokenKind::RParen);
+                        e
+                    } else {
+                        let _ = self.eat(TokenKind::KwPosedge);
+                        let _ = self.eat(TokenKind::KwNegedge);
+                        self.parse_expression()
+                    };
+                    // §16.12: optional `disable iff (<expr>)` after the
+                    // clocking event, before the property expression. Consume
+                    // it (parse-accept; the abort condition isn't modelled).
+                    if self.at(TokenKind::KwDisable) && self.peek_kind() == TokenKind::KwIff {
+                        self.bump(); // disable
+                        self.bump(); // iff
+                        if self.at(TokenKind::LParen) {
+                            self.bump();
+                            let mut depth = 1;
+                            while depth > 0 && !self.at(TokenKind::Eof) {
+                                match self.current_kind() {
+                                    TokenKind::LParen => depth += 1,
+                                    TokenKind::RParen => depth -= 1,
+                                    _ => {}
+                                }
+                                self.bump();
+                            }
+                        }
+                    }
+                    self.in_sva_seq = true;
+                    let body = self.parse_expression();
+                    self.in_sva_seq = false;
+                    let _ = self.eat(TokenKind::Semicolon);
+                    Some(crate::ast::expr::Expression::new(
+                        crate::ast::expr::ExprKind::SvaClocked {
+                            clock: Box::new(clk),
+                            body: Box::new(body),
+                        },
+                        self.span_from(bstart),
+                    ))
+                } else {
+                    None
+                };
                 while !self.at(TokenKind::KwEndproperty) && !self.at(TokenKind::Eof) { self.bump(); }
                 self.expect(TokenKind::KwEndproperty);
                 let endlabel = self.parse_end_label();
-                Some(ModuleItem::PropertyDeclaration(PropertyDeclaration { name, items, endlabel, span: self.span_from(start) }))
+                let items = Vec::new();
+                Some(ModuleItem::PropertyDeclaration(PropertyDeclaration { name, items, body: body_expr, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwSequence => {
                 let start = self.current().span.start; self.bump();
                 let name = self.parse_identifier();
                 if self.at(TokenKind::LParen) { self.bump(); while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) { self.bump(); } self.expect(TokenKind::RParen); }
                 self.expect(TokenKind::Semicolon);
-                // Sequence expressions (e.g. ##n) are not represented in Statement AST yet.
-                // Skip body tokens to keep parsing resilient.
-                let items = Vec::new();
+                // LRM §16.5 — capture the sequence body when it matches
+                // the common `@(<event>) <expr>;` shape, mirroring the
+                // property-decl path. Other shapes (raw `##N` chains)
+                // fall back to the token-skip path.
+                let body_expr = if self.at(TokenKind::At) {
+                    let bstart = self.current().span.start;
+                    self.bump();
+                    let clk = if self.at(TokenKind::LParen) {
+                        self.bump();
+                        let _ = self.eat(TokenKind::KwPosedge);
+                        let _ = self.eat(TokenKind::KwNegedge);
+                        let _ = self.eat(TokenKind::KwEdge);
+                        let e = self.parse_expression();
+                        let _ = self.eat(TokenKind::RParen);
+                        e
+                    } else {
+                        let _ = self.eat(TokenKind::KwPosedge);
+                        let _ = self.eat(TokenKind::KwNegedge);
+                        self.parse_expression()
+                    };
+                    self.in_sva_seq = true;
+                    let body = self.parse_expression();
+                    self.in_sva_seq = false;
+                    let _ = self.eat(TokenKind::Semicolon);
+                    Some(crate::ast::expr::Expression::new(
+                        crate::ast::expr::ExprKind::SvaClocked {
+                            clock: Box::new(clk),
+                            body: Box::new(body),
+                        },
+                        self.span_from(bstart),
+                    ))
+                } else { None };
                 while !self.at(TokenKind::KwEndsequence) && !self.at(TokenKind::Eof) { self.bump(); }
                 self.expect(TokenKind::KwEndsequence);
                 let endlabel = self.parse_end_label();
-                Some(ModuleItem::SequenceDeclaration(SequenceDeclaration { name, items, endlabel, span: self.span_from(start) }))
+                let items = Vec::new();
+                Some(ModuleItem::SequenceDeclaration(SequenceDeclaration { name, items, body: body_expr, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwCovergroup => {
                 Some(ModuleItem::CovergroupDeclaration(self.parse_covergroup_declaration()))
@@ -553,7 +760,7 @@ impl Parser {
                 // ClockingDeclaration struct needs an Option<Identifier> for name if we want to store it accurately,
                 // but for now let's just use a dummy identifier if it's missing.
                 let id = name.unwrap_or_else(|| Identifier { name: "default".to_string(), span: self.span_from(start) });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, signals, items, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: None, signals, items, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwDefault => {
                 self.bump();
@@ -724,6 +931,27 @@ impl Parser {
     fn parse_net_declaration(&mut self) -> NetDeclaration {
         let start = self.current().span.start;
         let net_type = self.parse_optional_net_type().unwrap_or(NetType::Wire);
+        // §6.9.2: optional `vectored` / `scalared` charge/drive qualifier
+        // between the net type and the (optional) range — `tri1 vectored [15:0] a;`.
+        if self.at(TokenKind::KwVectored) || self.at(TokenKind::KwScalared) { self.bump(); }
+        // §10.3.3: optional net delay `wire #10 w;` / `wire #(d1,d2) w;`.
+        // Parse-accept; xezim doesn't model net delays.
+        if self.at(TokenKind::Hash) {
+            self.bump();
+            if self.eat(TokenKind::LParen).is_some() {
+                let mut depth = 1i32;
+                while depth > 0 && !self.at(TokenKind::Eof) {
+                    match self.current_kind() {
+                        TokenKind::LParen => depth += 1,
+                        TokenKind::RParen => depth -= 1,
+                        _ => {}
+                    }
+                    self.bump();
+                }
+            } else {
+                self.bump(); // #10 / #delay_id
+            }
+        }
         let data_type = if self.is_data_type_keyword() { self.parse_data_type() }
             else if self.at(TokenKind::LBracket) {
                 let dimensions = self.parse_packed_dimensions();
@@ -1009,6 +1237,10 @@ impl Parser {
     pub(super) fn parse_class_declaration(&mut self) -> ClassDeclaration {
         let start = self.current().span.start;
         let virt = self.eat(TokenKind::KwVirtual).is_some();
+        // IEEE 1800-2017 §8.26: `interface class <name>; … endclass`. The
+        // leading `interface` keyword (mutually exclusive with `virtual`)
+        // marks an interface class; the rest parses like a normal class.
+        let is_iface = self.eat(TokenKind::KwInterface).is_some();
         self.expect(TokenKind::KwClass);
         // IEEE 1800-2023 §8.20.5: `class :final <name>` — only `:final` is
         // legal on a class declaration. Gated on --sv2023.
@@ -1027,15 +1259,43 @@ impl Parser {
         let params = self.parse_parameter_port_list();
         let extends = if self.eat(TokenKind::KwExtends).is_some() {
             let ext_start = self.current().span.start;
-            let base_name = self.parse_identifier();
+            // §8.13: the base class may be package/class-scoped —
+            // `extends pkg::Base` or `extends A::B::C`. Keep the final
+            // segment as the base-class name; the scope prefix is consumed.
+            let mut base_name = self.parse_identifier();
+            while self.at(TokenKind::DoubleColon) {
+                self.bump();
+                base_name = self.parse_identifier();
+            }
             let args = if self.at(TokenKind::Hash) { self.parse_param_args() }
                        else if self.at(TokenKind::LParen) { self.parse_param_args() } // Support extends C(args) or C#(args)
                        else { Vec::new() };
+            // §8.26: an interface class may extend MULTIPLE interface classes
+            // (`extends ic1#(T), ic2#(T)`). Keep the first in the AST and
+            // parse-accept the rest (consume `, base[::seg]…[#(args)]`).
+            while self.at(TokenKind::Comma) {
+                self.bump();
+                let _ = self.parse_identifier();
+                while self.at(TokenKind::DoubleColon) { self.bump(); let _ = self.parse_identifier(); }
+                if self.at(TokenKind::Hash) || self.at(TokenKind::LParen) { let _ = self.parse_param_args(); }
+            }
             Some(ClassExtends { name: base_name, args, span: self.span_from(ext_start) })
         } else { None };
         let mut implements = Vec::new();
         if self.eat(TokenKind::KwImplements).is_some() {
-            loop { implements.push(self.parse_identifier()); if self.eat(TokenKind::Comma).is_none() { break; } }
+            loop {
+                let mut iface = self.parse_identifier();
+                // §8.26: scoped interface-class name `implements pkg::Iface`.
+                while self.at(TokenKind::DoubleColon) {
+                    self.bump();
+                    iface = self.parse_identifier();
+                }
+                implements.push(iface);
+                // §8.26.1: `implements Iface#(params)` — consume and discard
+                // the parameterization (only the base name is recorded).
+                if self.at(TokenKind::Hash) { let _ = self.parse_param_args(); }
+                if self.eat(TokenKind::Comma).is_none() { break; }
+            }
         }
         self.expect(TokenKind::Semicolon);
         // Push the class name onto the parser's class-context stack so
@@ -1046,7 +1306,7 @@ impl Parser {
         crate::pop_class_context();
         self.expect(TokenKind::KwEndclass);
         let endlabel = self.parse_end_label();
-        ClassDeclaration { virtual_kw: virt, is_interface: false, is_final, name, params, extends, implements, items, endlabel, span: self.span_from(start) }
+        ClassDeclaration { virtual_kw: virt, is_interface: is_iface, is_final, name, params, extends, implements, items, endlabel, span: self.span_from(start) }
     }
 
     fn parse_class_item(&mut self) -> ClassItem {
@@ -1166,6 +1426,28 @@ impl Parser {
         }
     }
 
+    /// Skip an unmodeled coverpoint bin body up to (but not consuming) the
+    /// terminating `;` at nesting depth 0, or a `}` / `)` / `]` that CLOSES
+    /// the enclosing scope. Depth-aware so bodies like
+    /// `cp with (item inside {list})` don't desync the coverpoint's brace
+    /// matching on the inner `}`.
+    fn skip_bin_body_to_semicolon(&mut self) {
+        let mut depth = 0usize;
+        loop {
+            match self.current_kind() {
+                TokenKind::Eof => break,
+                TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => depth += 1,
+                TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => {
+                    if depth == 0 { break; }
+                    depth -= 1;
+                }
+                TokenKind::Semicolon if depth == 0 => break,
+                _ => {}
+            }
+            self.bump();
+        }
+    }
+
     pub(super) fn parse_covergroup_declaration(&mut self) -> CovergroupDeclaration {
         let start = self.current().span.start;
         self.bump();
@@ -1209,25 +1491,148 @@ impl Parser {
         match self.current_kind() {
             TokenKind::KwCoverpoint => {
                 self.bump();
-                let expr = self.parse_expression();
-                // Optional `iff (guard)` enable condition on the coverpoint.
+                // `parse_expression` includes `iff` as a low-precedence
+                // binary op (`BinaryOp::Iff`), so `v iff (guard)` parses
+                // as `Binary(Iff, v, guard)` — split that back into
+                // `expr = v, iff_guard = guard` here. Standalone `iff` in
+                // its own token still works as a fallback.
+                let mut iff_guard: Option<crate::ast::expr::Expression> = None;
+                let parsed_expr = self.parse_expression();
+                let expr = match parsed_expr.kind {
+                    crate::ast::expr::ExprKind::Binary {
+                        op: crate::ast::expr::BinaryOp::Iff,
+                        left, right,
+                    } => {
+                        iff_guard = Some(*right);
+                        *left
+                    }
+                    _ => parsed_expr,
+                };
                 if self.at(TokenKind::KwIff) {
                     self.bump();
-                    self.skip_balanced_parens();
+                    if self.eat(TokenKind::LParen).is_some() {
+                        iff_guard = Some(self.parse_expression());
+                        let _ = self.eat(TokenKind::RParen);
+                    }
                 }
-                // Handle optional bins etc (simplified: skip for now)
+                let mut bins: Vec<crate::ast::decl::CoverBin> = Vec::new();
                 if self.at(TokenKind::LBrace) {
                     self.bump();
-                    let mut depth = 1;
-                    while depth > 0 && !self.at(TokenKind::Eof) {
-                        if self.at(TokenKind::LBrace) { depth += 1; }
-                        else if self.at(TokenKind::RBrace) { depth -= 1; }
-                        self.bump();
+                    // Parse a sequence of bin declarations until matching `}`.
+                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        let bin_start = self.current().span.start;
+                        // Optional `wildcard` modifier (LRM §19.5) — applies
+                        // to the next `bins`/`ignore_bins`/`illegal_bins`.
+                        let is_wildcard = self.eat(TokenKind::KwWildcard).is_some();
+                        let kind_tok = self.current_kind();
+                        let kind = match kind_tok {
+                            TokenKind::KwBins => Some(crate::ast::decl::CoverBinKind::Bins),
+                            TokenKind::KwIgnore_bins => Some(crate::ast::decl::CoverBinKind::Ignore),
+                            TokenKind::KwIllegal_bins => Some(crate::ast::decl::CoverBinKind::Illegal),
+                            // Identifier text fallback for tokenizer variants.
+                            TokenKind::Identifier => match self.current().text.as_str() {
+                                "bins" => Some(crate::ast::decl::CoverBinKind::Bins),
+                                "ignore_bins" => Some(crate::ast::decl::CoverBinKind::Ignore),
+                                "illegal_bins" => Some(crate::ast::decl::CoverBinKind::Illegal),
+                                _ => None,
+                            },
+                            _ => None,
+                        };
+                        if let Some(k) = kind {
+                            self.bump(); // bins / ignore_bins / illegal_bins / KwBins
+                            let bin_name = if self.at(TokenKind::Identifier) {
+                                self.parse_identifier()
+                            } else {
+                                // unnamed — skip to next `;` (depth-aware)
+                                // and continue.
+                                self.skip_bin_body_to_semicolon();
+                                if self.at(TokenKind::Semicolon) { self.bump(); }
+                                continue;
+                            };
+                            // Optional `[]` or `[N]` array form (LRM §19.5).
+                            // Captured into `array_form` so the sampler
+                            // splits hits into per-value sub-bins.
+                            let mut is_array = false;
+                            if self.at(TokenKind::LBracket) {
+                                is_array = true;
+                                self.bump();
+                                while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) { self.bump(); }
+                                if self.at(TokenKind::RBracket) { self.bump(); }
+                            }
+                            // `=` then bin body.
+                            if self.eat(TokenKind::Assign).is_some() {
+                                let mut values: Vec<crate::ast::decl::ConstraintRange> = Vec::new();
+                                let mut transitions: Vec<Vec<crate::ast::decl::ConstraintRange>> = Vec::new();
+                                let mut bin_kind = k;
+                                if self.at(TokenKind::LBrace) {
+                                    self.bump();
+                                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                                        values.push(self.parse_constraint_range());
+                                        if self.at(TokenKind::Comma) { self.bump(); }
+                                    }
+                                    if self.at(TokenKind::RBrace) { self.bump(); }
+                                } else if self.at(TokenKind::KwDefault) {
+                                    // `bins other = default;` — LRM §19.5
+                                    // catches every value not matched by any
+                                    // explicit bin in the same coverpoint.
+                                    self.bump();
+                                    bin_kind = crate::ast::decl::CoverBinKind::Default;
+                                } else if self.at(TokenKind::LParen) {
+                                    // LRM §19.5 transition bins:
+                                    // `bins name = (prev => cur);` or
+                                    // `bins name = (a => b, c => d);`.
+                                    // `=>` is also parsed as a binary op
+                                    // (BinaryOp::OrFatArrow), so
+                                    // `parse_expression` slurps `a => b` as
+                                    // one Binary node — split it back here.
+                                    // Multi-step `a => b => c` only retains
+                                    // the leftmost pair for now.
+                                    self.bump(); // (
+                                    loop {
+                                        // Collect the whole chain
+                                        // `a => b => c => …` where each
+                                        // step is either a single value or
+                                        // a `[lo:hi]` range. We re-use
+                                        // `parse_constraint_range` to
+                                        // capture both forms.
+                                        let mut chain: Vec<crate::ast::decl::ConstraintRange> = Vec::new();
+                                        chain.push(self.parse_constraint_range());
+                                        while self.eat(TokenKind::FatArrow).is_some() {
+                                            chain.push(self.parse_constraint_range());
+                                        }
+                                        transitions.push(chain);
+                                        if !self.at(TokenKind::Comma) { break; }
+                                        self.bump();
+                                    }
+                                    if self.at(TokenKind::RParen) { self.bump(); }
+                                } else {
+                                    // Forms we don't handle yet — gobble to
+                                    // the terminating `;` (depth-aware).
+                                    self.skip_bin_body_to_semicolon();
+                                }
+                                bins.push(crate::ast::decl::CoverBin {
+                                    name: bin_name,
+                                    kind: bin_kind,
+                                    values,
+                                    array_form: is_array,
+                                    is_wildcard,
+                                    transitions,
+                                    span: self.span_from(bin_start),
+                                });
+                            } else {
+                                self.skip_bin_body_to_semicolon();
+                            }
+                            if self.at(TokenKind::Semicolon) { self.bump(); }
+                        } else {
+                            // Not a bin keyword — skip token to make progress.
+                            self.bump();
+                        }
                     }
+                    if self.at(TokenKind::RBrace) { self.bump(); }
                 } else {
                     self.expect(TokenKind::Semicolon);
                 }
-                CovergroupItem::Coverpoint(Coverpoint { name, expr, span: self.span_from(start) })
+                CovergroupItem::Coverpoint(Coverpoint { name, expr, iff_guard, bins, span: self.span_from(start) })
             }
             TokenKind::KwCross => {
                 self.bump();
@@ -1237,22 +1642,83 @@ impl Parser {
                     if !self.at(TokenKind::Comma) { break; }
                     self.bump();
                 }
+                // LRM §19.6 `iff (guard)` — sample is skipped when guard
+                // is false. (Note: unlike for coverpoint, `parse_expression`
+                // doesn't slurp `iff` here because we already consumed
+                // identifiers.)
+                let mut iff_guard: Option<crate::ast::expr::Expression> = None;
                 if self.at(TokenKind::KwIff) {
                     self.bump();
-                    self.skip_balanced_parens();
+                    if self.eat(TokenKind::LParen).is_some() {
+                        iff_guard = Some(self.parse_expression());
+                        let _ = self.eat(TokenKind::RParen);
+                    }
                 }
+                let mut bins: Vec<crate::ast::decl::CrossBin> = Vec::new();
                 if self.at(TokenKind::LBrace) {
                     self.bump();
-                    let mut depth = 1;
-                    while depth > 0 && !self.at(TokenKind::Eof) {
-                        if self.at(TokenKind::LBrace) { depth += 1; }
-                        else if self.at(TokenKind::RBrace) { depth -= 1; }
-                        self.bump();
+                    // Lightweight body parser: recognise
+                    //   `bins NAME = binsof(IDENT) intersect { ranges };`
+                    // Everything else is skipped depth-tracked so the
+                    // outer brace match remains balanced (legacy behavior).
+                    loop {
+                        if self.at(TokenKind::Eof) { break; }
+                        if self.at(TokenKind::RBrace) { self.bump(); break; }
+                        if self.current().text == "bins" {
+                            let save = self.pos;
+                            self.bump();
+                            let bin_name = self.parse_identifier();
+                            if self.eat(TokenKind::Assign).is_some()
+                                && self.current().text == "binsof"
+                            {
+                                self.bump();
+                                let _ = self.eat(TokenKind::LParen);
+                                let cp_ref = self.parse_identifier();
+                                let _ = self.eat(TokenKind::RParen);
+                                if self.current().text == "intersect" {
+                                    self.bump();
+                                    let mut ranges: Vec<crate::ast::decl::ConstraintRange> = Vec::new();
+                                    if self.eat(TokenKind::LBrace).is_some() {
+                                        loop {
+                                            if self.at(TokenKind::RBrace) { self.bump(); break; }
+                                            if self.at(TokenKind::Eof) { break; }
+                                            // parse_constraint_range handles
+                                            // both bare values and `[lo:hi]`
+                                            // range form (mirrors bins
+                                            // value-list parsing).
+                                            ranges.push(self.parse_constraint_range());
+                                            if self.at(TokenKind::Comma) { self.bump(); }
+                                        }
+                                    }
+                                    let _ = self.eat(TokenKind::Semicolon);
+                                    bins.push(crate::ast::decl::CrossBin {
+                                        name: bin_name,
+                                        cp_ref,
+                                        ranges,
+                                    });
+                                    continue;
+                                }
+                            }
+                            // Not the form we recognise — restore and skip.
+                            self.pos = save;
+                        }
+                        // Skip one token (depth-aware for nested braces).
+                        if self.at(TokenKind::LBrace) {
+                            let mut depth = 1usize;
+                            self.bump();
+                            while depth > 0 && !self.at(TokenKind::Eof) {
+                                if self.at(TokenKind::LBrace) { depth += 1; }
+                                else if self.at(TokenKind::RBrace) { depth -= 1; }
+                                self.bump();
+                            }
+                        } else {
+                            self.bump();
+                        }
                     }
                 } else {
                     self.expect(TokenKind::Semicolon);
                 }
-                CovergroupItem::Cross(Cross { name, items: ids, span: self.span_from(start) })
+                CovergroupItem::Cross(Cross { name, items: ids, iff_guard, bins, span: self.span_from(start) })
             }
             TokenKind::Identifier if self.current().text == "option" || self.current().text == "type_option" => {
                 let id = self.parse_identifier();
@@ -1363,22 +1829,43 @@ impl Parser {
                 ConstraintItem::Block(Vec::new())
             }
             TokenKind::KwUnique => {
-                // `unique { var_list };` — accept; approximate as a no-op block.
+                // `unique { expr_list };` — LRM §18.5.5. Desugared at parse
+                // time into the pairwise inequalities it denotes
+                // (`e[i] != e[j]` for all i<j) so the constraint solver only
+                // ever sees plain relational items.
                 self.bump();
+                let mut exprs: Vec<crate::ast::expr::Expression> = Vec::new();
                 if self.at(TokenKind::LBrace) {
                     self.bump();
-                    let mut depth = 1;
-                    while depth > 0 && !self.at(TokenKind::Eof) {
-                        match self.current_kind() {
-                            TokenKind::LBrace => depth += 1,
-                            TokenKind::RBrace => depth -= 1,
-                            _ => {}
-                        }
-                        self.bump();
+                    while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                        exprs.push(self.parse_expression());
+                        if self.at(TokenKind::Comma) { self.bump(); } else { break; }
                     }
+                    self.expect(TokenKind::RBrace);
                 }
                 if self.at(TokenKind::Semicolon) { self.bump(); }
-                ConstraintItem::Block(Vec::new())
+                let span = self.span_from(start);
+                if exprs.len() == 1 {
+                    // A single-expression list names a whole array (`unique
+                    // {gpr}`) — its element count is only known at solve
+                    // time, so keep it as a dedicated item for the solver.
+                    ConstraintItem::Unique { exprs, span }
+                } else {
+                    let mut items = Vec::new();
+                    for i in 0..exprs.len() {
+                        for j in (i + 1)..exprs.len() {
+                            items.push(ConstraintItem::Expr(crate::ast::expr::Expression::new(
+                                crate::ast::expr::ExprKind::Binary {
+                                    op: crate::ast::expr::BinaryOp::Neq,
+                                    left: Box::new(exprs[i].clone()),
+                                    right: Box::new(exprs[j].clone()),
+                                },
+                                span,
+                            )));
+                        }
+                    }
+                    ConstraintItem::Block(items)
+                }
             }
             TokenKind::LBrace => {
                 self.bump();
@@ -1392,18 +1879,25 @@ impl Parser {
             _ => {
                 let expr = self.parse_expression();
                 if self.at(TokenKind::KwDist) {
-                    // `expr dist { value (:= | :/ ) weight, ... };` — approximate
-                    // as `expr inside { value_list }` by keeping values/ranges and
-                    // discarding weights.
+                    // `expr dist { value (:= | :/ ) weight, ... };` — LRM
+                    // §18.5.4. Weights are captured into a parallel vector
+                    // so the runtime distribution picker can honor them.
                     self.bump();
                     self.expect(TokenKind::LBrace);
                     let mut range = Vec::new();
+                    let mut dist_weights: Vec<Option<crate::ast::decl::DistWeight>> = Vec::new();
                     loop {
                         range.push(self.parse_constraint_range());
-                        // Optional `:= weight` or `:/ weight`
-                        if self.at(TokenKind::ColonAssign) || self.at(TokenKind::ColonSlash) {
+                        if self.at(TokenKind::ColonAssign) {
                             self.bump();
-                            let _w = self.parse_expression();
+                            let w = self.parse_expression();
+                            dist_weights.push(Some(crate::ast::decl::DistWeight::Each(w)));
+                        } else if self.at(TokenKind::ColonSlash) {
+                            self.bump();
+                            let w = self.parse_expression();
+                            dist_weights.push(Some(crate::ast::decl::DistWeight::Total(w)));
+                        } else {
+                            dist_weights.push(None);
                         }
                         if !self.at(TokenKind::Comma) { break; }
                         self.bump();
@@ -1411,7 +1905,7 @@ impl Parser {
                     self.expect(TokenKind::RBrace);
                     let span = self.span_from(start);
                     self.expect(TokenKind::Semicolon);
-                    return ConstraintItem::Inside { expr, range, is_dist: true, span };
+                    return ConstraintItem::Inside { expr, range, is_dist: true, dist_weights, span };
                 }
                 if self.at(TokenKind::KwInside) {
                     self.bump(); self.expect(TokenKind::LBrace);
@@ -1424,7 +1918,7 @@ impl Parser {
                     self.expect(TokenKind::RBrace);
                     let span = self.span_from(start);
                     self.expect(TokenKind::Semicolon);
-                    ConstraintItem::Inside { expr, range, is_dist: false, span }
+                    ConstraintItem::Inside { expr, range, is_dist: false, dist_weights: Vec::new(), span }
                 } else if self.at(TokenKind::Arrow) {
                     self.bump();
                     let constraint = self.parse_constraint_item();

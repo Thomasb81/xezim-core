@@ -34,6 +34,13 @@ pub struct Preprocessor {
     /// invalid version strings can be reported and (future) per-region
     /// keyword sets can be wired in. SV-2023 §22.14.
     keywords_stack: Vec<String>,
+    /// Most-recently-seen `timescale` directive parsed to (unit_s, prec_s)
+    /// where each is in seconds (e.g. 1ns → 1e-9). The simulator currently
+    /// runs at a fixed 1ns tick, so anything finer is silently truncated
+    /// — we warn once per distinct timescale instead of dropping it.
+    /// LRM §22.7.
+    timescale: Option<(f64, f64)>,
+    timescale_warned: std::collections::HashSet<(String, String)>,
 }
 
 const MAX_INCLUDE_DEPTH: usize = 32;
@@ -85,7 +92,31 @@ impl Preprocessor {
             current_file: String::new(),
             current_line: 0,
             keywords_stack: Vec::new(),
+            timescale: None,
+            timescale_warned: std::collections::HashSet::new(),
         }
+    }
+
+    /// Parse a `1ns`-style time literal into seconds. Returns None on
+    /// malformed input. LRM §22.7 Table 22-5 — units are s/ms/us/ns/ps/fs
+    /// and the mantissa must be 1, 10, or 100.
+    fn parse_time_literal(s: &str) -> Option<f64> {
+        let s = s.trim();
+        let (num_str, unit) = if let Some(stripped) = s.strip_suffix("fs") { (stripped, 1e-15) }
+            else if let Some(stripped) = s.strip_suffix("ps") { (stripped, 1e-12) }
+            else if let Some(stripped) = s.strip_suffix("ns") { (stripped, 1e-9) }
+            else if let Some(stripped) = s.strip_suffix("us") { (stripped, 1e-6) }
+            else if let Some(stripped) = s.strip_suffix("ms") { (stripped, 1e-3) }
+            else if let Some(stripped) = s.strip_suffix("s")  { (stripped, 1.0) }
+            else { return None; };
+        let mantissa: f64 = num_str.trim().parse().ok()?;
+        if mantissa != 1.0 && mantissa != 10.0 && mantissa != 100.0 { return None; }
+        Some(mantissa * unit)
+    }
+
+    /// Return the most recent `timescale` (unit_s, prec_s) seen, if any.
+    pub fn timescale(&self) -> Option<(f64, f64)> {
+        self.timescale
     }
 
     /// Set include search directories.
@@ -274,6 +305,15 @@ impl Preprocessor {
                         if text[pos+1..].chars().all(|c| c.is_ascii_whitespace()) {
                             clean_line.push_str(&text[..pos]);
                             if let Some(next) = lines.next() {
+                                // Preserve the line break between continuation
+                                // lines of a multi-line `define body. Without
+                                // it, a body line like `\`ifndef X` is flattened
+                                // mid-line and the post-expansion directive
+                                // re-scan (which only recognises line-start
+                                // directives) misses it — exactly how UVM's
+                                // field macros leaked `\`ifndef … \`endif` into
+                                // the parser.
+                                clean_line.push('\n');
                                 consumed_lines += 1;
                                 current = next.to_string();
                                 continue;
@@ -445,6 +485,11 @@ impl Preprocessor {
                         // Push anyway so end_keywords stays balanced.
                         self.keywords_stack.push(ver.to_string());
                     }
+                    // Pass the directive through so the lexer can switch its
+                    // active keyword set (downgrade SV-only keywords under a
+                    // `1364-*` region). The version string is consumed by the
+                    // scanner; the trailing `\n` keeps line numbers stable.
+                    output.push_str(&format!("`begin_keywords \"{}\"", ver));
                 }
                 output.push('\n');
                 continue;
@@ -457,15 +502,42 @@ impl Preprocessor {
                              (IEEE 1800-2023 §22.14)"
                         );
                     }
+                    output.push_str("`end_keywords");
                 }
                 output.push('\n');
                 continue;
             }
 
-            // Skip `timescale and other compiler directives
-            // that don't affect simulation semantics
-            if trimmed.starts_with("`timescale")
-                || trimmed.starts_with("`celldefine") || trimmed.starts_with("`endcelldefine")
+            // `timescale: parse it so the value is available downstream,
+            // but emit no SV tokens (drop to a blank line). LRM §22.7.
+            if let Some(rest) = trimmed.strip_prefix("`timescale") {
+                let rest = rest.trim_start();
+                if let Some(slash) = rest.find('/') {
+                    let unit_str = rest[..slash].trim();
+                    let prec_str = rest[slash + 1..].trim_end_matches("//").trim_end_matches("/*").trim();
+                    let unit = Self::parse_time_literal(unit_str);
+                    let prec = Self::parse_time_literal(prec_str);
+                    if let (Some(u), Some(p)) = (unit, prec) {
+                        self.timescale = Some((u, p));
+                        // Sim runs at 1ns ticks; finer precision is silently
+                        // truncated by `#delay` evaluation. Warn once per
+                        // distinct directive so the user knows.
+                        if p < 1e-9 - 1e-18 {
+                            let key = (unit_str.to_string(), prec_str.to_string());
+                            if self.timescale_warned.insert(key) {
+                                eprintln!("[warn] `timescale {}/{}` declares precision finer than 1ns; sim ticks are 1ns",
+                                    unit_str, prec_str);
+                            }
+                        }
+                    }
+                }
+                output.push('\n');
+                continue;
+            }
+
+            // Skip other compiler directives that don't affect simulation
+            // semantics (kept silent — no warning).
+            if trimmed.starts_with("`celldefine") || trimmed.starts_with("`endcelldefine")
                 || trimmed.starts_with("`resetall")
                 || trimmed.starts_with("`nounconnected_drive") || trimmed.starts_with("`unconnected_drive")
                 || trimmed.starts_with("`pragma")

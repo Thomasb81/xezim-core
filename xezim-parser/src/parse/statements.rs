@@ -225,12 +225,56 @@ impl Parser {
             // Delay control: #
             TokenKind::Hash => {
                 self.bump();
-                let delay = self.parse_expression();
+                // §11.11: a delay value may be a `(min:typ:max)` triple —
+                // `#(100:200:300)`. Use the typical (middle) value.
+                let delay = if self.at(TokenKind::LParen) {
+                    self.bump();
+                    let first = self.parse_expression();
+                    let chosen = if self.eat(TokenKind::Colon).is_some() {
+                        let typ = self.parse_expression();
+                        self.expect(TokenKind::Colon);
+                        let _max = self.parse_expression();
+                        typ
+                    } else { first };
+                    self.expect(TokenKind::RParen);
+                    chosen
+                } else {
+                    self.parse_expression()
+                };
                 let stmt = self.parse_statement();
                 Statement::new(StatementKind::TimingControl {
                     control: TimingControl::Delay(delay),
                     stmt: Box::new(stmt),
                 }, self.span_from(start))
+            }
+            // §6.20.6 / §6.8: `const` / `var` qualified local variable
+            // declaration in a procedural block — `const int k = 3;`,
+            // `var logic x;`. Grammar: `[const] [var] [lifetime] data_type …`.
+            // The qualifier is consumed; VarDecl carries no const flag, so the
+            // §6.20.6 write-once rule is not enforced for block-locals (a known
+            // limitation — module-scope consts ARE enforced).
+            TokenKind::KwConst | TokenKind::KwVar => {
+                let _is_const = self.eat(TokenKind::KwConst).is_some();
+                self.eat(TokenKind::KwVar);
+                let lifetime = match self.current_kind() {
+                    TokenKind::KwStatic => { self.bump(); Some(Lifetime::Static) }
+                    TokenKind::KwAutomatic => { self.bump(); Some(Lifetime::Automatic) }
+                    _ => None,
+                };
+                let data_type = self.parse_data_type();
+                let mut declarators = Vec::new();
+                loop {
+                    let ds = self.current().span.start;
+                    let name = self.parse_identifier();
+                    let dimensions = self.parse_unpacked_dimensions();
+                    let init = if self.eat(TokenKind::Assign).is_some() {
+                        Some(self.parse_expression())
+                    } else { None };
+                    declarators.push(VarDeclarator { name, dimensions, init, span: self.span_from(ds) });
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                }
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::VarDecl { data_type, lifetime, declarators }, self.span_from(start))
             }
             // Variable declaration (data type keywords)
             k if self.is_data_type_keyword() && k != TokenKind::KwEvent &&
@@ -341,6 +385,8 @@ impl Parser {
                 ]) {
                     let op_kind = self.current().kind.clone();
                     self.bump();
+                    // §9.4.5 intra-assignment timing (only on plain `=`).
+                    if op_kind == TokenKind::Assign { self.skip_intra_assignment_timing(); }
                     let rhs = self.parse_expression();
                     self.expect(TokenKind::Semicolon);
                     // Expand compound assignments: lhs += rhs => lhs = lhs + rhs
@@ -363,6 +409,7 @@ impl Parser {
                 } else if self.at(TokenKind::Leq) {
                     // Nonblocking assignment: lvalue <= rvalue
                     self.bump();
+                    self.skip_intra_assignment_timing(); // §9.4.5
                     let rvalue = self.parse_expression();
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::NonblockingAssign {
@@ -430,13 +477,47 @@ impl Parser {
         }
     }
 
+    /// IEEE 1800-2017 §12.6: wrap `stmt` so each `.name` pattern binding is
+    /// declared as an implicit logic local visible inside it. The bindings are
+    /// prepended as `logic <name>;` decls in a synthetic begin/end block, so
+    /// elaboration's scope walk finds them in `locals` before the matched
+    /// statement runs. Returns `stmt` unchanged when there are no bindings.
+    fn wrap_with_pattern_bindings(&self, bindings: Vec<crate::ast::Identifier>, stmt: Statement) -> Statement {
+        if bindings.is_empty() { return stmt; }
+        let span = stmt.span;
+        let mut stmts: Vec<Statement> = Vec::with_capacity(bindings.len() + 1);
+        for id in bindings {
+            let id_span = id.span;
+            let decl = StatementKind::VarDecl {
+                data_type: DataType::IntegerVector {
+                    kind: crate::ast::types::IntegerVectorType::Logic,
+                    signing: None, dimensions: Vec::new(), span: id_span,
+                },
+                lifetime: None,
+                declarators: vec![VarDeclarator {
+                    name: id, dimensions: Vec::new(), init: None, span: id_span,
+                }],
+            };
+            stmts.push(Statement::new(decl, id_span));
+        }
+        stmts.push(stmt);
+        Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
+    }
+
     fn parse_if_with_priority(&mut self, up: Option<UniquePriority>) -> Statement {
         let start = self.current().span.start;
         self.expect(TokenKind::KwIf);
         self.expect(TokenKind::LParen);
+        // Clear any stale bindings (e.g. from a `matches` in a prior
+        // conditional expression) before this condition.
+        self.pending_pattern_bindings.clear();
         let condition = self.parse_expression();
         self.expect(TokenKind::RParen);
-        let then_stmt = self.parse_statement();
+        // §12.6.2: `if (expr matches pattern '{… .v})` — the `.v` binding is
+        // visible in the then-branch. Declare it there.
+        let bindings = std::mem::take(&mut self.pending_pattern_bindings);
+        let then_body = self.parse_statement();
+        let then_stmt = self.wrap_with_pattern_bindings(bindings, then_body);
         let else_stmt = if self.eat(TokenKind::KwElse).is_some() {
             Some(Box::new(self.parse_statement()))
         } else { None };
@@ -464,6 +545,45 @@ impl Parser {
         let kind = if kind == CaseKind::Case && self.eat(TokenKind::KwInside).is_some() {
             CaseKind::CaseInside
         } else { kind };
+
+        // IEEE 1800-2017 §12.6.1: pattern case statement
+        // `case (expr) matches { pattern [&&& expr] : stmt } endcase`.
+        // Parse-accept only: consume each item's pattern (via parse_pattern,
+        // which handles `tagged X '{…}`, `.field`, etc.) plus an optional
+        // `&&& <guard>`, and lower it to an ordinary CaseItem with the guard
+        // dropped. The pattern's structure is consumed but not modelled.
+        if self.eat(TokenKind::KwMatches).is_some() {
+            let mut items = Vec::new();
+            while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
+                let istart = self.current().span.start;
+                let before = self.pos;
+                if self.eat(TokenKind::KwDefault).is_some() {
+                    self.eat(TokenKind::Colon);
+                    let stmt = self.parse_statement();
+                    items.push(CaseItem { patterns: Vec::new(), is_default: true, stmt, span: self.span_from(istart) });
+                } else {
+                    self.pending_pattern_bindings.clear();
+                    self.parse_pattern();
+                    // Optional pattern guard: `&&& <expression>`.
+                    // `&&&` lexes as LogAnd (`&&`) followed by BitAnd (`&`).
+                    if self.at(TokenKind::LogAnd) && self.peek_kind() == TokenKind::BitAnd {
+                        self.bump(); self.bump();
+                        let _ = self.parse_expression();
+                    }
+                    self.expect(TokenKind::Colon);
+                    // §12.6.1: the item's `.v` bindings are visible in its stmt.
+                    let bindings = std::mem::take(&mut self.pending_pattern_bindings);
+                    let body = self.parse_statement();
+                    let stmt = self.wrap_with_pattern_bindings(bindings, body);
+                    items.push(CaseItem { patterns: Vec::new(), is_default: false, stmt, span: self.span_from(istart) });
+                }
+                if self.pos == before { self.bump(); }
+            }
+            self.expect(TokenKind::KwEndcase);
+            return Statement::new(StatementKind::Case {
+                unique_priority: up, kind, expr, items,
+            }, self.span_from(start));
+        }
 
         let mut items = Vec::new();
         while !self.at(TokenKind::KwEndcase) && !self.at(TokenKind::Eof) {
@@ -517,7 +637,12 @@ impl Parser {
         let mut init = Vec::new();
         if !self.at(TokenKind::Semicolon) {
             loop {
-                if self.is_data_type_keyword() ||
+                // Optional `var`/`const` lifetime/qualifier prefix on a typed
+                // init declaration: `for (var int i = 1, bit c = 0; …)`.
+                let var_prefix = matches!(self.current_kind(),
+                    TokenKind::KwVar | TokenKind::KwConst);
+                if var_prefix { self.bump(); }
+                if var_prefix || self.is_data_type_keyword() ||
                     (self.at(TokenKind::Identifier) &&
                         matches!(self.peek_kind(),
                             TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)) {
@@ -653,6 +778,37 @@ impl Parser {
         Statement::new(StatementKind::Repeat { count, body: Box::new(body) }, self.span_from(start))
     }
 
+    /// IEEE 1800-2017 §9.4.5: intra-assignment timing control that may appear
+    /// between the `=`/`<=` and the RHS expression — `#delay`, `@event`, or
+    /// `repeat(N) @event`. Parsed and discarded (the value is assigned; the
+    /// wait/repeat is not modeled), so `a = repeat(3) @(posedge clk) b;`
+    /// parses instead of erroring on the leading `repeat`.
+    pub(super) fn skip_intra_assignment_timing(&mut self) {
+        match self.current_kind() {
+            TokenKind::KwRepeat => {
+                self.bump();
+                if self.eat(TokenKind::LParen).is_some() {
+                    let _ = self.parse_expression();
+                    self.expect(TokenKind::RParen);
+                }
+                if self.at(TokenKind::At) { let _ = self.parse_event_control(); }
+            }
+            TokenKind::At => { let _ = self.parse_event_control(); }
+            TokenKind::Hash => {
+                self.bump();
+                if self.eat(TokenKind::LParen).is_some() {
+                    let _ = self.parse_expression();
+                    self.expect(TokenKind::RParen);
+                } else {
+                    // `#5`, `#delay_id`, `#1.5ns` — consume the single delay
+                    // token (number / time / identifier).
+                    self.bump();
+                }
+            }
+            _ => {}
+        }
+    }
+
     pub(super) fn parse_event_control(&mut self) -> EventControl {
         self.expect(TokenKind::At);
         if self.eat(TokenKind::Star).is_some() {
@@ -710,32 +866,99 @@ impl Parser {
                 }
             } else { self.bump(); }
         }
-        let _is_property = self.eat(TokenKind::KwProperty).is_some();
+        let is_property = self.eat(TokenKind::KwProperty).is_some();
         self.expect(TokenKind::LParen);
         // For property expressions starting with a clocking event `@(...)`,
-        // skip the whole assertion (we don't model SVA semantics).
+        // capture the clock event and the body separately so the executor
+        // can drive SVA-style cycle delay (LRM §16.5). The clock event is
+        // wrapped on `SvaClocked { clock, body }` (the executor checks for
+        // it before falling back to plain-logical evaluation).
         if self.at(TokenKind::At) {
-            let mut depth = 1i32;
-            while !self.at(TokenKind::Eof) && depth > 0 {
-                match self.current_kind() {
-                    TokenKind::LParen => depth += 1,
-                    TokenKind::RParen => { depth -= 1; if depth == 0 { break; } }
-                    _ => {}
-                }
+            self.bump(); // @
+            // Parse the @(...) clocking event: optional posedge/negedge,
+            // then a signal expression. Wrap in a Unary node so the
+            // executor can see the edge polarity. We use UnaryOp::HashHash
+            // as a placeholder marker for the polarity since the expr AST
+            // has no dedicated edge op — we stash the polarity in the
+            // SvaClocked wrapper via a parallel side channel (see executor).
+            let clk_event = if self.at(TokenKind::LParen) {
                 self.bump();
-            }
+                // Skip optional edge keyword; we encode it lossily as
+                // the bare signal — the executor treats any change as an
+                // edge for now (works for posedge-only clocks).
+                let _ = self.eat(TokenKind::KwPosedge);
+                let _ = self.eat(TokenKind::KwNegedge);
+                let _ = self.eat(TokenKind::KwEdge);
+                let e = self.parse_expression();
+                self.expect(TokenKind::RParen);
+                e
+            } else {
+                let _ = self.eat(TokenKind::KwPosedge);
+                let _ = self.eat(TokenKind::KwNegedge);
+                let _ = self.eat(TokenKind::KwEdge);
+                self.parse_expression()
+            };
+            // LRM §16.6 — optional `disable iff (<expr>)` clause.
+            // Captured as a Binary{LogOr, guard_expr, body} so the SVA
+            // executor can short-circuit when the guard is true (the
+            // guard inversion is folded into the executor's check).
+            // Encoded into the SvaClocked.body via a wrapper expression
+            // — a follow-up could add a dedicated field if needed.
+            let disable_guard = if self.at(TokenKind::KwDisable)
+                && self.peek_kind() == TokenKind::KwIff
+            {
+                self.bump(); // disable
+                self.bump(); // iff
+                let _ = self.eat(TokenKind::LParen);
+                let g = self.parse_expression();
+                let _ = self.eat(TokenKind::RParen);
+                Some(g)
+            } else {
+                None
+            };
+            let body_inner = self.parse_expression();
+            // When `disable iff (g)` is present, wrap the body in a
+            // Binary{LogAnd, !g, body} — this is the structural
+            // encoding the SVA executor recognises: it evaluates the
+            // left side and short-circuits when the guard is true.
+            // Specifically, the executor checks `Binary{LogAnd, l, r}`
+            // as: "if l is false, the property is vacuously suppressed".
+            let body = if let Some(g) = disable_guard {
+                let span = body_inner.span;
+                let not_g = Expression::new(
+                    ExprKind::Unary {
+                        op: crate::ast::expr::UnaryOp::LogNot,
+                        operand: Box::new(g),
+                    },
+                    span,
+                );
+                Expression::new(
+                    ExprKind::Binary {
+                        op: crate::ast::expr::BinaryOp::LogAnd,
+                        left: Box::new(not_g),
+                        right: Box::new(body_inner),
+                    },
+                    span,
+                )
+            } else {
+                body_inner
+            };
             self.expect(TokenKind::RParen);
-            // Skip optional action and else action
-            if !self.at(TokenKind::Semicolon) && !self.at(TokenKind::KwElse) {
-                let _ = self.parse_statement_skip();
-            }
-            if self.eat(TokenKind::KwElse).is_some() {
-                let _ = self.parse_statement_skip();
-            }
+            let action = if !self.at(TokenKind::Semicolon) && !self.at(TokenKind::KwElse) {
+                Some(Box::new(self.parse_statement()))
+            } else { None };
+            let else_action = if self.eat(TokenKind::KwElse).is_some() {
+                Some(Box::new(self.parse_statement()))
+            } else { None };
             self.eat(TokenKind::Semicolon);
-            let s0 = self.current().span.start;
-            let dummy = Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal, value: "1".to_string(), cached_val: std::cell::Cell::new(None) }), self.span_from(s0));
-            return AssertionStatement { kind, expr: dummy, action: None, else_action: None, span: self.span_from(start) };
+            let combined = Expression::new(
+                ExprKind::SvaClocked {
+                    clock: Box::new(clk_event),
+                    body: Box::new(body),
+                },
+                self.span_from(start),
+            );
+            return AssertionStatement { kind, expr: combined, action, else_action, is_property, span: self.span_from(start) };
         }
         let expr = self.parse_expression();
         self.expect(TokenKind::RParen);
@@ -748,7 +971,7 @@ impl Parser {
         let else_action = if self.eat(TokenKind::KwElse).is_some() {
             Some(Box::new(self.parse_statement()))
         } else { None };
-        AssertionStatement { kind, expr, action, else_action, span: self.span_from(start) }
+        AssertionStatement { kind, expr, action, else_action, is_property, span: self.span_from(start) }
     }
 
     /// `randcase { weight : statement }+ endcase`

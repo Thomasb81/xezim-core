@@ -16,11 +16,24 @@ pub struct Parser {
     tokens: Vec<Token>,
     pos: usize,
     diagnostics: Vec<Diagnostic>,
+    /// IEEE 1800-2017 §12.6: `.name` pattern bindings collected while parsing a
+    /// pattern (`tagged X '{… , .v}` / `expr matches tagged a '{.v}`). The
+    /// enclosing `if`/`case … matches` consumes these to synthesize local
+    /// variable declarations so the binding is in scope in the matched
+    /// statement. Drained at each consumption point.
+    pending_pattern_bindings: Vec<Identifier>,
+    /// IEEE 1800-2017 §16.9: true while parsing a property/sequence body, so
+    /// the keyword sequence operators `and`/`or` are recognised as binary SVA
+    /// operators. Outside this context `or` stays an event-list separator
+    /// (`@(a or b)`) and `and` a gate primitive, so the flag is essential.
+    in_sva_seq: bool,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0, diagnostics: Vec::new() }
+        Self { tokens, pos: 0, diagnostics: Vec::new(),
+               pending_pattern_bindings: Vec::new(),
+               in_sva_seq: false }
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] { &self.diagnostics }
@@ -34,12 +47,16 @@ impl Parser {
         let start = self.current().span.start;
         let mut descriptions = Vec::new();
         while !self.at(TokenKind::Eof) {
+            let before = self.pos;
             if let Some(desc) = self.parse_description() {
                 descriptions.push(desc);
-            } else {
+            } else if self.pos == before {
+                // No progress AND nothing produced — genuinely stuck.
                 self.error(format!("unexpected token: {:?}", self.current().text));
                 self.bump();
             }
+            // A None that advanced (e.g. a stray top-level `;` consumed by the
+            // Semicolon arm) is a clean skip, not an error.
         }
         SourceText { descriptions, span: self.span_from(start) }
     }
@@ -48,6 +65,10 @@ impl Parser {
         match self.current_kind() {
             TokenKind::KwModule | TokenKind::KwMacromodule =>
                 Some(Description::Module(self.parse_module_declaration())),
+            // IEEE 1800-2017 §8.26: `interface class …` is a class, not a
+            // module-style interface — route it to the class parser.
+            TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass =>
+                Some(Description::Class(self.parse_class_declaration())),
             TokenKind::KwInterface =>
                 Some(Description::Interface(self.parse_interface_declaration())),
             TokenKind::KwProgram =>
@@ -84,6 +105,14 @@ impl Parser {
             }
             TokenKind::KwTypedef =>
                 Some(Description::TypedefDecl(self.parse_typedef_declaration())),
+            // IEEE 1800-2017 §3.12 / §6.20: compilation-unit ($unit) scope
+            // `parameter`/`localparam` declarations. Surface them as a
+            // PackageItem::Parameter so elaboration can hoist them into every
+            // module (like $unit functions/tasks). Without this the top-level
+            // `parameter int N = 1;` form was an "unexpected token".
+            TokenKind::KwParameter | TokenKind::KwLocalparam =>
+                Some(Description::PackageItem(PackageItem::Parameter(
+                    self.parse_parameter_decl_stmt()))),
             TokenKind::KwImport => {
                 if self.peek_kind() == TokenKind::StringLiteral {
                     Some(Description::DPIImport(self.parse_dpi_import()))
@@ -166,10 +195,19 @@ impl Parser {
                 self.parse_description()
             }
             TokenKind::KwConstraint => {
-                // Out-of-class constraint definition at $unit scope:
-                // `constraint ClassName::name { ... }[;]`. Parse and discard.
+                // §18.5.1 out-of-class constraint definition at $unit scope:
+                // `constraint ClassName::name { ... }[;]`. Capture the
+                // (class, constraint) pair so elaboration can satisfy the
+                // class's `extern constraint name;`; the body is consumed.
                 self.bump();
-                let _ = self.parse_hierarchical_identifier();
+                let hid = self.parse_hierarchical_identifier();
+                let (class_name, constraint_name) = if hid.path.len() >= 2 {
+                    (hid.path[hid.path.len() - 2].name.name.clone(),
+                     hid.path[hid.path.len() - 1].name.name.clone())
+                } else {
+                    (String::new(),
+                     hid.path.last().map(|s| s.name.name.clone()).unwrap_or_default())
+                };
                 if self.at(TokenKind::LBrace) {
                     self.bump();
                     let mut depth = 1;
@@ -183,7 +221,11 @@ impl Parser {
                     }
                 }
                 if self.at(TokenKind::Semicolon) { self.bump(); }
-                self.parse_description()
+                if class_name.is_empty() {
+                    self.parse_description()
+                } else {
+                    Some(Description::OutOfClassConstraint { class_name, constraint_name })
+                }
             }
             TokenKind::KwTimeunit | TokenKind::KwTimeprecision =>
                 Some(Description::TimeunitsDecl(self.parse_timeunits_declaration())),
@@ -192,10 +234,23 @@ impl Parser {
             TokenKind::KwTask =>
                 Some(Description::PackageItem(self.parse_package_item().unwrap())),
             TokenKind::Directive => { self.bump(); self.parse_description() }
+            // Stray top-level `;` — e.g. `endmodule;` (an empty
+            // compilation-unit item, §A.1.2). Skip and continue.
+            TokenKind::Semicolon => { self.bump(); self.parse_description() }
             _ => {
-                // Top-level data declaration like `string label = "...";` —
-                // xezim doesn't model $unit-scope vars, so skip past it.
+                // Compilation-unit ($unit) scope data declaration like
+                // `string label = "...";`. Surface it as a PackageItem::Data so
+                // elaboration can hoist it into modules (and thus make it
+                // visible to class methods that reference it — UVM tests do
+                // `string label = "X"; … \`uvm_info(label, …)`).
                 if self.is_data_type_keyword() || self.at(TokenKind::KwVar) || self.at(TokenKind::KwConst) {
+                    let before = self.pos;
+                    let decl = self.parse_data_declaration();
+                    // Guard against a parse that made no progress (avoid a
+                    // hang): fall back to the brute-force skip.
+                    if self.pos > before {
+                        return Some(Description::PackageItem(PackageItem::Data(decl)));
+                    }
                     let mut depth = 0i32;
                     while !self.at(TokenKind::Eof) {
                         match self.current_kind() {

@@ -244,7 +244,11 @@ fn parse_and_elaborate(
     let mut top_level_functions: Vec<ast::decl::FunctionDeclaration> = Vec::new();
     let mut top_level_tasks: Vec<ast::decl::TaskDeclaration> = Vec::new();
     let mut top_level_nettypes: Vec<ast::decl::NettypeDeclaration> = Vec::new();
+    let mut top_level_params: Vec<ast::decl::ParameterDeclaration> = Vec::new();
+    let mut top_level_vars: Vec<ast::decl::DataDeclaration> = Vec::new();
     let mut top_level_binds: Vec<ast::decl::BindDirective> = Vec::new();
+    // §18.5.1 $unit-scope out-of-class constraint definitions (class, name).
+    let mut top_level_ooc_constraints: Vec<(String, String)> = Vec::new();
     for desc in all_descriptions {
         match desc {
             ast::Description::Module(m) => {
@@ -277,7 +281,16 @@ fn parse_and_elaborate(
             }
             ast::Description::TypedefDecl(t) => {
                 let name = t.name.name.clone();
-                definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
+                // §6.18: a bare forward typedef (`typedef name;`) must not
+                // displace a real definition of the same name — `typedef_test_0`
+                // restates the forward name after the full `typedef int name;`.
+                // Forward → insert only if absent; real → always (replaces a
+                // prior forward placeholder).
+                if t.forward {
+                    definitions.entry(name).or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
+                } else {
+                    definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
+                }
             }
             ast::Description::ImportDecl(id) => {
                 top_level_imports.push(id);
@@ -309,8 +322,17 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {
                 top_level_nettypes.push(n);
             }
+            ast::Description::PackageItem(ast::decl::PackageItem::Parameter(p)) => {
+                top_level_params.push(p);
+            }
+            ast::Description::PackageItem(ast::decl::PackageItem::Data(d)) => {
+                top_level_vars.push(d);
+            }
             ast::Description::Bind(b) => {
                 top_level_binds.push(b);
+            }
+            ast::Description::OutOfClassConstraint { class_name, constraint_name } => {
+                top_level_ooc_constraints.push((class_name, constraint_name));
             }
             _ => {}
         }
@@ -328,7 +350,9 @@ fn parse_and_elaborate(
             m.items.push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
         }
     }
-    if !top_level_functions.is_empty() || !top_level_tasks.is_empty() || !top_level_nettypes.is_empty() {
+    if !top_level_functions.is_empty() || !top_level_tasks.is_empty()
+        || !top_level_nettypes.is_empty() || !top_level_params.is_empty()
+        || !top_level_vars.is_empty() {
         for def in definitions.values_mut() {
             if let SourceDefinition::Module(m) = def {
                 let m = Rc::make_mut(m);
@@ -341,9 +365,29 @@ fn parse_and_elaborate(
                 for n in top_level_nettypes.iter().rev() {
                     m.items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
                 }
+                // $unit-scope parameters become body localparams (constants):
+                // visible inside the module, not part of its override interface.
+                for p in top_level_params.iter().rev() {
+                    m.items.insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p.clone()));
+                }
+                // $unit-scope variables (`string label = "X";`) become module
+                // signals so references — including from class methods
+                // validated against this module — resolve.
+                for d in top_level_vars.iter().rev() {
+                    m.items.insert(0, ast::decl::ModuleItem::DataDeclaration(d.clone()));
+                }
             }
         }
     }
+    // Capture the definitions that came from the explicitly-provided source
+    // files BEFORE pulling in library (`-y` / `+incdir`) modules. Library
+    // modules satisfy instantiations but must NEVER be candidates for the
+    // implicit top: otherwise compiling a self-contained file (e.g. a lone
+    // `class`) that shares an include dir with sibling testbenches would let
+    // one of those testbenches (`module tb; initial run_test(); …`) get picked
+    // as the top and run. An include dir is a search path, not a compile list.
+    let explicit_def_names: std::collections::HashSet<String> =
+        definitions.keys().cloned().collect();
     if !include_dirs.is_empty() { resolve_library_modules(&mut definitions, include_dirs, lib_defines)?; }
 
     if let Some(name) = top_module_name {
@@ -352,7 +396,10 @@ fn parse_and_elaborate(
     } else {
         let mut instantiated: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in definitions.values() { collect_instantiated_modules(m.items(), &mut instantiated); }
-        let mut candidates: Vec<String> = definitions.keys().filter(|n| !instantiated.contains(n.as_str())).cloned().collect();
+        let mut candidates: Vec<String> = definitions.keys()
+            .filter(|n| !instantiated.contains(n.as_str())
+                && explicit_def_names.contains(n.as_str()))
+            .cloned().collect();
         // Sort to make top-module selection deterministic when more than one
         // module is uninstantiated. Without this, ahash's random seed picks
         // arbitrarily between, e.g., openc910's `tb` and `top` testbenches —
@@ -376,6 +423,14 @@ fn parse_and_elaborate(
                     top_module = Some(c.clone()); break;
                 }
             }
+        }
+        // No candidate carried an `initial` (e.g. a file of several `class`
+        // declarations with no module — common in §18 constrained-random
+        // tests). Rather than failing with "No module found", fall back to the
+        // first candidate so the design still elaborates: a single-class file
+        // already behaved this way, and a multi-class file should too.
+        if top_module.is_none() && !candidates.is_empty() {
+            top_module = Some(candidates[0].clone());
         }
     }
 
@@ -410,6 +465,7 @@ fn parse_and_elaborate(
         Some(&def_refs),
         &top_level_imports,
         &top_level_lets,
+        &top_level_ooc_constraints,
     )?;
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
@@ -542,8 +598,21 @@ fn resolve_library_modules(
                     definitions.entry(name).or_insert_with(|| SourceDefinition::Package(Rc::new(p)));
                 }
                 ast::Description::TypedefDecl(t) => {
+                    // §6.18: a bare forward typedef is a scope-local promise; a
+                    // *library* file's forward typedef is irrelevant to the
+                    // primary design and must not be imported (else its
+                    // unresolved-forward check would false-positive on an
+                    // unrelated incdir sibling). Only real typedefs are imported.
+                    if t.forward { continue; }
                     let name = t.name.name.clone();
-                    definitions.entry(name).or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
+                    let replace_forward = matches!(
+                        definitions.get(&name),
+                        Some(SourceDefinition::Typedef(e)) if e.forward);
+                    if replace_forward {
+                        definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
+                    } else {
+                        definitions.entry(name).or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
+                    }
                 }
                 _ => {}
             }

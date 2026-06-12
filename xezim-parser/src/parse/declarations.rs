@@ -31,19 +31,45 @@ impl Parser {
         if self.at(TokenKind::KwType) {
             self.bump();
             let mut assignments = Vec::new();
-            let name = self.parse_identifier();
-            // IEEE 1800-2023 §6.20.2.1: `type T extends Base` constrains the
-            // type argument to a class derived from `Base`. Gated on --sv2023;
-            // in 2017 mode an `extends` token here is a parse error as before.
-            let extends = if crate::is_sv2023() && self.eat(TokenKind::KwExtends).is_some() {
-                Some(self.parse_identifier())
-            } else {
-                None
-            };
-            let init = if self.eat(TokenKind::Assign).is_some() {
-                Some(self.parse_data_type())
-            } else { None };
-            assignments.push(TypeParamAssignment { name, extends, init, span: self.span_from(start) });
+            // §6.20.3: a single `parameter type` may declare several comma-
+            // separated type assignments — `parameter type A = int, B = X;`.
+            loop {
+                let astart = self.current().span.start;
+                let name = self.parse_identifier();
+                // IEEE 1800-2023 §6.20.2.1: `type T extends Base` constrains the
+                // type argument to a class derived from `Base`. Gated on
+                // --sv2023; in 2017 mode an `extends` here is a parse error.
+                let extends = if crate::is_sv2023() && self.eat(TokenKind::KwExtends).is_some() {
+                    Some(self.parse_identifier())
+                } else {
+                    None
+                };
+                let init = if self.eat(TokenKind::Assign).is_some() {
+                    Some(self.parse_data_type())
+                } else { None };
+                assignments.push(TypeParamAssignment { name, extends, init, span: self.span_from(astart) });
+                // A comma followed by a new parameter/localparam/type keyword
+                // OR a data-type keyword ends this `type` declaration — e.g.
+                // `#(type TYPE = int, string FIELD = "x")` (UVM uvm_utils): the
+                // `string` begins a new typed value parameter, not another type
+                // assignment. A comma followed by a bare identifier stays a
+                // type-assignment continuation (`type A = int, B = bit`).
+                if self.at(TokenKind::Comma)
+                    && !matches!(self.peek_kind(),
+                        TokenKind::KwParameter | TokenKind::KwLocalparam | TokenKind::KwType
+                        | TokenKind::KwBit | TokenKind::KwLogic | TokenKind::KwReg
+                        | TokenKind::KwByte | TokenKind::KwShortint | TokenKind::KwInt
+                        | TokenKind::KwLongint | TokenKind::KwInteger | TokenKind::KwTime
+                        | TokenKind::KwReal | TokenKind::KwShortreal | TokenKind::KwRealtime
+                        | TokenKind::KwString | TokenKind::KwChandle | TokenKind::KwEvent
+                        | TokenKind::KwVoid | TokenKind::KwStruct | TokenKind::KwUnion
+                        | TokenKind::KwEnum)
+                {
+                    self.bump();
+                } else {
+                    break;
+                }
+            }
             return ParameterDeclaration { local, kind: ParameterKind::Type { assignments }, span: self.span_from(start) };
         }
         // Check if there's an explicit data type keyword or just an implicit type
@@ -71,11 +97,25 @@ impl Parser {
                 Some(self.parse_expression())
             } else { None };
             assignments.push(ParamAssignment { name, dimensions, init, span: self.span_from(astart) });
-            // Don't consume comma if next token after comma is parameter/localparam
-            // (those belong to the parameter port list, not this declaration)
+            // Don't consume comma if next token after comma starts a NEW
+            // parameter declaration rather than another same-type assignment:
+            //  - `parameter`/`localparam` keyword, or
+            //  - an explicit data-type keyword (`#(int N, int P)` — each is its
+            //    own typed param; `#(int A, B)` keeps B as a same-type assign
+            //    because B is a bare identifier, handled by the default path).
             if self.at(TokenKind::Comma) {
                 let next = self.peek_kind();
-                if next == TokenKind::KwParameter || next == TokenKind::KwLocalparam {
+                if next == TokenKind::KwParameter || next == TokenKind::KwLocalparam
+                    || next == TokenKind::KwType
+                    || matches!(next,
+                        TokenKind::KwBit | TokenKind::KwLogic | TokenKind::KwReg |
+                        TokenKind::KwByte | TokenKind::KwShortint | TokenKind::KwInt |
+                        TokenKind::KwLongint | TokenKind::KwInteger | TokenKind::KwTime |
+                        TokenKind::KwReal | TokenKind::KwShortreal | TokenKind::KwRealtime |
+                        TokenKind::KwString | TokenKind::KwChandle | TokenKind::KwEvent |
+                        TokenKind::KwVoid | TokenKind::KwStruct | TokenKind::KwUnion |
+                        TokenKind::KwEnum)
+                {
                     break;
                 }
                 self.bump(); // consume comma
@@ -111,13 +151,26 @@ impl Parser {
                 name,
                 dimensions: Vec::new(),
                 span: self.span_from(start),
+                forward: false, // forward CLASS — resolved via a class decl, not checked here
+            };
+        }
+        // IEEE 1800-2017 §6.18: bare forward type declaration `typedef name;`
+        // (no type body) — promises a later full typedef. Multiple are legal.
+        if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
+            && self.peek_kind() == TokenKind::Semicolon {
+            let name = self.parse_identifier();
+            self.expect(TokenKind::Semicolon);
+            return TypedefDeclaration {
+                data_type: DataType::Void(self.span_from(start)),
+                name, dimensions: Vec::new(), span: self.span_from(start),
+                forward: true,
             };
         }
         let data_type = self.parse_data_type();
         let name = self.parse_identifier();
         let dimensions = self.parse_unpacked_dimensions();
         self.expect(TokenKind::Semicolon);
-        TypedefDeclaration { data_type, name, dimensions, span: self.span_from(start) }
+        TypedefDeclaration { data_type, name, dimensions, span: self.span_from(start), forward: false }
     }
 
     pub(super) fn parse_import_declaration(&mut self) -> ImportDeclaration {
@@ -389,11 +442,25 @@ impl Parser {
             if !var_kw && self.at(TokenKind::KwVar) { var_kw = self.eat(TokenKind::KwVar).is_some(); } // Handle var after const
             let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
 
-            // Handle 'virtual interface <name>' port type
-            if self.at(TokenKind::KwVirtual) && self.peek_kind() == TokenKind::KwInterface {
+            // Handle `virtual interface <name>` port type (legacy form)
+            // and the LRM 1800-2017 §25.9 form `virtual <iface_type>` /
+            // `virtual <iface_type>.<modport> <name>` (no `interface`
+            // keyword). Both produce a TypeReference for the iface.
+            if self.at(TokenKind::KwVirtual)
+                && (self.peek_kind() == TokenKind::KwInterface
+                    || self.peek_kind() == TokenKind::Identifier)
+            {
                 self.bump(); // virtual
-                self.bump(); // interface
+                if self.at(TokenKind::KwInterface) {
+                    self.bump();
+                }
                 let iface_name = self.parse_identifier();
+                // Optional `.<modport>` suffix — for now consumed and
+                // discarded (the data_type just records the iface).
+                if self.at(TokenKind::Dot) {
+                    self.bump();
+                    let _modport = self.parse_identifier();
+                }
                 let name = self.parse_identifier();
                 let data_type = DataType::TypeReference { name: TypeName { scope: None, name: iface_name, span: self.span_from(start) }, dimensions: Vec::new(), type_args: Vec::new(), span: self.span_from(start) };
                 let dimensions = self.parse_unpacked_dimensions();
@@ -488,6 +555,9 @@ impl Parser {
                     Some(PackageItem::Null)
                 }
             }
+            // §8.26: `interface class …` inside a package is a class.
+            TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass =>
+                Some(PackageItem::Class(self.parse_class_declaration())),
             TokenKind::KwClass => Some(PackageItem::Class(self.parse_class_declaration())),
             // IEEE 1800-2023 §19: covergroup at package scope. Parsed for
             // syntactic acceptance, but not hosted as a PackageItem (no

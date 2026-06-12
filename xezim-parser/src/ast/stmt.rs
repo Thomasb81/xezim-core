@@ -133,6 +133,16 @@ pub struct AssertionStatement {
     pub expr: Expression,
     pub action: Option<Box<Statement>>,
     pub else_action: Option<Box<Statement>>,
+    /// `assert property (…)` / `assume property (…)` / `cover property (…)`.
+    /// LRM §16.5: concurrent assertions evaluate in the observed region
+    /// at the property's clocking event, not immediately at the statement
+    /// site. Today's runtime distinguishes them by deferring evaluation —
+    /// the inline predicate (`expr`) is queued into `pending_observed`
+    /// instead of evaluated in place. Captured by the parser (the
+    /// `property` keyword previously parsed via `is_property` was
+    /// discarded; this field surfaces it for the executor).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_property: bool,
     pub span: Span,
 }
 

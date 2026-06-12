@@ -6,11 +6,16 @@ use crate::ast::Span;
 pub struct Lexer<'a> {
     input: &'a [u8],
     pos: usize,
+    /// IEEE 1800-2023 §22.14: stack of active `begin_keywords` regions; each
+    /// entry is `true` for a `1364-*` (legacy Verilog) keyword set. The
+    /// innermost region wins — while its top is `true`, SystemVerilog-only
+    /// keywords (`logic`, `bit`, …) lex as ordinary identifiers.
+    kw_stack: Vec<bool>,
 }
 
 impl<'a> Lexer<'a> {
     pub fn new(source: &'a str) -> Self {
-        Self { input: source.as_bytes(), pos: 0 }
+        Self { input: source.as_bytes(), pos: 0, kw_stack: Vec::new() }
     }
 
     pub fn tokenize(mut self) -> Vec<Token> {
@@ -359,6 +364,35 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        // §22.14: track `begin_keywords "<version>"` / `end_keywords` so the
+        // identifier scanner can downgrade SV-only keywords in legacy regions.
+        // The version string is consumed here (not emitted as a separate token).
+        if text == "`begin_keywords" {
+            let save = self.pos;
+            while self.pos < self.input.len()
+                && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t') {
+                self.pos += 1;
+            }
+            if self.pos < self.input.len() && self.input[self.pos] == b'"' {
+                self.pos += 1; // opening quote
+                let vstart = self.pos;
+                while self.pos < self.input.len() && self.input[self.pos] != b'"' {
+                    self.pos += 1;
+                }
+                let ver = String::from_utf8_lossy(&self.input[vstart..self.pos]).to_string();
+                if self.pos < self.input.len() { self.pos += 1; } // closing quote
+                self.kw_stack.push(ver.starts_with("1364"));
+            } else {
+                // Malformed (no version) — keep the stack balanced anyway.
+                self.pos = save;
+                self.kw_stack.push(false);
+            }
+            return Token::new(TokenKind::Directive, text, Span::new(start, self.pos));
+        }
+        if text == "`end_keywords" {
+            self.kw_stack.pop();
+            return Token::new(TokenKind::Directive, text, Span::new(start, self.pos));
+        }
         Token::new(TokenKind::Directive, text, Span::new(start, self.pos))
     }
 
@@ -385,7 +419,13 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
-        let kind = keyword(&text).unwrap_or(TokenKind::Identifier);
+        let mut kind = keyword(&text).unwrap_or(TokenKind::Identifier);
+        // §22.14: inside a `begin_keywords "1364-*"` region, a SystemVerilog-
+        // only keyword is a legal identifier (e.g. `reg logic;` declares a reg
+        // named `logic` in Verilog-2001).
+        if self.kw_stack.last().copied().unwrap_or(false) && is_sv_only_keyword(&text) {
+            kind = TokenKind::Identifier;
+        }
         Token::new(kind, text, Span::new(start, self.pos))
     }
 
@@ -394,10 +434,18 @@ impl<'a> Lexer<'a> {
         while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') {
             self.pos += 1;
         }
-        // Check for based literal: <size>'<base><value>
-        if self.pos < self.input.len() && self.input[self.pos] == b'\'' {
-            let next = self.input.get(self.pos + 1).copied().unwrap_or(0);
+        // Check for based literal: <size>'<base><value>. IEEE 1800-2017
+        // §5.7.1 permits whitespace between the size and the base specifier
+        // (`32 'h ff`), so probe past spaces/tabs before the apostrophe and
+        // only commit if a real base specifier follows.
+        let mut probe = self.pos;
+        while probe < self.input.len() && (self.input[probe] == b' ' || self.input[probe] == b'\t') {
+            probe += 1;
+        }
+        if probe < self.input.len() && self.input[probe] == b'\'' {
+            let next = self.input.get(probe + 1).copied().unwrap_or(0);
             if matches!(next, b's' | b'S' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H') {
+                self.pos = probe; // consume the inter-token whitespace
                 self.pos += 1; // skip '
                 if matches!(self.input.get(self.pos), Some(b's' | b'S')) { self.pos += 1; }
                 if self.pos < self.input.len() && matches!(self.input[self.pos], b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H') {
@@ -484,4 +532,38 @@ impl<'a> Lexer<'a> {
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
         Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos))
     }
+}
+
+/// IEEE 1800-2023 §B.1 vs §22.14: a keyword that SystemVerilog adds over
+/// Verilog-1364 (2001). Inside a `begin_keywords "1364-*"` region these are not
+/// reserved and lex as ordinary identifiers. Verilog-2001 keywords (`reg`,
+/// `wire`, `module`, `begin`, `if`, …) are deliberately excluded so they stay
+/// reserved. The set is generous — it only ever applies inside a (rare) legacy
+/// keyword region, so over-inclusion is harmless while under-inclusion would
+/// leave a legacy identifier wrongly reserved.
+fn is_sv_only_keyword(s: &str) -> bool {
+    matches!(s,
+        // data types
+        "logic" | "bit" | "byte" | "shortint" | "int" | "longint"
+        | "shortreal" | "void" | "chandle" | "string" | "var" | "type"
+        | "enum" | "struct" | "union" | "packed" | "tagged" | "const"
+        // classes / OOP
+        | "class" | "endclass" | "extends" | "implements" | "super" | "this"
+        | "virtual" | "pure" | "local" | "protected" | "rand" | "randc"
+        | "constraint" | "solve" | "before" | "null" | "new" | "extern"
+        | "forkjoin" | "interface" | "endinterface" | "modport"
+        // procedural / control additions
+        | "always_comb" | "always_ff" | "always_latch" | "final" | "do"
+        | "return" | "break" | "continue" | "unique" | "unique0" | "priority"
+        | "iff" | "inside" | "dist" | "with" | "throughout" | "within"
+        | "first_match" | "matches" | "ref" | "context" | "import" | "export"
+        // assertions / coverage
+        | "assert" | "assume" | "cover" | "property" | "endproperty"
+        | "sequence" | "endsequence" | "expect" | "covergroup" | "endgroup"
+        | "coverpoint" | "cross" | "bins" | "binsof" | "intersect" | "wildcard"
+        | "ignore_bins" | "illegal_bins"
+        // clocking / programs / packages
+        | "clocking" | "endclocking" | "program" | "endprogram" | "package"
+        | "endpackage" | "timeunit" | "timeprecision"
+    )
 }

@@ -26,6 +26,35 @@ impl Parser {
     pub(super) fn parse_data_type(&mut self) -> DataType {
         let start = self.current().span.start;
         match self.current_kind() {
+            // §6.20.2.1 / §25.3: `virtual [interface] <iface>[#(params)][.modport]`
+            // used as a type — e.g. a parameter-type default
+            // `#(type IFType = virtual x_if)`.
+            TokenKind::KwVirtual => {
+                self.bump();
+                self.eat(TokenKind::KwInterface);
+                let name = self.parse_identifier();
+                if self.at(TokenKind::Hash) { let _ = self.parse_param_args(); }
+                let modport = if self.eat(TokenKind::Dot).is_some() {
+                    Some(self.parse_identifier())
+                } else { None };
+                DataType::Interface { name, modport, span: self.span_from(start) }
+            }
+            // §6.23 type operator `type(expr_or_data_type)` — parse-accept and
+            // treat as implicit (the resolved type is not modelled).
+            TokenKind::KwType if self.peek_kind() == TokenKind::LParen => {
+                self.bump(); // type
+                self.bump(); // (
+                let mut depth = 1i32;
+                while depth > 0 && !self.at(TokenKind::Eof) {
+                    match self.current_kind() {
+                        TokenKind::LParen => depth += 1,
+                        TokenKind::RParen => depth -= 1,
+                        _ => {}
+                    }
+                    self.bump();
+                }
+                DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+            }
             TokenKind::KwBit | TokenKind::KwLogic | TokenKind::KwReg => {
                 let kind = match self.bump().kind {
                     TokenKind::KwBit => IntegerVectorType::Bit,
@@ -299,6 +328,15 @@ impl Parser {
 fn parse_enum_type(&mut self) -> DataType {
     let start = self.current().span.start;
     self.expect(TokenKind::KwEnum);
+    // Forward enum typedef `typedef enum name;` (§6.18): the identifier after
+    // `enum` is the typedef NAME (left for the caller to consume), not a base
+    // type or enum name. Return an empty enum without touching it.
+    if self.at(TokenKind::Identifier)
+        && matches!(self.peek_kind(), TokenKind::Semicolon | TokenKind::Comma) {
+        return DataType::Enum(crate::ast::types::EnumType {
+            base_type: None, members: Vec::new(), span: self.span_from(start),
+        });
+    }
     let base_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
         if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBrace {
             // This is the enum name, not a base type
@@ -312,11 +350,21 @@ fn parse_enum_type(&mut self) -> DataType {
         Some(self.parse_identifier())
     } else { None };
 
+    // Forward / bodyless enum typedef `typedef enum name;` (§6.18) — no member
+    // list. (The forward name may have been consumed above as `base_type`;
+    // harmless for a forward declaration.) Without this the member loop below
+    // started on a non-`{` token and could spin without progress.
+    if !self.at(TokenKind::LBrace) {
+        return DataType::Enum(crate::ast::types::EnumType {
+            base_type, members: Vec::new(), span: self.span_from(start),
+        });
+    }
     self.expect(TokenKind::LBrace);
 
         let mut members = Vec::new();
         loop {
             if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+            let loop_start = self.pos;
             let mstart = self.current().span.start;
             let name = self.parse_identifier();
             // IEEE 1800-2017 §6.19 enum_name_declaration:
@@ -342,6 +390,7 @@ fn parse_enum_type(&mut self) -> DataType {
             members.push(crate::ast::types::EnumMember {
                 name, range, init, span: self.span_from(mstart),
             });
+            if self.pos == loop_start { self.bump(); } // defensive progress guard
             if self.eat(TokenKind::Comma).is_none() { break; }
         }
         self.expect(TokenKind::RBrace);
@@ -392,10 +441,23 @@ fn parse_enum_type(&mut self) -> DataType {
         let tagged2 = self.eat(TokenKind::KwTagged).is_some();
         let tagged = tagged1 || tagged2;
         let signing = self.parse_optional_signing();
+        // Forward / bodyless `struct`/`union` — e.g. the forward typedef
+        // `typedef union myu;` (IEEE 1800-2017 §6.18). With no `{`, there is no
+        // member list: return an empty aggregate. Without this guard the member
+        // loop below started at a non-`{` token (`expect(LBrace)` reports the
+        // error but doesn't consume) and could spin without making progress,
+        // pushing members until the process OOMs.
+        if !self.at(TokenKind::LBrace) {
+            return DataType::Struct(StructUnionType {
+                kind, packed, tagged, signing, members: Vec::new(),
+                span: self.span_from(start),
+            });
+        }
         self.expect(TokenKind::LBrace);
         let mut members = Vec::new();
         while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
             let mstart = self.current().span.start;
+            let loop_start_pos = self.pos;
             let rand_qualifier = match self.current_kind() {
                 TokenKind::KwRand => { self.bump(); Some(RandQualifier::Rand) }
                 TokenKind::KwRandc => { self.bump(); Some(RandQualifier::Randc) }
@@ -415,6 +477,9 @@ fn parse_enum_type(&mut self) -> DataType {
             }
             self.expect(TokenKind::Semicolon);
             members.push(StructMember { rand_qualifier, data_type, declarators, span: self.span_from(mstart) });
+            // Defensive: guarantee forward progress so a malformed body can
+            // never spin this loop into an OOM.
+            if self.pos == loop_start_pos { self.bump(); }
         }
         self.expect(TokenKind::RBrace);
         DataType::Struct(StructUnionType { kind, packed, tagged, signing, members, span: self.span_from(start) })

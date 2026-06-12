@@ -989,26 +989,25 @@ impl Value {
         Value::from_u64(1, 1)
     }
 
-    /// SV §11.4.6 wildcard equality (`==?`). X/Z bits *on the right*
-    /// operand are wildcards (always match). X/Z bits on the left
-    /// (where the right is 0/1) make the result X — unless a hard
-    /// mismatch already forced it to 0. Returns a 3-state 1-bit value.
+    /// SV §11.4.6 wildcard equality (`==?`). X/Z bits in *either*
+    /// operand are wildcards (always match) — LRM 1800-2017 explicitly
+    /// says "either operand". A hard mismatch on a non-wildcard bit
+    /// forces the result to 0; otherwise the result is 1.
     pub fn wildcard_eq(&self, other: &Value) -> Value {
         let w = self.width.max(other.width) as usize;
-        let mut eq = LogicBit::One;
         for i in 0..w {
             let l = self.get_bit(i);
             let r = other.get_bit(i);
-            if matches!(r, LogicBit::X | LogicBit::Z) { continue; }
-            if matches!(l, LogicBit::X | LogicBit::Z) {
-                if eq == LogicBit::One { eq = LogicBit::X; }
+            if matches!(l, LogicBit::X | LogicBit::Z)
+                || matches!(r, LogicBit::X | LogicBit::Z)
+            {
                 continue;
             }
-            if l != r { return Value::from_u64(0, 1); }
+            if l != r {
+                return Value::from_u64(0, 1);
+            }
         }
-        let mut v = Value::zero(1);
-        v.set_bit(0, eq);
-        v
+        Value::from_u64(1, 1)
     }
 
     /// SV §11.4.6 wildcard inequality (`!=?`) — `wildcard_eq` inverted;

@@ -71,7 +71,12 @@ impl Parser {
             } else if self.at(TokenKind::DoubleColon) {
                 let s = self.current().span.start;
                 self.bump();
-                let member = self.parse_identifier();
+                let member = if self.at(TokenKind::KwNew) {
+                    let tok = self.bump();
+                    crate::ast::Identifier { name: "new".to_string(), span: tok.span }
+                } else {
+                    self.parse_identifier()
+                };
                 lval = Expression::new(ExprKind::MemberAccess {
                     expr: Box::new(lval), member,
                 }, self.span_from(s));
@@ -97,11 +102,68 @@ impl Parser {
     }
 
     /// Pratt parser: parse expression with minimum binding power.
+    /// §12.6 pattern (used by `matches` / `case … matches`). Parse-accept only
+    /// — consumes the pattern structure; bindings/semantics aren't modelled.
+    ///   pattern ::= `.` ident | `.*` | `tagged` ident [pattern]
+    ///             | `'{` pattern {, [name:] pattern} `}` | expression
+    pub(super) fn parse_pattern(&mut self) {
+        if self.eat(TokenKind::KwTagged).is_some() {
+            let _ = self.parse_identifier();
+            // Optional member sub-pattern.
+            if matches!(self.current_kind(),
+                TokenKind::ApostropheLBrace | TokenKind::KwTagged | TokenKind::Dot) {
+                self.parse_pattern();
+            }
+        } else if self.eat(TokenKind::Dot).is_some() {
+            // `.field` binding or `.*` wildcard. `.name` introduces a pattern
+            // variable (§12.6) visible in the matched statement — record it so
+            // the enclosing if/case can declare it.
+            if self.eat(TokenKind::Star).is_none() {
+                let id = self.parse_identifier();
+                self.pending_pattern_bindings.push(id);
+            }
+        } else if self.eat(TokenKind::ApostropheLBrace).is_some() {
+            loop {
+                if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+                // optional `name:` member tag
+                if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
+                    && self.peek_kind() == TokenKind::Colon {
+                    let _ = self.parse_identifier();
+                    self.bump(); // :
+                }
+                self.parse_pattern();
+                if self.eat(TokenKind::Comma).is_none() { break; }
+            }
+            self.expect(TokenKind::RBrace);
+        } else {
+            // Constant-expression pattern.
+            let _ = self.parse_expr_bp(16);
+        }
+    }
+
     fn parse_expr_bp(&mut self, min_bp: u8) -> Expression {
         let start = self.current().span.start;
         let mut lhs = self.parse_prefix();
 
         loop {
+            // §12.6: `expr matches pattern` — a boolean conditional-pattern
+            // match. Binding power 15 (like relational). Parse-accept: consume
+            // the pattern and yield a placeholder boolean (the match semantics
+            // are not modelled).
+            if self.at(TokenKind::KwMatches) {
+                if 15 < min_bp { break; }
+                self.bump();
+                self.parse_pattern();
+                lhs = Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: Some(1), signed: false, base: NumberBase::Binary,
+                        value: "0".to_string(),
+                        cached_val: std::cell::Cell::new(Some((0u64, 0u64, 1u32))),
+                    }),
+                    self.span_from(start),
+                );
+                continue;
+            }
             // inside operator: expr inside { range_list }
             // Binding power 15 (same as relational)
             if self.at(TokenKind::KwInside) {
@@ -222,6 +284,53 @@ impl Parser {
                     // This shouldn't happen here; ternary handled below
                 }
 
+                // LRM §16.8: infix `a ##N b` — the cycle count `N`
+                // sits between the `##` token and the right operand.
+                // Parse the count, the operand, and synthesise
+                // `Binary{HashHash, a, Binary{HashHash, N, b}}` so the
+                // SVA executor sees `a` then an N-cycle-delayed `b`.
+                // `a ##[m:n] b` range form is collapsed to the lower
+                // bound for now.
+                if op == BinaryOp::HashHash {
+                    // Optional `[m:n]` / `[*]` / `[+]` range form: skip
+                    // to the closing bracket and use the first number.
+                    let count_expr = if self.at(TokenKind::LBracket) {
+                        self.bump();
+                        let lo = if self.at(TokenKind::IntegerLiteral) {
+                            self.parse_prefix()
+                        } else {
+                            // `[*]`/`[+]` — default to 1 cycle.
+                            Expression::new(ExprKind::Number(
+                                crate::ast::expr::NumberLiteral::Integer {
+                                    size: None, signed: false,
+                                    base: crate::ast::expr::NumberBase::Decimal,
+                                    value: "1".to_string(),
+                                    cached_val: std::cell::Cell::new(None),
+                                }), self.span_from(start))
+                        };
+                        while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
+                            self.bump();
+                        }
+                        let _ = self.eat(TokenKind::RBracket);
+                        lo
+                    } else {
+                        // Bare count `##1`.
+                        self.parse_prefix()
+                    };
+                    let rhs = self.parse_expr_bp(r_bp);
+                    let delayed = Expression::new(ExprKind::Binary {
+                        op: BinaryOp::HashHash,
+                        left: Box::new(count_expr),
+                        right: Box::new(rhs),
+                    }, self.span_from(start));
+                    lhs = Expression::new(ExprKind::Binary {
+                        op: BinaryOp::SeqAnd,
+                        left: Box::new(lhs),
+                        right: Box::new(delayed),
+                    }, self.span_from(start));
+                    continue;
+                }
+
                 let rhs = self.parse_expr_bp(r_bp);
                 lhs = Expression::new(ExprKind::Binary {
                     op, left: Box::new(lhs), right: Box::new(rhs),
@@ -307,7 +416,13 @@ impl Parser {
             // Scope resolution: :: (e.g. pkg::name, class::static_member)
             if self.at(TokenKind::DoubleColon) {
                 self.bump();
-                let member = self.parse_identifier();
+                // §8.8: `Class::new` typed-constructor reference.
+                let member = if self.at(TokenKind::KwNew) {
+                    let tok = self.bump();
+                    crate::ast::Identifier { name: "new".to_string(), span: tok.span }
+                } else {
+                    self.parse_identifier()
+                };
                 lhs = Expression::new(ExprKind::MemberAccess {
                     expr: Box::new(lhs), member,
                 }, self.span_from(start));
@@ -352,8 +467,26 @@ impl Parser {
             // Index/range select: [expr] or [expr:expr] or [expr+:expr] or new[size]
             if self.at(TokenKind::LBracket) {
                 self.bump();
+                // IEEE 1800-2017 §16.9 SVA sequence repetition immediately
+                // after a sequence operand: `[*n:m]` (consecutive), `[=n:m]`
+                // (non-consecutive), `[->n:m]` (goto). The leading `*`/`=`/`->`
+                // can't begin a normal index expression, so this is
+                // unambiguous. Parse-accept: consume to the matching `]` and
+                // leave the operand unchanged (repetition count not modelled).
+                if self.at(TokenKind::Star) || self.at(TokenKind::Assign) || self.at(TokenKind::Arrow) {
+                    let mut depth = 1i32;
+                    while depth > 0 && !self.at(TokenKind::Eof) {
+                        match self.current_kind() {
+                            TokenKind::LBracket => depth += 1,
+                            TokenKind::RBracket => depth -= 1,
+                            _ => {}
+                        }
+                        self.bump();
+                    }
+                    continue;
+                }
                 let idx = self.parse_expression();
-                
+
                 // Special case: new[size] for dynamic arrays
                 let is_new = if let ExprKind::Ident(ref hier) = lhs.kind {
                     hier.path.len() == 1 && hier.path[0].name.name == "new"
@@ -402,7 +535,25 @@ impl Parser {
                 continue;
             }
 
-            // with clause: expr with ( filter_expr )
+            // with clause: `expr with ( filter_expr )` (array methods), or the
+            // §11.4.14 stream-expression form `expr with [ array_range ]`
+            // (`<<8{ data with [0 +: len] }`). The bracketed range selects a
+            // slice of the operand inside a streaming concatenation.
+            if self.at(TokenKind::KwWith) && self.peek_kind() == TokenKind::LBracket {
+                self.bump(); // with
+                self.bump(); // [
+                let _lo = self.parse_expression();
+                // optional `: hi` / `+: width` / `-: width`
+                if self.at(TokenKind::Colon) || self.at(TokenKind::PlusColon)
+                    || self.at(TokenKind::MinusColon) {
+                    self.bump();
+                    let _hi = self.parse_expression();
+                }
+                self.expect(TokenKind::RBracket);
+                // Pass the operand through unchanged — the range is a slice hint.
+                lhs = Expression::new(ExprKind::Paren(Box::new(lhs)), self.span_from(start));
+                continue;
+            }
             if self.eat(TokenKind::KwWith).is_some() {
                 self.expect(TokenKind::LParen);
                 let filter = self.parse_expression();
@@ -437,6 +588,26 @@ impl Parser {
         let start = self.current().span.start;
 
         match self.current_kind() {
+            // §16.13 multiclock sequence: a clocking-event prefix `@(event)` on
+            // a (sub-)sequence operand — `… ##1 @(posedge clk1) out1`. Only in
+            // an SVA sequence/property body; consume the event and continue with
+            // the operand (the clock retiming is parse-accepted, not modelled).
+            TokenKind::At if self.in_sva_seq => {
+                self.bump(); // @
+                if self.at(TokenKind::LParen) {
+                    self.bump();
+                    let mut depth = 1;
+                    while depth > 0 && !self.at(TokenKind::Eof) {
+                        match self.current_kind() {
+                            TokenKind::LParen => depth += 1,
+                            TokenKind::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        self.bump();
+                    }
+                }
+                self.parse_expr_bp(0)
+            }
             // Unary operators
             TokenKind::Plus => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::Plus, operand: Box::new(e) }, self.span_from(start)) }
             TokenKind::Minus => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::Minus, operand: Box::new(e) }, self.span_from(start)) }
@@ -488,6 +659,36 @@ impl Parser {
                 };
                 self.expect(TokenKind::RParen);
                 Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
+            }
+
+            // IEEE 1800-2017 §6.23: the type operator `type(<type_or_expr>)` as
+            // an expression — used in type comparisons (`type(T) == type(U)`)
+            // and `case (type(T)) … type(logic[11:0]) : …`. Parse-accept: we
+            // consume `type` + the balanced parenthesised operand and yield a
+            // placeholder constant (type identity isn't modelled at runtime, so
+            // comparisons fold to a constant — enough to elaborate).
+            TokenKind::KwType if self.peek_kind() == TokenKind::LParen => {
+                self.bump(); // type
+                self.expect(TokenKind::LParen);
+                let mut depth = 1i32;
+                while depth > 0 && !self.at(TokenKind::Eof) {
+                    match self.current_kind() {
+                        TokenKind::LParen => depth += 1,
+                        TokenKind::RParen => depth -= 1,
+                        _ => {}
+                    }
+                    if depth == 0 { break; }
+                    self.bump();
+                }
+                self.expect(TokenKind::RParen);
+                Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: Some(1), signed: false, base: NumberBase::Binary,
+                        value: "0".to_string(),
+                        cached_val: std::cell::Cell::new(Some((0u64, 0u64, 1u32))),
+                    }),
+                    self.span_from(start),
+                )
             }
 
             // Concatenation / replication: { ... }
@@ -554,7 +755,14 @@ impl Parser {
                         items.push(AssignmentPatternItem::Keyed(key, val));
                     } else {
                         let count_expr = self.parse_expression();
-                        if first && self.at(TokenKind::LBrace) {
+                        if self.at(TokenKind::Colon) {
+                            // Expression-keyed entry `1 : val` — an
+                            // associative-array / integer-indexed literal key
+                            // (§10.9.2), e.g. `'{1:1, default:0}`.
+                            self.bump();
+                            let val = self.parse_expression();
+                            items.push(AssignmentPatternItem::Keyed(count_expr, val));
+                        } else if first && self.at(TokenKind::LBrace) {
                             // Replication form: count { e1, e2, ... }
                             self.bump(); // '{'
                             let mut rep_items = Vec::new();
@@ -785,10 +993,97 @@ impl Parser {
                 Expression::new(ExprKind::Empty, self.span_from(start))
             }
 
-            TokenKind::HashHash => {
+            // LRM §16.12.6 strong temporal operators in property context.
+            // Parse as a prefix unary expression: `s_eventually <expr>`,
+            // `s_always <expr>`. The SVA executor treats these as
+            // future-cycle obligations.
+            TokenKind::KwS_eventually => {
                 let start = self.current().span.start; self.bump();
-                let operand = self.parse_expr_bp(30);
-                Expression::new(ExprKind::Unary { op: UnaryOp::HashHash, operand: Box::new(operand) }, self.span_from(start))
+                let operand = self.parse_expr_bp(3);
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::SEventually,
+                        operand: Box::new(operand),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::KwS_always => {
+                let start = self.current().span.start; self.bump();
+                let operand = self.parse_expr_bp(3);
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::SAlways,
+                        operand: Box::new(operand),
+                    },
+                    self.span_from(start),
+                )
+            }
+            // LRM §16.12.5 — `nexttime <expr>` and `s_nexttime <expr>`.
+            // Desugar to `Binary{HashHash, 1, expr}` which the SVA
+            // executor already treats as a 1-cycle delay.
+            TokenKind::KwNexttime | TokenKind::KwS_nexttime => {
+                let start = self.current().span.start; self.bump();
+                let operand = self.parse_expr_bp(3);
+                let one = Expression::new(
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: crate::ast::expr::NumberBase::Decimal,
+                        value: "1".to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    self.span_from(start),
+                );
+                Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::HashHash,
+                        left: Box::new(one),
+                        right: Box::new(operand),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::HashHash => {
+                // LRM §16.8: `##N <rest>` — a cycle-delay sequence
+                // operator. Parse the cycle count, then the following
+                // sub-expression, and synthesize a Binary{HashHash,
+                // cycles, rest}. Without consuming the right-hand side
+                // here, the bare `##N` would leave the trailing operand
+                // dangling (e.g. `a |-> ##1 b` errored on `b`).
+                let start = self.current().span.start; self.bump();
+                let cycles = self.parse_expr_bp(30);
+                // The next token is either another operand (a bare
+                // sequence) or end-of-expression. We greedily parse one
+                // following sub-expression at low precedence — same as
+                // the `|->` body — so chains like `a |-> ##1 b ##2 c`
+                // associate left-to-right inside the implication.
+                let allow_rhs = matches!(
+                    self.current_kind(),
+                    TokenKind::Identifier
+                        | TokenKind::LParen
+                        | TokenKind::IntegerLiteral
+                        | TokenKind::HashHash
+                );
+                if allow_rhs {
+                    let rest = self.parse_expr_bp(3);
+                    Expression::new(
+                        ExprKind::Binary {
+                            op: BinaryOp::HashHash,
+                            left: Box::new(cycles),
+                            right: Box::new(rest),
+                        },
+                        self.span_from(start),
+                    )
+                } else {
+                    Expression::new(
+                        ExprKind::Unary {
+                            op: UnaryOp::HashHash,
+                            operand: Box::new(cycles),
+                        },
+                        self.span_from(start),
+                    )
+                }
             }
 
             _ => {
@@ -937,7 +1232,14 @@ impl Parser {
                 path.push(HierPathSegment { name: member, selects: Vec::new() });
             } else if self.at(TokenKind::DoubleColon) {
                 self.bump();
-                let member = self.parse_identifier();
+                // §8.8: `Class::new` typed-constructor reference — `new` is a
+                // keyword but names the constructor here.
+                let member = if self.at(TokenKind::KwNew) {
+                    let tok = self.bump();
+                    crate::ast::Identifier { name: "new".to_string(), span: tok.span }
+                } else {
+                    self.parse_identifier()
+                };
                 path.push(HierPathSegment { name: member, selects: Vec::new() });
             } else if self.at(TokenKind::LBracket) {
                 // Peek after the balanced bracket
@@ -1019,6 +1321,20 @@ impl Parser {
             TokenKind::OrFatArrow => Some((BinaryOp::OrFatArrow, 1, 2)),
             TokenKind::HashHash => Some((BinaryOp::HashHash, 28, 27)), // High precedence
             TokenKind::KwIff => Some((BinaryOp::Iff, 1, 2)),
+            // LRM §16.9 sequence operators. Low precedence (just above
+            // `|->`/`|=>`) so a property `a |-> (b throughout c)` parses
+            // the way the parens suggest. `intersect`/sequence-`and`/`or`
+            // bind tighter than `throughout`/`within`/`until`.
+            TokenKind::KwThroughout => Some((BinaryOp::Throughout, 2, 3)),
+            TokenKind::KwWithin => Some((BinaryOp::Within, 2, 3)),
+            TokenKind::KwUntil => Some((BinaryOp::Until, 2, 3)),
+            TokenKind::KwS_until => Some((BinaryOp::SUntil, 2, 3)),
+            TokenKind::KwIntersect => Some((BinaryOp::Intersect, 4, 5)),
+            // §16.9 sequence `and`/`or` — only inside a property/sequence body
+            // (the `in_sva_seq` flag), else `or` is an event-list separator and
+            // `and` a gate primitive. Bind just above intersect/below throughout.
+            TokenKind::KwAnd if self.in_sva_seq => Some((BinaryOp::SeqAnd, 4, 5)),
+            TokenKind::KwOr if self.in_sva_seq => Some((BinaryOp::SeqOr, 3, 4)),
             // Logical implication / equivalence (IEEE 1800-2017 Table
             // 11-2): lowest-precedence binary ops, below `||`, above the
             // ternary. `->` is right-associative.

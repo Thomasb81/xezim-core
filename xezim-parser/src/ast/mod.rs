@@ -69,4 +69,8 @@ pub enum Description {
     /// Resolved during elaboration: the wrapped instantiation is appended
     /// to the named target module's items.
     Bind(decl::BindDirective),
+    /// §18.5.1 compilation-unit-scope out-of-class constraint definition
+    /// `constraint ClassName::name { ... }`. Records that the class's
+    /// `extern constraint name;` has an external body.
+    OutOfClassConstraint { class_name: String, constraint_name: String },
 }

@@ -53,6 +53,12 @@ pub enum ExprKind {
     StreamOp { left_to_right: bool, slice_size: Option<Box<Expression>>, exprs: Vec<Expression> },
     /// Tagged union constructor: `tagged Name` or `tagged Name (expr)`.
     Tagged { tag: Identifier, inner: Option<Box<Expression>> },
+    /// LRM §16.5: SVA property body wrapped by a clocking event,
+    /// e.g. `@(posedge clk) a |=> b`. `clock` is the trigger; `body`
+    /// is the predicate. The executor evaluates this only at the
+    /// clocking event and tracks `|=>` / `##N` cycle-delay deferral
+    /// state across firings.
+    SvaClocked { clock: Box<Expression>, body: Box<Expression> },
 }
 
 #[derive(Debug, Clone)]
@@ -105,6 +111,10 @@ pub enum UnaryOp {
     Plus, Minus, LogNot, BitNot, BitAnd, BitNand, BitOr, BitNor, BitXor, BitXnor,
     PreIncr, PreDecr, PostIncr, PostDecr,
     HashHash,
+    /// LRM §16.12.6 — `s_eventually <expr>` (strong eventually).
+    /// `s_always <expr>` and friends use the same Unary encoding.
+    SEventually,
+    SAlways,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -120,6 +130,10 @@ pub enum BinaryOp {
     OrMinusArrow, OrFatArrow,
     HashHash,
     Iff,
+    /// LRM §16.9 sequence operators. `Throughout` (`expr throughout seq`),
+    /// `Within` (`seq1 within seq2`), `Intersect`, `SeqAnd`/`SeqOr`
+    /// (sequence `and`/`or`), `Until`/`SUntil` (`until`/`s_until`).
+    Throughout, Within, Intersect, SeqAnd, SeqOr, Until, SUntil,
 }
 
 #[derive(Clone)]

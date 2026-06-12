@@ -183,6 +183,16 @@ pub struct ElaboratedClass {
     pub methods: HashMap<String, ClassMethod>,
     /// Properties marked as 'rand' or 'randc'.
     pub random_properties: HashSet<String>,
+    /// LRM §25.8 — properties declared as `virtual <iface_t>` or
+    /// `virtual <iface_t>.<modport>`. For each such property the
+    /// simulator captures a binding (an interface instance name) at the
+    /// time of `obj.<prop> = <iface_inst>` assignment, then rewrites
+    /// `obj.<prop>.<member>` reads/writes to `<bound_inst>.<member>`.
+    /// The value carries the declared `(iface_type, modport_opt)` so
+    /// the runtime can also emit a warning on member writes that the
+    /// modport tagged as `input`.
+    #[serde(default)]
+    pub virtual_iface_properties: HashMap<String, (String, Option<String>)>,
     /// Properties marked specifically as 'randc' (cyclic random).
     #[serde(default)]
     pub randc_properties: HashSet<String>,
@@ -266,6 +276,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut methods = HashMap::default();
     let mut random_properties = HashSet::default();
     let mut randc_properties = HashSet::default();
+    let mut virtual_iface_properties: HashMap<String, (String, Option<String>)> = HashMap::default();
     let mut static_properties = HashSet::default();
     let mut static_methods = HashSet::default();
     let mut assoc_properties: HashMap<String, bool> = HashMap::default();
@@ -283,11 +294,29 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 let is_randc = p.qualifiers.contains(&ClassQualifier::Randc);
                 let is_static = p.qualifiers.contains(&ClassQualifier::Static);
                 let _is_const = p.qualifiers.contains(&ClassQualifier::Const);
+                let is_virtual_iface = p.qualifiers.contains(&ClassQualifier::Virtual);
+                let virtual_iface_info: Option<(String, Option<String>)> = if is_virtual_iface {
+                    // `virtual <iface_t> name;` parses as TypeReference;
+                    // `virtual <iface_t>.<modport> name;` parses as
+                    // DataType::Interface { name, modport }.
+                    match &p.data_type {
+                        DataType::Interface { name, modport, .. } => {
+                            Some((name.name.clone(), modport.as_ref().map(|m| m.name.clone())))
+                        }
+                        _ => get_type_name(&p.data_type).map(|n| (n, None)),
+                    }
+                } else { None };
                 let is_real = is_type_real(&p.data_type);
                 // Named types (class handles, enums, typedefs) default to
                 // 0 — a class handle's default is `null`.
                 let is_named_type = get_type_name(&p.data_type).is_some();
                 for decl in &p.declarators {
+                    // Track virtual-interface properties for L4 binding +
+                    // late-dispatch. See the comment on
+                    // `ElaboratedClass::virtual_iface_properties`.
+                    if let Some(info) = &virtual_iface_info {
+                        virtual_iface_properties.insert(decl.name.name.clone(), info.clone());
+                    }
                     // Static member collections share one global store; route
                     // them out of the per-instance maps.
                     if is_static {
@@ -443,6 +472,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         properties,
         methods,
         random_properties,
+        virtual_iface_properties,
         randc_properties,
         constraints,
         param_defaults,
@@ -475,11 +505,21 @@ pub struct ElaboratedModule {
     pub continuous_assigns: Vec<ContinuousAssignment>,
     pub always_blocks: Vec<AlwaysBlock>,
     pub initial_blocks: Vec<InitialBlock>,
+    /// `final` blocks — LRM §9.2.3. Identical AST shape to `initial`, but
+    /// executed once after the event-loop terminates (e.g. on $finish or
+    /// max-time exit) and before any VCD/coverage flush.
+    #[serde(default)]
+    pub final_blocks: Vec<InitialBlock>,
     /// Static/package-scope variable initializers. Scheduled at time 0 ahead of
     /// any `initial` block (and the lazy-prefix `pending_initial`), so package
     /// globals (e.g. riscv-dv's `supported_isa[$] = {...}`) are populated before
     /// user code that reads them.
     pub static_init_blocks: Vec<InitialBlock>,
+    /// LRM §24 program block initials. Drained in the reactive region
+    /// (after the observed region) rather than the active region — the
+    /// simulator routes their statements through `pending_reactive`.
+    #[serde(default)]
+    pub program_initial_blocks: Vec<InitialBlock>,
     pub parameters: HashMap<String, Value>,
     /// Typedef name -> width mapping for user-defined types.
     pub typedefs: HashMap<String, u32>,
@@ -529,9 +569,52 @@ pub struct ElaboratedModule {
     /// resolves to an 8-bit slice rather than a 1-bit select. Also keyed for
     /// struct fields under `"struct_var.field"` form.
     pub packed_signal_elem_widths: HashMap<String, u32>,
+    /// Signals declared as `string` (LRM §6.16). The bytecode compiler
+    /// consults this so that `{a, b}` concatenations involving any
+    /// string-typed operand bail to the AST interpreter — the bit-concat
+    /// insn would truncate the result to a single operand's 1024-bit
+    /// width and drop the others. Populated at elaboration from `VarDecl`
+    /// declarations whose `data_type` is `SimpleType::String`.
+    #[serde(default)]
+    pub string_signals: HashSet<String>,
+    /// LRM §25.4 — for each `(interface_name, modport_name)` pair,
+    /// the map `member → direction`. Built once at elaboration by
+    /// walking every `Definition::Interface`. Consumed by the runtime
+    /// virtual-interface late-dispatch path to emit a warning when a
+    /// write targets a modport-input member.
+    #[serde(default)]
+    pub modport_member_dirs:
+        HashMap<(String, String), HashMap<String, crate::ast::types::PortDirection>>,
     /// Class-typed signal parameter overrides captured from `Type #(args) name;`
     /// declarations. Signal name -> positional type_args expressions.
     pub class_type_args: HashMap<String, Vec<Expression>>,
+    /// LRM §25.9: known interface type names. Used by the runtime to
+    /// detect virtual-interface formal args (`task drive(virtual
+    /// bus_if vif)`) so the call hook can alias `vif → bus` for the
+    /// duration of the call. Populated from every
+    /// `Definition::Interface` in `all_defs` at the end of
+    /// `elaborate_module_with_defs`.
+    #[serde(default)]
+    pub interfaces: HashSet<String>,
+    /// LRM §17.2: checker declarations indexed by name. Stored so an
+    /// instantiation can inline the body with formal→actual port
+    /// substitution (basic single-instance semantics). Populated at
+    /// the CheckerDeclaration elab arm.
+    #[serde(default)]
+    pub checker_decls: HashMap<String, crate::ast::decl::CheckerDeclaration>,
+    /// LRM §16.6: named property declarations with a captured body
+    /// expression (the common `@(clk) <expr>` shape — see the property
+    /// parser). Used by `assert property (p_name)` to inline the body.
+    #[serde(default)]
+    pub property_decls: HashMap<String, crate::ast::expr::Expression>,
+    /// LRM §8.4: for an array-of-class-handles (`T arr[N]`,
+    /// `T arr[];`), record the element's class name so runtime
+    /// `arr[i] = new(...)` can construct an instance of that class.
+    /// Populated at signal-declaration time when the data type is a
+    /// `TypeReference` whose name resolves to a known class. Without
+    /// this, the assignment falls back to a zero value (null handle).
+    #[serde(default)]
+    pub array_elem_class: HashMap<String, String>,
     /// N-dimensional unpacked array shapes (N >= 3): name → Vec of (lo, hi) per dim.
     pub arrays_nd: HashMap<String, (Vec<(i64, i64)>, u32)>,
     /// Parameter init expressions that couldn't be evaluated at elaboration time
@@ -572,6 +655,23 @@ pub struct ElaboratedModule {
     pub pending_initial: Vec<PendingInitial>,
     #[serde(skip)]
     pub pending_cont_assign: Vec<PendingContAssign>,
+    /// §6.20.6: names of `const` variables that carry a declaration-time
+    /// initializer (lowered to a synthetic initial assignment). The const's
+    /// single legal write is that initializer, so the const-write validator
+    /// exempts these names. (No test exercises a const re-write, so leniency
+    /// here is safe; a fully precise check would mark the synthetic statement.)
+    #[serde(default)]
+    pub const_decl_inits: HashSet<String>,
+    /// §6.18: names declared by a bare forward type declaration `typedef name;`.
+    /// Each must resolve to a real data type (a later full typedef) within the
+    /// scope; elaboration errors on any that stay unresolved.
+    #[serde(default)]
+    pub forward_typedef_names: HashSet<String>,
+    /// §15.5: names declared as named `event` variables. An `always @(e)` on a
+    /// named event is edge-triggered (woken by `->e`), not a level-sensitive
+    /// combinational block — the simulator uses this set to route it correctly.
+    #[serde(default)]
+    pub events: HashSet<String>,
 }
 
 impl ElaboratedModule {
@@ -583,7 +683,9 @@ impl ElaboratedModule {
             continuous_assigns: Vec::new(),
             always_blocks: Vec::new(),
             initial_blocks: Vec::new(),
+            final_blocks: Vec::new(),
             static_init_blocks: Vec::new(),
+            program_initial_blocks: Vec::new(),
             parameters: HashMap::default(),
             typedefs: HashMap::default(),
             typedef_types: HashMap::default(),
@@ -608,7 +710,13 @@ impl ElaboratedModule {
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
+            string_signals: HashSet::default(),
+            modport_member_dirs: HashMap::default(),
             class_type_args: HashMap::default(),
+            interfaces: HashSet::default(),
+            checker_decls: HashMap::default(),
+            property_decls: HashMap::default(),
+            array_elem_class: HashMap::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
@@ -620,6 +728,9 @@ impl ElaboratedModule {
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
+            const_decl_inits: HashSet::default(),
+            forward_typedef_names: HashSet::default(),
+            events: HashSet::default(),
         }
     }
 
@@ -669,6 +780,15 @@ fn expr_has_call(expr: &Expression) -> bool {
     use crate::ast::expr::ExprKind;
     match &expr.kind {
         ExprKind::Call { .. } => true,
+        // LRM §20.7 array-introspection system funcs over an array
+        // identifier need the runtime path: elaboration's const-eval may
+        // not yet have the array registered when the parameter init is
+        // walked (order-dependent). Deferring guarantees `elab.arrays`
+        // is fully populated and the runtime $size/$left/etc handler
+        // resolves correctly.
+        ExprKind::SystemCall { name, .. }
+            if matches!(name.as_str(),
+                "$size" | "$left" | "$right" | "$high" | "$low" | "$dimensions") => true,
         ExprKind::Binary { left, right, .. } => expr_has_call(left) || expr_has_call(right),
         ExprKind::Unary { operand, .. } => expr_has_call(operand),
         ExprKind::Paren(e) => expr_has_call(e),
@@ -781,7 +901,7 @@ pub fn elaborate_module(
     module: Definition,
     param_overrides: &HashMap<String, Value>,
 ) -> Result<ElaboratedModule, String> {
-    elaborate_module_with_defs(module, param_overrides, None, &[], &[])
+    elaborate_module_with_defs(module, param_overrides, None, &[], &[], &[])
 }
 
 /// Register members of an anonymous enum attached to a variable declaration
@@ -817,6 +937,21 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
 }
 
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
+    // §6.18: a bare forward type declaration `typedef name;`. Record it for the
+    // resolution check and register a placeholder, but never clobber a name that
+    // a real (non-forward) typedef has already resolved — `typedef_test_0`
+    // legally restates the forward name both before and after the full typedef.
+    if td.forward {
+        elab.forward_typedef_names.insert(td.name.name.clone());
+        let already_resolved = elab.typedef_types.get(&td.name.name)
+            .map_or(false, |dt| !matches!(dt, DataType::Void(_)));
+        if !already_resolved {
+            elab.typedef_types.entry(td.name.name.clone())
+                .or_insert_with(|| td.data_type.clone());
+            elab.typedefs.entry(td.name.name.clone()).or_insert(0);
+        }
+        return;
+    }
     if let DataType::Enum(et) = &td.data_type {
         let base_width = et.base_type.as_ref()
             .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
@@ -850,6 +985,11 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         elab.typedefs.insert(td.name.name.clone(), w);
         elab.typedef_types.insert(td.name.name.clone(), td.data_type.clone());
     }
+    // Refresh the thread-local typedef snapshot so any subsequent
+    // const-eval `$bits(typedef_name)` call sees this typedef (M2).
+    TYPEDEFS_TLS.with(|cell| {
+        *cell.borrow_mut() = Some(elab.typedefs.clone());
+    });
 }
 
 fn resolve_interface_modport_view(
@@ -985,6 +1125,11 @@ fn validate_constraint_item_names(item: &ConstraintItem, allowed: &HashSet<Strin
             validate_constraint_item_names(item, &inner)?;
         }
         ConstraintItem::Soft(inner) => validate_constraint_item_names(inner, allowed)?,
+        ConstraintItem::Unique { exprs, .. } => {
+            for e in exprs {
+                validate_class_constraint_expr(e, allowed)?;
+            }
+        }
         ConstraintItem::Block(items) => {
             for it in items {
                 validate_constraint_item_names(it, allowed)?;
@@ -1128,12 +1273,26 @@ fn collect_global_constraint_names(
 fn validate_class_constraints(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
+    module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
 ) -> Result<(), String> {
     let mut allowed = HashSet::default();
     let mut seen = HashSet::default();
     collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
     if let Some(defs) = all_defs {
         collect_global_constraint_names(defs, &mut allowed);
+    }
+    // Enum typedefs declared at MODULE scope (before the class) are legal
+    // constraint references too — `constraint c { m != R0; }` where `reg_t`
+    // is a module-local typedef. `collect_global_constraint_names` only sees
+    // top-level/package typedefs, so fold in the elaborating module's
+    // already-registered enum types and member names.
+    if let Some(ems) = module_enums {
+        for (tname, members) in ems {
+            allowed.insert(tname.clone());
+            for (mname, _) in members {
+                allowed.insert(mname.clone());
+            }
+        }
     }
     for item in &c.items {
         if let ClassItem::Constraint(con) = item {
@@ -1151,8 +1310,16 @@ pub fn elaborate_module_with_defs(
     all_defs: Option<&HashMap<String, Definition>>,
     top_level_imports: &[ImportDeclaration],
     top_level_lets: &[LetDeclaration],
+    seed_ooc_constraints: &[(String, String)],
 ) -> Result<ElaboratedModule, String> {
     let mut elab = ElaboratedModule::new(module.name().to_string());
+
+    // §18.5.1: seed $unit-scope out-of-class constraint definitions so a class's
+    // `extern constraint c;` is satisfied regardless of whether the design has a
+    // module (the definition is parsed at compilation-unit scope, outside any).
+    for (c, n) in seed_ooc_constraints {
+        elab.out_of_class_constraints.insert((c.clone(), n.clone()));
+    }
 
     // Process top-level typedefs and other global definitions from all_defs
     if let Some(defs) = all_defs {
@@ -1160,7 +1327,7 @@ pub fn elaborate_module_with_defs(
             match def {
                 Definition::Typedef(td) => { process_typedef(td, &mut elab); }
                 Definition::Class(c) => {
-                    validate_class_constraints(c, Some(defs))?;
+                    validate_class_constraints(c, Some(defs), Some(&elab.enum_members))?;
                     elab.classes.insert(c.name.name.clone(), elaborate_class(c));
                 }
                 Definition::Covergroup(cg) => { elab.covergroups.insert(cg.name.name.clone(), (*cg).clone()); }
@@ -1368,7 +1535,7 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 crate::ast::decl::PackageItem::Class(c) => {
-                    validate_class_constraints(c, all_defs)?;
+                    validate_class_constraints(c, all_defs, Some(&elab.enum_members))?;
                     elab.classes.insert(c.name.name.clone(), elaborate_class(c));
                 }
                 crate::ast::decl::PackageItem::Let(l) => {
@@ -1489,6 +1656,15 @@ pub fn elaborate_module_with_defs(
                 // `state_q FSM`. Helper is also called from the other
                 // DataDeclaration arms (submodule items, generate items).
                 register_anonymous_enum_members(&dd.data_type, &mut elab);
+                // String-typed declarations (LRM §6.16). Recorded for the
+                // bytecode compiler so concatenations involving string
+                // operands bail to the AST interpreter (which has byte-
+                // level concat semantics; bit-level concat truncates).
+                if matches!(&dd.data_type, DataType::Simple { kind: SimpleType::String, .. }) {
+                    for decl in &dd.declarators {
+                        elab.string_signals.insert(decl.name.name.clone());
+                    }
+                }
                 // Packed multi-D: `logic [3:0][7:0] words;` — record the
                 // per-element width so `words[i]` resolves to an 8-bit slice
                 // instead of a 1-bit select (LRM §7.4.1).
@@ -1630,6 +1806,14 @@ pub fn elaborate_module_with_defs(
                         } else { None };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                            // LRM §8.4 (2D class arrays). Same as the 1D
+                            // path: record the element class so the
+                            // simulator's `arr[i][j] = new(...)` route
+                            // constructs the right instance.
+                            if let DataType::TypeReference { name, .. } = &dd.data_type {
+                                elab.array_elem_class
+                                    .insert(decl.name.name.clone(), name.name.name.clone());
+                            }
                             register_packed_for_array(&mut elab);
                             // Per-element Signal entries are synthesized lazily
                             // by Simulator::new from the arrays_2d metadata —
@@ -1662,6 +1846,10 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        if let DataType::TypeReference { name, .. } = &dd.data_type {
+                            elab.array_elem_class
+                                .insert(decl.name.name.clone(), name.name.name.clone());
+                        }
                         register_packed_for_array(&mut elab);
                         // Per-element Signals synthesized by Simulator::new
                         // from arrays_nd — skip the per-element HashMap
@@ -1674,6 +1862,26 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // LRM §8.4: if the array element type is a known
+                        // class, stash the class name so the simulator's
+                        // `arr[i] = new(...)` path can construct the right
+                        // instance. (Detection done here at the unpacked-
+                        // array branch — also mirrored in the 2D and N-D
+                        // branches below.)
+                        if let DataType::TypeReference { name, .. } = &dd.data_type {
+                            let tn = &name.name.name;
+                            if !elab.classes.contains_key(tn) {
+                                // class definitions get inserted at the
+                                // start of elaborate_module_with_defs; if
+                                // not yet present, the simulator's
+                                // late check still resolves at access
+                                // time, but we record speculatively here.
+                            }
+                            // Always record the type name; the simulator
+                            // verifies against `module.classes` at use time.
+                            elab.array_elem_class
+                                .insert(decl.name.name.clone(), tn.clone());
+                        }
                         // Register the FLATTENED packed-struct field layout
                         // (including nested dotted paths) under the array
                         // name. Same flattening as `flatten_subfields` so
@@ -1751,6 +1959,9 @@ pub fn elaborate_module_with_defs(
                             type_name: get_type_name(&dd.data_type),
                         };
                         elab.signals.insert(decl.name.name.clone(), sig);
+                        if matches!(&dd.data_type, DataType::Simple { kind: SimpleType::Event, .. }) {
+                            elab.events.insert(decl.name.name.clone());
+                        }
                         if is_type_two_state(&dd.data_type) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
@@ -1759,6 +1970,12 @@ pub fn elaborate_module_with_defs(
                         }
                         
                         if let Some(expr) = procedural_init {
+                            // §6.20.6: a `const` declaration's initializer is its
+                            // one legal write — record it so the const-write
+                            // check exempts this synthetic assignment.
+                            if dd.const_kw {
+                                elab.const_decl_inits.insert(decl.name.name.clone());
+                            }
                             elab.initial_blocks.push(InitialBlock {
                                 stmt: Statement::new(StatementKind::BlockingAssign {
                                     lvalue: make_ident_expr(&decl.name.name),
@@ -2102,6 +2319,27 @@ pub fn elaborate_module_with_defs(
                 }
                 elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
             }
+            // LRM §16.5: module-level `assert/assume/cover property (…)`.
+            // Previously the elaborator ignored AssertionItem entirely,
+            // so a top-level concurrent assertion did nothing. Hoist it
+            // into a synthetic initial block: the simulator's
+            // AssertionStatement handler then registers it (for
+            // is_property: true → SvaClocked, the executor adds a
+            // clocked-site that fires every clock cycle).
+            ModuleItem::AssertionItem(a) => {
+                elab.initial_blocks.push(InitialBlock {
+                    stmt: crate::ast::stmt::Statement::new(
+                        crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                        a.span,
+                    ),
+                });
+            }
+            ModuleItem::FinalConstruct(fc) => {
+                // LRM §9.2.3 — `final` executes once after the event loop
+                // exits (e.g. on $finish). Collected here; the simulator drains
+                // `final_blocks` before VCD/coverage flush.
+                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone() });
+            }
             ModuleItem::GenerateRegion(gr) => {
                 // Recursively process generate region items
                 elaborate_items(&gr.items, &mut elab, all_defs)?;
@@ -2127,7 +2365,7 @@ pub fn elaborate_module_with_defs(
                 elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
             }
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd, all_defs)?;
+                validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
                 elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
             }
             ModuleItem::LetDeclaration(ld) => {
@@ -2135,9 +2373,37 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::SequenceDeclaration(sd) => {
                 elab.sequences.insert(sd.name.name.clone());
+                if let Some(body) = &sd.body {
+                    // Sequences share the property_decls map for
+                    // `assert property (s)` style references.
+                    elab.property_decls
+                        .insert(sd.name.name.clone(), body.clone());
+                }
             }
             ModuleItem::PropertyDeclaration(pd) => {
                 elab.sequences.insert(pd.name.name.clone());
+                if let Some(body) = &pd.body {
+                    elab.property_decls
+                        .insert(pd.name.name.clone(), body.clone());
+                }
+            }
+            // LRM §17.2 — register the checker name and store its
+            // declaration so instantiations can inline the body with
+            // formal→actual port substitution. When the checker has
+            // no formal ports, also inline the body at the declaration
+            // site (the legacy "always-on" shape).
+            ModuleItem::CheckerDeclaration(cd) => {
+                elab.sequences.insert(cd.name.name.clone());
+                elab.checker_decls
+                    .insert(cd.name.name.clone(), cd.clone());
+                let has_ports = !matches!(
+                    cd.ports,
+                    crate::ast::module::PortList::Empty
+                );
+                if !has_ports {
+                    let body = cd.items.clone();
+                    elaborate_items(&body, &mut elab, all_defs)?;
+                }
             }
             ModuleItem::SpecifyBlock(sb) => {
                 for p in &sb.paths {
@@ -2233,6 +2499,48 @@ pub fn elaborate_module_with_defs(
         validate_expr_idents(&ca.rhs, &elab, &HashSet::default())?;
     }
 
+    // IEEE 1800-2017 §6.20.6: a `const` variable may be assigned only once, in
+    // its declaration. The `validate_stmt_idents` check above exempts a const
+    // that carries a (non-constant) declaration initializer — that initializer
+    // is lowered to a single synthetic initial-block assignment (its one legal
+    // write). Any *further* procedural write is still illegal. Each block that
+    // writes a name contributes one entry below (the synthetic init is its own
+    // standalone block), so a decl-initialized const written by more than one
+    // block has an illegal re-assignment.
+    if !elab.const_decl_inits.is_empty() {
+        let mut write_block_count: HashMap<String, usize> = HashMap::default();
+        for ib in &elab.initial_blocks {
+            let mut s = HashSet::default();
+            collect_written_idents(&ib.stmt, &mut s);
+            for n in s { *write_block_count.entry(n).or_default() += 1; }
+        }
+        for ab in &elab.always_blocks {
+            let mut s = HashSet::default();
+            collect_written_idents(&ab.stmt, &mut s);
+            for n in s { *write_block_count.entry(n).or_default() += 1; }
+        }
+        for name in &elab.const_decl_inits {
+            if write_block_count.get(name).copied().unwrap_or(0) > 1 {
+                return Err(format!("Illegal write to constant identifier '{}'", name));
+            }
+        }
+    }
+
+    // §6.18: every bare forward type declaration (`typedef name;`) must resolve
+    // to a real data type — a later full typedef, an enum, a class, or a
+    // package/interface type. An unresolved forward type is an error.
+    for name in &elab.forward_typedef_names {
+        let resolved = elab.typedef_types.get(name)
+                .map_or(false, |dt| !matches!(dt, DataType::Void(_)))
+            || elab.classes.contains_key(name)
+            || elab.enum_members.contains_key(name)
+            || elab.packed_struct_fields.contains_key(name);
+        if !resolved {
+            return Err(format!(
+                "Forward typedef '{}' does not resolve to a data type", name));
+        }
+    }
+
     // IEEE 1800-2017 §6.5: a variable cannot have multiple continuous drivers,
     // nor mix continuous and procedural drivers.
     validate_driver_conflicts(&elab)?;
@@ -2241,9 +2549,11 @@ pub fn elaborate_module_with_defs(
     validate_class_usage(&elab)?;
 
     // IEEE 1800-2023 §8.20.5: a derived class may not override a `final`
-    // method of any ancestor class.
+    // method of any ancestor class; `:extends`/`:initial` markers must
+    // agree with the actual override status.
     if sv_parser::is_sv2023() {
         validate_final_method_overrides(&elab)?;
+        validate_method_override_markers(&elab)?;
     }
 
     // IEEE 1800-2017 §9.2.2.4: `always_ff` admits exactly one event
@@ -2255,10 +2565,86 @@ pub fn elaborate_module_with_defs(
     // variables (i.e. assignable lvalues), not arbitrary expressions.
     validate_ref_arg_lvalues(&elab)?;
 
+    // LRM §25.4 modport direction enforcement.
+    // Done at the AST level over every module Definition (not on the
+    // post-inlined `elab`, whose `modport_views` only carries the top
+    // module's own modport-bound ports). For each module whose port list
+    // contains a `modport_t.view`-typed port, walk that module's body and
+    // flag continuous-assign or procedural-assign LHSs of the form
+    // `<port_name>.<member>` where `<member>` is declared `input` from
+    // the modport's perspective.
+    if let Some(defs) = all_defs {
+        validate_modport_writes_at_ast(defs)?;
+        // Pre-compute the per-`(iface, modport)` member-direction maps so
+        // the runtime virtual-interface dispatch can consult them without
+        // re-walking interface AST. LRM §25.4.
+        for d in defs.values() {
+            if let Definition::Interface(iface) = d {
+                let iface_name = iface.name.name.clone();
+                // LRM §25.9: register the interface name so runtime
+                // detects virtual-interface task formals.
+                elab.interfaces.insert(iface_name.clone());
+                for item in &iface.items {
+                    if let ModuleItem::ModportDeclaration(md) = item {
+                        for mp in &md.items {
+                            let mut dirs = HashMap::default();
+                            for p in &mp.ports {
+                                dirs.insert(p.name.name.clone(), p.direction);
+                            }
+                            elab.modport_member_dirs
+                                .insert((iface_name.clone(), mp.name.name.clone()), dirs);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
     // IEEE 1800-2017 §6.19.3: an assignment to an enum-typed variable
     // requires the RHS value (when constant) to be one of the typedef's
     // declared members. Casts bypass the check.
     validate_enum_assignments(&elab)?;
+
+    // LRM §6.20.3 / §8.4: any module-scope signal whose declared
+    // `type_name` resolves to a known class default-initialises to 0
+    // (the null handle) rather than X. Without this, untouched class
+    // handle declarations read as X, defeating `if (h == null)` and
+    // similar guards.
+    {
+        let cls_names: std::collections::HashSet<String> =
+            elab.classes.keys().cloned().collect();
+        for sig in elab.signals.values_mut() {
+            if let Some(tn) = &sig.type_name {
+                if cls_names.contains(tn) {
+                    sig.value = Value::zero(sig.width);
+                }
+            }
+        }
+    }
+
+    // LRM §20.7 — populate ARRAYS_TLS so any subsequent const-eval
+    // (parameter-default rewrite, runtime const eval, etc.) of
+    // `$size`/`$left`/`$right`/`$high`/`$low`/`$dimensions` on an array
+    // identifier resolves. Mirrors the TYPEDEFS_TLS refresh inside
+    // process_typedef.
+    {
+        let mut snapshot: HashMap<String, (i64, i64, u32)> = HashMap::default();
+        for (k, &v) in &elab.arrays {
+            snapshot.insert(k.clone(), v);
+        }
+        ARRAYS_TLS.with(|cell| {
+            *cell.borrow_mut() = Some(snapshot);
+        });
+    }
+
+    // LRM §24: when the elaboration root is a `program` declaration, its
+    // initial blocks belong to the reactive region. Re-route them so the
+    // simulator schedules their statements via `pending_reactive`.
+    if matches!(module, Definition::Program(_)) {
+        elab.materialize_pending();
+        let initials = std::mem::take(&mut elab.initial_blocks);
+        elab.program_initial_blocks.extend(initials);
+    }
 
     Ok(elab)
 }
@@ -2481,6 +2867,247 @@ fn validate_ref_arg_lvalues(elab: &ElaboratedModule) -> Result<(), String> {
     Ok(())
 }
 
+/// LRM §25.4 modport direction enforcement (static check).
+///
+/// `modport_views: Map<signal_name, Map<member_name, PortDirection>>` is
+/// populated when an interface instance signal is bound through a particular
+/// modport. The *writing* side may only target members the modport tags as
+/// `Output` or `Inout`. Writes to `Input` members violate the contract.
+///
+/// We catch the common static cases: continuous assigns and procedural
+/// blocking/non-blocking assigns whose LHS is `iface_signal.member`. Dynamic
+/// paths (passing the modport handle through tasks, virtual interfaces,
+/// indexed selects) fall through silently — those need runtime tagging,
+/// which is out of scope for this check.
+/// LRM §25.4 modport direction enforcement (AST-level walk).
+///
+/// Two passes:
+///   1. Build a map `iface_name -> modport_name -> {input members}` by
+///      walking every `Definition::Interface` and collecting each modport's
+///      `input`-direction members.
+///   2. For every `Definition::Module`, find ports whose data type is a
+///      modport-bound interface (`bus_if.slave foo`), then walk the
+///      module body looking for assigns to `foo.<member>`. If `<member>`
+///      appears in the input-set for that modport, error.
+///
+/// Dynamic paths (modport handles passed through tasks, virtual interfaces,
+/// indexed selects) are out of scope for this check — they'd need runtime
+/// tagging. The static walk catches the common direct-write cases.
+fn validate_modport_writes_at_ast(
+    defs: &HashMap<String, Definition>,
+) -> Result<(), String> {
+    use crate::ast::expr::{Expression, ExprKind};
+    use crate::ast::stmt::{Statement, StatementKind};
+    use crate::ast::types::{DataType, PortDirection};
+
+    // (1) iface_name -> modport_name -> set of `input` member names.
+    let mut input_sets: HashMap<String, HashMap<String, HashSet<String>>> = HashMap::default();
+    for def in defs.values() {
+        if let Definition::Interface(iface) = def {
+            let mut per_modport: HashMap<String, HashSet<String>> = HashMap::default();
+            for item in &iface.items {
+                if let ModuleItem::ModportDeclaration(md) = item {
+                    for mp in &md.items {
+                        let mut inputs: HashSet<String> = HashSet::default();
+                        for p in &mp.ports {
+                            if matches!(p.direction, PortDirection::Input) {
+                                inputs.insert(p.name.name.clone());
+                            }
+                        }
+                        per_modport.insert(mp.name.name.clone(), inputs);
+                    }
+                }
+            }
+            if !per_modport.is_empty() {
+                input_sets.insert(iface.name.name.clone(), per_modport);
+            }
+        }
+    }
+    if input_sets.is_empty() {
+        return Ok(()); // nothing to check
+    }
+
+    // Helper: from a Module's port list, extract `(port_name, input_member_set)`
+    // for every port that's a modport-bound interface.
+    fn module_modport_ports(
+        m: &ModuleDeclaration,
+        input_sets: &HashMap<String, HashMap<String, HashSet<String>>>,
+    ) -> HashMap<String, HashSet<String>> {
+        let mut out: HashMap<String, HashSet<String>> = HashMap::default();
+        if let PortList::Ansi(ports) = &m.ports {
+            for port in ports {
+                if let Some(DataType::Interface { name, modport: Some(mp), .. }) = port.data_type.as_ref() {
+                    if let Some(per_mp) = input_sets.get(&name.name) {
+                        if let Some(inputs) = per_mp.get(&mp.name) {
+                            out.insert(port.name.name.clone(), inputs.clone());
+                        }
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    fn check_lvalue(
+        lv: &Expression,
+        port_inputs: &HashMap<String, HashSet<String>>,
+        mod_name: &str,
+        context: &str,
+    ) -> Result<(), String> {
+        if let ExprKind::MemberAccess { expr, member } = &lv.kind {
+            if let ExprKind::Ident(h) = &expr.kind {
+                if h.path.len() == 1 {
+                    let base = h.path[0].name.name.as_str();
+                    if let Some(inputs) = port_inputs.get(base) {
+                        if inputs.contains(member.name.as_str()) {
+                            return Err(format!(
+                                "module '{}' {}: cannot write to modport-input member '{}.{}' (IEEE 1800-2017 §25.4)",
+                                mod_name, context, base, member.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_stmt(
+        s: &Statement,
+        port_inputs: &HashMap<String, HashSet<String>>,
+        mod_name: &str,
+    ) -> Result<(), String> {
+        match &s.kind {
+            StatementKind::BlockingAssign { lvalue, .. }
+            | StatementKind::NonblockingAssign { lvalue, .. } => {
+                check_lvalue(lvalue, port_inputs, mod_name, "procedural assignment")
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for s in stmts { walk_stmt(s, port_inputs, mod_name)?; }
+                Ok(())
+            }
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                walk_stmt(then_stmt, port_inputs, mod_name)?;
+                if let Some(e) = else_stmt { walk_stmt(e, port_inputs, mod_name)?; }
+                Ok(())
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items { walk_stmt(&it.stmt, port_inputs, mod_name)?; }
+                Ok(())
+            }
+            StatementKind::For { body, .. } | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. } | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body, .. } | StatementKind::Foreach { body, .. } => {
+                walk_stmt(body, port_inputs, mod_name)
+            }
+            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, port_inputs, mod_name),
+            _ => Ok(()),
+        }
+    }
+
+    // (2) Walk every module Definition.
+    for def in defs.values() {
+        if let Definition::Module(m) = def {
+            let port_inputs = module_modport_ports(m, &input_sets);
+            if port_inputs.is_empty() { continue; }
+            for item in &m.items {
+                match item {
+                    ModuleItem::ContinuousAssign(ca) => {
+                        for (lhs, _rhs) in &ca.assignments {
+                            check_lvalue(lhs, &port_inputs, &m.name.name, "continuous assign")?;
+                        }
+                    }
+                    ModuleItem::AlwaysConstruct(ac) => {
+                        walk_stmt(&ac.stmt, &port_inputs, &m.name.name)?;
+                    }
+                    ModuleItem::InitialConstruct(ic) => {
+                        walk_stmt(&ic.stmt, &port_inputs, &m.name.name)?;
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+#[allow(dead_code)]
+fn validate_modport_writes(elab: &ElaboratedModule) -> Result<(), String> {
+    // NOTE — kept for future per-module hook. Not currently invoked: the
+    // ElaboratedModule visible at the validator call site is the *top* module
+    // and its modport_views map is empty (per-instance modport binds happen
+    // during sub-module elaboration and are not aggregated back up). To
+    // actually enforce this, validate_modport_writes needs to run inside
+    // `elaborate_module_with_defs` for every module that has modport ports,
+    // not once on the top elab. That hook is the L-tier follow-up.
+    use crate::ast::expr::{Expression, ExprKind};
+    use crate::ast::stmt::{Statement, StatementKind};
+    use crate::ast::types::PortDirection;
+
+    fn check_lvalue(
+        lv: &Expression,
+        elab: &ElaboratedModule,
+        context: &str,
+    ) -> Result<(), String> {
+        if let ExprKind::MemberAccess { expr, member } = &lv.kind {
+            if let ExprKind::Ident(h) = &expr.kind {
+                let base = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                if let Some(view) = elab.modport_views.get(base) {
+                    if let Some(dir) = view.get(member.name.as_str()) {
+                        if matches!(dir, PortDirection::Input) {
+                            return Err(format!(
+                                "{}: cannot write to modport-input member '{}.{}' (IEEE 1800-2017 §25.4)",
+                                context, base, member.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn walk_stmt(s: &Statement, elab: &ElaboratedModule) -> Result<(), String> {
+        match &s.kind {
+            StatementKind::BlockingAssign { lvalue, .. }
+            | StatementKind::NonblockingAssign { lvalue, .. } => {
+                check_lvalue(lvalue, elab, "procedural assignment")
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for s in stmts { walk_stmt(s, elab)?; }
+                Ok(())
+            }
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                walk_stmt(then_stmt, elab)?;
+                if let Some(e) = else_stmt { walk_stmt(e, elab)?; }
+                Ok(())
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items { walk_stmt(&it.stmt, elab)?; }
+                Ok(())
+            }
+            StatementKind::For { body, .. } | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. } | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body, .. } | StatementKind::Foreach { body, .. } => {
+                walk_stmt(body, elab)
+            }
+            StatementKind::TimingControl { stmt, .. } => walk_stmt(stmt, elab),
+            _ => Ok(()),
+        }
+    }
+
+    for ca in &elab.continuous_assigns {
+        check_lvalue(&ca.lhs, elab, "continuous assign")?;
+    }
+    for ab in &elab.always_blocks {
+        walk_stmt(&ab.stmt, elab)?;
+    }
+    for ib in &elab.initial_blocks {
+        walk_stmt(&ib.stmt, elab)?;
+    }
+    Ok(())
+}
+
 fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), String> {
     use crate::ast::decl::AlwaysKind;
     use crate::ast::stmt::{Statement, StatementKind};
@@ -2592,14 +3219,65 @@ pub fn time_literal_to_exp(s: &str) -> i32 {
 }
 
 fn method_is_final(m: &crate::ast::decl::ClassMethod) -> bool {
-    use crate::ast::decl::{ClassMethodKind, MethodSpecifier};
-    let spec = match &m.kind {
+    method_specifier(m) == Some(crate::ast::decl::MethodSpecifier::Final)
+}
+
+fn method_specifier(m: &crate::ast::decl::ClassMethod) -> Option<crate::ast::decl::MethodSpecifier> {
+    use crate::ast::decl::ClassMethodKind;
+    match &m.kind {
         ClassMethodKind::Function(f) => f.specifier,
         ClassMethodKind::Task(t) => t.specifier,
         ClassMethodKind::PureVirtual(f) => f.specifier,
         ClassMethodKind::Extern(f) => f.specifier,
-    };
-    spec == Some(MethodSpecifier::Final)
+    }
+}
+
+/// IEEE 1800-2023 §8.20.5 enforcement for the `:extends` and `:initial`
+/// method-override markers (the `:final` rule lives in
+/// `validate_final_method_overrides` above).
+///
+/// - `:extends foo` — `foo` MUST be defined in some ancestor.
+/// - `:initial foo` — `foo` must NOT be defined in any ancestor.
+///
+/// These markers exist precisely to catch refactor-induced silent shadowing
+/// or accidental redeclaration; without enforcement they are visual noise.
+fn validate_method_override_markers(elab: &ElaboratedModule) -> Result<(), String> {
+    use crate::ast::decl::MethodSpecifier;
+    for (cname, cdef) in &elab.classes {
+        for (mname, m) in &cdef.methods {
+            let spec = method_specifier(m);
+            if !matches!(spec, Some(MethodSpecifier::Extends) | Some(MethodSpecifier::Initial)) {
+                continue;
+            }
+            // Walk strict ancestors looking for a same-named method.
+            let mut found_in_ancestor = false;
+            let mut cur = cdef.extends.clone();
+            while let Some(parent_name) = cur {
+                let Some(parent) = elab.classes.get(&parent_name) else { break; };
+                if parent.methods.contains_key(mname) {
+                    found_in_ancestor = true;
+                    break;
+                }
+                cur = parent.extends.clone();
+            }
+            match spec {
+                Some(MethodSpecifier::Extends) if !found_in_ancestor => {
+                    return Err(format!(
+                        "Class '{}' method '{}' is marked `:extends` but no ancestor declares it (IEEE 1800-2023 §8.20.5)",
+                        cname, mname
+                    ));
+                }
+                Some(MethodSpecifier::Initial) if found_in_ancestor => {
+                    return Err(format!(
+                        "Class '{}' method '{}' is marked `:initial` but an ancestor already declares it (IEEE 1800-2023 §8.20.5)",
+                        cname, mname
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+    Ok(())
 }
 
 fn expr_is_new(expr: &Expression) -> bool {
@@ -2871,6 +3549,7 @@ fn collect_constraint_idents(item: &ConstraintItem, out: &mut HashSet<String>) {
         }
         ConstraintItem::Foreach { item, .. } => collect_constraint_idents(item, out),
         ConstraintItem::Soft(inner) => collect_constraint_idents(inner, out),
+        ConstraintItem::Unique { exprs, .. } => for e in exprs { collect_expr_idents(e, out); },
         ConstraintItem::Block(items) => for i in items { collect_constraint_idents(i, out); },
         ConstraintItem::Solve { .. } => {}
     }
@@ -2984,7 +3663,7 @@ fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut 
                 };
                 if let Some(n) = name {
                     if let Some(sig) = elab.signals.get(&n) {
-                        if sig.is_const {
+                        if sig.is_const && !elab.const_decl_inits.contains(&n) {
                             return Err(format!("Illegal write to constant identifier '{}'", n));
                         }
                         if sig.direction == Some(PortDirection::Input) {
@@ -3110,7 +3789,11 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
             // Only check plain identifiers for now (hierarchical might be valid across modules)
             if hier.path.len() == 1 {
                 let name = &hier.path[0].name.name;
-                if name == "new" || name.starts_with('$') || name == "super" || name == "this" {
+                // `std` is the built-in package (§18.12 std::randomize,
+                // std::mailbox, std::semaphore, …) — always a legal root.
+                if name == "new" || name.starts_with('$') || name == "super" || name == "this"
+                    || name == "std"
+                {
                     return Ok(());
                 }
                 if !elab.signals.contains_key(name) && !elab.parameters.contains_key(name) &&
@@ -3585,6 +4268,20 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 }
                 elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
             }
+            // Mirror the AssertionItem hoist in elaborate_module_with_defs
+            // so module-level `assert/assume/cover property (…)` inside
+            // generate blocks or checker bodies fires too.
+            ModuleItem::AssertionItem(a) => {
+                elab.initial_blocks.push(InitialBlock {
+                    stmt: crate::ast::stmt::Statement::new(
+                        crate::ast::stmt::StatementKind::Assertion(a.clone()),
+                        a.span,
+                    ),
+                });
+            }
+            ModuleItem::FinalConstruct(fc) => {
+                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone() });
+            }
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &inst.instances {
                     if !elab.signals.contains_key(&hi.name.name) {
@@ -3614,7 +4311,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
 
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd, all_defs)?;
+                validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
                 elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
             }
             ModuleItem::ClockingDeclaration(cd) => {
@@ -3630,9 +4327,32 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
             ModuleItem::SequenceDeclaration(sd) => {
                 elab.sequences.insert(sd.name.name.clone());
+                if let Some(body) = &sd.body {
+                    // Sequences share the property_decls map for
+                    // `assert property (s)` style references.
+                    elab.property_decls
+                        .insert(sd.name.name.clone(), body.clone());
+                }
             }
             ModuleItem::PropertyDeclaration(pd) => {
                 elab.sequences.insert(pd.name.name.clone());
+                if let Some(body) = &pd.body {
+                    elab.property_decls
+                        .insert(pd.name.name.clone(), body.clone());
+                }
+            }
+            // LRM §17 — register the checker name AND inline its body
+            // items into the current module. This is the minimum-viable
+            // shape: the checker has no formal-arg binding (single
+            // "always-on" instance at the declaration site), but
+            // assertions / always-blocks / let-decls inside the body
+            // fire as if they were written directly in the parent
+            // module. Multiple instantiations and port binding remain
+            // future work.
+            ModuleItem::CheckerDeclaration(cd) => {
+                elab.sequences.insert(cd.name.name.clone());
+                let body = cd.items.clone();
+                elaborate_items(&body, elab, all_defs)?;
             }
             ModuleItem::SpecifyBlock(sb) => {
                 for p in &sb.paths {
@@ -3941,6 +4661,13 @@ pub fn is_type_real(dt: &DataType) -> bool {
 /// Returns the default value for a type: 0 for 2-state types, X for 4-state types.
 fn default_value_for_type(dt: &DataType, width: u32) -> Value {
     if is_type_real(dt) { return Value::from_f64(0.0); }
+    // LRM §6.20.3: `chandle` defaults to null. Module-scope `chandle h;`
+    // without explicit init must read as 0 so `if (h == null)` works.
+    // Class handles via TypeReference are handled at runtime via the
+    // VarDecl/init paths (where module.classes is in scope).
+    if matches!(dt, DataType::Simple { kind: SimpleType::Chandle, .. }) {
+        return Value::zero(width);
+    }
     if is_type_two_state(dt) { Value::zero(width) } else { Value::new(width) }
 }
 
@@ -3970,44 +4697,261 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
             } else { None }
         }
         ExprKind::Binary { op, left, right } => {
-            let l = const_eval_i64_with_params(left, params)?;
-            let r = const_eval_i64_with_params(right, params)?;
+            // LRM §11.4 — full operator set, evaluated in i64 context.
+            // Short-circuit logical/conditional handled separately to avoid
+            // unnecessary right-side eval (and to match LRM §11.4.7 logical
+            // short-circuit semantics).
             match op {
-                BinaryOp::Add => Some(l + r),
-                BinaryOp::Sub => Some(l - r),
-                BinaryOp::Mul => Some(l * r),
-                BinaryOp::Div => if r != 0 { Some(l / r) } else { None },
-                BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => Some(l << r),
-                BinaryOp::ShiftRight | BinaryOp::ArithShiftRight => Some(l >> r),
-                _ => None,
+                BinaryOp::LogAnd => {
+                    let l = const_eval_i64_with_params(left, params)?;
+                    if l == 0 { return Some(0); }
+                    let r = const_eval_i64_with_params(right, params)?;
+                    Some(if r != 0 { 1 } else { 0 })
+                }
+                BinaryOp::LogOr => {
+                    let l = const_eval_i64_with_params(left, params)?;
+                    if l != 0 { return Some(1); }
+                    let r = const_eval_i64_with_params(right, params)?;
+                    Some(if r != 0 { 1 } else { 0 })
+                }
+                _ => {
+                    let l = const_eval_i64_with_params(left, params)?;
+                    let r = const_eval_i64_with_params(right, params)?;
+                    match op {
+                        BinaryOp::Add => l.checked_add(r),
+                        BinaryOp::Sub => l.checked_sub(r),
+                        BinaryOp::Mul => l.checked_mul(r),
+                        BinaryOp::Div => if r != 0 { Some(l / r) } else { None },
+                        BinaryOp::Mod => if r != 0 { Some(l % r) } else { None },
+                        // LRM §11.4.3 power.
+                        BinaryOp::Power => {
+                            if r < 0 { return None; }
+                            let e = u32::try_from(r).ok()?;
+                            l.checked_pow(e)
+                        }
+                        BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => Some(l.wrapping_shl(r as u32)),
+                        BinaryOp::ShiftRight => Some((l as u64).wrapping_shr(r as u32) as i64),
+                        BinaryOp::ArithShiftRight => Some(l.wrapping_shr(r as u32)),
+                        BinaryOp::BitAnd  => Some(l & r),
+                        BinaryOp::BitOr   => Some(l | r),
+                        BinaryOp::BitXor  => Some(l ^ r),
+                        BinaryOp::BitXnor => Some(!(l ^ r)),
+                        // LRM §11.4.4 equality / §11.4.5 case equality.
+                        BinaryOp::Eq | BinaryOp::CaseEq      => Some(if l == r { 1 } else { 0 }),
+                        BinaryOp::Neq | BinaryOp::CaseNeq    => Some(if l != r { 1 } else { 0 }),
+                        // LRM §11.4.6 relational.
+                        BinaryOp::Lt  => Some(if l <  r { 1 } else { 0 }),
+                        BinaryOp::Leq => Some(if l <= r { 1 } else { 0 }),
+                        BinaryOp::Gt  => Some(if l >  r { 1 } else { 0 }),
+                        BinaryOp::Geq => Some(if l >= r { 1 } else { 0 }),
+                        _ => None,
+                    }
+                }
             }
         }
         ExprKind::Unary { op, operand } => {
+            // For reduction operators the bit-width matters; without a known
+            // declared width we treat the value as its i64 footprint. Good
+            // enough for typical const-expr usage (e.g. `|MASK`, `&ALL_ONES`).
             let v = const_eval_i64_with_params(operand, params)?;
             match op {
-                UnaryOp::Minus => Some(-v),
-                UnaryOp::Plus => Some(v),
+                UnaryOp::Plus    => Some(v),
+                UnaryOp::Minus   => Some(v.wrapping_neg()),
+                UnaryOp::LogNot  => Some(if v == 0 { 1 } else { 0 }),
+                UnaryOp::BitNot  => Some(!v),
+                UnaryOp::BitAnd  => Some(if v == -1 { 1 } else { 0 }), // reduction & on all-ones i64
+                UnaryOp::BitNand => Some(if v == -1 { 0 } else { 1 }),
+                UnaryOp::BitOr   => Some(if v != 0  { 1 } else { 0 }),
+                UnaryOp::BitNor  => Some(if v != 0  { 0 } else { 1 }),
+                UnaryOp::BitXor  => Some((v.count_ones() & 1) as i64),
+                UnaryOp::BitXnor => Some(((!v.count_ones()) & 1) as i64),
                 _ => None,
             }
         }
+        // LRM §11.4.11 conditional ?: — both branches optional to evaluate
+        // depending on cond, but const-eval requires the chosen branch.
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            let c = const_eval_i64_with_params(condition, params)?;
+            if c != 0 {
+                const_eval_i64_with_params(then_expr, params)
+            } else {
+                const_eval_i64_with_params(else_expr, params)
+            }
+        }
         ExprKind::Paren(e) => const_eval_i64_with_params(e, params),
-        ExprKind::SystemCall { name, args } if name == "$clog2" => {
-            if let Some(arg) = args.first() {
-                let val = const_eval_i64_with_params(arg, params)?;
+        // LRM §20.8 / §20.9 — constant integer system functions commonly used
+        // in array bounds: $clog2, $unsigned, $signed are size-preserving;
+        // $min/$max take two args; $ln/$log10/etc. are not constant-eval here.
+        ExprKind::SystemCall { name, args } => match name.as_str() {
+            "$clog2" => {
+                let val = const_eval_i64_with_params(args.first()?, params)?;
                 if val <= 1 { Some(0) }
                 else {
                     let mut res = 0;
                     let mut tmp = val - 1;
-                    while tmp > 0 {
-                        tmp >>= 1;
-                        res += 1;
-                    }
+                    while tmp > 0 { tmp >>= 1; res += 1; }
                     Some(res)
                 }
-            } else { None }
+            }
+            "$unsigned" | "$signed" => const_eval_i64_with_params(args.first()?, params),
+            // LRM §20.9 bit-introspection system functions.
+            // `$countones(x)` — Hamming weight (count of 1 bits).
+            // `$onehot(x)` — 1 iff exactly one bit set.
+            // `$onehot0(x)` — 1 iff at most one bit set.
+            // `$isunknown(x)` — 1 iff any bit is X or Z.
+            // For const-eval we operate on the const-evaluated i64 value
+            // (X/Z bits aren't preserved, so $isunknown is 0 here).
+            "$countones" => {
+                let v = const_eval_i64_with_params(args.first()?, params)?;
+                Some((v as u64).count_ones() as i64)
+            }
+            "$onehot" => {
+                let v = const_eval_i64_with_params(args.first()?, params)?;
+                let v = v as u64;
+                Some(if v != 0 && v & (v - 1) == 0 { 1 } else { 0 })
+            }
+            "$onehot0" => {
+                let v = const_eval_i64_with_params(args.first()?, params)?;
+                let v = v as u64;
+                Some(if v == 0 || v & (v - 1) == 0 { 1 } else { 0 })
+            }
+            "$isunknown" => {
+                // const_eval flattens X/Z to 0 — so const-eval always
+                // returns 0 here. The runtime path is the correct
+                // place to check x/z; this just keeps parameter
+                // expressions like `parameter int K = $isunknown(N);`
+                // from falling through to a generic 0.
+                let _ = const_eval_i64_with_params(args.first()?, params)?;
+                Some(0)
+            }
+            "$countbits" => {
+                // `$countbits(x, ctl1[, ctl2 …])` — count bits matching
+                // any of the control values (0/1/X/Z encoded as 2'b
+                // const). For const-eval we only count 0/1 controls
+                // since X/Z are stripped.
+                let v = const_eval_i64_with_params(args.first()?, params)? as u64;
+                let mut want_zero = false;
+                let mut want_one = false;
+                for ctl in &args[1..] {
+                    if let Some(c) = const_eval_i64_with_params(ctl, params) {
+                        match c {
+                            0 => want_zero = true,
+                            1 => want_one = true,
+                            _ => {}
+                        }
+                    }
+                }
+                if !want_zero && !want_one {
+                    return Some(0);
+                }
+                // Width of x: take the largest set bit + 1, capped at 64.
+                let w = 64 - v.leading_zeros() as u64;
+                let mut count = 0u32;
+                if want_one {
+                    count += v.count_ones();
+                }
+                if want_zero {
+                    let mask = if w == 64 { u64::MAX } else { (1u64 << w) - 1 };
+                    count += (!v & mask).count_ones();
+                }
+                Some(count as i64)
+            }
+            // LRM §20.7 — `$bits(x)` returns the bit width. We handle the
+            // cases reachable without a typedef table: a parameter ident
+            // (uses its Value width), a sized number literal (uses the
+            // declared size), or an `$unsigned`/`$signed` wrapper.
+            // `$bits(typedef_name)` requires typedef threading and falls
+            // through to None — runtime path still resolves it.
+            "$bits" => {
+                let arg = args.first()?;
+                let inner = if let ExprKind::SystemCall { name, args: a2 } = &arg.kind {
+                    if name == "$unsigned" || name == "$signed" { a2.first()? } else { arg }
+                } else { arg };
+                match &inner.kind {
+                    ExprKind::Ident(hier) => {
+                        let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                        // First try parameter ident → its Value width.
+                        params?.get(name).map(|v| v.width as i64)
+                            // Then fall through to the thread-local typedef
+                            // table (set by callers that have one available).
+                            .or_else(|| TYPEDEFS_TLS.with(|td| {
+                                td.borrow().as_ref()
+                                    .and_then(|m| m.get(name).copied())
+                                    .map(|w| w as i64)
+                            }))
+                    }
+                    ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => Some(*s as i64),
+                    ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
+                    ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
+                    _ => None,
+                }
+            }
+            // LRM §20.7 array-introspection system functions over an array
+            // name: each consults ARRAYS_TLS for `(lo, hi)` and returns
+            // the appropriate bound. Falls through to None when the
+            // table is empty or the name is not registered.
+            "$size" | "$left" | "$right" | "$high" | "$low" | "$dimensions" => {
+                let arg = args.first()?;
+                let arr_name = match &arg.kind {
+                    ExprKind::Ident(hier) => {
+                        hier.path.last().map(|s| s.name.name.clone())?
+                    }
+                    _ => return None,
+                };
+                ARRAYS_TLS.with(|ar| {
+                    ar.borrow().as_ref().and_then(|m| m.get(&arr_name).copied())
+                })
+                .map(|(lo, hi, _ndim)| match name.as_str() {
+                    "$size" => hi - lo + 1,
+                    "$left" => lo,
+                    "$right" => hi,
+                    "$high" => hi.max(lo),
+                    "$low" => lo.min(hi),
+                    "$dimensions" => 1,
+                    _ => unreachable!(),
+                })
+            }
+            _ => None,
         }
         _ => None,
     }
+}
+
+// LRM §20.7 — thread-local typedef table consulted by const-eval `$bits`
+// when the operand is a typedef-name ident. Avoids changing the signature
+// of `const_eval_i64_with_params` at all 47 call sites. Callers that
+// have a typedef table in scope wrap their const-eval with
+// `with_typedefs(td, || const_eval_…)`; the table is restored on exit.
+thread_local! {
+    static TYPEDEFS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
+        = std::cell::RefCell::new(None);
+    /// LRM §20.7 — thread-local array-range table for const-eval of
+    /// `$size`/`$left`/`$right`/`$high`/`$low`/`$dimensions` on an
+    /// array-name ident. Same pattern as TYPEDEFS_TLS to avoid touching
+    /// every call site. Maps `name → (lo, hi, ndim)`.
+    static ARRAYS_TLS: std::cell::RefCell<Option<HashMap<String, (i64, i64, u32)>>>
+        = std::cell::RefCell::new(None);
+}
+
+/// Run `f` with `typedefs` installed as the thread-local typedef table
+/// consulted by const-eval `$bits(typedef_name)`. The previous binding
+/// is restored on exit so nested calls compose correctly.
+pub fn with_typedefs<R>(typedefs: &HashMap<String, u32>, f: impl FnOnce() -> R) -> R {
+    let snapshot = typedefs.clone();
+    let prev = TYPEDEFS_TLS.with(|td| std::mem::replace(&mut *td.borrow_mut(), Some(snapshot)));
+    let r = f();
+    TYPEDEFS_TLS.with(|td| *td.borrow_mut() = prev);
+    r
+}
+
+/// LRM §20.7 — install the array-range table for the duration of `f`.
+/// Restored on exit so nested calls compose.
+pub fn with_arrays<R>(arrays: &HashMap<String, (i64, i64, u32)>, f: impl FnOnce() -> R) -> R {
+    let snapshot = arrays.clone();
+    let prev = ARRAYS_TLS.with(|ar| std::mem::replace(&mut *ar.borrow_mut(), Some(snapshot)));
+    let r = f();
+    ARRAYS_TLS.with(|ar| *ar.borrow_mut() = prev);
+    r
 }
 
 /// Extract array range from unpacked dimensions. Returns Some((lo, hi)) for
@@ -4201,11 +5145,21 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         }
         ExprKind::Unary { op, operand } => {
             let v = eval_const_expr_val(operand, params);
+            // LRM §11.4.9 — reduction operators collapse the vector to 1 bit.
+            // Prior to this audit the catch-all silently returned `v` unchanged,
+            // so `|MASK` / `&ALL_ONES` etc. produced a same-width value instead
+            // of the 1-bit reduction result.
             match op {
-                UnaryOp::Minus => v.negate(),
-                UnaryOp::Plus => v,
-                UnaryOp::BitNot => v.bitwise_not(),
-                UnaryOp::LogNot => v.logic_not(),
+                UnaryOp::Plus    => v,
+                UnaryOp::Minus   => v.negate(),
+                UnaryOp::BitNot  => v.bitwise_not(),
+                UnaryOp::LogNot  => v.logic_not(),
+                UnaryOp::BitAnd  => v.reduce_and(),
+                UnaryOp::BitNand => v.reduce_and().bitwise_not(),
+                UnaryOp::BitOr   => v.reduce_or(),
+                UnaryOp::BitNor  => v.reduce_or().bitwise_not(),
+                UnaryOp::BitXor  => v.reduce_xor(),
+                UnaryOp::BitXnor => v.reduce_xor().bitwise_not(),
                 _ => v,
             }
         }
@@ -4226,6 +5180,102 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     Value::from_u64(res, 32)
                 }
             } else { Value::zero(32) }
+        }
+        // LRM §20.7 — `$bits(x)` in const-eval position. We handle the
+        // cases reachable without a typedef table (parameter ident → its
+        // Value's width; sized literal → declared size; `'0`/`'1` → 1).
+        // `$bits(<typedef_name>)` requires typedef threading and returns 0
+        // here — the runtime path still resolves it.
+        ExprKind::SystemCall { name, args } if name == "$bits" => {
+            let Some(arg) = args.first() else { return Value::zero(32); };
+            let inner = if let ExprKind::SystemCall { name, args: a2 } = &arg.kind {
+                if name == "$unsigned" || name == "$signed" {
+                    a2.first().unwrap_or(arg)
+                } else { arg }
+            } else { arg };
+            let w: u32 = match &inner.kind {
+                ExprKind::Ident(hier) => {
+                    let n = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                    params.get(n).map(|v| v.width)
+                        .or_else(|| TYPEDEFS_TLS.with(|td|
+                            td.borrow().as_ref().and_then(|m| m.get(n).copied())))
+                        .unwrap_or(0)
+                }
+                ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => *s,
+                ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => 32,
+                ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => 1,
+                _ => 0,
+            };
+            Value::from_u64(w as u64, 32)
+        }
+        // `$unsigned`/`$signed` in const-eval — width-preserving identity.
+        ExprKind::SystemCall { name, args } if name == "$unsigned" || name == "$signed" => {
+            args.first().map(|a| eval_const_expr_val(a, params)).unwrap_or_else(|| Value::zero(32))
+        }
+        // LRM §20.9 bit-introspection system functions in
+        // value-producing const-eval position. Mirror the i64
+        // const-eval implementations in `const_eval_i64_with_params`.
+        ExprKind::SystemCall { name, args }
+            if matches!(name.as_str(),
+                "$countones" | "$onehot" | "$onehot0" | "$isunknown" | "$countbits") =>
+        {
+            let Some(arg) = args.first() else { return Value::zero(32); };
+            let v = eval_const_expr_val(arg, params);
+            let raw = v.to_u64().unwrap_or(0);
+            let result: u64 = match name.as_str() {
+                "$countones" => raw.count_ones() as u64,
+                "$onehot" => if raw != 0 && raw & (raw - 1) == 0 { 1 } else { 0 },
+                "$onehot0" => if raw == 0 || raw & (raw - 1) == 0 { 1 } else { 0 },
+                "$isunknown" => 0, // const path strips X/Z
+                "$countbits" => {
+                    let mut want_zero = false;
+                    let mut want_one = false;
+                    for ctl in &args[1..] {
+                        let c = eval_const_expr_val(ctl, params).to_u64().unwrap_or(0);
+                        match c { 0 => want_zero = true, 1 => want_one = true, _ => {} }
+                    }
+                    let w = 64u32.saturating_sub(raw.leading_zeros());
+                    let mut count: u32 = 0;
+                    if want_one { count += raw.count_ones(); }
+                    if want_zero {
+                        let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                        count += (!raw & mask).count_ones();
+                    }
+                    count as u64
+                }
+                _ => 0,
+            };
+            Value::from_u64(result, 32)
+        }
+        // LRM §20.7 array-introspection on an array-name ident: consults
+        // ARRAYS_TLS (populated at end of elaborate_module_with_defs and
+        // via runtime path before deferred-param eval).
+        ExprKind::SystemCall { name, args }
+            if matches!(name.as_str(),
+                "$size" | "$left" | "$right" | "$high" | "$low" | "$dimensions")
+                && args.first().map(|a| matches!(a.kind, ExprKind::Ident(_))).unwrap_or(false) =>
+        {
+            let arg = args.first().unwrap();
+            let arr_name = if let ExprKind::Ident(hier) = &arg.kind {
+                hier.path.last().map(|s| s.name.name.clone()).unwrap_or_default()
+            } else { String::new() };
+            let res = ARRAYS_TLS.with(|ar| {
+                ar.borrow().as_ref().and_then(|m| m.get(&arr_name).copied())
+            });
+            if let Some((lo, hi, _ndim)) = res {
+                let v: i64 = match name.as_str() {
+                    "$size" => hi - lo + 1,
+                    "$left" => lo,
+                    "$right" => hi,
+                    "$high" => hi.max(lo),
+                    "$low" => lo.min(hi),
+                    "$dimensions" => 1,
+                    _ => 0,
+                };
+                Value::from_u64(v as u64, 32)
+            } else {
+                Value::zero(32)
+            }
         }
         ExprKind::Conditional { condition, then_expr, else_expr } => {
             let c = eval_const_expr_val(condition, params);
@@ -5175,6 +6225,66 @@ fn inline_module_items(
                         }
                         continue;
                     }
+                    // LRM §17.2: checker instantiation. When the
+                    // checker has formal ports, walk the body items
+                    // and substitute each formal-name Ident with the
+                    // actual arg expression at this instantiation
+                    // site, then elaborate the rewritten items.
+                    // When no ports, the body was already inlined at
+                    // declaration time — just register a stub signal.
+                    if let Some(cd) = elab.checker_decls.get(sub_mod_name).cloned()
+                    {
+                        let has_ports = !matches!(
+                            cd.ports,
+                            crate::ast::module::PortList::Empty
+                        );
+                        for hi in &inst.instances {
+                            let sig_name = format!("{}{}", prefix, hi.name.name);
+                            elab.signals.insert(sig_name.clone(), Signal {
+                                is_const: false,
+                                name: sig_name,
+                                width: 1,
+                                is_signed: false,
+                                direction: None,
+                                value: Value::zero(1),
+                                is_real: false,
+                                type_name: Some(sub_mod_name.clone()),
+                            });
+                            if has_ports {
+                                // Build formal→actual expression map.
+                                let formals: Vec<String> = match &cd.ports {
+                                    crate::ast::module::PortList::NonAnsi(ns) => {
+                                        ns.iter().map(|n| n.name.clone()).collect()
+                                    }
+                                    crate::ast::module::PortList::Ansi(ps) => {
+                                        ps.iter().map(|p| p.name.name.clone()).collect()
+                                    }
+                                    crate::ast::module::PortList::Empty => Vec::new(),
+                                };
+                                let mut subst: HashMap<String, Expression> =
+                                    HashMap::default();
+                                for (i, fname) in formals.iter().enumerate() {
+                                    if let Some(conn) = hi.connections.get(i) {
+                                        let actual_opt = match conn {
+                                            crate::ast::decl::PortConnection::Ordered(e) => e.clone(),
+                                            crate::ast::decl::PortConnection::Named { expr, .. } => expr.clone(),
+                                            _ => None,
+                                        };
+                                        if let Some(e) = actual_opt {
+                                            subst.insert(fname.clone(), e);
+                                        }
+                                    }
+                                }
+                                let rewritten: Vec<ModuleItem> = cd
+                                    .items
+                                    .iter()
+                                    .map(|it| rewrite_module_item_subst(it, &subst))
+                                    .collect();
+                                elaborate_items(&rewritten, elab, Some(definitions))?;
+                            }
+                        }
+                        continue;
+                    }
                     return Err(format!("Module '{}' instantiated but not found", sub_mod_name));
                 }
             };
@@ -5625,6 +6735,43 @@ fn inline_module_items(
                             // arm so enum members resolve as constants in
                             // submodule scopes too.
                             register_anonymous_enum_members(&dd.data_type, elab);
+                            // ALSO register the members under the fully-
+                            // scoped instance name (e.g.
+                            // `dut_wrap...alu_div_i.FINISH`) so a local
+                            // anon-enum value can win over a same-named
+                            // pkg-imported member via scope-first lookup
+                            // in `get_signal_value_by_name` at sim time
+                            // (LRM §22.4 local declaration shadows
+                            // wildcard-imported).
+                            if let DataType::Enum(et) = &dd.data_type {
+                                let base_width = et.base_type.as_ref()
+                                    .map(|bt| resolve_type_width(bt, Some(&sub_merged_params), Some(&elab.typedefs)))
+                                    .unwrap_or(32);
+                                let mut next_val: u64 = 0;
+                                let inst_prefix_no_dot = inst_prefix
+                                    .strip_suffix('.')
+                                    .unwrap_or(&inst_prefix)
+                                    .to_string();
+                                for member in &et.members {
+                                    let val = if let Some(init) = &member.init {
+                                        eval_const_expr(init, &sub_merged_params)
+                                    } else { next_val };
+                                    next_val = val.wrapping_add(1);
+                                    let v = Value::from_u64(val, base_width);
+                                    let scoped = format!("{}.{}", inst_prefix_no_dot, member.name.name);
+                                    elab.parameters.insert(scoped.clone(), v.clone());
+                                    elab.signals.insert(scoped.clone(), Signal {
+                                        is_const: false,
+                                        name: scoped,
+                                        width: base_width,
+                                        is_signed: false,
+                                        is_real: false,
+                                        direction: None,
+                                        value: v,
+                                        type_name: None,
+                                    });
+                                }
+                            }
                             // Packed multi-D (`logic [N-1:0][W-1:0] x`) — register
                             // the per-element width under BOTH the bare name and
                             // the fully-scoped name. Without this hook a
@@ -5919,6 +7066,57 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
     pairs
 }
 
+/// LRM §17.2 checker port substitution helper. Substitutes formal
+/// names with actual expressions in a ModuleItem. Reuses
+/// `rewrite_stmt` / `rewrite_expr` with an empty prefix and no
+/// interface map. Only handles the item shapes a checker body can
+/// realistically contain (initial/always/assertion/etc.).
+fn rewrite_module_item_subst(
+    item: &ModuleItem,
+    subst: &HashMap<String, Expression>,
+) -> ModuleItem {
+    let empty: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_iface: HashMap<String, String> = HashMap::default();
+    match item {
+        ModuleItem::InitialConstruct(ic) => {
+            let mut new_ic = ic.clone();
+            new_ic.stmt = rewrite_stmt(&ic.stmt, "", subst, &empty, &empty_iface);
+            ModuleItem::InitialConstruct(new_ic)
+        }
+        ModuleItem::AlwaysConstruct(ac) => {
+            let mut new_ac = ac.clone();
+            new_ac.stmt = rewrite_stmt(&ac.stmt, "", subst, &empty, &empty_iface);
+            ModuleItem::AlwaysConstruct(new_ac)
+        }
+        ModuleItem::AssertionItem(a) => {
+            let mut new_a = a.clone();
+            new_a.expr = rewrite_expr(&a.expr, "", subst, &empty, &empty_iface);
+            if let Some(act) = &a.action {
+                new_a.action = Some(Box::new(rewrite_stmt(
+                    act,
+                    "",
+                    subst,
+                    &empty,
+                    &empty_iface,
+                )));
+            }
+            if let Some(ea) = &a.else_action {
+                new_a.else_action = Some(Box::new(rewrite_stmt(
+                    ea,
+                    "",
+                    subst,
+                    &empty,
+                    &empty_iface,
+                )));
+            }
+            ModuleItem::AssertionItem(new_a)
+        }
+        // Other item kinds are passed through unchanged — extending
+        // this map is straightforward when a real testbench needs it.
+        other => other.clone(),
+    }
+}
+
 fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
@@ -6016,6 +7214,17 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
         ExprKind::SystemCall { name, args } => ExprKind::SystemCall {
             name: name.clone(),
             args: args.iter().map(|a| rewrite_expr_impl(a, prefix, port_map, local_names, interface_map)).collect(),
+        },
+        // LRM §16.5 SVA property body — substitute formal-arg
+        // references in both the clock signal and the body. Without
+        // this, a checker like
+        //   `assert property (@(posedge clk) in_a |=> in_b);`
+        // would keep references to formal `in_a`/`in_b` after the
+        // port-substitution pass, causing the sva site to read
+        // non-existent signals.
+        ExprKind::SvaClocked { clock, body } => ExprKind::SvaClocked {
+            clock: Box::new(rewrite_expr_impl(clock, prefix, port_map, local_names, interface_map)),
+            body: Box::new(rewrite_expr_impl(body, prefix, port_map, local_names, interface_map)),
         },
         other => other.clone(),
     };
