@@ -20,6 +20,12 @@ impl Statement {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum StatementKind {
     Null,
+    /// INTERNAL (not parsed): marks the end of an inlined blocking task/method
+    /// body in a process statement stream. When the simulator inlines a
+    /// blocking call so its waits can suspend the process, it appends this
+    /// sentinel; executing it pops + replays the call's deferred cleanup
+    /// (frame/context unwind, output copy-back). See `task_cleanup`.
+    ScopePop,
     /// IEEE 1800-2017 §9.6.3: `disable fork` aborts all currently
     /// active child processes of the enclosing scope's most-recent
     /// fork that haven't yet completed.
