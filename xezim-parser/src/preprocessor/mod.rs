@@ -294,7 +294,13 @@ impl Preprocessor {
                     continue;
                 }
                 if bytes[i+1] == b'*' {
-                    // Block comment: replace with spaces and newlines
+                    // Block comment: replace with spaces, preserving newlines.
+                    // A `\` immediately before a newline is a line-continuation;
+                    // keep it so a multi-line `/* */` comment inside a `define
+                    // body doesn't sever the macro's backslash-continuation
+                    // (IEEE 1800-2017 §22.5.1 — the macro text continues across
+                    // backslash-newline, and the comment is part of that text).
+                    // Mirrors the `//` branch above.
                     result.push(' ');
                     result.push(' ');
                     i += 2;
@@ -307,6 +313,8 @@ impl Preprocessor {
                         }
                         if bytes[i] == b'\n' {
                             result.push('\n');
+                        } else if bytes[i] == b'\\' && bytes[i+1] == b'\n' {
+                            result.push('\\');
                         } else {
                             result.push(' ');
                         }
