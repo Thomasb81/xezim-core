@@ -247,6 +247,13 @@ impl Parser {
                     stmt: Box::new(stmt),
                 }, self.span_from(start))
             }
+            // §26.3: a local `import pkg::item;` / `import pkg::*;` inside a
+            // statement block (UVM's `initial begin import uvm_pkg::…; … end`).
+            // It affects name visibility only; consume it and emit a no-op.
+            TokenKind::KwImport => {
+                let _ = self.parse_import_declaration();
+                Statement::new(StatementKind::Null, self.span_from(start))
+            }
             // §6.20.6 / §6.8: `const` / `var` qualified local variable
             // declaration in a procedural block — `const int k = 3;`,
             // `var logic x;`. Grammar: `[const] [var] [lifetime] data_type …`.

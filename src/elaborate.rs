@@ -1345,6 +1345,16 @@ pub fn elaborate_module_with_defs(
                             crate::ast::decl::PackageItem::Task(t) if t.name.scope.is_none() => {
                                 elab.tasks.entry(t.name.name.name.clone()).or_insert_with(|| t.clone());
                             }
+                            // §26.3: register package classes by name so an
+                            // (imported or scoped) reference like
+                            // `uvm_config_db#(T)::set` resolves instead of being
+                            // flagged "Undeclared identifier". Class bodies are
+                            // also reachable through their package for
+                            // `pkg::Class::method`.
+                            crate::ast::decl::PackageItem::Class(c) => {
+                                elab.classes.entry(c.name.name.clone())
+                                    .or_insert_with(|| elaborate_class(c));
+                            }
                             _ => {}
                         }
                     }
