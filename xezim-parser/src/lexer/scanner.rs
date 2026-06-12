@@ -518,10 +518,20 @@ impl<'a> Lexer<'a> {
 
     fn scan_based_number(&mut self, start: usize) -> Token {
         self.pos += 1; // skip '
-        if self.pos < self.input.len() && matches!(self.input[self.pos], b's' | b'S') { self.pos += 1; }
-        if self.pos < self.input.len() && matches!(self.input[self.pos], b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H') {
-            self.pos += 1;
+        let mut p = self.pos;
+        if p < self.input.len() && matches!(self.input[p], b's' | b'S') { p += 1; }
+        let has_base = p < self.input.len()
+            && matches!(self.input[p], b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H');
+        if !has_base {
+            // No base specifier after `'` — this is a cast operator (`expr'(…)`)
+            // or an assignment pattern, NOT a based literal. Emit a bare `'`
+            // token WITHOUT consuming any following whitespace, so a spaced
+            // cast like `(w) ' (v)` still has `text == "'"` for the parser's
+            // cast handler. (Consuming the space here was tokenizing `"' "`,
+            // breaking real-world RTL such as basejump's `(nodes_p) ' (0)`.)
+            return Token::new(TokenKind::IntegerLiteral, "'".into(), Span::new(start, self.pos));
         }
+        self.pos = p + 1; // consume optional sign + base specifier
         // IEEE 1800-2017 §5.7.1: whitespace allowed between base and value
         while self.pos < self.input.len() && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t') {
             self.pos += 1;
