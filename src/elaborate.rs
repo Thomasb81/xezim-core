@@ -554,6 +554,12 @@ pub struct ElaboratedModule {
     pub dynamic_arrays: HashSet<String>,
     /// Arrays declared with descending range (e.g. [7:0])
     pub descending_arrays: HashSet<String>,
+    /// Packed vectors declared with an ASCENDING range (`logic [0:7]`), mapped
+    /// to their width. Bit/part selects index these from the MSB end (label 0 =
+    /// MSB), so the interpreter remaps `sig[i]` → internal bit `(W-1)-i`
+    /// (IEEE 1800-2017 §7.4.1, §11.5.1). Default-declared `[N:0]` vectors are
+    /// descending and absent here.
+    pub ascending_packed: HashMap<String, u32>,
     /// Bounded queue max sizes: name -> max element count (i.e., $:N means N+1).
     pub queue_max_sizes: HashMap<String, u32>,
     /// 2D unpacked arrays: name -> ((dim1_lo,dim1_hi),(dim2_lo,dim2_hi),elem_width).
@@ -704,6 +710,7 @@ impl ElaboratedModule {
             assoc_defaults: HashMap::default(),
             dynamic_arrays: HashSet::default(),
             descending_arrays: HashSet::default(),
+            ascending_packed: HashMap::default(),
             queue_max_sizes: HashMap::default(),
             arrays_2d: HashMap::default(),
             packages: HashSet::default(),
@@ -1708,6 +1715,16 @@ pub fn elaborate_module_with_defs(
                 if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs) {
                     for decl in &dd.declarators {
                         elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
+                    }
+                }
+                // Ascending packed vector (`logic [0:7] pa;`): bit/part selects
+                // index from the MSB end (label 0 = MSB), so the interpreter
+                // remaps `pa[i]` → internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
+                if let Some(w) = packed_ascending_width(&dd.data_type, &elab.parameters) {
+                    for decl in &dd.declarators {
+                        if decl.dimensions.is_empty() {
+                            elab.ascending_packed.insert(decl.name.name.clone(), w);
+                        }
                     }
                 }
                 // User-defined nettype → classify as net (allow multiple continuous drivers).
@@ -5087,6 +5104,27 @@ fn eval_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> u64 {
 /// type — `logic [3:0][7:0]` returns `Some(8)`; single-dim or unsupported
 /// shapes return None. Used to register `packed_signal_elem_widths` so that
 /// `var[i]` resolves to an element slice instead of a bit-select.
+/// If `dt` is a single-dimension packed vector with an ASCENDING range
+/// (`logic [0:7]`, left < right), return its width; else None. Multi-dim
+/// packed (`[0:3][7:0]`) is intentionally excluded — its outer index selects
+/// an element, not a bit, and ascending element ordering is vanishingly rare.
+fn packed_ascending_width(dt: &DataType, params: &HashMap<String, Value>) -> Option<u32> {
+    let dims = match dt {
+        DataType::IntegerVector { dimensions, .. } => dimensions,
+        DataType::Implicit { dimensions, .. } => dimensions,
+        _ => return None,
+    };
+    if dims.len() != 1 { return None; }
+    if let Some(PackedDimension::Range { left, right, .. }) = dims.first() {
+        let l = const_eval_i64_with_params(left, Some(params))?;
+        let r = const_eval_i64_with_params(right, Some(params))?;
+        if l < r {
+            return Some((r - l + 1) as u32);
+        }
+    }
+    None
+}
+
 pub fn packed_inner_elem_width(
     dt: &DataType,
     params: &HashMap<String, Value>,
