@@ -1385,7 +1385,13 @@ pub fn elaborate_module_with_defs(
                 // scalar parameter path.
                 if let Some(init) = &assign.init {
                     if let ExprKind::AssignmentPattern(items) = &init.kind {
-                        let all_keyed = !items.is_empty()
+                        // A struct/union-typed parameter is NOT an associative
+                        // array even if its `'{ident: v}` items parse as Keyed —
+                        // its keys are field names, handled by the struct path.
+                        let is_struct_dt = flatten_struct_fields(
+                            data_type, &elab.parameters, &elab.typedefs,
+                            &elab.typedef_types).map_or(false, |f| !f.is_empty());
+                        let all_keyed = !is_struct_dt && !items.is_empty()
                             && items.iter().all(|it| matches!(it, AssignmentPatternItem::Keyed(_, _)));
                         if all_keyed {
                             let elem_w = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
@@ -1441,10 +1447,26 @@ pub fn elaborate_module_with_defs(
                     }
                 }
 
+                // IEEE 1800-2017 §6.20: a struct/union-typed parameter whose
+                // value is an assignment pattern (`parameter cfg_t C = '{f:v}`)
+                // must be packed by field offset at elaboration, and its field
+                // layout registered so later `C.f` selects resolve.
+                let struct_fields = flatten_struct_fields(
+                    data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types);
+                let is_struct_param = struct_fields.as_ref().map_or(false, |f| !f.is_empty());
+
                 let mut val = if let Some(override_val) = param_overrides.get(&assign.name.name) {
                     override_val.clone()
                 } else if let Some(init) = &assign.init {
-                    let mut v = eval_init_for_width(init, &elab.parameters, width);
+                    let mut v = if is_struct_param {
+                        pack_struct_const_value(
+                            data_type, init, &elab.parameters,
+                            &elab.typedefs, &elab.typedef_types)
+                        .map(|sv| sv.resize(width))
+                        .unwrap_or_else(|| eval_init_for_width(init, &elab.parameters, width))
+                    } else {
+                        eval_init_for_width(init, &elab.parameters, width)
+                    };
                     if signed { v.is_signed = true; }
                     v
                 } else {
@@ -1457,6 +1479,11 @@ pub fn elaborate_module_with_defs(
                     val = Value::from_f64(val.to_f64());
                 }
 
+                if let Some(fields) = struct_fields {
+                    elab.packed_struct_fields
+                        .entry(assign.name.name.clone())
+                        .or_insert(fields);
+                }
                 elab.parameters.insert(assign.name.name.clone(), val);
             }
         }
@@ -2184,6 +2211,13 @@ pub fn elaborate_module_with_defs(
                             }
                         }
 
+                        // IEEE 1800-2017 §6.20: struct/union-typed parameter with
+                        // an assignment-pattern value — pack by field offset and
+                        // register the field layout so later `P.f` selects work.
+                        let struct_fields = flatten_struct_fields(
+                            data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types);
+                        let is_struct_param = struct_fields.as_ref().map_or(false, |f| !f.is_empty());
+
                         let mut val = if elab.parameters.contains_key(&assign.name.name) {
                             elab.parameters.get(&assign.name.name).cloned().unwrap_or(Value::zero(current_width))
                         } else if let Some(init) = &assign.init {
@@ -2193,7 +2227,15 @@ pub fn elaborate_module_with_defs(
                                 if current_signed { v.is_signed = true; }
                                 v
                             } else {
-                                let mut v = eval_init_for_width(init, &elab.parameters, current_width);
+                                let mut v = if is_struct_param {
+                                    pack_struct_const_value(
+                                        data_type, init, &elab.parameters,
+                                        &elab.typedefs, &elab.typedef_types)
+                                    .map(|sv| sv.resize(current_width))
+                                    .unwrap_or_else(|| eval_init_for_width(init, &elab.parameters, current_width))
+                                } else {
+                                    eval_init_for_width(init, &elab.parameters, current_width)
+                                };
                                 if current_signed { v.is_signed = true; }
                                 v
                             }
@@ -2207,6 +2249,11 @@ pub fn elaborate_module_with_defs(
                             val = Value::from_f64(val.to_f64());
                         }
 
+                        if let Some(fields) = struct_fields {
+                            elab.packed_struct_fields
+                                .entry(assign.name.name.clone())
+                                .or_insert(fields);
+                        }
                         if !elab.parameters.contains_key(&assign.name.name) {
                             elab.parameters.insert(assign.name.name.clone(), val.clone());
                         }
@@ -2225,6 +2272,16 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::TypedefDeclaration(td) => {
+                // IEEE 1800-2017 §7.2.1: a struct/union may not contain a member
+                // of its own type (it would have infinite size). Reject with a
+                // clean diagnostic instead of recursing into a stack overflow.
+                if let Some(cycle) = struct_typedef_self_reference(
+                    &td.name.name, &td.data_type, &elab.typedef_types) {
+                    return Err(format!(
+                        "type '{}' contains a member of its own type via '{}' \
+                         — recursive struct/union is illegal (IEEE 1800-2017 §7.2.1)",
+                        td.name.name, cycle));
+                }
                 process_typedef(td, &mut elab);
             }
             ModuleItem::TimeunitsDecl(td) => {
@@ -5084,6 +5141,175 @@ fn sized_literal_width(init: &Expression) -> Option<u32> {
             _ => return None,
         }
     }
+}
+
+/// Detect whether struct/union type `target` (body `dt`) transitively contains
+/// a by-value member of its own type — illegal per IEEE 1800-2017 §7.2.1 (it
+/// would have infinite size). Returns the offending member path, or None.
+/// Catches direct (`node_t next;`) and mutual (A→B→A) recursion; a `visited`
+/// set bounds the walk. Class-handle "linked list" members are NOT flagged
+/// (classes live outside `typedef_types`, so they never resolve to a struct).
+fn struct_typedef_self_reference(
+    target: &str,
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<String> {
+    fn walk(
+        target: &str,
+        dt: &DataType,
+        typedef_types: &HashMap<String, DataType>,
+        visited: &mut Vec<String>,
+    ) -> Option<String> {
+        let su = match dt {
+            DataType::Struct(su) => su,
+            _ => return None,
+        };
+        for member in &su.members {
+            let field = member.declarators.first()
+                .map(|d| d.name.name.clone()).unwrap_or_default();
+            if let DataType::TypeReference { name, .. } = &member.data_type {
+                let mn = &name.name.name;
+                if mn == target {
+                    return Some(field);
+                }
+                if !visited.iter().any(|v| v == mn) {
+                    if let Some(inner) = typedef_types.get(mn) {
+                        visited.push(mn.clone());
+                        if let Some(p) = walk(target, inner, typedef_types, visited) {
+                            return Some(format!("{}.{}", field, p));
+                        }
+                        visited.pop();
+                    }
+                }
+            } else if let DataType::Struct(_) = &member.data_type {
+                if let Some(p) = walk(target, &member.data_type, typedef_types, visited) {
+                    return Some(format!("{}.{}", field, p));
+                }
+            }
+        }
+        None
+    }
+    let mut visited = vec![target.to_string()];
+    walk(target, dt, typedef_types, &mut visited)
+}
+
+/// Flatten a (possibly nested) packed struct/union `DataType` into
+/// `(field_path, lsb_offset, width)` tuples for `packed_struct_fields`.
+/// First-declared member is the MSB (IEEE 1800-2017 §7.2.1), so offsets are
+/// assigned LSB-first by walking members in reverse. Returns None if `dt`
+/// does not resolve to a struct/union.
+fn flatten_struct_fields(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<(String, u32, u32)>> {
+    let resolved = if let DataType::TypeReference { name, .. } = dt {
+        typedef_types.get(&name.name.name).unwrap_or(dt)
+    } else { dt };
+    if let DataType::Struct(su) = resolved {
+        let is_union = matches!(su.kind, StructUnionKind::Union);
+        let mut raw: Vec<(String, u32, DataType)> = Vec::new();
+        for member in &su.members {
+            let mw = resolve_type_width(&member.data_type, Some(params), Some(typedefs));
+            for mdecl in &member.declarators {
+                raw.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
+            }
+        }
+        let mut out: Vec<(String, u32, u32)> = Vec::new();
+        if is_union {
+            for (mn, mw, mdt) in &raw {
+                out.push((mn.clone(), 0, *mw));
+                if let Some(subs) = flatten_struct_fields(mdt, params, typedefs, typedef_types) {
+                    for (sn, so, sw) in subs { out.push((format!("{}.{}", mn, sn), so, sw)); }
+                }
+            }
+        } else {
+            let mut offset: u32 = 0;
+            for (mn, mw, mdt) in raw.iter().rev() {
+                out.push((mn.clone(), offset, *mw));
+                if let Some(subs) = flatten_struct_fields(mdt, params, typedefs, typedef_types) {
+                    for (sn, so, sw) in subs { out.push((format!("{}.{}", mn, sn), offset + so, sw)); }
+                }
+                offset += mw;
+            }
+        }
+        Some(out)
+    } else { None }
+}
+
+/// Pack a struct/union assignment-pattern literal into a packed `Value`,
+/// honoring declaration order (first member = MSB) so a struct-typed
+/// parameter `parameter cfg_t C = '{base:.., len:..}` evaluates at elaboration
+/// (IEEE 1800-2017 §6.20, §10.9.2). Handles named (`'{f:v}`), ordered
+/// (`'{v0,v1}`), and `default:` items, and recurses for nested struct fields.
+/// Returns None if `dt` is not a struct/union or `expr` is not a pattern.
+fn pack_struct_const_value(
+    dt: &DataType,
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
+    let resolved = if let DataType::TypeReference { name, .. } = dt {
+        typedef_types.get(&name.name.name).cloned()
+    } else { Some(dt.clone()) };
+    let su = match resolved {
+        Some(DataType::Struct(su)) => su,
+        _ => return None,
+    };
+    let items = match &expr.kind {
+        ExprKind::AssignmentPattern(items) => items,
+        _ => return None,
+    };
+    // Top-level members in declaration order (first = MSB).
+    let mut members: Vec<(String, u32, DataType)> = Vec::new();
+    for member in &su.members {
+        let mw = resolve_type_width(&member.data_type, Some(params), Some(typedefs));
+        for mdecl in &member.declarators {
+            members.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
+        }
+    }
+    // Index the pattern: named-by-field, ordered-by-position, and default.
+    let mut named: HashMap<String, &Expression> = HashMap::default();
+    let mut ordered: Vec<&Expression> = Vec::new();
+    let mut default_expr: Option<&Expression> = None;
+    for it in items {
+        match it {
+            AssignmentPatternItem::Named(id, v) => { named.insert(id.name.clone(), v); }
+            AssignmentPatternItem::Ordered(v) => ordered.push(v),
+            AssignmentPatternItem::Default(v) => default_expr = Some(v),
+            // `'{<ident>: v}` may parse as Keyed when the key is an identifier
+            AssignmentPatternItem::Keyed(k, v) => {
+                if let ExprKind::Ident(h) = &k.kind {
+                    if let Some(last) = h.path.last() { named.insert(last.name.name.clone(), v); }
+                }
+            }
+            _ => {}
+        }
+    }
+    let use_ordered = named.is_empty() && !ordered.is_empty();
+    // Build MSB-first parts (declaration order) and concat.
+    let mut parts: Vec<Value> = Vec::new();
+    for (idx, (mn, mw, mdt)) in members.iter().enumerate() {
+        let ve: Option<&Expression> = if use_ordered {
+            ordered.get(idx).copied().or(default_expr)
+        } else {
+            named.get(mn).copied().or(default_expr)
+        };
+        let val = match ve {
+            Some(e) => {
+                if let Some(sub) = pack_struct_const_value(mdt, e, params, typedefs, typedef_types) {
+                    sub.resize(*mw)
+                } else {
+                    eval_init_for_width(e, params, *mw)
+                }
+            }
+            None => Value::zero(*mw),
+        };
+        parts.push(val);
+    }
+    Some(Value::concat(&parts))
 }
 
 fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width: u32) -> Value {
