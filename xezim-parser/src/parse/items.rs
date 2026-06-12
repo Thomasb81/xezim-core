@@ -134,6 +134,8 @@ impl Parser {
             || (self.at(TokenKind::KwVirtual)
                 && matches!(self.peek_kind(),
                     TokenKind::KwInterface | TokenKind::Identifier))
+            // LRM §25.3.2 — generic interface port `interface [.mp] <name>`.
+            || self.at(TokenKind::KwInterface)
         {
             let mut ports = Vec::new();
             let mut last_direction: Option<PortDirection> = None;
@@ -194,6 +196,17 @@ impl Parser {
                 Some(self.parse_identifier())
             } else { None };
             Some(DataType::Interface { name: if_name, modport, span: self.span_from(start) })
+        } else if self.at(TokenKind::KwInterface) {
+            // §25.3.2 generic interface port: `interface [.<modport>] <name>`.
+            self.bump(); // interface
+            let modport = if self.at(TokenKind::Dot) {
+                self.bump();
+                Some(self.parse_identifier())
+            } else { None };
+            Some(DataType::Interface {
+                name: crate::ast::Identifier { name: "interface".to_string(), span: self.span_from(start) },
+                modport, span: self.span_from(start),
+            })
         } else if self.is_data_type_keyword() {
             Some(self.parse_data_type())
         } else if self.at(TokenKind::LBracket) {
