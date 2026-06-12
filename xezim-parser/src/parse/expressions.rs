@@ -423,6 +423,24 @@ impl Parser {
                 } else {
                     self.parse_identifier()
                 };
+                // §8.25: parameterized-class specialization in a scoped chain —
+                // `pkg::Class#(params)::method` (UVM's
+                // `uvm_pkg::uvm_config_db#(virtual if)::get/set`). The bare
+                // primary consumes a trailing `#(...)`, but after a `::` it must
+                // be consumed here too. Discard the balanced parameter list.
+                if self.at(TokenKind::Hash) && self.peek_kind() == TokenKind::LParen {
+                    self.bump(); // #
+                    self.bump(); // (
+                    let mut depth = 1;
+                    while depth > 0 && !self.at(TokenKind::Eof) {
+                        match self.current_kind() {
+                            TokenKind::LParen => depth += 1,
+                            TokenKind::RParen => depth -= 1,
+                            _ => {}
+                        }
+                        self.bump();
+                    }
+                }
                 lhs = Expression::new(ExprKind::MemberAccess {
                     expr: Box::new(lhs), member,
                 }, self.span_from(start));

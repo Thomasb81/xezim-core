@@ -276,6 +276,28 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 Statement::new(StatementKind::VarDecl { data_type, lifetime, declarators }, self.span_from(start))
             }
+            // §25.9: a `virtual interface` local variable declaration inside a
+            // procedural block — `virtual <iface> [#(...)] [.modport] name;`
+            // (UVM stores `virtual <bfm>` handles in function-body locals).
+            // Only when an identifier (the interface type) and then a declarator
+            // name follow, so a stray `virtual` elsewhere isn't misparsed.
+            TokenKind::KwVirtual
+                if matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::KwInterface) => {
+                let data_type = self.parse_data_type();
+                let mut declarators = Vec::new();
+                loop {
+                    let ds = self.current().span.start;
+                    let name = self.parse_identifier();
+                    let dimensions = self.parse_unpacked_dimensions();
+                    let init = if self.eat(TokenKind::Assign).is_some() {
+                        Some(self.parse_expression())
+                    } else { None };
+                    declarators.push(VarDeclarator { name, dimensions, init, span: self.span_from(ds) });
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                }
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::VarDecl { data_type, lifetime: None, declarators }, self.span_from(start))
+            }
             // Variable declaration (data type keywords)
             k if self.is_data_type_keyword() && k != TokenKind::KwEvent &&
                  !(self.peek_kind() == TokenKind::IntegerLiteral && {
