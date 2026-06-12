@@ -560,6 +560,10 @@ pub struct ElaboratedModule {
     /// (IEEE 1800-2017 §7.4.1, §11.5.1). Default-declared `[N:0]` vectors are
     /// descending and absent here.
     pub ascending_packed: HashMap<String, u32>,
+    /// Unpacked dimensions attached to a typedef (`typedef T A[0:3];`), keyed by
+    /// typedef name. A variable `A v;` inherits these dims so it elaborates as
+    /// an unpacked array (IEEE 1800-2017 §6.18, §7.4). Empty for scalar typedefs.
+    pub typedef_unpacked_dims: HashMap<String, Vec<UnpackedDimension>>,
     /// Bounded queue max sizes: name -> max element count (i.e., $:N means N+1).
     pub queue_max_sizes: HashMap<String, u32>,
     /// 2D unpacked arrays: name -> ((dim1_lo,dim1_hi),(dim2_lo,dim2_hi),elem_width).
@@ -711,6 +715,7 @@ impl ElaboratedModule {
             dynamic_arrays: HashSet::default(),
             descending_arrays: HashSet::default(),
             ascending_packed: HashMap::default(),
+            typedef_unpacked_dims: HashMap::default(),
             queue_max_sizes: HashMap::default(),
             arrays_2d: HashMap::default(),
             packages: HashSet::default(),
@@ -991,6 +996,12 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         let w = resolve_type_width(&td.data_type, Some(&elab.parameters), Some(&elab.typedefs));
         elab.typedefs.insert(td.name.name.clone(), w);
         elab.typedef_types.insert(td.name.name.clone(), td.data_type.clone());
+    }
+    // §6.18/§7.4: record any unpacked dimensions on the typedef
+    // (`typedef logic [7:0] A [0:3];`) so a variable `A v;` inherits them.
+    if !td.dimensions.is_empty() {
+        elab.typedef_unpacked_dims
+            .insert(td.name.name.clone(), td.dimensions.clone());
     }
     // Refresh the thread-local typedef snapshot so any subsequent
     // const-eval `$bits(typedef_name)` call sees this typedef (M2).
@@ -1766,7 +1777,22 @@ pub fn elaborate_module_with_defs(
                         eprintln!("[xezim][warning] duplicate declaration of '{}' (data); keeping first definition", decl.name.name);
                         continue;
                     }
-                    if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = decl.dimensions.first() {
+                    // A variable typed by an unpacked-array typedef
+                    // (`typedef T A[0:3]; A v;`) inherits the typedef's unpacked
+                    // dimensions when it declares none of its own (LRM §6.18,
+                    // §7.4). For every other declaration this is exactly
+                    // `decl.dimensions`, so behavior is unchanged.
+                    let effective_dims: Vec<UnpackedDimension> = if decl.dimensions.is_empty() {
+                        match &dd.data_type {
+                            DataType::TypeReference { name, .. } =>
+                                elab.typedef_unpacked_dims.get(&name.name.name).cloned()
+                                    .unwrap_or_default(),
+                            _ => Vec::new(),
+                        }
+                    } else {
+                        decl.dimensions.clone()
+                    };
+                    if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = effective_dims.first() {
                         let is_string_key = key_dt.as_ref().map_or(false, |dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
                         if let Some(init_expr) = &decl.init {
@@ -1779,11 +1805,11 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     }
-                    let is_dynamic_dim = decl.dimensions.first().map_or(false, |d| matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }));
+                    let is_dynamic_dim = effective_dims.first().map_or(false, |d| matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }));
                     if is_dynamic_dim {
                         elab.dynamic_arrays.insert(decl.name.name.clone());
                     }
-                    if let Some(UnpackedDimension::Queue { max_size: Some(ms), .. }) = decl.dimensions.first() {
+                    if let Some(UnpackedDimension::Queue { max_size: Some(ms), .. }) = effective_dims.first() {
                         let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
                         if n >= 0 { elab.queue_max_sizes.insert(decl.name.name.clone(), (n + 1) as u32); }
                     }
@@ -1847,13 +1873,13 @@ pub fn elaborate_module_with_defs(
                         }
                     };
                     // Check for 2D unpacked array (e.g., mem [0:1023][0:3])
-                    if decl.dimensions.len() == 2 {
-                        let r1 = if let UnpackedDimension::Range { left, right, .. } = &decl.dimensions[0] {
+                    if effective_dims.len() == 2 {
+                        let r1 = if let UnpackedDimension::Range { left, right, .. } = &effective_dims[0] {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
                             Some((l.min(r), l.max(r)))
                         } else { None };
-                        let r2 = if let UnpackedDimension::Range { left, right, .. } = &decl.dimensions[1] {
+                        let r2 = if let UnpackedDimension::Range { left, right, .. } = &effective_dims[1] {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
                             Some((l.min(r), l.max(r)))
@@ -1881,11 +1907,11 @@ pub fn elaborate_module_with_defs(
                         }
                     }
                     // Check for N-dimensional unpacked array (N >= 3)
-                    if decl.dimensions.len() >= 3
-                        && decl.dimensions.iter().all(|d| matches!(d, UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }))
+                    if effective_dims.len() >= 3
+                        && effective_dims.iter().all(|d| matches!(d, UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }))
                     {
                         let mut shape: Vec<(i64, i64)> = Vec::new();
-                        for d in &decl.dimensions {
+                        for d in &effective_dims {
                             match d {
                                 UnpackedDimension::Range { left, right, .. } => {
                                     let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
@@ -1912,7 +1938,7 @@ pub fn elaborate_module_with_defs(
                         continue;
                     }
                     // Check for unpacked array dimensions (e.g., memory [0:255])
-                    let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
+                    let array_range = extract_array_range(&effective_dims, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
@@ -1943,7 +1969,7 @@ pub fn elaborate_module_with_defs(
                         // to `var.outer.inner.leaf` on a standalone struct.
                         register_packed_for_array(&mut elab);
                         // Track descending arrays (left > right in the declaration)
-                        if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
+                        if let Some(UnpackedDimension::Range { left, right, .. }) = effective_dims.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
                             if l > r { elab.descending_arrays.insert(decl.name.name.clone()); }
