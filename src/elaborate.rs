@@ -4908,6 +4908,8 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
         }
         ExprKind::Number(NumberLiteral::UnbasedUnsized('0')) => Some(0),
         ExprKind::Number(NumberLiteral::UnbasedUnsized('1')) => Some(1),
+        // Time literal magnitude in tick units (1 ns).
+        ExprKind::Number(NumberLiteral::Time(s)) => Some((*s * 1e9) as i64),
         ExprKind::Ident(hier) => {
             let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
             params.and_then(|p| p.get(name)).and_then(|v| v.to_i64())
@@ -5650,6 +5652,10 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     v
                 }
                 NumberLiteral::Real(f) => Value::from_f64(*f),
+                // A time literal in a value context evaluates to its magnitude in
+                // the simulation tick unit (1 ns), preserving the prior behaviour
+                // where `10ns` const-folded to 10.
+                NumberLiteral::Time(s) => Value::from_f64(*s * 1e9),
                 NumberLiteral::UnbasedUnsized(c) => match c {
                     '0' => Value::zero(1), '1' => Value::from_u64(1, 1), _ => Value::new(1),
                 },

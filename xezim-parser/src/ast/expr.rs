@@ -95,6 +95,12 @@ pub enum NumberLiteral {
     Integer { size: Option<u32>, signed: bool, base: NumberBase, value: String, #[cfg_attr(feature = "serde", serde(skip))] cached_val: Cell<Option<(u64, u64, u32)>> },
     Real(f64),
     UnbasedUnsized(char),
+    /// Time literal `<number><unit>` (`10ns`, `5ps`, …), value stored in
+    /// ABSOLUTE SECONDS (LRM §22.7). Kept distinct from `Real` so the simulator
+    /// can convert it against the global tick precision, while a *bare* delay
+    /// `#5` (no unit) is scaled by its module's timeunit instead. Conflating the
+    /// two (the old `Real(ns)` form) broke relative timing in sub-ns timescales.
+    Time(f64),
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

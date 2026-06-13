@@ -1396,14 +1396,13 @@ fn ternary_bp() -> (u8, u8) { (1, 1) }
 /// Parse a number literal string into our AST representation.
 fn parse_number_literal(text: &str) -> NumberLiteral {
     // Time literal: <number><suffix> where suffix is one of fs/ps/ns/us/ms/s.
-    // Scale the mantissa to NANOSECONDS — the simulator runs at a fixed 1 ns
-    // tick, so a time-literal delay (`#10ns`) becomes that many ticks. (Scaling
-    // to *seconds* produced tiny Reals like 1e-8 that the delay handler then
-    // rounded to 0 — every `#10ns` collapsed to `#0`, so a clock generator
-    // `repeat(8) #10ns clk=~clk` busy-looped at time 0 and never advanced.)
+    // Stored in ABSOLUTE SECONDS as `NumberLiteral::Time` (LRM §22.7); the
+    // simulator converts it against the global tick precision. Kept distinct
+    // from a bare numeric delay (scaled by the module timeunit) so relative
+    // timing is correct under sub-ns timescales.
     let time_suffixes: &[(&str, f64)] = &[
-        ("fs", 1e-6), ("ps", 1e-3), ("ns", 1.0),
-        ("us", 1e3),  ("ms", 1e6),  ("s",  1e9),
+        ("fs", 1e-15), ("ps", 1e-12), ("ns", 1e-9),
+        ("us", 1e-6),  ("ms", 1e-3),  ("s",  1.0),
     ];
     for (suf, scale) in time_suffixes {
         if text.ends_with(suf)
@@ -1412,7 +1411,7 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
         {
             let mantissa = &text[..text.len() - suf.len()];
             if let Ok(v) = mantissa.replace('_', "").parse::<f64>() {
-                return NumberLiteral::Real(v * *scale);
+                return NumberLiteral::Time(v * *scale);
             }
         }
     }
