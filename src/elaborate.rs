@@ -1524,6 +1524,7 @@ pub fn elaborate_module_with_defs(
                 }
 
                 if let Some(fields) = struct_fields {
+                    tls_register_struct_layout(&assign.name.name, &fields);
                     elab.packed_struct_fields
                         .entry(assign.name.name.clone())
                         .or_insert(fields);
@@ -1591,6 +1592,7 @@ pub fn elaborate_module_with_defs(
                         );
                         let is_signed = is_type_signed(data_type);
                         for assign in assignments {
+                            register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
                             if let Some(init) = &assign.init {
                                 // For implicit-typed parameters, infer width
                                 // from a sized literal initializer so
@@ -1892,6 +1894,7 @@ pub fn elaborate_module_with_defs(
                             } else { &dd.data_type };
                         if let Some(fields) = flatten_elem(elem_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
                             if !fields.is_empty() {
+                                tls_register_struct_layout(&decl.name.name, &fields);
                                 elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
                             }
                         }
@@ -2129,6 +2132,7 @@ pub fn elaborate_module_with_defs(
                         }
                         if let Some(fields) = flatten_subfields(dt_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
                             if !fields.is_empty() {
+                                tls_register_struct_layout(&decl.name.name, &fields);
                                 elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
                             }
                         }
@@ -2315,6 +2319,7 @@ pub fn elaborate_module_with_defs(
                         }
 
                         if let Some(fields) = struct_fields {
+                            tls_register_struct_layout(&assign.name.name, &fields);
                             elab.packed_struct_fields
                                 .entry(assign.name.name.clone())
                                 .or_insert(fields);
@@ -5128,6 +5133,71 @@ thread_local! {
     /// every call site. Maps `name → (lo, hi, ndim)`.
     static ARRAYS_TLS: std::cell::RefCell<Option<HashMap<String, (i64, i64, u32)>>>
         = std::cell::RefCell::new(None);
+    /// Const-eval support for struct-member select `s.field` (IEEE 1800-2017
+    /// §7.2.1): packed-struct field layout `name → [(field, lsb_offset, width)]`,
+    /// mirroring `ElaboratedModule.packed_struct_fields`. Lets `eval_const_expr_val`
+    /// slice a field out of a struct-typed parameter Value (black-parrot's
+    /// `proc_param_lp.icache_sets`). Updated incrementally as struct params/
+    /// localparams register their layout, so a later localparam that selects from
+    /// an earlier one resolves.
+    static STRUCT_FIELDS_TLS: std::cell::RefCell<HashMap<String, Vec<(String, u32, u32)>>>
+        = std::cell::RefCell::new(HashMap::default());
+    /// Const-eval support for packed-array element select `a[i]` on an
+    /// array-of-structs parameter: `name → element bit-width`. Lets
+    /// `eval_const_expr_val` slice element `i` (`[i*elem_w +: elem_w]`) out of a
+    /// packed-array parameter Value (black-parrot's `all_cfgs_gp[bp_params_p]`).
+    static PACKED_ELEM_W_TLS: std::cell::RefCell<HashMap<String, u32>>
+        = std::cell::RefCell::new(HashMap::default());
+    /// Globally-visible parameter fallback for const-eval: package/$unit params
+    /// (snapshot taken after package elaboration, before module inlining). When a
+    /// const-eval `Ident` misses the scoped param map — e.g. a sub-module
+    /// header localparam `sc = all_cfgs_gp[SEL]` evaluated in the instance-merge
+    /// context, which holds only the sub-instance's own params — fall back here so
+    /// the imported package parameter still resolves.
+    static PARAM_FALLBACK_TLS: std::cell::RefCell<HashMap<String, Value>>
+        = std::cell::RefCell::new(HashMap::default());
+}
+
+/// Install the global package/$unit parameter snapshot consulted by const-eval
+/// `Ident` lookups that miss the scoped map. Idempotent overwrite.
+fn set_param_fallback(params: &HashMap<String, Value>) {
+    PARAM_FALLBACK_TLS.with(|c| *c.borrow_mut() = params.clone());
+}
+
+/// Look up `name` in the global parameter fallback (package/$unit params).
+fn param_fallback_get(name: &str) -> Option<Value> {
+    PARAM_FALLBACK_TLS.with(|c| c.borrow().get(name).cloned())
+}
+
+/// Record a struct param/localparam's packed field layout for const-eval
+/// member selects (`s.field`). Keyed by bare name; later registrations win
+/// (matches `packed_struct_fields`).
+fn tls_register_struct_layout(name: &str, fields: &[(String, u32, u32)]) {
+    STRUCT_FIELDS_TLS.with(|c| {
+        c.borrow_mut().insert(name.to_string(), fields.to_vec());
+    });
+}
+
+/// Record a packed-array parameter's element width for const-eval index selects
+/// (`a[i]`).
+fn tls_register_elem_w(name: &str, elem_w: u32) {
+    if elem_w == 0 { return; }
+    PACKED_ELEM_W_TLS.with(|c| {
+        c.borrow_mut().insert(name.to_string(), elem_w);
+    });
+}
+
+/// If `dt` is a packed array of a named type (`T [hi:lo]…`, e.g. black-parrot's
+/// `bp_proc_param_s [max_cfgs-1:0] all_cfgs_gp`), register the element width
+/// `$bits(T)` so const-eval `name[i]` can slice one element. No-op otherwise.
+fn register_packed_array_elem_w(name: &str, dt: &DataType, typedefs: &HashMap<String, u32>) {
+    if let DataType::TypeReference { name: tn, dimensions, .. } = dt {
+        if !dimensions.is_empty() {
+            if let Some(&ew) = typedefs.get(&tn.name.name) {
+                tls_register_elem_w(name, ew);
+            }
+        }
+    }
 }
 
 /// Run `f` with `typedefs` installed as the thread-local typedef table
@@ -5347,6 +5417,60 @@ fn struct_typedef_self_reference(
 /// Flatten a (possibly nested) packed struct/union `DataType` into
 /// `(field_path, lsb_offset, width)` tuples for `packed_struct_fields`.
 /// First-declared member is the MSB (IEEE 1800-2017 §7.2.1), so offsets are
+/// Pack an assignment-pattern literal for a PACKED ARRAY OF STRUCTS parameter
+/// (`T [N-1:0] p = '{ '{...}, '{...}, ... }`, e.g. black-parrot's
+/// `bp_proc_param_s [max_cfgs-1:0] all_cfgs_gp`) into one packed Value. Each
+/// pattern element is packed as the element struct type and the elements are
+/// concatenated MSB-first (first pattern item = highest index, IEEE 1800-2017
+/// §10.9.2 / §7.4.2). Returns None unless `dt` is a packed array of a struct
+/// typedef and `expr` is an assignment pattern, so callers fall back cleanly.
+fn pack_packed_array_const_value(
+    dt: &DataType,
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
+    let ExprKind::AssignmentPattern(items) = &expr.kind else { return None };
+    let DataType::TypeReference { name, dimensions, .. } = dt else { return None };
+    if dimensions.is_empty() { return None; }
+    // Element type = the referenced typedef, fully chased to its struct.
+    let elem_dt = resolve_typedef_chain(typedef_types.get(&name.name.name)?, typedef_types);
+    if !matches!(elem_dt, DataType::Struct(_)) { return None; }
+    let elem_w = resolve_type_width(elem_dt, Some(params), Some(typedefs));
+    if elem_w == 0 { return None; }
+    let mut parts: Vec<Value> = Vec::with_capacity(items.len());
+    for it in items {
+        let e = it.expr();
+        let v = pack_struct_const_value(elem_dt, e, params, typedefs, typedef_types)
+            .map(|sv| sv.resize(elem_w))
+            .unwrap_or_else(|| eval_init_for_width(e, params, elem_w));
+        parts.push(v);
+    }
+    Some(Value::concat(&parts))
+}
+
+/// Type-aware parameter initializer evaluation: packed array-of-structs pattern,
+/// then single struct pattern, else the generic const-eval. Centralises the
+/// black-parrot config-table packing so every param-load site resolves
+/// `all_cfgs_gp` (and struct params) consistently.
+fn eval_param_value(
+    dt: &DataType,
+    init: &Expression,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+    width: u32,
+) -> Value {
+    if let Some(v) = pack_packed_array_const_value(dt, init, params, typedefs, typedef_types) {
+        return v.resize(width);
+    }
+    if let Some(v) = pack_struct_const_value(dt, init, params, typedefs, typedef_types) {
+        return v.resize(width);
+    }
+    eval_init_for_width(init, params, width)
+}
+
 /// assigned LSB-first by walking members in reverse. Returns None if `dt`
 /// does not resolve to a struct/union.
 fn flatten_struct_fields(
@@ -5495,7 +5619,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         ExprKind::StringLiteral(s) => Value::from_string(s),
         ExprKind::Ident(hier) => {
             let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            params.get(name).cloned().unwrap_or(Value::zero(32))
+            params.get(name).cloned()
+                .or_else(|| param_fallback_get(name))
+                .unwrap_or(Value::zero(32))
         }
         ExprKind::Binary { op, left, right } => {
             let l = eval_const_expr_val(left, params);
@@ -5691,6 +5817,52 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         // ran ~313× over budget and consumed ~1.4 GB elaborating phantom
         // assigns.
         ExprKind::AssignExpr { rvalue, .. } => eval_const_expr_val(rvalue, params),
+        // §7.2.1 struct member select in const context: `s.field`. Slice the
+        // field out of the struct-typed parameter Value using its registered
+        // packed layout. Enables black-parrot's
+        // `localparam icache_sets_p = proc_param_lp.icache_sets`.
+        ExprKind::MemberAccess { expr: base, member } => {
+            let base_val = eval_const_expr_val(base, params);
+            if let ExprKind::Ident(h) = &base.kind {
+                let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                if let Some(found) = STRUCT_FIELDS_TLS.with(|c| {
+                    c.borrow().get(nm).and_then(|layout|
+                        layout.iter().find(|(f, _, _)| f == &member.name).map(|&(_, off, w)| (off, w)))
+                }) {
+                    let (off, w) = found;
+                    if w > 0 && off + w <= base_val.width {
+                        return base_val.range_select((off + w - 1) as usize, off as usize);
+                    }
+                }
+            }
+            Value::zero(32)
+        }
+        // Packed-array element select in const context: `a[i]`. For an
+        // array-of-structs parameter with a registered element width, slice
+        // element `i` (`[i*elem_w +: elem_w]`). Enables black-parrot's
+        // `localparam bp_proc_param_s proc_param_lp = all_cfgs_gp[bp_params_p]`.
+        // Falls back to a single-bit select for plain vectors.
+        ExprKind::Index { expr: base, index } => {
+            let base_val = eval_const_expr_val(base, params);
+            let idx = eval_const_expr_val(index, params).to_u64().unwrap_or(0);
+            if let ExprKind::Ident(h) = &base.kind {
+                let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                if let Some(elem_w) = PACKED_ELEM_W_TLS.with(|c| c.borrow().get(nm).copied()) {
+                    if elem_w > 0 {
+                        let lo = (idx as u32).saturating_mul(elem_w);
+                        if lo + elem_w <= base_val.width {
+                            return base_val.range_select((lo + elem_w - 1) as usize, lo as usize);
+                        }
+                    }
+                }
+            }
+            let i = idx as usize;
+            if (i as u32) < base_val.width {
+                base_val.range_select(i, i)
+            } else {
+                Value::zero(1)
+            }
+        }
         _ => Value::zero(32),
     };
     // eprintln!("[DEBUG] eval_const_expr_val: {:?} -> {}", expr, res.to_dec_string());
@@ -5737,8 +5909,9 @@ pub fn inline_instantiations(
                                         let width = if is_implicit {
                                             assign.init.as_ref().and_then(|e| sized_literal_width(e)).unwrap_or(32)
                                         } else { base_width };
+                                        register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
                                         if let Some(init) = &assign.init {
-                                            let mut v = eval_init_for_width(init, &elab.parameters, width);
+                                            let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                             if is_signed { v.is_signed = true; }
                                             elab.parameters.insert(assign.name.name.clone(), v);
                                         }
@@ -5773,8 +5946,9 @@ pub fn inline_instantiations(
                                             .and_then(|e| sized_literal_width(e))
                                             .unwrap_or(32)
                                     } else { base_width };
+                                    register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
                                     if let Some(init) = &assign.init {
-                                        let mut v = eval_init_for_width(init, &elab.parameters, width);
+                                        let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                         if is_signed { v.is_signed = true; }
                                         elab.parameters.insert(assign.name.name.clone(), v);
                                     }
@@ -5875,6 +6049,11 @@ pub fn inline_instantiations(
     };
     // Recursively inline starting from the top module's items
     let top_params = elab.parameters.clone();
+    // Snapshot the now-complete package/$unit parameters as the const-eval
+    // fallback so sub-module header localparams (evaluated in the instance-merge
+    // context, which only carries the sub-instance's own params) can still
+    // resolve imported package parameters like black-parrot's `all_cfgs_gp`.
+    set_param_fallback(&top_params);
     let mut cache = HashMap::default();
     inline_module_items(elab, top_def, "", definitions, &mut HashMap::default(), &top_params, &mut cache)?;
     if elab_trace_enabled() {
@@ -6987,6 +7166,15 @@ fn inline_module_items(
                                             continue;
                                         }
                                     }
+                                    // Register element-width / struct layout so a
+                                    // header localparam like
+                                    // `sc = all_cfgs_gp[SEL]` / `x = sc.field`
+                                    // resolves through the const-eval index /
+                                    // member-select arms (black-parrot config).
+                                    register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
+                                    if let Some(fields) = flatten_struct_fields(data_type, &sub_local_params, &elab.typedefs, &elab.typedef_types) {
+                                        if !fields.is_empty() { tls_register_struct_layout(&assign.name.name, &fields); }
+                                    }
                                     let mut val = eval_const_expr_val(init, &sub_local_params);
                                     if is_type_real(data_type) {
                                         val = Value::from_f64(val.to_f64());
@@ -7001,7 +7189,7 @@ fn inline_module_items(
                         }
                     }
                 }
-                
+
                 // 2. Parameters from module items
                 add_params_from_items(sub_mod.items(), &mut sub_local_params);
 
@@ -7929,8 +8117,9 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             .and_then(|e| sized_literal_width(e))
                                             .unwrap_or(32)
                                     } else { base_width };
+                                    register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
                                     if let Some(init) = &assign.init {
-                                        let mut v = eval_init_for_width(init, &elab.parameters, width);
+                                        let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                         if signed { v.is_signed = true; }
                                         if is_real { v = Value::from_f64(v.to_f64()); }
                                         elab.parameters.insert(assign.name.name.clone(), v.clone());
