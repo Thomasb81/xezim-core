@@ -5122,6 +5122,16 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
             }
             _ => None,
         }
+        // Packed-array element select / struct member select in an integer
+        // const context — e.g. a dimension `[all_cfgs_gp[idx].icache_sets-1:0]`
+        // or `[proc_param_lp.field-1:0]`. Delegate to the full value evaluator
+        // (which carries the array-elem / struct-layout / package-param TLS
+        // context) and reduce to i64. Without this, such a dimension underflows
+        // to ~u32::MAX (black-parrot config widths used directly in a range).
+        ExprKind::Index { .. } | ExprKind::MemberAccess { .. } => {
+            let p = params?;
+            eval_const_expr_val(expr, p).to_u64().map(|u| u as i64)
+        }
         _ => None,
     }
 }
@@ -7198,6 +7208,30 @@ fn inline_module_items(
                             }
                         }
                     }
+                }
+
+                // 1b. Pre-register the sub-module's LOCAL typedef widths using
+                // THIS instance's (bare-named) parameters, then install them in
+                // TYPEDEFS_TLS so the body localparams' `$bits(<local typedef>)`
+                // resolve. black-parrot declares its types via macros
+                // (`declare_bp_be_dcache_wbuf_entry_s(caddr_width_mp, ways_mp)`,
+                // `bp_pte_leaf_s` …) parameterised by header params; without this
+                // the body localparam `r_entry_high_bits_lp = $bits(bp_pte_leaf_s)
+                // - …` saw $bits = 0 and the subtraction wrapped to ~u32::MAX,
+                // producing a multi-GB phantom width. A few passes converge
+                // typedefs whose width depends on an earlier-resolved typedef.
+                {
+                    let body_items = collect_effective_items(sub_mod.items(), &sub_local_params);
+                    let mut local_tds = elab.typedefs.clone();
+                    for _ in 0..3 {
+                        for it in &body_items {
+                            if let ModuleItem::TypedefDeclaration(td) = it {
+                                let w = resolve_type_width(&td.data_type, Some(&sub_local_params), Some(&local_tds));
+                                local_tds.insert(td.name.name.clone(), w);
+                            }
+                        }
+                    }
+                    TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(local_tds));
                 }
 
                 // 2. Parameters from module items
