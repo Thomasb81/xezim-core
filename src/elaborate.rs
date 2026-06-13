@@ -4891,6 +4891,15 @@ pub fn is_type_two_state(dt: &DataType) -> bool {
     }
 }
 
+/// Ceil-log2 (number of bits to index `n` values): `$clog2(n)`. 0 for n<=1.
+fn ceil_log2(n: u64) -> u64 {
+    if n <= 1 { return 0; }
+    let mut res = 0u64;
+    let mut t = n - 1;
+    while t > 0 { t >>= 1; res += 1; }
+    res
+}
+
 pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<String, Value>>) -> Option<i64> {
     match &expr.kind {
         ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
@@ -4900,10 +4909,15 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
         ExprKind::Number(NumberLiteral::UnbasedUnsized('0')) => Some(0),
         ExprKind::Number(NumberLiteral::UnbasedUnsized('1')) => Some(1),
         ExprKind::Ident(hier) => {
-            if let Some(p) = params {
-                let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                p.get(name).and_then(|v| v.to_i64())
-            } else { None }
+            let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            params.and_then(|p| p.get(name)).and_then(|v| v.to_i64())
+                // Fall back to the global package/$unit param snapshot so that a
+                // dimension like `[paddr_width_p - page_offset_width_gp - 1:0]`
+                // (where the global `page_offset_width_gp` is absent from the
+                // scoped instance-merge param map) resolves instead of dropping
+                // the whole dimension — which otherwise mis-sized black-parrot's
+                // bp_pte_leaf_s and wrapped r_entry_high_bits_lp.
+                .or_else(|| param_fallback_get(name).and_then(|v| v.to_i64()))
         }
         ExprKind::Binary { op, left, right } => {
             // LRM §11.4 — full operator set, evaluated in i64 context.
@@ -5131,6 +5145,14 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
         ExprKind::Index { .. } | ExprKind::MemberAccess { .. } => {
             let p = params?;
             eval_const_expr_val(expr, p).to_u64().map(|u| u as i64)
+        }
+        // User ceil-log2 const function (HardFloat `clog2`), == $clog2.
+        ExprKind::Call { func, args }
+            if matches!(&func.kind, ExprKind::Ident(h)
+                if h.path.last().map(|s| s.name.name.as_str()) == Some("clog2")) =>
+        {
+            let n = const_eval_i64_with_params(args.first()?, params)? as u64;
+            Some(ceil_log2(n) as i64)
         }
         _ => None,
     }
@@ -5834,6 +5856,18 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         // ran ~313× over budget and consumed ~1.4 GB elaborating phantom
         // assigns.
         ExprKind::AssignExpr { rvalue, .. } => eval_const_expr_val(rvalue, params),
+        // User-defined ceil-log2 helper used as a constant function — most
+        // notably HardFloat's `clog2` (`for (clog2=0; fa>0; …) fa>>=1;` over
+        // `a-1`), which is exactly `$clog2`. Without const-eval it returned 0, so
+        // `alignDistWidth = clog2(sigWidth)` was 0 and `inWidth = alignDistWidth-2`
+        // wrapped to ~u32::MAX. Recognise a 1-arg call named `clog2` and fold it.
+        ExprKind::Call { func, args }
+            if matches!(&func.kind, ExprKind::Ident(h)
+                if h.path.last().map(|s| s.name.name.as_str()) == Some("clog2")) =>
+        {
+            let n = args.first().map(|a| eval_const_expr_val(a, params).to_u64().unwrap_or(0)).unwrap_or(0);
+            Value::from_u64(ceil_log2(n), 32)
+        }
         // §7.2.1 struct member select in const context: `s.field`. Slice the
         // field out of the struct-typed parameter Value using its registered
         // packed layout. Enables black-parrot's
