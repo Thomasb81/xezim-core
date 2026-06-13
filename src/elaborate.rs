@@ -4649,7 +4649,14 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
         // copy. Without this, two iterations both declare e.g. `valid_q` and
         // the elaborator's flat signal table flags a duplicate.
         let subst = substitute_genvar_in_items(&gf.items, var, i);
-        let suffix = format!("__gf_{}_{}_", var, i);
+        // Namespace the per-iteration rename by the block label so two
+        // generate-for blocks sharing a genvar name (common in black-parrot:
+        // many `for (genvar i …) begin : <label>`) don't collide on the flat
+        // signal table (`sig__gf_i_<n>_`).
+        let suffix = match &gf.name {
+            Some(l) => format!("__gf_{}_{}_{}_", l, var, i),
+            None => format!("__gf_{}_{}_", var, i),
+        };
         let renamed = rename_decls_in_iter(&subst, &suffix);
         elaborate_items(&renamed, elab, all_defs)?;
         if trace && (iter_count % 8) == 0 {
@@ -6526,7 +6533,10 @@ fn collect_effective_items(items: &[ModuleItem], params: &HashMap<String, Value>
                     // iteration gets its own unique copy. Without this, two
                     // iterations both declare `valid_q` and the elaborator
                     // sees a flat duplicate.
-                    let suffix = format!("__gf_{}_{}_", gf.var, i);
+                    let suffix = match &gf.name {
+                        Some(l) => format!("__gf_{}_{}_{}_", l, gf.var, i),
+                        None => format!("__gf_{}_{}_", gf.var, i),
+                    };
                     let subst = rename_decls_in_iter(&subst, &suffix);
                     result.extend(collect_effective_items(&subst, &local_params));
                     match &gf.incr.kind {

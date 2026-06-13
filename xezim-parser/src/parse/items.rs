@@ -890,8 +890,8 @@ impl Parser {
                     }
                 };
                 self.expect(TokenKind::RParen);
-                let items = self.parse_generate_branch_items();
-                Some(ModuleItem::GenerateFor(GenerateFor { var: var_name, init_val, cond, incr, items, span: self.span_from(s) }))
+                let (items, name) = self.parse_generate_branch_items_named();
+                Some(ModuleItem::GenerateFor(GenerateFor { var: var_name, init_val, cond, incr, items, name, span: self.span_from(s) }))
             }
             TokenKind::KwAnd | TokenKind::KwNand | TokenKind::KwOr | TokenKind::KwNor |
             TokenKind::KwXor | TokenKind::KwXnor | TokenKind::KwBuf | TokenKind::KwNot |
@@ -1096,12 +1096,18 @@ impl Parser {
     }
 
     fn parse_generate_branch_items(&mut self) -> Vec<ModuleItem> {
+        self.parse_generate_branch_items_named().0
+    }
+
+    /// Like `parse_generate_branch_items` but also returns the optional
+    /// `begin : <label>` block name (needed to namespace generate-for renames).
+    fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>) {
         if self.eat(TokenKind::KwBegin).is_some() {
-            let _ = self.parse_end_label();
+            let label = self.parse_end_label().map(|id| id.name);
             let items = self.parse_module_items_until(TokenKind::KwEnd);
             self.expect(TokenKind::KwEnd); let _ = self.parse_end_label();
-            items
-        } else { self.parse_module_item().into_iter().collect() }
+            (items, label)
+        } else { (self.parse_module_item().into_iter().collect(), None) }
     }
 
     fn parse_identifier_starting_item(&mut self) -> ModuleItem {

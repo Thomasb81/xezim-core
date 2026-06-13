@@ -576,6 +576,12 @@ pub struct GenerateFor {
     pub incr: super::expr::Expression,
     /// Body items to replicate
     pub items: Vec<ModuleItem>,
+    /// Optional `begin : <label>` block name. Used to namespace per-iteration
+    /// declaration renames so two generate-for blocks that share a genvar name
+    /// (e.g. black-parrot's many `for (genvar i …) begin : <label>` blocks)
+    /// don't collide on `sig__gf_i_<n>_`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub name: Option<String>,
     pub span: Span,
 }
 
