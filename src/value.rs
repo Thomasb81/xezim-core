@@ -1677,6 +1677,15 @@ impl Value {
     #[inline]
     pub fn range_select(&self, left: usize, right: usize) -> Value {
         let width = if left >= right { left - right + 1 } else { right - left + 1 };
+        // LRM §11.5.1: out-of-range part-select bits read as X. A runtime index
+        // that underflowed (`sig[v-1:0]` with `v` = 0 at time 0 → left ≈ u32::MAX)
+        // requests a slice far beyond the source; building it would allocate a
+        // multi-GB (cap-clamped) value and stall settling. Return a bounded all-X
+        // value instead. Only fires for absurd widths, so in-range selects (which
+        // are never wider than MAX_WIDTH) are unaffected.
+        if width > Self::MAX_WIDTH as usize {
+            return Value::new(width.min((self.width.max(1)) as usize) as u32);
+        }
         let lo = left.min(right);
         // Fast path: Inline source whose extraction fits in 64 bits collapses
         // to a single shift+mask per of (val_bits, xz_bits) instead of `width`
