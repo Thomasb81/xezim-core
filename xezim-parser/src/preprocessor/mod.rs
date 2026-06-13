@@ -41,6 +41,12 @@ pub struct Preprocessor {
     /// LRM §22.7.
     timescale: Option<(f64, f64)>,
     timescale_warned: std::collections::HashSet<(String, String)>,
+    /// Per-design-element timescale: `module/interface/program/package name →
+    /// (unit_s, prec_s)`, captured as each declaration is emitted so the
+    /// elaborator/simulator can scale that scope's delays by its own timeunit
+    /// (LRM §22.7 — a `timescale` applies to all following declarations until the
+    /// next directive, persisting across files in compilation order).
+    pub module_timescales: std::collections::HashMap<String, (f64, f64)>,
     /// §22 strict-mode directive errors (bad `\`line`/`\`define`/`\`pragma`/
     /// `\`resetall`). Collected only when `strict_checks()` is on; the driver
     /// treats a non-empty list as a hard failure (non-zero exit).
@@ -105,6 +111,7 @@ impl Preprocessor {
             keywords_stack: Vec::new(),
             timescale: None,
             timescale_warned: std::collections::HashSet::new(),
+            module_timescales: std::collections::HashMap::new(),
             errors: Vec::new(),
             design_element_depth: 0,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
@@ -197,6 +204,33 @@ impl Preprocessor {
     /// Return the most recent `timescale` (unit_s, prec_s) seen, if any.
     pub fn timescale(&self) -> Option<(f64, f64)> {
         self.timescale
+    }
+
+    /// If `line` begins a design-element declaration
+    /// (`module`/`macromodule`/`interface`/`program`/`package <name>`), return
+    /// its name. Used to associate the active timescale with each scope.
+    fn design_element_name(line: &str) -> Option<String> {
+        let t = line.trim_start();
+        for kw in ["macromodule", "module", "interface", "program", "package"] {
+            if let Some(rest) = t.strip_prefix(kw) {
+                if !rest.starts_with(char::is_whitespace) { continue; }
+                let mut rest = rest.trim_start();
+                // skip an optional lifetime qualifier
+                for q in ["static", "automatic"] {
+                    if let Some(r2) = rest.strip_prefix(q) {
+                        if r2.starts_with(char::is_whitespace) { rest = r2.trim_start(); }
+                    }
+                }
+                let name: String = rest
+                    .chars()
+                    .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
+                    .collect();
+                if name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') {
+                    return Some(name);
+                }
+            }
+        }
+        None
     }
 
     /// Set include search directories.
@@ -701,6 +735,16 @@ impl Preprocessor {
                     output.push('\n');
                 }
             } else {
+                // Capture the timescale in effect for any design element this
+                // (expanded) line declares, so its scope's delays can later be
+                // scaled by the right timeunit. `module foo`, `interface bar`,
+                // `program baz`, `package p` — name is the first identifier after
+                // the keyword. Standard one-declaration-per-line form (which
+                // black-parrot uses); good enough for timescale association.
+                if let Some(name) = Self::design_element_name(&expanded) {
+                    let ts = self.timescale.unwrap_or((1e-9, 1e-9));
+                    self.module_timescales.entry(name).or_insert(ts);
+                }
                 output.push_str(&expanded);
                 output.push('\n');
             }

@@ -228,7 +228,8 @@ pub fn parse_and_elaborate_multi(
     }
 
     let lib_defines = pp.snapshot_defines();
-    parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines)
+    let module_timescales = pp.module_timescales.clone();
+    parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales)
 }
 
 fn parse_and_elaborate(
@@ -236,7 +237,11 @@ fn parse_and_elaborate(
     top_module_name: Option<&str>,
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+    module_timescales: &std::collections::HashMap<String, (f64, f64)>,
 ) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
+    // Global simulation tick = the finest `timescale` precision across the
+    // design (default 1 ns). All module delays are then pre-scaled to this unit.
+    let tick_s = module_timescales.values().map(|&(_, p)| p).fold(1e-9_f64, f64::min);
     let mut definitions: crate::hasher::HashMap<String, SourceDefinition> = crate::hasher::HashMap::default();
     let mut top_module = None;
     let mut top_level_imports = Vec::new();
@@ -251,13 +256,18 @@ fn parse_and_elaborate(
     let mut top_level_ooc_constraints: Vec<(String, String)> = Vec::new();
     for desc in all_descriptions {
         match desc {
-            ast::Description::Module(m) => {
+            ast::Description::Module(mut m) => {
                 let name = m.name.name.clone();
                 if definitions.contains_key(&name) {
                     return Err(format!(
                         "Duplicate module definition '{}' (IEEE 1800-2017 §3.3)",
                         name
                     ));
+                }
+                // Pre-scale this module's delays from its own timeunit to the
+                // global tick (no-op when both are 1 ns).
+                if let Some(&(unit_s, _prec_s)) = module_timescales.get(&name) {
+                    elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
                 }
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Module(Rc::new(m)));
@@ -467,6 +477,7 @@ fn parse_and_elaborate(
         &top_level_lets,
         &top_level_ooc_constraints,
     )?;
+    elab.tick_s = tick_s;
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
     // Link `function ClassName::m(); ...` out-of-class bodies into their

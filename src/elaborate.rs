@@ -526,6 +526,11 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ElaboratedModule {
     pub name: String,
+    /// Global simulation tick in seconds — the finest `timescale` precision
+    /// across the design (default 1e-9 = 1 ns when none is finer). Delays are
+    /// pre-scaled to this unit at elaboration; the simulator counts ticks of it.
+    #[serde(default = "default_tick_s")]
+    pub tick_s: f64,
     pub signals: HashMap<String, Signal>,
     pub port_order: Vec<String>,
     pub continuous_assigns: Vec<ContinuousAssignment>,
@@ -714,6 +719,7 @@ impl ElaboratedModule {
     pub fn new(name: String) -> Self {
         Self {
             name,
+            tick_s: default_tick_s(),
             signals: HashMap::default(),
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
@@ -4718,6 +4724,98 @@ fn clamp_packed_width(w: u64, ctx: &str) -> u32 {
         UNDERFLOW_WIDTH_PLACEHOLDER
     } else {
         w as u32
+    }
+}
+
+pub fn default_tick_s() -> f64 { 1e-9 }
+
+/// Public entry to pre-scale a module's delays from its timeunit to the global
+/// tick (see `rewrite_module_item_delays`).
+pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, tick_s: f64) {
+    rewrite_module_item_delays(items, unit_s, tick_s);
+}
+
+/// Rewrite every delay expression inside a module's items so it is expressed in
+/// GLOBAL TICK units (`tick_s` seconds each), given the module's own timeunit
+/// `unit_s`. A *bare* delay `#5` is a count of `unit_s`, so it scales by
+/// `unit_s / tick_s`; a *time literal* `#10ns` is absolute seconds, so it
+/// becomes `seconds / tick_s`. With no finer timescale anywhere (tick_s = unit_s
+/// = 1 ns) both are identities, so behaviour is unchanged. LRM §22.7 / §3.14.
+fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64) {
+    for item in items.iter_mut() {
+        match item {
+            ModuleItem::AlwaysConstruct(ac) => rewrite_stmt_delays(&mut ac.stmt, unit_s, tick_s),
+            ModuleItem::InitialConstruct(ic) => rewrite_stmt_delays(&mut ic.stmt, unit_s, tick_s),
+            ModuleItem::FinalConstruct(fc) => rewrite_stmt_delays(&mut fc.stmt, unit_s, tick_s),
+            ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, tick_s),
+            ModuleItem::GenerateIf(gi) => {
+                for (_c, items) in gi.branches.iter_mut() {
+                    rewrite_module_item_delays(items, unit_s, tick_s);
+                }
+            }
+            ModuleItem::GenerateRegion(gr) => rewrite_module_item_delays(&mut gr.items, unit_s, tick_s),
+            ModuleItem::GenerateCase(gc) => {
+                for arm in gc.arms.iter_mut() {
+                    rewrite_module_item_delays(&mut arm.items, unit_s, tick_s);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Replace a single delay expression with its tick-count equivalent.
+fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, tick_s: f64) {
+    use crate::ast::expr::NumberLiteral;
+    if let ExprKind::Number(NumberLiteral::Time(s)) = &d.kind {
+        // Absolute time literal → ticks.
+        let ticks = *s / tick_s;
+        *d = Expression::new(ExprKind::Number(NumberLiteral::Real(ticks)), d.span);
+    } else {
+        // Bare delay (count of the module timeunit) → ticks.
+        let scale = unit_s / tick_s;
+        if (scale - 1.0).abs() > f64::EPSILON {
+            let span = d.span;
+            let inner = std::mem::replace(d, Expression::new(ExprKind::Null, span));
+            *d = Expression::new(ExprKind::Binary {
+                op: BinaryOp::Mul,
+                left: Box::new(inner),
+                right: Box::new(Expression::new(
+                    ExprKind::Number(NumberLiteral::Real(scale)), span)),
+            }, span);
+        }
+    }
+}
+
+fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, tick_s: f64) {
+    match &mut stmt.kind {
+        StatementKind::TimingControl { control, stmt } => {
+            if let TimingControl::Delay(d) = control {
+                rewrite_delay_expr(d, unit_s, tick_s);
+            }
+            rewrite_stmt_delays(stmt, unit_s, tick_s);
+        }
+        StatementKind::NonblockingAssign { delay: Some(d), .. } => {
+            rewrite_delay_expr(d, unit_s, tick_s);
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts.iter_mut() { rewrite_stmt_delays(s, unit_s, tick_s); }
+        }
+        StatementKind::If { then_stmt, else_stmt, .. } => {
+            rewrite_stmt_delays(then_stmt, unit_s, tick_s);
+            if let Some(e) = else_stmt { rewrite_stmt_delays(e, unit_s, tick_s); }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body, .. } => rewrite_stmt_delays(body, unit_s, tick_s),
+        StatementKind::Wait { stmt, .. } => rewrite_stmt_delays(stmt, unit_s, tick_s),
+        StatementKind::Case { items, .. } => {
+            for it in items.iter_mut() { rewrite_stmt_delays(&mut it.stmt, unit_s, tick_s); }
+        }
+        _ => {}
     }
 }
 
