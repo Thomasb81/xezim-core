@@ -1855,9 +1855,7 @@ pub fn elaborate_module_with_defs(
                             typedefs: &HashMap<String, u32>,
                             typedef_types: &HashMap<String, DataType>,
                         ) -> Option<Vec<(String, u32, u32)>> {
-                            let resolved = if let DataType::TypeReference { name, .. } = dt {
-                                typedef_types.get(&name.name.name).unwrap_or(dt)
-                            } else { dt };
+                            let resolved = resolve_typedef_chain(dt, typedef_types);
                             if let DataType::Struct(su) = resolved {
                                 let is_union = matches!(su.kind, StructUnionKind::Union);
                                 let mut raw: Vec<(String, u32, DataType)> = Vec::new();
@@ -2098,9 +2096,7 @@ pub fn elaborate_module_with_defs(
                         // Recursively flatten nested struct/union members so multi-segment
                         // paths like u.s.a resolve via a single packed_struct_fields lookup.
                         fn flatten_subfields(dt: &DataType, params: &HashMap<String, Value>, typedefs: &HashMap<String, u32>, typedef_types: &HashMap<String, DataType>) -> Option<Vec<(String, u32, u32)>> {
-                            let resolved = if let DataType::TypeReference { name, .. } = dt {
-                                typedef_types.get(&name.name.name).unwrap_or(dt)
-                            } else { dt };
+                            let resolved = resolve_typedef_chain(dt, typedef_types);
                             if let DataType::Struct(su) = resolved {
                                 let is_union = matches!(su.kind, StructUnionKind::Union);
                                 let mut raw: Vec<(String, u32, DataType)> = Vec::new();
@@ -4194,7 +4190,12 @@ fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
         ExprKind::Index { expr, index } => { collect_ident_names(expr, out); collect_ident_names(index, out); }
         ExprKind::RangeSelect { expr, left, right, .. } => { collect_ident_names(expr, out); collect_ident_names(left, out); collect_ident_names(right, out); }
         ExprKind::Paren(inner) => collect_ident_names(inner, out),
-        ExprKind::Call { func, args } => { collect_ident_names(func, out); for a in args { collect_ident_names(a, out); } }
+        // Only the CALL ARGUMENTS can name nets — the callee (`func`) is a
+        // function/task name, never an implicit net. Collecting it created a
+        // phantom 1-bit net for const functions like a user `clog2(N)`, which
+        // then re-dirtied on every combinational settle pass so settle never
+        // converged (black-parrot HardFloat / BSG width helpers).
+        ExprKind::Call { func: _, args } => { for a in args { collect_ident_names(a, out); } }
         ExprKind::MemberAccess { expr, .. } => collect_ident_names(expr, out),
         _ => {}
     }
@@ -4706,6 +4707,27 @@ fn clamp_packed_width(w: u64, ctx: &str) -> u32 {
     } else {
         w as u32
     }
+}
+
+/// Fully resolve a `DataType` through a chain of typedef aliases
+/// (`typedef A B; typedef B C; typedef C struct{…}`). A single
+/// `typedef_types.get(name)` only peels one level, so a struct reached through
+/// several aliases (black-parrot's CCE types) loses its layout. Follow the chain
+/// until a non-`TypeReference` (or an unresolved name) is hit; a small iteration
+/// guard prevents looping on recursive typedefs (caught separately at decl time).
+fn resolve_typedef_chain<'a>(
+    dt: &'a DataType,
+    typedef_types: &'a HashMap<String, DataType>,
+) -> &'a DataType {
+    let mut cur = dt;
+    for _ in 0..64 {
+        let DataType::TypeReference { name, .. } = cur else { break };
+        match typedef_types.get(&name.name.name) {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    cur
 }
 
 /// Resolve the width of a data type.
@@ -5333,9 +5355,7 @@ fn flatten_struct_fields(
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Vec<(String, u32, u32)>> {
-    let resolved = if let DataType::TypeReference { name, .. } = dt {
-        typedef_types.get(&name.name.name).unwrap_or(dt)
-    } else { dt };
+    let resolved = resolve_typedef_chain(dt, typedef_types);
     if let DataType::Struct(su) = resolved {
         let is_union = matches!(su.kind, StructUnionKind::Union);
         let mut raw: Vec<(String, u32, DataType)> = Vec::new();
@@ -5380,11 +5400,8 @@ fn pack_struct_const_value(
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Value> {
-    let resolved = if let DataType::TypeReference { name, .. } = dt {
-        typedef_types.get(&name.name.name).cloned()
-    } else { Some(dt.clone()) };
-    let su = match resolved {
-        Some(DataType::Struct(su)) => su,
+    let su = match resolve_typedef_chain(dt, typedef_types) {
+        DataType::Struct(su) => su.clone(),
         _ => return None,
     };
     let items = match &expr.kind {
@@ -5693,6 +5710,46 @@ pub fn inline_instantiations(
             Definition::Covergroup(cg) => { elab.covergroups.insert(name.clone(), (*cg).clone()); }
             Definition::Package(p) => {
                 elab.packages.insert(name.clone());
+                // Forward-reference fixpoint: package items may reference
+                // parameters/localparams declared LATER in include order.
+                // black-parrot's bp_common_pkg includes aviary_pkgdef (which has
+                // `typedef enum bit [lg_max_cfgs-1:0] {...} bp_params_e;` and
+                // `parameter bp_proc_param_s [max_cfgs-1:0] all_cfgs_gp`) BEFORE
+                // aviary_cfg_pkgdef (which defines max_cfgs / lg_max_cfgs). A
+                // single in-order pass resolves those widths to garbage — the
+                // enum collapses to 1 bit and its member values truncate, so the
+                // config selector `bp_params_e` is wrong. Pre-resolve parameters
+                // and typedefs to a fixpoint first; both paths only overwrite
+                // elab.parameters/typedefs/typedef_types/enum_members (idempotent),
+                // so repeating is safe and the side-effecting Data initializers in
+                // the main pass below run exactly once. Three passes cover the
+                // chains here (max_cfgs → lg_max_cfgs → enum width → member values).
+                for _ in 0..3 {
+                    for item in &p.items {
+                        match item {
+                            crate::ast::decl::PackageItem::Parameter(pd) => {
+                                if let ParameterKind::Data { data_type, assignments } = &pd.kind {
+                                    let base_width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                    let mut is_signed = is_type_signed(data_type);
+                                    let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
+                                    if is_implicit { is_signed = true; }
+                                    for assign in assignments {
+                                        let width = if is_implicit {
+                                            assign.init.as_ref().and_then(|e| sized_literal_width(e)).unwrap_or(32)
+                                        } else { base_width };
+                                        if let Some(init) = &assign.init {
+                                            let mut v = eval_init_for_width(init, &elab.parameters, width);
+                                            if is_signed { v.is_signed = true; }
+                                            elab.parameters.insert(assign.name.name.clone(), v);
+                                        }
+                                    }
+                                }
+                            }
+                            crate::ast::decl::PackageItem::Typedef(td) => { process_typedef(td, elab); }
+                            _ => {}
+                        }
+                    }
+                }
                 for item in &p.items {
                     match item {
                         crate::ast::decl::PackageItem::Class(c) => {
@@ -7515,7 +7572,40 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                 return Expression::new(ExprKind::Ident(new_hier), expr.span);
             }
             if let Some(mapped) = port_map.get(name) {
-                return mapped.clone();
+                // Preserve any trailing path segments and first-segment selects:
+                // `a.b.c` parsed as one ident with path=[a,b,c] where `a` is the
+                // port-mapped name must become `<mapped>.b.c`, not just
+                // `<mapped>`. Dropping the tail silently mis-resolved black-parrot
+                // coherence-NoC multi-segment port references (the 6th write /
+                // header-length field).
+                let has_tail = hier.path.len() > 1 || !hier.path[0].selects.is_empty();
+                if !has_tail {
+                    return mapped.clone();
+                }
+                if let ExprKind::Ident(mut mhier) = mapped.kind.clone() {
+                    // Graft seg0's selects onto the mapped target's last
+                    // segment, then append the trailing segments verbatim
+                    // (each keeps its own selects).
+                    if !hier.path[0].selects.is_empty() {
+                        if let Some(last) = mhier.path.last_mut() {
+                            last.selects.extend(hier.path[0].selects.iter().cloned());
+                        }
+                    }
+                    for seg in &hier.path[1..] {
+                        mhier.path.push(seg.clone());
+                    }
+                    return Expression::new(ExprKind::Ident(mhier), expr.span);
+                }
+                // Non-ident mapped target (e.g. an Index/concat connection):
+                // rebuild the trailing member chain as MemberAccess.
+                let mut acc = mapped.clone();
+                for seg in &hier.path[1..] {
+                    acc = Expression::new(ExprKind::MemberAccess {
+                        expr: Box::new(acc),
+                        member: seg.name.clone(),
+                    }, expr.span);
+                }
+                return acc;
             }
             if local_names.contains(name) {
                 let mut new_hier = hier.clone();
