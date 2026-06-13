@@ -4671,6 +4671,43 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
     Ok(())
 }
 
+/// Largest plausible width for a single PACKED signal/net/port (1 Mibit ≈
+/// 128 KiB as a Wide value). No real RTL declares a single packed vector wider
+/// than this; a computed width at/above it is invariably a parameter-resolution
+/// underflow (e.g. `[N-1:0]` with N evaluating to 0, so `N-1` wraps to ~u32::MAX
+/// → a multi-GB phantom signal that OOMs elaboration). Clamp such widths so
+/// elaboration survives a config the const-evaluator can't fully resolve. The
+/// largest legitimate value observed across the corpus (black-parrot's
+/// `all_cfgs_gp` config table) is 344064 bits, well under this cap.
+pub const SANE_MAX_PACKED_WIDTH: u32 = 1 << 20;
+
+/// Width substituted for an absurd (underflowed) packed width. A width past the
+/// sane cap is never real data — it comes from `[N-1:0]` with N resolving to 0,
+/// so `N-1` wraps to ~u32::MAX. The slice carries no meaningful value, so we
+/// collapse it to a single bit: this keeps both elaboration AND simulation
+/// memory bounded (a 1 Mibit clamp still costs 128 KiB/signal and, once such a
+/// phantom feeds continuous-assign/always evaluation, re-materializes per
+/// update and OOMs the run). 1 bit is exactly as wrong as any other clamp for a
+/// config the const-evaluator could not resolve, but free.
+const UNDERFLOW_WIDTH_PLACEHOLDER: u32 = 1;
+
+/// Combine packed-dimension widths with saturating math and clamp the result to
+/// `SANE_MAX_PACKED_WIDTH`, warning once when an absurd width is suppressed.
+fn clamp_packed_width(w: u64, ctx: &str) -> u32 {
+    if w > SANE_MAX_PACKED_WIDTH as u64 {
+        use std::sync::atomic::{AtomicBool, Ordering};
+        static WARNED: AtomicBool = AtomicBool::new(false);
+        if !WARNED.swap(true, Ordering::Relaxed) {
+            eprintln!("[xezim][warning] packed width {} exceeds sane cap {} ({}); collapsing to \
+                       {} bit — a parameter likely resolved to 0 causing an `[N-1:0]` underflow",
+                w, SANE_MAX_PACKED_WIDTH, ctx, UNDERFLOW_WIDTH_PLACEHOLDER);
+        }
+        UNDERFLOW_WIDTH_PLACEHOLDER
+    } else {
+        w as u32
+    }
+}
+
 /// Resolve the width of a data type.
 pub fn resolve_type_width(
     dt: &DataType,
@@ -4680,18 +4717,18 @@ pub fn resolve_type_width(
     match dt {
         DataType::IntegerVector { dimensions, .. } => {
             if dimensions.is_empty() { return 1; }
-            let mut total = 1u32;
+            let mut total = 1u64;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
                     let lv = const_eval_i64_with_params(left, params);
                     let rv = const_eval_i64_with_params(right, params);
                     if let (Some(l), Some(r)) = (lv, rv) {
-                        let w = (l - r).abs() + 1;
-                        total *= w as u32;
+                        let w = ((l - r).abs() + 1) as u64;
+                        total = total.saturating_mul(w);
                     }
                 }
             }
-            total
+            clamp_packed_width(total, "IntegerVector")
         }
         DataType::IntegerAtom { kind, .. } => match kind {
             IntegerAtomType::Byte => 8,
@@ -4704,18 +4741,18 @@ pub fn resolve_type_width(
         DataType::Real { .. } => 64,
         DataType::Implicit { dimensions, .. } => {
             if dimensions.is_empty() { return 1; }
-            let mut total = 1u32;
+            let mut total = 1u64;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
                     let lv = const_eval_i64_with_params(left, params);
                     let rv = const_eval_i64_with_params(right, params);
                     if let (Some(l), Some(r)) = (lv, rv) {
-                        let w = (l - r).abs() + 1;
-                        total *= w as u32;
+                        let w = ((l - r).abs() + 1) as u64;
+                        total = total.saturating_mul(w);
                     }
                 }
             }
-            total
+            clamp_packed_width(total, "Implicit")
         }
         DataType::TypeReference { name, dimensions, .. } => {
             let mut base_width = if let Some(td) = typedefs {
@@ -4724,14 +4761,16 @@ pub fn resolve_type_width(
                 32
             };
             if !dimensions.is_empty() {
+                let mut total = base_width as u64;
                 for dim in dimensions {
                     if let PackedDimension::Range { left, right, .. } = dim {
                         if let (Some(l), Some(r)) = (const_eval_i64_with_params(left, params), const_eval_i64_with_params(right, params)) {
-                            let w = (l - r).abs() + 1;
-                            base_width *= w as u32;
+                            let w = ((l - r).abs() + 1) as u64;
+                            total = total.saturating_mul(w);
                         }
                     }
                 }
+                base_width = clamp_packed_width(total, "TypeReference");
             }
             base_width
         }

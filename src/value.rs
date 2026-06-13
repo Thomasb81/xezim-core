@@ -75,7 +75,34 @@ impl Value {
         if width >= 64 { u64::MAX } else { (1u64 << width) - 1 }
     }
 
+    /// Hard ceiling on a single Value's bit width (1 Mibit ≈ 128 KiB of `Wide`
+    /// storage). No legitimate scalar/packed value is this wide; a larger width
+    /// is always an artifact of a parameter underflow — e.g. `[N-1:0]` or a
+    /// part-select/`infer_lhs_width` where N resolved to 0, so `N-1` wrapped to
+    /// ~u32::MAX. Without this cap such a width allocates multiple GB and OOMs
+    /// the run (notably black-parrot config-table extraction the const-evaluator
+    /// can't resolve). Matches `elaborate::SANE_MAX_PACKED_WIDTH`.
+    pub const MAX_WIDTH: u32 = 1 << 20;
+
+    /// Clamp an absurd (underflowed) width to `MAX_WIDTH`, warning once.
+    #[inline]
+    fn cap_width(width: u32) -> u32 {
+        if width > Self::MAX_WIDTH {
+            use std::sync::atomic::{AtomicBool, Ordering};
+            static WARNED: AtomicBool = AtomicBool::new(false);
+            if !WARNED.swap(true, Ordering::Relaxed) {
+                eprintln!("[xezim][warning] value width {} exceeds cap {}; clamping \
+                           — likely a parameter underflow (`[N-1:0]` with N=0)",
+                    width, Self::MAX_WIDTH);
+            }
+            Self::MAX_WIDTH
+        } else {
+            width
+        }
+    }
+
     pub fn new(width: u32) -> Self {
+        let width = Self::cap_width(width);
         if width <= 64 {
             // All X: xz_bits = all 1s for width bits, val_bits = 0
             Self {
@@ -93,6 +120,7 @@ impl Value {
     }
 
     pub fn zero(width: u32) -> Self {
+        let width = Self::cap_width(width);
         if width <= 64 {
             Self { storage: ValueStorage::Inline { val_bits: 0, xz_bits: 0 }, width, is_signed: false, is_real: false }
         } else {
@@ -102,6 +130,7 @@ impl Value {
 
     #[inline]
     pub fn from_u64(val: u64, width: u32) -> Self {
+        let width = Self::cap_width(width);
         if width <= 64 {
             let mask = Self::mask(width);
             Self { storage: ValueStorage::Inline { val_bits: val & mask, xz_bits: 0 }, width, is_signed: false, is_real: false }
@@ -118,6 +147,7 @@ impl Value {
     /// Bits beyond 128 are zero-filled.
     #[inline]
     pub fn from_u128(val: u128, width: u32) -> Self {
+        let width = Self::cap_width(width);
         if width <= 64 {
             let mask = Self::mask(width);
             Self { storage: ValueStorage::Inline { val_bits: (val as u64) & mask, xz_bits: 0 }, width, is_signed: false, is_real: false }
@@ -1445,6 +1475,7 @@ impl Value {
 
     /// Create a value with all bits set to 1
     pub fn ones(width: u32) -> Self {
+        let width = Self::cap_width(width);
         if width <= 64 {
             Self::from_u64(Self::mask(width), width)
         } else {
