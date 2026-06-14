@@ -400,10 +400,18 @@ fn parse_and_elaborate(
         definitions.keys().cloned().collect();
     if !include_dirs.is_empty() { resolve_library_modules(&mut definitions, include_dirs, lib_defines)?; }
 
-    if let Some(name) = top_module_name {
-        if definitions.contains_key(name) { top_module = Some(name.to_string()); }
-        else { return Err(format!("Top module '{}' not found.", name)); }
+    let named_top_found = top_module_name.map_or(false, |n| definitions.contains_key(n));
+    if let (Some(name), true) = (top_module_name, named_top_found) {
+        top_module = Some(name.to_string());
     } else {
+        // No top named, OR the named top wasn't found — auto-detect the
+        // hierarchy root (a module instantiated by no other). This recovers
+        // from a wrong `:top_module:` in a generated test (e.g. sv-tests'
+        // veer-el2 specifies `veer-el2_wrapper`, but the module is
+        // `el2_veer_wrapper`).
+        if let Some(name) = top_module_name {
+            eprintln!("[xezim][warning] top module '{}' not found; auto-detecting the design root", name);
+        }
         let mut instantiated: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in definitions.values() { collect_instantiated_modules(m.items(), &mut instantiated); }
         let mut candidates: Vec<String> = definitions.keys()

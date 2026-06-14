@@ -277,6 +277,15 @@ impl Parser {
             TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
                 Some(ModuleItem::TimeunitsDecl(self.parse_timeunits_declaration()))
             }
+            // Deprecated hierarchical parameter override `defparam path.p = e;`
+            // (LRM §23.10.1). Parse and discard — consume to the terminating
+            // semicolon so it doesn't break the module-item stream (veer-el2 tb).
+            TokenKind::KwDefparam => {
+                self.bump();
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                let _ = self.eat(TokenKind::Semicolon);
+                None
+            }
             // Elaboration-time system tasks at module-item level: $error, $warning,
             // $info, $fatal — typically inside a `STATIC_ASSERT` macro expansion
             // (`generate if (!(cond)) $error msg; endgenerate`). Parse and discard.
@@ -482,6 +491,13 @@ impl Parser {
                     let name = self.parse_identifier();
                     self.expect(TokenKind::LParen);
                     let mut ports = Vec::new();
+                    // LRM §25.5: a direction keyword applies to ALL following
+                    // comma-separated members until the next direction keyword
+                    // (`output a, b, c, input d` → a/b/c output, d input). Carry
+                    // the last-seen direction; a bare member inherits it instead
+                    // of defaulting to input (which mis-marked outputs as inputs,
+                    // wrongly rejecting writes — veer-el2 / rsd).
+                    let mut last_dir = PortDirection::Input;
                     loop {
                         if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
                         let pstart = self.current().span.start;
@@ -498,9 +514,9 @@ impl Parser {
                                 span: self.span_from(pstart),
                             });
                         } else {
-                            let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
+                            if let Some(d) = self.parse_optional_direction() { last_dir = d; }
                             let port_name = self.parse_identifier();
-                            ports.push(ModportPort { direction, name: port_name, span: self.span_from(pstart) });
+                            ports.push(ModportPort { direction: last_dir, name: port_name, span: self.span_from(pstart) });
                         }
                         if self.eat(TokenKind::Comma).is_none() { break; }
                     }
