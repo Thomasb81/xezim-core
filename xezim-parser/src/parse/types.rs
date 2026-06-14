@@ -173,6 +173,13 @@ impl Parser {
                     DataType::TypeReference { name, dimensions, type_args, span: self.span_from(start) }
                 }
             }
+            // Implicit data type that begins with a packed dimension, e.g.
+            // `var [7:0] y;` or `wire [3:0] w;` reached via a `data_type`
+            // context. Consume the dimensions so the declarator list parses.
+            TokenKind::LBracket => {
+                let dimensions = self.parse_packed_dimensions();
+                DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
+            }
             _ => DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
         }
     }

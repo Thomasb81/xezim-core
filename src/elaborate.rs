@@ -7853,13 +7853,94 @@ fn inline_module_items(
     Ok(())
 }
 
+/// Build a high-impedance (`'z`) literal expression for tristate gate models.
+fn make_z_expr(span: Span) -> Expression {
+    Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('z')), span)
+}
+
+/// `cond ? then : 'z` — the canonical enabled-output / tristate shape used by
+/// `bufif`/`notif` and the MOS/switch primitives.
+fn make_tristate(cond: Expression, then_e: Expression, span: Span) -> Expression {
+    Expression::new(ExprKind::Conditional {
+        condition: Box::new(cond),
+        then_expr: Box::new(then_e),
+        else_expr: Box::new(make_z_expr(span)),
+    }, span)
+}
+
 fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Expression)> {
     let mut pairs = Vec::new();
     for inst in &gi.instances {
+        // §28 pull gates: `pullup (net)` / `pulldown (net)` — single terminal
+        // tied to a constant. Handled before the 2-terminal guard.
+        match gi.gate_type {
+            GateType::Pullup | GateType::Pulldown => {
+                if let Some(net) = inst.terminals.first() {
+                    let v = if matches!(gi.gate_type, GateType::Pullup) { '1' } else { '0' };
+                    let lit = Expression::new(
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(v)), net.span);
+                    pairs.push((net.clone(), lit));
+                }
+                continue;
+            }
+            _ => {}
+        }
         if inst.terminals.len() < 2 { continue; }
         let out = inst.terminals[0].clone();
         let in1 = inst.terminals[1].clone();
+        let sp = out.span;
         match gi.gate_type {
+            // §28 tristate buffers/inverters: `bufif1(out,in,ctl)` etc.
+            GateType::Bufif1 | GateType::Bufif0 | GateType::Notif1 | GateType::Notif0 => {
+                if inst.terminals.len() >= 3 {
+                    let ctl = inst.terminals[2].clone();
+                    let data = if matches!(gi.gate_type, GateType::Notif0 | GateType::Notif1) {
+                        Expression::new(ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(in1) }, sp)
+                    } else { in1 };
+                    let active_high = matches!(gi.gate_type, GateType::Bufif1 | GateType::Notif1);
+                    let cond = if active_high { ctl } else {
+                        Expression::new(ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(ctl) }, sp)
+                    };
+                    pairs.push((out, make_tristate(cond, data, sp)));
+                }
+            }
+            // §28 MOS switches: `nmos(out,data,ctl)` conducts on ctl, `pmos` on !ctl.
+            GateType::Nmos | GateType::Rnmos | GateType::Pmos | GateType::Rpmos => {
+                if inst.terminals.len() >= 3 {
+                    let ctl = inst.terminals[2].clone();
+                    let active_high = matches!(gi.gate_type, GateType::Nmos | GateType::Rnmos);
+                    let cond = if active_high { ctl } else {
+                        Expression::new(ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(ctl) }, sp)
+                    };
+                    pairs.push((out, make_tristate(cond, in1, sp)));
+                }
+            }
+            // §28 CMOS: `cmos(out,data,nctl,pctl)` — conducts when nctl|!pctl.
+            GateType::Cmos | GateType::Rcmos => {
+                if inst.terminals.len() >= 4 {
+                    let nctl = inst.terminals[2].clone();
+                    let pctl = inst.terminals[3].clone();
+                    let pnot = Expression::new(ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(pctl) }, sp);
+                    let cond = Expression::new(ExprKind::Binary {
+                        op: BinaryOp::LogOr, left: Box::new(nctl), right: Box::new(pnot) }, sp);
+                    pairs.push((out, make_tristate(cond, in1, sp)));
+                }
+            }
+            // §28 bidirectional switches: model as a one-directional connection
+            // so simulation runs (functional value flow only, no real bidi).
+            GateType::Tran | GateType::Rtran => {
+                pairs.push((out, in1));
+            }
+            GateType::Tranif1 | GateType::Rtranif1 | GateType::Tranif0 | GateType::Rtranif0 => {
+                if inst.terminals.len() >= 3 {
+                    let ctl = inst.terminals[2].clone();
+                    let active_high = matches!(gi.gate_type, GateType::Tranif1 | GateType::Rtranif1);
+                    let cond = if active_high { ctl } else {
+                        Expression::new(ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(ctl) }, sp)
+                    };
+                    pairs.push((out, make_tristate(cond, in1, sp)));
+                }
+            }
             GateType::And => {
                 let mut rhs = in1;
                 for i in 2..inst.terminals.len() {

@@ -359,6 +359,10 @@ pub enum GateType {
     And, Nand, Or, Nor, Xor, Xnor,
     Buf, Not,
     Bufif0, Bufif1, Notif0, Notif1,
+    // §28 switch (MOS/bidirectional/pull) primitives
+    Nmos, Pmos, Cmos, Rnmos, Rpmos, Rcmos,
+    Tran, Rtran, Tranif0, Tranif1, Rtranif0, Rtranif1,
+    Pullup, Pulldown,
 }
 
 #[derive(Debug, Clone)]

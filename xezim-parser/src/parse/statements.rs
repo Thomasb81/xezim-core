@@ -262,13 +262,19 @@ impl Parser {
             // limitation — module-scope consts ARE enforced).
             TokenKind::KwConst | TokenKind::KwVar => {
                 let _is_const = self.eat(TokenKind::KwConst).is_some();
-                self.eat(TokenKind::KwVar);
+                let var_kw = self.eat(TokenKind::KwVar).is_some();
                 let lifetime = match self.current_kind() {
                     TokenKind::KwStatic => { self.bump(); Some(Lifetime::Static) }
                     TokenKind::KwAutomatic => { self.bump(); Some(Lifetime::Automatic) }
                     _ => None,
                 };
-                let data_type = self.parse_data_type();
+                // §6.8: `var name;` with no explicit type — implicit `logic`.
+                let data_type = if var_kw && self.at(TokenKind::Identifier)
+                    && matches!(self.peek_kind(), TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign) {
+                    DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+                } else {
+                    self.parse_data_type()
+                };
                 let mut declarators = Vec::new();
                 loop {
                     let ds = self.current().span.start;

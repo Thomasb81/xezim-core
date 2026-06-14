@@ -305,7 +305,10 @@ impl Parser {
             TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef => {
                 let dir = self.parse_optional_direction().unwrap_or(PortDirection::Input);
                 let nt = self.parse_optional_net_type();
-                let dt = if self.is_data_type_keyword() { self.parse_data_type() }
+                // §23.2.2.1: `input var x;` — optional `var` keyword.
+                self.eat(TokenKind::KwVar);
+                let dt = if self.is_data_type_keyword()
+                    || self.at(TokenKind::KwSigned) || self.at(TokenKind::KwUnsigned) { self.parse_data_type() }
                     else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash | TokenKind::LBracket) {
                         self.parse_data_type()
                     }
@@ -379,6 +382,13 @@ impl Parser {
                 Some(ModuleItem::FinalConstruct(FinalConstruct { stmt: st, span: self.span_from(start) })) }
             TokenKind::KwAssign => {
                 self.bump();
+                // Optional drive_strength `(strong1, weak0)` (§10.3.1). xezim
+                // doesn't model strengths; consume the group when present.
+                if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
+                    self.bump();
+                    while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) { self.bump(); }
+                    self.expect(TokenKind::RParen);
+                }
                 let delay = if self.eat(TokenKind::Hash).is_some() {
                     if self.eat(TokenKind::LParen).is_some() {
                         let expr = self.parse_expression();
@@ -911,40 +921,26 @@ impl Parser {
             }
             TokenKind::KwAnd | TokenKind::KwNand | TokenKind::KwOr | TokenKind::KwNor |
             TokenKind::KwXor | TokenKind::KwXnor | TokenKind::KwBuf | TokenKind::KwNot |
-            TokenKind::KwBufif0 | TokenKind::KwBufif1 | TokenKind::KwNotif0 | TokenKind::KwNotif1 =>
+            TokenKind::KwBufif0 | TokenKind::KwBufif1 | TokenKind::KwNotif0 | TokenKind::KwNotif1 |
+            TokenKind::KwNmos | TokenKind::KwPmos | TokenKind::KwCmos |
+            TokenKind::KwRnmos | TokenKind::KwRpmos | TokenKind::KwRcmos |
+            TokenKind::KwTran | TokenKind::KwRtran |
+            TokenKind::KwTranif0 | TokenKind::KwTranif1 | TokenKind::KwRtranif0 | TokenKind::KwRtranif1 |
+            TokenKind::KwPullup | TokenKind::KwPulldown =>
                 Some(ModuleItem::GateInstantiation(self.parse_gate_instantiation())),
             TokenKind::KwSpecify => {
+                // §28.2 specify block: timing/path declarations. xezim does not
+                // model path delays for functional simulation, and the path
+                // grammar is rich (`=>`/`*>` parallel/full, edge-sensitive,
+                // state-dependent, `if (...)` conditionals, $setup/$hold system
+                // timing checks). Rather than parse each variant, skip the whole
+                // block to `endspecify` — robust against every form.
                 self.bump();
-                let mut paths = Vec::new();
                 while !self.at(TokenKind::KwEndspecify) && !self.at(TokenKind::Eof) {
-                    let pstart = self.current().span.start;
-                    if self.eat(TokenKind::LParen).is_some() {
-                        let src = self.parse_identifier();
-                        self.expect(TokenKind::FatArrow);
-                        let dst = self.parse_identifier();
-                        self.expect(TokenKind::RParen);
-                        self.expect(TokenKind::Assign);
-                        let delay = if self.eat(TokenKind::LParen).is_some() {
-                            let d = self.parse_expression();
-                            if self.eat(TokenKind::Comma).is_some() {
-                                let _ = self.parse_expression();
-                                if self.eat(TokenKind::Comma).is_some() {
-                                    let _ = self.parse_expression();
-                                }
-                            }
-                            self.expect(TokenKind::RParen);
-                            d
-                        } else {
-                            self.parse_expression()
-                        };
-                        self.expect(TokenKind::Semicolon);
-                        paths.push(SpecifyPath { src, dst, delay, span: self.span_from(pstart) });
-                    } else {
-                        self.bump();
-                    }
+                    self.bump();
                 }
                 self.expect(TokenKind::KwEndspecify);
-                Some(ModuleItem::SpecifyBlock(SpecifyBlock { paths, span: self.span_from(start) }))
+                Some(ModuleItem::SpecifyBlock(SpecifyBlock { paths: Vec::new(), span: self.span_from(start) }))
             }
             TokenKind::Identifier | TokenKind::EscapedIdentifier => Some(self.parse_identifier_starting_item()),
             TokenKind::Semicolon => { self.bump(); Some(ModuleItem::Null) }
@@ -1014,21 +1010,24 @@ impl Parser {
             TokenKind::KwBuf => GateType::Buf, TokenKind::KwNot => GateType::Not,
             TokenKind::KwBufif0 => GateType::Bufif0, TokenKind::KwBufif1 => GateType::Bufif1,
             TokenKind::KwNotif0 => GateType::Notif0, TokenKind::KwNotif1 => GateType::Notif1,
+            TokenKind::KwNmos => GateType::Nmos, TokenKind::KwPmos => GateType::Pmos,
+            TokenKind::KwCmos => GateType::Cmos,
+            TokenKind::KwRnmos => GateType::Rnmos, TokenKind::KwRpmos => GateType::Rpmos,
+            TokenKind::KwRcmos => GateType::Rcmos,
+            TokenKind::KwTran => GateType::Tran, TokenKind::KwRtran => GateType::Rtran,
+            TokenKind::KwTranif0 => GateType::Tranif0, TokenKind::KwTranif1 => GateType::Tranif1,
+            TokenKind::KwRtranif0 => GateType::Rtranif0, TokenKind::KwRtranif1 => GateType::Rtranif1,
+            TokenKind::KwPullup => GateType::Pullup, TokenKind::KwPulldown => GateType::Pulldown,
             _ => GateType::And,
         };
         self.bump();
-        // Optional drive_strength `(strong0, strong1)` etc.
-        if self.at(TokenKind::LParen) && self.peek_kind() == TokenKind::Identifier {
-            // Heuristic: if it looks like (strength, strength), skip it.
-            // We don't track strengths, just consume.
-            let mut k = 1;
-            while !matches!(self.peek_kind_n(k + 1), TokenKind::RParen | TokenKind::Eof) {
-                k += 1;
-                if k > 8 { break; }
-            }
-            // Only swallow if balanced and contains a comma — otherwise this
-            // `(` likely belongs to the first instance's terminal list.
-            // Skip — too risky without proper strength keyword detection.
+        // Optional drive_strength `(strong0, strong1)` / charge_strength
+        // `(small)` / pull strength `(pull1)` (§28.4). xezim doesn't model
+        // strengths; consume the group when it opens with a strength keyword.
+        if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
+            self.bump(); // (
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) { self.bump(); }
+            self.expect(TokenKind::RParen);
         }
         // Optional `#(delay)` or `#delay` spec between the gate keyword and
         // the first instance: `buf #(D) name (...)`.

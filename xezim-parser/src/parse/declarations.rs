@@ -251,7 +251,14 @@ impl Parser {
         let const_kw = self.eat(TokenKind::KwConst).is_some();
         let var_kw = self.eat(TokenKind::KwVar).is_some();
         let lifetime = self.parse_optional_lifetime();
-        let data_type = self.parse_data_type();
+        // §6.8: `var name;` — the `var` keyword with no explicit type means the
+        // identifier is the declarator (implicit `logic`), not a type name.
+        let data_type = if var_kw && self.at(TokenKind::Identifier)
+            && matches!(self.peek_kind(), TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign) {
+            DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+        } else {
+            self.parse_data_type()
+        };
         let declarators = self.parse_var_declarator_list();
         self.expect(TokenKind::Semicolon);
         DataDeclaration { const_kw, var_kw, lifetime, data_type, declarators, span: self.span_from(start) }
@@ -441,6 +448,8 @@ impl Parser {
             let _const_kw = self.eat(TokenKind::KwConst).is_some();
             if !var_kw && self.at(TokenKind::KwVar) { var_kw = self.eat(TokenKind::KwVar).is_some(); } // Handle var after const
             let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
+            // §13.3: `input var int x` — `var` may follow the direction too.
+            if !var_kw && self.at(TokenKind::KwVar) { var_kw = self.eat(TokenKind::KwVar).is_some(); }
 
             // Handle `virtual interface <name>` port type (legacy form)
             // and the LRM 1800-2017 §25.9 form `virtual <iface_type>` /

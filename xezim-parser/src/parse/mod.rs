@@ -73,6 +73,49 @@ impl Parser {
                 Some(Description::Interface(self.parse_interface_declaration())),
             TokenKind::KwProgram =>
                 Some(Description::Program(self.parse_program_declaration())),
+            // §28.3 User-Defined Primitive. xezim doesn't model UDP truth
+            // tables; surface it as an empty module with the same port list so
+            // instantiations resolve and simulation completes (the output net
+            // is simply left undriven). Robust against combinational and
+            // sequential (`reg`/`table`) UDP bodies alike.
+            TokenKind::KwPrimitive => {
+                let start = self.current().span.start;
+                self.bump();
+                let name = self.parse_identifier();
+                // Collect bare port identifiers from the header `(...)`,
+                // skipping ANSI direction keywords / punctuation.
+                let mut ports: Vec<crate::ast::Identifier> = Vec::new();
+                if self.eat(TokenKind::LParen).is_some() {
+                    let mut depth = 1i32;
+                    while depth > 0 && !self.at(TokenKind::Eof) {
+                        match self.current_kind() {
+                            TokenKind::LParen => { depth += 1; self.bump(); }
+                            TokenKind::RParen => { depth -= 1; self.bump(); }
+                            TokenKind::Identifier | TokenKind::EscapedIdentifier
+                                if depth == 1 => { ports.push(self.parse_identifier()); }
+                            _ => { self.bump(); }
+                        }
+                    }
+                }
+                self.eat(TokenKind::Semicolon);
+                // Skip the body up to `endprimitive`.
+                while !self.at(TokenKind::KwEndprimitive) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
+                self.expect(TokenKind::KwEndprimitive);
+                if self.eat(TokenKind::Colon).is_some() { let _ = self.parse_identifier(); }
+                Some(Description::Module(crate::ast::module::ModuleDeclaration {
+                    attrs: Vec::new(),
+                    kind: crate::ast::module::ModuleKind::Module,
+                    lifetime: None,
+                    name,
+                    params: Vec::new(),
+                    ports: crate::ast::module::PortList::NonAnsi(ports),
+                    items: Vec::new(),
+                    endlabel: None,
+                    span: self.span_from(start),
+                }))
+            }
             TokenKind::KwPackage =>
                 Some(Description::Package(self.parse_package_declaration())),
             TokenKind::KwNettype => {

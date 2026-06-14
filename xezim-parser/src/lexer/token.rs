@@ -112,6 +112,19 @@ pub enum TokenKind {
     Unknown,
 }
 
+impl TokenKind {
+    /// §28.4 drive/charge/pull strength keyword (used to disambiguate a
+    /// gate-instance strength group `(strong0, strong1)` from a terminal list).
+    pub fn is_strength_keyword(self) -> bool {
+        use TokenKind::*;
+        matches!(self,
+            KwSupply0 | KwSupply1 | KwStrong0 | KwStrong1 | KwPull0 | KwPull1 |
+            KwWeak0 | KwWeak1 | KwHighz0 | KwHighz1 |
+            KwStrong | KwWeak |
+            KwSmall | KwMedium | KwLarge)
+    }
+}
+
 /// Look up a keyword from an identifier string.
 pub fn keyword(s: &str) -> Option<TokenKind> {
     use TokenKind::*;
