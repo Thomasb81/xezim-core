@@ -1070,7 +1070,31 @@ impl Parser {
                 // here, the bare `##N` would leave the trailing operand
                 // dangling (e.g. `a |-> ##1 b` errored on `b`).
                 let start = self.current().span.start; self.bump();
-                let cycles = self.parse_expr_bp(30);
+                // LRM §16.8: prefix `##N rest` or a cycle-delay RANGE
+                // `##[m:n]` / `##[m:$]` / `##[*]` / `##[+]` (e.g. after `|->`:
+                // `a |-> ##[1:$] b`). Mirror the infix range handling: collapse
+                // the range to its lower bound (the SVA executor is approximate).
+                let cycles = if self.at(TokenKind::LBracket) {
+                    self.bump();
+                    let lo = if self.at(TokenKind::IntegerLiteral) {
+                        self.parse_prefix()
+                    } else {
+                        Expression::new(ExprKind::Number(
+                            crate::ast::expr::NumberLiteral::Integer {
+                                size: None, signed: false,
+                                base: crate::ast::expr::NumberBase::Decimal,
+                                value: "1".to_string(),
+                                cached_val: std::cell::Cell::new(None),
+                            }), self.span_from(start))
+                    };
+                    while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
+                        self.bump();
+                    }
+                    let _ = self.eat(TokenKind::RBracket);
+                    lo
+                } else {
+                    self.parse_expr_bp(30)
+                };
                 // The next token is either another operand (a bare
                 // sequence) or end-of-expression. We greedily parse one
                 // following sub-expression at low precedence — same as

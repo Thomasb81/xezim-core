@@ -936,6 +936,18 @@ fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
         ExprKind::Conditional { condition, then_expr, else_expr } => is_const_expr(condition, params) && is_const_expr(then_expr, params) && is_const_expr(else_expr, params),
         ExprKind::Concatenation(parts) => parts.iter().all(|p| is_const_expr(p, params)),
         ExprKind::Paren(inner) => is_const_expr(inner, params),
+        // Struct member / packed-array element select on a constant base — e.g.
+        // a generate-if on a config-struct parameter field `CVA6Cfg.RVF` (ariane)
+        // or `all_cfgs_gp[idx]`. eval_const_expr_val resolves these via the
+        // struct-layout / elem-width TLS context (see the Index/MemberAccess arms).
+        ExprKind::MemberAccess { expr, member } => {
+            // `s.field` (const struct base) OR `pkg::CONST` (the scoped member is
+            // an imported package constant / enum value, resolved by bare name).
+            is_const_expr(expr, params) || params.contains_key(&member.name)
+        }
+        ExprKind::Index { expr, index } => is_const_expr(expr, params) && is_const_expr(index, params),
+        // System constant functions used in generate conditions ($bits, $clog2…).
+        ExprKind::SystemCall { args, .. } => args.iter().all(|a| is_const_expr(a, params)),
         _ => false, // Calls (new()) etc. are not constant
     }
 }
@@ -4931,12 +4943,23 @@ pub fn resolve_type_width(
                     member_count += 1;
                 }
             }
-            if is_union {
+            let elem_w = if is_union {
                 if s.tagged {
                     let tag_w = (member_count.max(2) - 1).next_power_of_two().trailing_zeros().max(1);
                     max_w + tag_w
                 } else { max_w }
-            } else { total }
+            } else { total };
+            // Packed array dimensions after the body (`struct {...} [N-1:0]`)
+            // multiply the element width.
+            let mut w = elem_w as u64;
+            for dim in &s.dimensions {
+                if let PackedDimension::Range { left, right, .. } = dim {
+                    if let (Some(l), Some(r)) = (const_eval_i64_with_params(left, params), const_eval_i64_with_params(right, params)) {
+                        w = w.saturating_mul(((l - r).abs() + 1) as u64);
+                    }
+                }
+            }
+            clamp_packed_width(w, "Struct")
         }
         DataType::Void(_) => 0,
         _ => 32,
@@ -5980,6 +6003,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             let base_val = eval_const_expr_val(base, params);
             if let ExprKind::Ident(h) = &base.kind {
                 let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                // Package-scoped constant `pkg::CONST` (parsed as MemberAccess):
+                // when the base names no struct value, resolve the member as an
+                // imported package constant / enum member (held by bare name).
+                let base_is_struct = STRUCT_FIELDS_TLS.with(|c| c.borrow().contains_key(nm));
+                if !base_is_struct && !params.contains_key(nm) {
+                    if let Some(v) = params.get(&member.name) {
+                        return v.clone();
+                    }
+                }
                 if let Some(found) = STRUCT_FIELDS_TLS.with(|c| {
                     c.borrow().get(nm).and_then(|layout|
                         layout.iter().find(|(f, _, _)| f == &member.name).map(|&(_, off, w)| (off, w)))

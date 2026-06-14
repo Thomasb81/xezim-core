@@ -73,6 +73,11 @@ pub struct StructUnionType {
     pub tagged: bool,
     pub signing: Option<Signing>,
     pub members: Vec<StructMember>,
+    /// Packed array dimensions written AFTER the struct/union body
+    /// (`struct packed {...} [N-1:0] x;` — a packed array of the aggregate,
+    /// IEEE 1800-2017 §7.4.2). Empty for the usual unadorned struct.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dimensions: Vec<PackedDimension>,
     pub span: Span,
 }
 

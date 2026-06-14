@@ -450,6 +450,7 @@ fn parse_enum_type(&mut self) -> DataType {
         if !self.at(TokenKind::LBrace) {
             return DataType::Struct(StructUnionType {
                 kind, packed, tagged, signing, members: Vec::new(),
+                dimensions: Vec::new(),
                 span: self.span_from(start),
             });
         }
@@ -482,7 +483,9 @@ fn parse_enum_type(&mut self) -> DataType {
             if self.pos == loop_start_pos { self.bump(); }
         }
         self.expect(TokenKind::RBrace);
-        DataType::Struct(StructUnionType { kind, packed, tagged, signing, members, span: self.span_from(start) })
+        // Packed array dimensions after the body: `struct packed {...} [N-1:0] x;`
+        let dimensions = self.parse_packed_dimensions();
+        DataType::Struct(StructUnionType { kind, packed, tagged, signing, members, dimensions, span: self.span_from(start) })
     }
 
     pub(super) fn parse_optional_direction(&mut self) -> Option<PortDirection> {
