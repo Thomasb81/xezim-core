@@ -637,14 +637,17 @@ fn resolve_library_modules(
                     let name = p.name.name.clone();
                     definitions.entry(name).or_insert_with(|| SourceDefinition::Program(Rc::new(p)));
                 }
-                ast::Description::Class(c) => {
-                    let name = c.name.name.clone();
-                    definitions.entry(name).or_insert_with(|| SourceDefinition::Class(Rc::new(c)));
-                }
-                ast::Description::Package(p) => {
-                    let name = p.name.name.clone();
-                    definitions.entry(name).or_insert_with(|| SourceDefinition::Package(Rc::new(p)));
-                }
+                // §23.3.2 library-directory semantics: an incdir/libdir supplies
+                // *module* (and interface/program) definitions to satisfy
+                // unresolved instantiations — it does NOT auto-import packages or
+                // classes into the primary design's scope. Blanket-importing them
+                // poisons global elaboration: sv-tests aims `-I` at ivltests/,
+                // whose ~1000 unrelated files define packages/classes whose enum
+                // members and params (`A`, `B`, …) then collide with a primary
+                // module's own declarations. A package/class must be explicitly
+                // compiled (listed in the file set) to be visible.
+                ast::Description::Class(_c) => {}
+                ast::Description::Package(_p) => {}
                 ast::Description::TypedefDecl(t) => {
                     // §6.18: a bare forward typedef is a scope-local promise; a
                     // *library* file's forward typedef is irrelevant to the
@@ -653,13 +656,19 @@ fn resolve_library_modules(
                     // unrelated incdir sibling). Only real typedefs are imported.
                     if t.forward { continue; }
                     let name = t.name.name.clone();
+                    // Only adopt a library file's typedef when the primary design
+                    // already declared it as a forward typedef (i.e. it is
+                    // genuinely referenced). Blanket-importing every typedef from
+                    // an incdir poisons the global scope — e.g. sv-tests points
+                    // `-I` at ivltests/, whose ~1000 unrelated files each define
+                    // typedefs/enums; their enum members (`A`, `B`, …) then
+                    // collide with a primary module's own localparams. A library
+                    // directory satisfies module instantiations, not type names.
                     let replace_forward = matches!(
                         definitions.get(&name),
                         Some(SourceDefinition::Typedef(e)) if e.forward);
                     if replace_forward {
                         definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
-                    } else {
-                        definitions.entry(name).or_insert_with(|| SourceDefinition::Typedef(Rc::new(t)));
                     }
                 }
                 _ => {}
