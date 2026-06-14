@@ -532,6 +532,13 @@ pub struct ElaboratedModule {
     #[serde(default = "default_tick_s")]
     pub tick_s: f64,
     pub signals: HashMap<String, Signal>,
+    /// Transient elaboration bookkeeping (not serialized): names that already
+    /// received a type-bearing declaration, mapped to whether that type was
+    /// *incompatible* (a named/atom/real/struct/enum type, which cannot be
+    /// combined with any other type spec). Used to flag §23.2.2.1 conflicting
+    /// non-ANSI redeclarations while still permitting the legal split forms.
+    #[serde(skip)]
+    pub typed_decls: HashMap<String, bool>,
     pub port_order: Vec<String>,
     pub continuous_assigns: Vec<ContinuousAssignment>,
     pub always_blocks: Vec<AlwaysBlock>,
@@ -716,11 +723,46 @@ pub struct ElaboratedModule {
 }
 
 impl ElaboratedModule {
+    /// Record an *explicit* data-type declaration for `name`. Returns Err if
+    /// `name` was already explicitly typed — a §23.2.2.1 redeclaration with
+    /// conflicting types (e.g. `wire integer x; input integer x;` or
+    /// `output [31:0] x; T x;`). Implicit types (a bare `output x;` direction
+    /// line, or `wire x;`) are ignored, so the legal non-ANSI split where only
+    /// one declaration carries a type still elaborates.
+    fn note_explicit_type(&mut self, name: &str, dt: &DataType) -> Result<(), String> {
+        // A *bare* implicit type — `output x;` / `wire x;` (no range, no
+        // signing) — carries no type; it is the legal half of a non-ANSI split
+        // and is ignored here.
+        let bare = matches!(dt,
+            DataType::Implicit { dimensions, signing: None, .. } if dimensions.is_empty());
+        if bare { return Ok(()); }
+        // An "incompatible" type cannot be combined with any other type spec:
+        // a named type, an integer atom (int/integer/byte/…), real, string/
+        // chandle/event, a struct/union, or an enum. A plain range
+        // (`[7:0]`/Implicit-with-dims) or a vector keyword (logic/bit/reg) is
+        // compatible — e.g. the standard `input [7:0] a; reg [7:0] a;` split is
+        // legal. A second type-bearing declaration is a conflict only when one
+        // of the two is incompatible.
+        let incompat = matches!(dt,
+            DataType::TypeReference { .. } | DataType::IntegerAtom { .. } | DataType::Real { .. }
+            | DataType::Simple { .. } | DataType::Struct(_) | DataType::Enum(_));
+        if let Some(&prev_incompat) = self.typed_decls.get(name) {
+            if incompat || prev_incompat {
+                return Err(format!("Duplicate declaration of '{}'", name));
+            }
+        }
+        self.typed_decls.entry(name.to_string())
+            .and_modify(|v| *v = *v || incompat)
+            .or_insert(incompat);
+        Ok(())
+    }
+
     pub fn new(name: String) -> Self {
         Self {
             name,
             tick_s: default_tick_s(),
             signals: HashMap::default(),
+            typed_decls: HashMap::default(),
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
             always_blocks: Vec::new(),
@@ -1723,6 +1765,7 @@ pub fn elaborate_module_with_defs(
                     if elab.parameters.contains_key(&decl.name.name) {
                         return Err(format!("Duplicate declaration of '{}'", decl.name.name));
                     }
+                    elab.note_explicit_type(&decl.name.name, &pd.data_type)?;
                     // §23.2.2.1 non-ANSI ports: the data type and the direction
                     // may be declared in separate statements (`byte x; output x;`).
                     // If `x` was already registered (by a prior data/net decl)
@@ -1779,6 +1822,7 @@ pub fn elaborate_module_with_defs(
                     if elab.parameters.contains_key(&decl.name.name) {
                         return Err(format!("Duplicate declaration of '{}'", decl.name.name));
                     }
+                    elab.note_explicit_type(&decl.name.name, &nd.data_type)?;
                     // A `wire X;` (or other NetDeclaration) following an
                     // `input X;` / `output X;` port declaration is the
                     // legal SystemVerilog idiom that explicitly attaches a
@@ -1887,6 +1931,7 @@ pub fn elaborate_module_with_defs(
                 }
                 let is_signed = is_type_signed(&dd.data_type);
                 for decl in &dd.declarators {
+                    elab.note_explicit_type(&decl.name.name, &dd.data_type)?;
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
                         // Demoted to a warning so DataDeclaration-vs-existing
                         // collisions (e.g. cv32e40p UVM TB's `bit tp;`

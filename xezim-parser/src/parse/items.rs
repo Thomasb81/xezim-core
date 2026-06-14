@@ -306,7 +306,13 @@ impl Parser {
                 let dir = self.parse_optional_direction().unwrap_or(PortDirection::Input);
                 let nt = self.parse_optional_net_type();
                 // §23.2.2.1: `input var x;` — optional `var` keyword.
-                self.eat(TokenKind::KwVar);
+                let has_var = self.eat(TokenKind::KwVar).is_some();
+                // §23.2.2.3: an `inout` port shall be of a net type — `inout var`
+                // is illegal (a variable cannot have multiple drivers / be
+                // bidirectionally connected).
+                if has_var && dir == PortDirection::Inout {
+                    self.error("an 'inout' port cannot be declared 'var' (must be a net type)");
+                }
                 let dt = if self.is_data_type_keyword()
                     || self.at(TokenKind::KwSigned) || self.at(TokenKind::KwUnsigned) { self.parse_data_type() }
                     else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash | TokenKind::LBracket) {
