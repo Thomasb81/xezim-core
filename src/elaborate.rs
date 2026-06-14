@@ -1417,6 +1417,16 @@ pub fn elaborate_module_with_defs(
                                 elab.classes.entry(c.name.name.clone())
                                     .or_insert_with(|| elaborate_class(c));
                             }
+                            // Hoist package typedefs (loads enum members + typedef
+                            // widths) so an explicit scoped reference `pkg::CONST`
+                            // — which does NOT require an import — resolves during
+                            // top-module elaboration, e.g. a generate-if
+                            // `CVA6Cfg.DCacheType == config_pkg::WT` (ariane).
+                            // Package types are otherwise only processed later in
+                            // inline_instantiations, after the top body.
+                            crate::ast::decl::PackageItem::Typedef(td) => {
+                                process_typedef(td, &mut elab);
+                            }
                             _ => {}
                         }
                     }
