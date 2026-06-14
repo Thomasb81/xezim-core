@@ -968,6 +968,37 @@ pub fn elaborate_module(
 /// `typedef enum {...}` already does this via `process_typedef`; this is the
 /// missing path for the bare-variable form. Used by every `DataDeclaration`
 /// arm in the elaborator (top-level, submodule, generate-scope, etc.).
+/// §6.19.1: expand one enum member into its concrete (name, value) entries,
+/// honoring a `[lo:hi]` element range (already normalized from the `[N]` count
+/// form by the parser). An `init` seeds the FIRST expanded name; the rest
+/// auto-increment. Returns the expanded entries and the next auto value.
+fn expand_enum_member(
+    member: &crate::ast::types::EnumMember,
+    next_val: u64,
+    params: &crate::hasher::HashMap<String, Value>,
+) -> (Vec<(String, u64)>, u64) {
+    let mut out = Vec::new();
+    let mut val = if let Some(init) = &member.init {
+        eval_const_expr(init, params)
+    } else { next_val };
+    match &member.range {
+        None => {
+            out.push((member.name.name.clone(), val));
+            val = val.wrapping_add(1);
+        }
+        Some((lo_e, hi_e)) => {
+            let lo = const_eval_i64_with_params(lo_e, Some(params)).unwrap_or(0);
+            let hi = const_eval_i64_with_params(hi_e, Some(params)).unwrap_or(lo);
+            let idxs: Vec<i64> = if lo <= hi { (lo..=hi).collect() } else { (hi..=lo).rev().collect() };
+            for i in idxs {
+                out.push((format!("{}{}", member.name.name, i), val));
+                val = val.wrapping_add(1);
+            }
+        }
+    }
+    (out, val)
+}
+
 pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModule) {
     if let DataType::Enum(et) = dt {
         let base_width = et.base_type.as_ref()
@@ -975,22 +1006,22 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
             .unwrap_or(32);
         let mut next_val: u64 = 0;
         for member in &et.members {
-            let val = if let Some(init) = &member.init {
-                eval_const_expr(init, &elab.parameters)
-            } else { next_val };
-            next_val = val.wrapping_add(1);
-            let v = Value::from_u64(val, base_width);
-            elab.parameters.entry(member.name.name.clone()).or_insert_with(|| v.clone());
-            elab.signals.entry(member.name.name.clone()).or_insert_with(|| Signal {
-                is_const: false,
-                name: member.name.name.clone(),
-                width: base_width,
-                is_signed: false,
-                is_real: false,
-                direction: None,
-                value: v,
-                type_name: None,
-            });
+            let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
+            next_val = nv;
+            for (nm, val) in entries {
+                let v = Value::from_u64(val, base_width);
+                elab.parameters.entry(nm.clone()).or_insert_with(|| v.clone());
+                elab.signals.entry(nm.clone()).or_insert_with(|| Signal {
+                    is_const: false,
+                    name: nm.clone(),
+                    width: base_width,
+                    is_signed: false,
+                    is_real: false,
+                    direction: None,
+                    value: v,
+                    type_name: None,
+                });
+            }
         }
     }
 }
@@ -1018,22 +1049,22 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         let mut next_val: u64 = 0;
         let mut members_ordered: Vec<(String, u64)> = Vec::new();
         for member in &et.members {
-            let val = if let Some(init) = &member.init {
-                eval_const_expr(init, &elab.parameters)
-            } else { next_val };
-            next_val = val.wrapping_add(1);
-            let v = Value::from_u64(val, base_width);
-            elab.parameters.insert(member.name.name.clone(), v.clone());
-            elab.signals.insert(member.name.name.clone(), Signal { is_const: false,
-                name: member.name.name.clone(),
-                width: base_width,
-                is_signed: false,
-                is_real: false,
-                direction: None,
-                value: v,
-                type_name: Some(td.name.name.clone()),
-            });
-            members_ordered.push((member.name.name.clone(), val));
+            let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
+            next_val = nv;
+            for (nm, val) in entries {
+                let v = Value::from_u64(val, base_width);
+                elab.parameters.insert(nm.clone(), v.clone());
+                elab.signals.insert(nm.clone(), Signal { is_const: false,
+                    name: nm.clone(),
+                    width: base_width,
+                    is_signed: false,
+                    is_real: false,
+                    direction: None,
+                    value: v,
+                    type_name: Some(td.name.name.clone()),
+                });
+                members_ordered.push((nm.clone(), val));
+            }
         }
         // Register the typedef width
         elab.typedefs.insert(td.name.name.clone(), base_width);
@@ -1689,7 +1720,37 @@ pub fn elaborate_module_with_defs(
                 let is_signed = is_type_signed(&pd.data_type);
                 let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
-                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                    if elab.parameters.contains_key(&decl.name.name) {
+                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                    }
+                    // §23.2.2.1 non-ANSI ports: the data type and the direction
+                    // may be declared in separate statements (`byte x; output x;`).
+                    // If `x` was already registered (by a prior data/net decl)
+                    // and carries no direction yet, this is the direction half of
+                    // the same port — merge instead of erroring. A port-only
+                    // direction line carries an Implicit type, so keep the
+                    // existing width/type; if this line DOES carry an explicit
+                    // type, adopt it.
+                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                        if existing.direction.is_none() {
+                            let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
+                            let existing = elab.signals.get_mut(&decl.name.name).unwrap();
+                            existing.direction = Some(pd.direction);
+                            if explicit_type {
+                                existing.width = width;
+                                existing.is_signed = is_signed;
+                                existing.is_real = is_real;
+                                existing.type_name = get_type_name(&pd.data_type);
+                                existing.value = if is_real { Value::from_f64(0.0) } else { Value::new(width) };
+                            }
+                            if !elab.port_order.contains(&decl.name.name) {
+                                elab.port_order.push(decl.name.name.clone());
+                            }
+                            if let Some(view) = &port_modport_view {
+                                elab.modport_views.insert(decl.name.name.clone(), view.clone());
+                            }
+                            continue;
+                        }
                         return Err(format!("Duplicate declaration of '{}'", decl.name.name));
                     }
                     let sig = Signal { is_const: false,
@@ -4253,7 +4314,31 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 let is_signed = is_type_signed(&pd.data_type);
                 let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
-                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                    if elab.parameters.contains_key(&decl.name.name) {
+                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                    }
+                    // §23.2.2.1 non-ANSI split type/direction — merge (see the
+                    // matching comment in the top-module elaboration path).
+                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                        if existing.direction.is_none() {
+                            let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
+                            let existing = elab.signals.get_mut(&decl.name.name).unwrap();
+                            existing.direction = Some(pd.direction);
+                            if explicit_type {
+                                existing.width = width;
+                                existing.is_signed = is_signed;
+                                existing.is_real = is_real;
+                                existing.type_name = get_type_name(&pd.data_type);
+                                existing.value = if is_real { Value::from_f64(0.0) } else { Value::new(width) };
+                            }
+                            if !elab.port_order.contains(&decl.name.name) {
+                                elab.port_order.push(decl.name.name.clone());
+                            }
+                            if let Some(view) = &port_modport_view {
+                                elab.modport_views.insert(decl.name.name.clone(), view.clone());
+                            }
+                            continue;
+                        }
                         return Err(format!("Duplicate declaration of '{}'", decl.name.name));
                     }
                     let sig = Signal { is_const: false,

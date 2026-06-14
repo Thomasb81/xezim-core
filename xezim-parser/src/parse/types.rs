@@ -379,12 +379,30 @@ fn parse_enum_type(&mut self) -> DataType {
             // E.g. `ReqPeriResetIdx[0:1]` declares `ReqPeriResetIdx0` and
             // `ReqPeriResetIdx1`. We capture the range; downstream
             // elaboration can split it.
+            // §6.19.1 enum name range. Two forms:
+            //   name[N]      => N names, indices 0 .. N-1
+            //   name[lo:hi]  => names indexed lo .. hi (inclusive, either dir)
+            // Normalize the count form `[N]` to the inclusive range `[0 : N-1]`
+            // so downstream expansion is uniform.
             let range = if self.eat(TokenKind::LBracket).is_some() {
-                let lo = self.parse_expression();
-                let hi = if self.eat(TokenKind::Colon).is_some() {
-                    self.parse_expression()
+                let first = self.parse_expression();
+                let (lo, hi) = if self.eat(TokenKind::Colon).is_some() {
+                    (first, self.parse_expression())
                 } else {
-                    lo.clone()
+                    let sp = first.span;
+                    let zero = crate::ast::expr::Expression::new(
+                        crate::ast::expr::ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                            size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal,
+                            value: "0".to_string(), cached_val: std::cell::Cell::new(None) }), sp);
+                    let one = crate::ast::expr::Expression::new(
+                        crate::ast::expr::ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                            size: None, signed: false, base: crate::ast::expr::NumberBase::Decimal,
+                            value: "1".to_string(), cached_val: std::cell::Cell::new(None) }), sp);
+                    let nminus1 = crate::ast::expr::Expression::new(
+                        crate::ast::expr::ExprKind::Binary {
+                            op: crate::ast::expr::BinaryOp::Sub,
+                            left: Box::new(first), right: Box::new(one) }, sp);
+                    (zero, nminus1)
                 };
                 self.expect(TokenKind::RBracket);
                 Some((lo, hi))

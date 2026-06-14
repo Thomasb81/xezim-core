@@ -416,7 +416,14 @@ fn parse_and_elaborate(
         for m in definitions.values() { collect_instantiated_modules(m.items(), &mut instantiated); }
         let mut candidates: Vec<String> = definitions.keys()
             .filter(|n| !instantiated.contains(n.as_str())
-                && explicit_def_names.contains(n.as_str()))
+                && explicit_def_names.contains(n.as_str())
+                // A top-level (`$unit`-scope) typedef is never a hierarchy
+                // root. Without this a file like `typedef enum {...} T;
+                // module test; ...` wrongly picked `T`, which then fails
+                // elaboration ("not a module or program"). Packages stay
+                // eligible: a package-only design (e.g. uvm_pkg) legitimately
+                // elaborates the package as the root.
+                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Typedef(_))))
             .cloned().collect();
         // Sort to make top-module selection deterministic when more than one
         // module is uninstantiated. Without this, ahash's random seed picks
