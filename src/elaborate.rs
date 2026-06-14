@@ -928,8 +928,11 @@ fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
     match &expr.kind {
         ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
         ExprKind::Ident(hier) => {
-            let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            params.contains_key(name)
+            let last = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+            // Const if the leaf is a param/enum const (`X`, `pkg::C`), or — for a
+            // hierarchical `pt.FIELD` — the BASE is a const struct param.
+            let base = hier.path.first().map(|s| s.name.name.as_str()).unwrap_or("");
+            params.contains_key(last) || (hier.path.len() > 1 && params.contains_key(base))
         }
         ExprKind::Unary { operand, .. } => is_const_expr(operand, params),
         ExprKind::Binary { left, right, .. } => is_const_expr(left, params) && is_const_expr(right, params),
@@ -5794,6 +5797,24 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         }
         ExprKind::StringLiteral(s) => Value::from_string(s),
         ExprKind::Ident(hier) => {
+            // Multi-segment hierarchical ident: `pt.FIELD` (a struct parameter's
+            // field, parsed as a path rather than MemberAccess). Slice the field
+            // from the struct param via its registered layout. Field path joins
+            // path[1..] with '.' to match nested flatten keys (`pt.a.b`).
+            if hier.path.len() > 1 {
+                let base = hier.path[0].name.name.as_str();
+                if let Some(base_val) = params.get(base).cloned() {
+                    let field_path = hier.path[1..].iter()
+                        .map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                    if let Some((off, w)) = STRUCT_FIELDS_TLS.with(|c|
+                        c.borrow().get(base).and_then(|layout|
+                            layout.iter().find(|(f, _, _)| f == &field_path).map(|&(_, o, w)| (o, w)))) {
+                        if w > 0 && off + w <= base_val.width {
+                            return base_val.range_select((off + w - 1) as usize, off as usize);
+                        }
+                    }
+                }
+            }
             let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
             params.get(name).cloned()
                 .or_else(|| param_fallback_get(name))

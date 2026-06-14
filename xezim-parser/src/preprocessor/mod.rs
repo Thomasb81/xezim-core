@@ -550,7 +550,9 @@ impl Preprocessor {
                 if let Some(inc_file) = Self::parse_include_path(trimmed) {
                     if self.include_depth < MAX_INCLUDE_DEPTH {
                         if let Some(resolved) = self.resolve_include(&inc_file, source_dir.as_deref()) {
-                            match std::fs::read_to_string(&resolved) {
+                            // Lossy decode — tolerate stray non-UTF-8 bytes in
+                            // included RTL (replace with U+FFFD, don't fail).
+                            match std::fs::read(&resolved).map(|b| String::from_utf8_lossy(&b).into_owned()) {
                                 Ok(contents) => {
                                     self.include_depth += 1;
                                     let stripped = self.strip_comments(&contents);
