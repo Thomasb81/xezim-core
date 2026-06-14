@@ -377,7 +377,29 @@ fn parse_and_elaborate(
                 }
                 // $unit-scope parameters become body localparams (constants):
                 // visible inside the module, not part of its override interface.
+                // A module-local parameter/localparam of the same name SHADOWS
+                // the $unit one (LRM §3.12.1 name resolution) — skip injecting
+                // any $unit param the module already declares, else the two
+                // collide as a "Duplicate declaration".
+                let local_param_names: std::collections::HashSet<String> = m.items.iter()
+                    .filter_map(|it| match it {
+                        ast::decl::ModuleItem::ParameterDeclaration(pd)
+                        | ast::decl::ModuleItem::LocalparamDeclaration(pd) => Some(pd),
+                        _ => None,
+                    })
+                    .flat_map(|pd| match &pd.kind {
+                        ast::decl::ParameterKind::Data { assignments, .. } =>
+                            assignments.iter().map(|a| a.name.name.clone()).collect::<Vec<_>>(),
+                        _ => Vec::new(),
+                    })
+                    .collect();
                 for p in top_level_params.iter().rev() {
+                    let shadowed = match &p.kind {
+                        ast::decl::ParameterKind::Data { assignments, .. } =>
+                            assignments.iter().all(|a| local_param_names.contains(&a.name.name)),
+                        _ => false,
+                    };
+                    if shadowed { continue; }
                     m.items.insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p.clone()));
                 }
                 // $unit-scope variables (`string label = "X";`) become module
