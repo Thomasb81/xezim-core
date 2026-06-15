@@ -111,20 +111,20 @@ pub struct PendingAlways {
     /// Source Statement, shared with the prepared-items cache so 26 sibling
     /// instances of the same submodule all point at the same Rc<Statement>.
     pub source: std::rc::Rc<Statement>,
-    pub ctx: RewriteCtx,
+    pub ctx: std::rc::Rc<RewriteCtx>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PendingInitial {
     pub source: std::rc::Rc<Statement>,
-    pub ctx: RewriteCtx,
+    pub ctx: std::rc::Rc<RewriteCtx>,
 }
 
 #[derive(Debug, Clone)]
 pub struct PendingContAssign {
     pub lhs_source: std::rc::Rc<Expression>,
     pub rhs_source: std::rc::Rc<Expression>,
-    pub ctx: RewriteCtx,
+    pub ctx: std::rc::Rc<RewriteCtx>,
 }
 
 impl PendingAlways {
@@ -7848,6 +7848,20 @@ fn inline_module_items(
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
 
+                // Build ONE RewriteCtx for this instance, shared (via Rc) across
+                // every pending always/initial/cont-assign it produces. The
+                // prefix, port_map and interface_map are instance-constant, so
+                // cloning them once here instead of per pending item collapses
+                // the duplicated port-map entries (on c910: ~10.8M -> ~1.2M),
+                // the dominant elaboration memory cost. `local_names` was already
+                // Rc-shared across sibling instances.
+                let pend_ctx = std::rc::Rc::new(RewriteCtx {
+                    prefix: inst_prefix.clone(),
+                    port_map: rewrite_port_map.clone(),
+                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
+                    interface_map: sub_interface_map.clone(),
+                });
+
                 // Inline the sub-module's continuous assigns
                 for (sub_item, body_src) in prepared_sub.effective_items.iter().zip(prepared_sub.body_sources.iter()) {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
@@ -7883,12 +7897,7 @@ fn inline_module_items(
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
-                                    ctx: RewriteCtx {
-                                        prefix: inst_prefix.clone(),
-                                        port_map: rewrite_port_map.clone(),
-                                        local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                        interface_map: sub_interface_map.clone(),
-                                    },
+                                    ctx: std::rc::Rc::clone(&pend_ctx),
                                 });
                             }
                         }
@@ -7899,12 +7908,7 @@ fn inline_module_items(
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
-                                    ctx: RewriteCtx {
-                                        prefix: inst_prefix.clone(),
-                                        port_map: rewrite_port_map.clone(),
-                                        local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                        interface_map: sub_interface_map.clone(),
-                                    },
+                                    ctx: std::rc::Rc::clone(&pend_ctx),
                                 });
                             }
                         }
@@ -7917,12 +7921,7 @@ fn inline_module_items(
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::new(new_lhs),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
-                                    ctx: RewriteCtx {
-                                        prefix: inst_prefix.clone(),
-                                        port_map: rewrite_port_map.clone(),
-                                        local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                        interface_map: sub_interface_map.clone(),
-                                    },
+                                    ctx: std::rc::Rc::clone(&pend_ctx),
                                 });
                             }
                         }
@@ -7948,12 +7947,7 @@ fn inline_module_items(
                             elab.pending_always.push(PendingAlways {
                                 kind: *kind,
                                 source: std::rc::Rc::clone(stmt_rc),
-                                ctx: RewriteCtx {
-                                    prefix: inst_prefix.clone(),
-                                    port_map: rewrite_port_map.clone(),
-                                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                    interface_map: sub_interface_map.clone(),
-                                },
+                                ctx: std::rc::Rc::clone(&pend_ctx),
                             });
                         }
                     }
@@ -7964,12 +7958,7 @@ fn inline_module_items(
                             }
                             elab.pending_initial.push(PendingInitial {
                                 source: std::rc::Rc::clone(stmt_rc),
-                                ctx: RewriteCtx {
-                                    prefix: inst_prefix.clone(),
-                                    port_map: rewrite_port_map.clone(),
-                                    local_names: std::rc::Rc::clone(&prepared_sub.local_names),
-                                    interface_map: sub_interface_map.clone(),
-                                },
+                                ctx: std::rc::Rc::clone(&pend_ctx),
                             });
                         }
                     }
