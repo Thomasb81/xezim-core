@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod lexer;
 pub mod parse;
 pub mod preprocessor;
+pub mod strict_check;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 

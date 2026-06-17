@@ -608,6 +608,12 @@ pub struct FunctionDeclaration {
     pub ports: Vec<FunctionPort>,
     pub items: Vec<super::stmt::Statement>,
     pub endlabel: Option<Identifier>,
+    /// Non-ANSI body port declarations (`function f; input int x; …`). The
+    /// main parser otherwise discards these (they parse to a `Null` stmt);
+    /// retained here only for the strict-check pass (duplicate-port detection).
+    /// Not consumed by elaboration — behavior-neutral.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub strict_body_ports: Vec<Identifier>,
     pub span: Span,
 }
 
@@ -622,6 +628,10 @@ pub struct TaskDeclaration {
     pub ports: Vec<FunctionPort>,
     pub items: Vec<super::stmt::Statement>,
     pub endlabel: Option<Identifier>,
+    /// Non-ANSI body port declarations (`task t; input int x; …`); retained
+    /// only for the strict-check pass. Not consumed by elaboration.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub strict_body_ports: Vec<Identifier>,
     pub span: Span,
 }
 

@@ -308,12 +308,46 @@ impl Parser {
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
+        let mut strict_body_ports = Vec::new();
         while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
-            items.push(self.parse_statement());
+            if matches!(self.current_kind(),
+                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef) {
+                self.capture_tf_body_port(&mut strict_body_ports);
+            } else {
+                items.push(self.parse_statement());
+            }
         }
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
-        FunctionDeclaration { lifetime, specifier, return_type, name, ports, items, endlabel, span: self.span_from(start) }
+        FunctionDeclaration { lifetime, specifier, return_type, name, ports, items, endlabel, strict_body_ports, span: self.span_from(start) }
+    }
+
+    /// Consume a non-ANSI task/function body port declaration
+    /// (`input integer x, y;`), recording the declared names for the
+    /// strict-check pass. Consumes exactly through the terminating `;` — the
+    /// same tokens the main path would have discarded into a `Null` statement,
+    /// so dropping the statement is behavior-neutral for elaboration.
+    pub(super) fn capture_tf_body_port(&mut self, out: &mut Vec<Identifier>) {
+        self.bump(); // direction keyword (input/output/inout/ref)
+        let mut bdepth = 0i32;
+        while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+            match self.current_kind() {
+                TokenKind::LBracket => { bdepth += 1; self.bump(); }
+                TokenKind::RBracket => { bdepth -= 1; self.bump(); }
+                TokenKind::Identifier | TokenKind::EscapedIdentifier if bdepth == 0 => {
+                    // A declared name is an identifier at bracket-depth 0
+                    // immediately followed by a declarator terminator.
+                    if matches!(self.peek_kind(),
+                        TokenKind::Comma | TokenKind::Semicolon | TokenKind::Assign) {
+                        let tok = self.current();
+                        out.push(Identifier { name: tok.text.clone(), span: tok.span });
+                    }
+                    self.bump();
+                }
+                _ => { self.bump(); }
+            }
+        }
+        self.eat(TokenKind::Semicolon);
     }
 
     pub(super) fn parse_task_declaration(&mut self) -> TaskDeclaration {
@@ -327,12 +361,18 @@ impl Parser {
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
+        let mut strict_body_ports = Vec::new();
         while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
-            items.push(self.parse_statement());
+            if matches!(self.current_kind(),
+                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef) {
+                self.capture_tf_body_port(&mut strict_body_ports);
+            } else {
+                items.push(self.parse_statement());
+            }
         }
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
-        TaskDeclaration { lifetime, specifier, name, ports, items, endlabel, span: self.span_from(start) }
+        TaskDeclaration { lifetime, specifier, name, ports, items, endlabel, strict_body_ports, span: self.span_from(start) }
     }
 
     /// Parse a method name: handles 'new', regular identifiers, and class_scope::name.
@@ -380,7 +420,7 @@ impl Parser {
         let name = self.parse_method_name();
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
-        FunctionDeclaration { lifetime, specifier, return_type, name, ports, items: Vec::new(), endlabel: None, span: self.span_from(start) }
+        FunctionDeclaration { lifetime, specifier, return_type, name, ports, items: Vec::new(), endlabel: None, strict_body_ports: Vec::new(), span: self.span_from(start) }
     }
 
     pub(super) fn parse_task_prototype(&mut self) -> TaskDeclaration {
@@ -391,7 +431,7 @@ impl Parser {
         let name = self.parse_method_name();
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
-        TaskDeclaration { lifetime, specifier, name, ports, items: Vec::new(), endlabel: None, span: self.span_from(start) }
+        TaskDeclaration { lifetime, specifier, name, ports, items: Vec::new(), endlabel: None, strict_body_ports: Vec::new(), span: self.span_from(start) }
     }
 
     pub(super) fn parse_param_value(&mut self) -> ParamValue {

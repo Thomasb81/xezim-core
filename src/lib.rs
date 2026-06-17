@@ -224,6 +224,13 @@ pub fn parse_and_elaborate_multi(
                 .map(|d| d.to_string()).collect();
             return Err(format!("Parse errors in source {}:\n{}", i, errs.join("\n")));
         }
+        // Second, AST-level strict pass (runs alongside the permissive parser;
+        // gated by --strict, on by default). Rejects LRM violations the main
+        // parser accepts. See sv_parser::strict_check.
+        let strict_viol = sv_parser::strict_check::strict_violations(&source_ast.descriptions);
+        if !strict_viol.is_empty() {
+            return Err(format!("Strict check failed in source {}:\n{}", i, strict_viol.join("\n")));
+        }
         all_descriptions.extend(source_ast.descriptions);
     }
 
