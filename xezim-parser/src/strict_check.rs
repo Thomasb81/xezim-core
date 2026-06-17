@@ -11,10 +11,11 @@
 //! checks don't suffer the scope ambiguity a token scan does (e.g. DPI/extern
 //! functions are distinct nodes, not open scopes).
 
+use std::collections::{HashMap, HashSet};
 use crate::ast::Description;
 use crate::ast::decl::{
-    ModuleItem, PackageItem, ClassItem, ClassMethodKind,
-    FunctionDeclaration, TaskDeclaration, FunctionPort,
+    ModuleItem, PackageItem, ClassItem, ClassMethodKind, ParameterKind, ParamConnection,
+    FunctionDeclaration, TaskDeclaration, FunctionPort, ParameterDeclaration,
 };
 
 /// Run all enabled strict checks over one file's parsed descriptions. Returns
@@ -35,7 +36,78 @@ pub fn strict_violations(descriptions: &[Description]) -> Vec<String> {
             _ => {}
         }
     }
+    // §6.20.2 / §23.10: a named parameter override must name an *overridable*
+    // parameter (not a localparam, and it must exist). Built from the modules
+    // declared in THIS file; instantiations of modules defined elsewhere are
+    // skipped (can't resolve, so no false positive).
+    let overridable = build_module_overridable_params(descriptions);
+    for d in descriptions {
+        if let Description::Module(m) = d {
+            check_param_overrides(&m.items, &overridable, &mut out);
+        }
+    }
     out
+}
+
+/// name -> set of overridable parameter names for every module in this file.
+/// "Overridable" excludes localparams (header `localparam` / body
+/// `localparam`); both header `#(...)` and body `parameter` decls are included.
+fn build_module_overridable_params(descriptions: &[Description]) -> HashMap<String, HashSet<String>> {
+    let mut map = HashMap::new();
+    for d in descriptions {
+        if let Description::Module(m) = d {
+            let mut params = HashSet::new();
+            for pd in &m.params {
+                add_overridable_param_names(pd, &mut params);
+            }
+            for it in &m.items {
+                if let ModuleItem::ParameterDeclaration(pd) = it {
+                    add_overridable_param_names(pd, &mut params);
+                }
+            }
+            map.insert(m.name.name.clone(), params);
+        }
+    }
+    map
+}
+
+fn add_overridable_param_names(pd: &ParameterDeclaration, out: &mut HashSet<String>) {
+    if pd.local {
+        return; // localparam — not overridable
+    }
+    match &pd.kind {
+        ParameterKind::Data { assignments, .. } => {
+            for a in assignments { out.insert(a.name.name.clone()); }
+        }
+        ParameterKind::Type { assignments } => {
+            for a in assignments { out.insert(a.name.name.clone()); }
+        }
+    }
+}
+
+fn check_param_overrides(
+    items: &[ModuleItem],
+    overridable: &HashMap<String, HashSet<String>>,
+    out: &mut Vec<String>,
+) {
+    for it in items {
+        if let ModuleItem::ModuleInstantiation(inst) = it {
+            // Only check when the target module is defined in this file.
+            let Some(params) = overridable.get(&inst.module_name.name) else { continue };
+            if let Some(conns) = &inst.params {
+                for c in conns {
+                    if let ParamConnection::Named { name, .. } = c {
+                        if !params.contains(&name.name) {
+                            out.push(format!(
+                                "cannot override '{}' of module '{}' — not an overridable parameter",
+                                name.name, inst.module_name.name
+                            ));
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 fn walk_module_items(items: &[ModuleItem], out: &mut Vec<String>) {
