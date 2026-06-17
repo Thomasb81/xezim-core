@@ -1224,6 +1224,25 @@ impl Parser {
             if self.at(TokenKind::Comma) {
                 // Empty argument: foo(a, , b)
                 args.push(Expression::new(ExprKind::Empty, self.span_from(start)));
+            } else if self.is_data_type_keyword()
+                && matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Comma) {
+                // §20.6.2: a bare built-in type keyword as a call argument, e.g.
+                // `$bits(integer)` / `$bits(byte)`. The expression grammar can't
+                // parse a lone type keyword, so capture it as an Ident carrying
+                // the type name — `$bits`/`$size` map it to the type's width.
+                let tok = self.bump();
+                let span = tok.span;
+                let ident = HierarchicalIdentifier {
+                    root: None,
+                    path: vec![HierPathSegment {
+                        name: Identifier { name: tok.text.clone(), span },
+                        selects: Vec::new(),
+                    }],
+                    span,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                args.push(Expression::new(ExprKind::Ident(ident), self.span_from(start)));
             } else if self.eat(TokenKind::Dot).is_some() {
                 let name = self.parse_identifier();
                 let expr = if self.eat(TokenKind::LParen).is_some() {

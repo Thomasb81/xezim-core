@@ -1635,6 +1635,20 @@ pub fn elaborate_module_with_defs(
                 }
                 elab.parameters.insert(assign.name.name.clone(), val);
             }
+        } else if let ParameterKind::Type { assignments } = &param.kind {
+            // §6.20.3 type parameter (`parameter type T1 = integer`): register
+            // the (default) type as a typedef so `T1 x;` and `$bits(T1)` resolve.
+            // The type may reference earlier value params (`logic [A-1:0]`), which
+            // are already in elab.parameters by this point (params elaborate in
+            // source order). Instance type-overrides aren't threaded here yet.
+            for a in assignments {
+                if let Some(dt) = &a.init {
+                    let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs));
+                    elab.typedefs.insert(a.name.name.clone(), w);
+                    elab.typedef_types.insert(a.name.name.clone(), dt.clone());
+                    register_anonymous_enum_members(dt, &mut elab);
+                }
+            }
         }
     }
 
@@ -2349,6 +2363,18 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                // §6.20.3 body type parameter (`localparam type T1 = logic [A-1:0];`)
+                // — register as a typedef so `T1 x;` / `$bits(T1)` resolve.
+                if let ParameterKind::Type { assignments } = &pd.kind {
+                    for a in assignments {
+                        if let Some(dt) = &a.init {
+                            let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs));
+                            elab.typedefs.insert(a.name.name.clone(), w);
+                            elab.typedef_types.insert(a.name.name.clone(), dt.clone());
+                            register_anonymous_enum_members(dt, &mut elab);
+                        }
+                    }
+                }
                 if let ParameterKind::Data { data_type, assignments } = &pd.kind {
                     let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     let mut signed = is_type_signed(data_type);
@@ -4067,6 +4093,17 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                 // std::mailbox, std::semaphore, …) — always a legal root.
                 if name == "new" || name.starts_with('$') || name == "super" || name == "this"
                     || name == "std"
+                {
+                    return Ok(());
+                }
+                // A built-in type keyword captured as an Ident — only the parser's
+                // `$bits(<type>)` / `$size(<type>)` type-argument path produces
+                // these (a bare keyword can't appear in normal expression
+                // position), so it's a type reference, not an undeclared signal.
+                if matches!(name.as_str(),
+                    "integer" | "int" | "shortint" | "longint" | "byte" | "time"
+                    | "bit" | "logic" | "reg" | "real" | "shortreal" | "realtime"
+                    | "string" | "chandle" | "void")
                 {
                     return Ok(());
                 }
