@@ -8471,6 +8471,12 @@ fn rewrite_event_control(ev: &EventControl, prefix: &str, port_map: &HashMap<Str
         other => other.clone(),
     }
 }
+thread_local! {
+    /// Recursion-depth guard for re-export resolution in `process_import`
+    /// (prevents stack overflow on cyclic `import`/`export` package graphs).
+    static IMPORT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
 fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &HashMap<String, Definition>) -> Result<(), String> {
     for ii in &imp.items {
         let pkg_name = &ii.package.name;
@@ -8574,6 +8580,43 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         _ => {}
                     }
                     if found { break; }
+                }
+                if !found {
+                    // §26.6 re-export: `package P2; import P1::x; export P1::*;`
+                    // makes P1's `x` visible to importers of P2. Non-DPI exports
+                    // aren't modeled directly, but P2 must `import` what it
+                    // re-exports — so resolve the symbol by following P2's own
+                    // imports to the source package (one synthetic explicit
+                    // import per candidate; depth-guarded against cyclic
+                    // re-export).
+                    found = IMPORT_DEPTH.with(|d| {
+                        if d.get() >= 32 { return false; }
+                        d.set(d.get() + 1);
+                        let mut ok = false;
+                        for pi in &pkg.items {
+                            if let PackageItem::Import(inner) = pi {
+                                for ii2 in &inner.items {
+                                    let provides = match &ii2.item {
+                                        Some(s) => s.name == *sym_name, // import Src::sym
+                                        None => true,                   // import Src::*
+                                    };
+                                    if !provides { continue; }
+                                    let synth = ImportDeclaration {
+                                        items: vec![ImportItem {
+                                            package: ii2.package.clone(),
+                                            item: Some(Identifier { name: sym_name.clone(), span: Span::dummy() }),
+                                            span: Span::dummy(),
+                                        }],
+                                        span: Span::dummy(),
+                                    };
+                                    if process_import(&synth, elab, defs).is_ok() { ok = true; break; }
+                                }
+                            }
+                            if ok { break; }
+                        }
+                        d.set(d.get() - 1);
+                        ok
+                    });
                 }
                 if !found {
                     return Err(format!("Symbol '{}' not found in package '{}'", sym_name, pkg_name));
