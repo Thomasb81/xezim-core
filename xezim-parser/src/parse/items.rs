@@ -962,6 +962,15 @@ impl Parser {
     fn parse_net_declaration(&mut self) -> NetDeclaration {
         let start = self.current().span.start;
         let net_type = self.parse_optional_net_type().unwrap_or(NetType::Wire);
+        // §10.3.1: optional drive_strength `(strong1, weak0)` on a net
+        // declaration with a continuous assignment, e.g.
+        // `wire (strong1, weak0) w = a & b;`. xezim doesn't model strengths;
+        // consume the group when it opens with a strength keyword.
+        if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
+            self.bump();
+            while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) { self.bump(); }
+            self.expect(TokenKind::RParen);
+        }
         // §6.9.2: optional `vectored` / `scalared` charge/drive qualifier
         // between the net type and the (optional) range — `tri1 vectored [15:0] a;`.
         if self.at(TokenKind::KwVectored) || self.at(TokenKind::KwScalared) { self.bump(); }
