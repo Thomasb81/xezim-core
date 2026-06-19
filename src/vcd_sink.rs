@@ -1,11 +1,11 @@
-//! Output sink for VCD / AITRACE dumps.
+//! Output sink for VCD / XTrace dumps.
 //!
 //! Two modes:
 //!   * Inline   — writes straight to a `BufWriter<File>` on the caller thread.
 //!   * Threaded — hands work to a dedicated writer thread. Two message
 //!                kinds are carried:
 //!                  - `Chunk(Vec<u8>)`: pre-formatted bytes (used for VCD
-//!                    headers, AITRACE records, and anything written via
+//!                    headers and anything written via
 //!                    `std::io::Write`).
 //!                  - `VcdBatch(Vec<VcdTimestep>)`: structured per-timestep
 //!                    value changes. The worker thread formats them with
@@ -26,6 +26,7 @@
 use std::fs::File;
 use std::io::{self, BufWriter, Write};
 use std::sync::mpsc::{self, Sender};
+use std::sync::Arc;
 use std::thread::JoinHandle;
 
 use super::value::{LogicBit, Value};
@@ -42,12 +43,19 @@ const VCD_BATCH_FLUSH: usize = 256;
 pub struct VcdTimestep {
     /// `Some(t)` → emit `#t` header before the changes.
     pub time: Option<u64>,
-    pub changes: Vec<(String, Value)>,
+    /// (VCD identifier code, value). The code is an `Arc<str>` so the caller's
+    /// per-change clone (millions of times on large dumps) is a refcount bump
+    /// instead of a fresh heap allocation of the short code string.
+    pub changes: Vec<(Arc<str>, Value)>,
 }
 
 enum WorkerMsg {
     Chunk(Vec<u8>),
     VcdBatch(Vec<VcdTimestep>),
+    /// Force the worker's `BufWriter` (and any streaming zstd encoder) to
+    /// flush accumulated bytes to the OS file, so a later crash/SIGKILL of
+    /// the main process leaves a readable partial dump.
+    Flush,
     Shutdown,
 }
 
@@ -89,6 +97,7 @@ impl VcdSink {
                                 }
                             }
                         }
+                        WorkerMsg::Flush => { let _ = bw.flush(); }
                         WorkerMsg::Shutdown => break,
                     }
                 }
@@ -123,7 +132,7 @@ impl VcdSink {
     /// In threaded mode: push a timestep's value changes into the pending
     /// batch (dispatched when the batch is full). In inline mode: format
     /// immediately on the caller thread.
-    pub fn post_vcd_changes(&mut self, time: Option<u64>, changes: Vec<(String, Value)>) {
+    pub fn post_vcd_changes(&mut self, time: Option<u64>, changes: Vec<(Arc<str>, Value)>) {
         match &mut self.mode {
             Mode::Inline(w) => {
                 if let Some(t) = time {
@@ -187,10 +196,22 @@ impl Write for VcdSink {
     fn flush(&mut self) -> io::Result<()> {
         match &mut self.mode {
             Mode::Inline(w) => w.flush(),
-            Mode::Threaded { .. } => {
-                self.commit();
+            // Unlike `commit()` (threshold-gated), a flush must force ALL
+            // buffered work to the worker AND have the worker flush its own
+            // BufWriter to disk — otherwise a crash loses the tail of the dump.
+            Mode::Threaded { buf, pending, tx: Some(tx), .. } => {
+                if !buf.is_empty() {
+                    let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
+                    let _ = tx.send(WorkerMsg::Chunk(chunk));
+                }
+                if !pending.is_empty() {
+                    let batch = std::mem::replace(pending, Vec::with_capacity(VCD_BATCH_FLUSH));
+                    let _ = tx.send(WorkerMsg::VcdBatch(batch));
+                }
+                let _ = tx.send(WorkerMsg::Flush);
                 Ok(())
             }
+            Mode::Threaded { .. } => Ok(()),
         }
     }
 }
