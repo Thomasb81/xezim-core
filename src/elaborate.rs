@@ -1068,6 +1068,21 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
     }
 }
 
+/// Register a class's CLASS-LOCAL `typedef enum {...}` members as resolvable
+/// bare-name constants (parameters/signals), like module/package enums.
+/// Without this, a class-local enum member (e.g. uvm_sequencer_base's
+/// `SEQ_TYPE_REQ` from `typedef enum {SEQ_TYPE_REQ,...} seq_req_t;`) resolves
+/// to X at eval time, so `req.request = SEQ_TYPE_REQ` stores X and the
+/// sequencer arbitration's `request == SEQ_TYPE_REQ` is always false (4-state).
+/// Uses or_insert semantics so module/package enums are never clobbered.
+pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedModule) {
+    for item in &c.items {
+        if let ClassItem::Typedef(td) = item {
+            register_anonymous_enum_members(&td.data_type, elab);
+        }
+    }
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // §6.18: a bare forward type declaration `typedef name;`. Record it for the
     // resolution check and register a placeholder, but never clobber a name that
@@ -1466,6 +1481,7 @@ pub fn elaborate_module_with_defs(
                 Definition::Typedef(td) => { process_typedef(td, &mut elab); }
                 Definition::Class(c) => {
                     validate_class_constraints(c, Some(defs), Some(&elab.enum_members))?;
+                    register_class_enum_members(c, &mut elab);
                     elab.classes.insert(c.name.name.clone(), elaborate_class(c));
                 }
                 Definition::Covergroup(cg) => { elab.covergroups.insert(cg.name.name.clone(), (*cg).clone()); }
@@ -1490,6 +1506,7 @@ pub fn elaborate_module_with_defs(
                             // also reachable through their package for
                             // `pkg::Class::method`.
                             crate::ast::decl::PackageItem::Class(c) => {
+                                register_class_enum_members(c, &mut elab);
                                 elab.classes.entry(c.name.name.clone())
                                     .or_insert_with(|| elaborate_class(c));
                             }
@@ -1737,6 +1754,7 @@ pub fn elaborate_module_with_defs(
                 }
                 crate::ast::decl::PackageItem::Class(c) => {
                     validate_class_constraints(c, all_defs, Some(&elab.enum_members))?;
+                    register_class_enum_members(c, &mut elab);
                     elab.classes.insert(c.name.name.clone(), elaborate_class(c));
                 }
                 crate::ast::decl::PackageItem::Let(l) => {
