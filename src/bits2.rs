@@ -281,6 +281,43 @@ impl Bits2 {
         Self::from_words(out, width)
     }
 
+    // ---- unsigned divide / remainder (result width = max operand width) ----
+    /// Unsigned quotient. Division by zero → 0 (Verilog gives X; 2-state → 0).
+    pub fn udiv(&self, o: &Bits2) -> Bits2 {
+        self.divmod(o).0
+    }
+    /// Unsigned remainder. Mod by zero → 0.
+    pub fn urem(&self, o: &Bits2) -> Bits2 {
+        self.divmod(o).1
+    }
+    fn divmod(&self, o: &Bits2) -> (Bits2, Bits2) {
+        let width = self.width.max(o.width);
+        if o.is_zero() {
+            return (Bits2::zero(width), Bits2::zero(width));
+        }
+        if width <= 64 {
+            let (a, b) = (self.to_u64(), o.to_u64());
+            return (Bits2::from_u64(a / b, width), Bits2::from_u64(a % b, width));
+        }
+        // Wide: restoring long division MSB→LSB. Partial remainder carries an
+        // extra bit (rw) so the left-shift never drops the high bit.
+        let rw = width + 1;
+        let mut q = Bits2::zero(width);
+        let mut r = Bits2::zero(rw);
+        let dvsr = o.resize(rw);
+        for i in (0..width).rev() {
+            r = r.shl(1);
+            if self.get_bit(i) {
+                r.set_bit(0, true);
+            }
+            if !r.ult(&dvsr) {
+                r = r.sub(&dvsr);
+                q.set_bit(i, true);
+            }
+        }
+        (q, r.resize(width))
+    }
+
     // ---- arithmetic shift right (sign-replicating) ----
     /// `>>>` for a value whose MSB (`bit width-1`) is the sign. Logical for a
     /// 0 sign; fills the vacated top `n` bits with 1 for a 1 sign.
@@ -459,6 +496,23 @@ mod tests {
         let r = w.ashr(4);
         assert!(r.get_bit(99) && r.get_bit(96) && r.get_bit(95));
         assert!(!r.get_bit(94));
+    }
+
+    #[test]
+    fn div_rem_narrow_and_wide() {
+        assert_eq!(Bits2::from_u64(100, 16).udiv(&Bits2::from_u64(7, 16)).to_u64(), 14);
+        assert_eq!(Bits2::from_u64(100, 16).urem(&Bits2::from_u64(7, 16)).to_u64(), 2);
+        assert_eq!(Bits2::from_u64(5, 8).udiv(&Bits2::zero(8)).to_u64(), 0); // /0 -> 0
+        // wide: (2^96 + 12345) / 2^32  — quotient 2^64, remainder 12345
+        let num = Bits2::from_u64(1, 128).shl(96).add(&Bits2::from_u64(12345, 128));
+        let den = Bits2::from_u64(1, 128).shl(32); // 2^32
+        let q = num.udiv(&den);
+        let r = num.urem(&den);
+        assert_eq!(q.word(1), 1); // 2^64
+        assert_eq!(q.word(0), 0);
+        assert_eq!(r.to_u64(), 12345);
+        // q*den + r == num  (round-trip)
+        assert!(q.mul(&den).add(&r).eq_value(&num));
     }
 
     #[test]
