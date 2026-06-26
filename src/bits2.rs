@@ -92,6 +92,14 @@ impl Bits2 {
         Self::from_words(vec![0; Self::nwords_for(width)], width)
     }
 
+    /// Zero-extend / truncate to `w` bits.
+    pub fn resize(&self, w: u32) -> Bits2 {
+        if self.width == w {
+            return self.clone();
+        }
+        Self::from_words(self.to_words(), w)
+    }
+
     pub fn from_u64(val: u64, width: u32) -> Bits2 {
         Self::from_words(vec![val], width)
     }
