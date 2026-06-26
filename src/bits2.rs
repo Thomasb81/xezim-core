@@ -250,6 +250,55 @@ impl Bits2 {
         hi.or(&lo)
     }
 
+    /// Numeric (value) equality, zero-extended to the wider operand. Unlike the
+    /// derived `==` (which also compares `width`/storage), this matches Verilog
+    /// `==` semantics where `8'd5 == 4'd5`.
+    pub fn eq_value(&self, o: &Bits2) -> bool {
+        let n = self.nwords().max(o.nwords());
+        (0..n).all(|i| self.word(i) == o.word(i))
+    }
+
+    // ---- multiply (mod 2^width) ----
+    /// Schoolbook multiply, result width = max(operand widths), truncated.
+    pub fn mul(&self, o: &Bits2) -> Bits2 {
+        let width = self.width.max(o.width);
+        let n = Self::nwords_for(width);
+        let mut out = vec![0u64; n];
+        for i in 0..n {
+            let ai = self.word(i) as u128;
+            if ai == 0 {
+                continue;
+            }
+            let mut carry: u128 = 0;
+            for j in 0..(n - i) {
+                let idx = i + j;
+                let prod = ai * (o.word(j) as u128) + out[idx] as u128 + carry;
+                out[idx] = prod as u64;
+                carry = prod >> 64;
+            }
+            // carry past the top word is dropped (mod 2^width).
+        }
+        Self::from_words(out, width)
+    }
+
+    // ---- arithmetic shift right (sign-replicating) ----
+    /// `>>>` for a value whose MSB (`bit width-1`) is the sign. Logical for a
+    /// 0 sign; fills the vacated top `n` bits with 1 for a 1 sign.
+    pub fn ashr(&self, n: u32) -> Bits2 {
+        if n == 0 || self.width == 0 {
+            return self.clone();
+        }
+        if !self.get_bit(self.width - 1) {
+            return self.shr(n);
+        }
+        let mut r = self.shr(n);
+        let fill_from = self.width.saturating_sub(n);
+        for i in fill_from..self.width {
+            r.set_bit(i, true);
+        }
+        r
+    }
+
     // ---- 4-state interop ----
     /// Collapse a 4-state [`Value`] to 2-state: known 1 → 1, everything else
     /// (0, X, Z) → 0. This is the cycle-engine entry conversion.
@@ -368,6 +417,59 @@ mod tests {
         assert!(lo_max.and(&one).get_bit(0));
         // wide slice across boundary
         assert_eq!(s.slice(64, 64).to_u64(), 1);
+    }
+
+    #[test]
+    fn eq_value_cross_width() {
+        // 8'd5 == 4'd5 numerically, even though widths differ.
+        let a = Bits2::from_u64(5, 8);
+        let b = Bits2::from_u64(5, 4);
+        assert_ne!(a, b); // derived == includes width
+        assert!(a.eq_value(&b)); // numeric == ignores width
+        assert!(!Bits2::from_u64(5, 8).eq_value(&Bits2::from_u64(6, 8)));
+    }
+
+    #[test]
+    fn mul_narrow_and_wide() {
+        assert_eq!(Bits2::from_u64(12, 8).mul(&Bits2::from_u64(12, 8)).to_u64(), 144);
+        assert_eq!(Bits2::from_u64(200, 8).mul(&Bits2::from_u64(3, 8)).to_u64(), 600 & 0xFF);
+        // wide: (2^64) * 3 = 3<<64 → word1 == 3, word0 == 0 at width 128.
+        let big = Bits2::from_u64(1, 128).shl(64); // == 2^64
+        let r = big.mul(&Bits2::from_u64(3, 128));
+        assert_eq!(r.word(0), 0);
+        assert_eq!(r.word(1), 3);
+        // wide carry: (2^64-1)*(2^64-1) at width 128.
+        let m = Bits2::from_u64(u64::MAX, 128);
+        let sq = m.mul(&m); // = 2^128 - 2^65 + 1
+        assert_eq!(sq.word(0), 1);
+        assert_eq!(sq.word(1), u64::MAX - 1);
+    }
+
+    #[test]
+    fn ashr_signed() {
+        // 8'b1000_0000 >>> 1 = 1100_0000 (sign fill)
+        assert_eq!(Bits2::from_u64(0x80, 8).ashr(1).to_u64(), 0xC0);
+        // positive: logical
+        assert_eq!(Bits2::from_u64(0x40, 8).ashr(1).to_u64(), 0x20);
+        // shift past width with sign → all ones
+        assert_eq!(Bits2::from_u64(0x80, 8).ashr(9).to_u64(), 0xFF);
+        // wide negative: bit 99 set, >>> 4 fills top 4 bits
+        let mut w = Bits2::zero(100);
+        w.set_bit(99, true);
+        let r = w.ashr(4);
+        assert!(r.get_bit(99) && r.get_bit(96) && r.get_bit(95));
+        assert!(!r.get_bit(94));
+    }
+
+    #[test]
+    fn wide_mul_add_chain() {
+        // accumulate 3 * 7 added across a 128-bit register many times.
+        let mut acc = Bits2::zero(128);
+        let step = Bits2::from_u64(3, 128).mul(&Bits2::from_u64(7, 128)); // 21
+        for _ in 0..1000 {
+            acc = acc.add(&step);
+        }
+        assert_eq!(acc.to_u64(), 21_000);
     }
 
     #[test]
