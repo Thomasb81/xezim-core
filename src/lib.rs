@@ -3,6 +3,7 @@
 //! `xezim-b` native compiler.
 
 pub mod value;
+pub mod bits2;
 pub mod elaborate;
 pub mod sdf;
 pub mod vcd_sink;

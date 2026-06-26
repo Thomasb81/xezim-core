@@ -1,0 +1,375 @@
+//! 2-state arbitrary-width logic value (Verilator-style): **no X/Z mask**.
+//!
+//! This is the compute-core value type for the cycle-based / 2-state simulation
+//! path (see xezim-pdes-wt/CYCLE_BASED.md, M1). Unlike the 4-state [`Value`]
+//! (which carries an `xz_bits` mask per value), `Bits2` stores only the value
+//! bits — `u64` inline for widths ≤ 64, `Vec<u64>` words (LSB word first) for
+//! wider — so arithmetic/logic are plain integer ops with no per-bit masking.
+//! That is the memory + speed lever vs 4-state. X/Z collapse to 0 on entry
+//! (`from_value`), matching Verilator's 2-state semantics.
+//!
+//! The top (most-significant) word is always kept masked to `width`.
+
+use crate::value::{LogicBit, Value};
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum B2 {
+    Inline(u64),
+    Wide(Vec<u64>),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Bits2 {
+    storage: B2,
+    pub width: u32,
+}
+
+impl Bits2 {
+    #[inline]
+    fn nwords_for(width: u32) -> usize {
+        ((width.max(1) as usize) + 63) / 64
+    }
+
+    /// Mask for the top word given `width` (all-ones when width is a multiple of 64).
+    #[inline]
+    fn top_mask(width: u32) -> u64 {
+        let r = width % 64;
+        if r == 0 {
+            u64::MAX
+        } else {
+            (1u64 << r) - 1
+        }
+    }
+
+    #[inline]
+    pub fn nwords(&self) -> usize {
+        match &self.storage {
+            B2::Inline(_) => 1,
+            B2::Wide(w) => w.len(),
+        }
+    }
+
+    /// Word `i` (0 if out of range).
+    #[inline]
+    pub fn word(&self, i: usize) -> u64 {
+        match &self.storage {
+            B2::Inline(v) => {
+                if i == 0 {
+                    *v
+                } else {
+                    0
+                }
+            }
+            B2::Wide(w) => *w.get(i).unwrap_or(&0),
+        }
+    }
+
+    /// Build from a word vector, normalizing length + masking the top word.
+    fn from_words(mut words: Vec<u64>, width: u32) -> Bits2 {
+        let nw = Self::nwords_for(width);
+        words.resize(nw, 0);
+        if nw > 0 {
+            words[nw - 1] &= Self::top_mask(width);
+        }
+        if width <= 64 {
+            Bits2 {
+                storage: B2::Inline(words[0] & Self::top_mask(width)),
+                width,
+            }
+        } else {
+            Bits2 {
+                storage: B2::Wide(words),
+                width,
+            }
+        }
+    }
+
+    fn to_words(&self) -> Vec<u64> {
+        (0..self.nwords()).map(|i| self.word(i)).collect()
+    }
+
+    pub fn zero(width: u32) -> Bits2 {
+        Self::from_words(vec![0; Self::nwords_for(width)], width)
+    }
+
+    pub fn from_u64(val: u64, width: u32) -> Bits2 {
+        Self::from_words(vec![val], width)
+    }
+
+    /// Low 64 bits.
+    pub fn to_u64(&self) -> u64 {
+        self.word(0)
+    }
+
+    #[inline]
+    pub fn get_bit(&self, i: u32) -> bool {
+        if i >= self.width {
+            return false;
+        }
+        (self.word((i / 64) as usize) >> (i % 64)) & 1 == 1
+    }
+
+    pub fn set_bit(&mut self, i: u32, b: bool) {
+        if i >= self.width {
+            return;
+        }
+        let mut words = self.to_words();
+        let w = (i / 64) as usize;
+        if b {
+            words[w] |= 1u64 << (i % 64);
+        } else {
+            words[w] &= !(1u64 << (i % 64));
+        }
+        *self = Self::from_words(words, self.width);
+    }
+
+    pub fn is_zero(&self) -> bool {
+        (0..self.nwords()).all(|i| self.word(i) == 0)
+    }
+
+    // ---- bitwise (operands assumed same width; result is that width) ----
+    fn zip_words<F: Fn(u64, u64) -> u64>(&self, o: &Bits2, f: F) -> Bits2 {
+        let n = self.nwords().max(o.nwords());
+        let words = (0..n).map(|i| f(self.word(i), o.word(i))).collect();
+        Self::from_words(words, self.width.max(o.width))
+    }
+    pub fn and(&self, o: &Bits2) -> Bits2 {
+        self.zip_words(o, |a, b| a & b)
+    }
+    pub fn or(&self, o: &Bits2) -> Bits2 {
+        self.zip_words(o, |a, b| a | b)
+    }
+    pub fn xor(&self, o: &Bits2) -> Bits2 {
+        self.zip_words(o, |a, b| a ^ b)
+    }
+    pub fn not(&self) -> Bits2 {
+        let words = (0..self.nwords()).map(|i| !self.word(i)).collect();
+        Self::from_words(words, self.width)
+    }
+
+    // ---- arithmetic (mod 2^width) ----
+    pub fn add(&self, o: &Bits2) -> Bits2 {
+        let n = Self::nwords_for(self.width.max(o.width));
+        let mut out = vec![0u64; n];
+        let mut carry = 0u128;
+        for i in 0..n {
+            let s = self.word(i) as u128 + o.word(i) as u128 + carry;
+            out[i] = s as u64;
+            carry = s >> 64;
+        }
+        Self::from_words(out, self.width.max(o.width))
+    }
+    /// Two's-complement subtract: a - b = a + ~b + 1 (mod 2^width).
+    pub fn sub(&self, o: &Bits2) -> Bits2 {
+        self.add(&o.not()).add(&Bits2::from_u64(1, self.width.max(o.width)))
+    }
+
+    // ---- shifts (logical) ----
+    pub fn shl(&self, n: u32) -> Bits2 {
+        if n >= self.width {
+            return Bits2::zero(self.width);
+        }
+        let nw = self.nwords();
+        let word_sh = (n / 64) as usize;
+        let bit_sh = n % 64;
+        let mut out = vec![0u64; nw];
+        for i in (0..nw).rev() {
+            if i < word_sh {
+                continue;
+            }
+            let src = i - word_sh;
+            let mut v = self.word(src) << bit_sh;
+            if bit_sh != 0 && src >= 1 {
+                v |= self.word(src - 1) >> (64 - bit_sh);
+            }
+            out[i] = v;
+        }
+        Self::from_words(out, self.width)
+    }
+    pub fn shr(&self, n: u32) -> Bits2 {
+        if n >= self.width {
+            return Bits2::zero(self.width);
+        }
+        let nw = self.nwords();
+        let word_sh = (n / 64) as usize;
+        let bit_sh = n % 64;
+        let mut out = vec![0u64; nw];
+        for i in 0..nw {
+            let src = i + word_sh;
+            if src >= nw {
+                break;
+            }
+            let mut v = self.word(src) >> bit_sh;
+            if bit_sh != 0 && src + 1 < nw {
+                v |= self.word(src + 1) << (64 - bit_sh);
+            }
+            out[i] = v;
+        }
+        Self::from_words(out, self.width)
+    }
+
+    // ---- unsigned compare ----
+    pub fn ult(&self, o: &Bits2) -> bool {
+        let n = self.nwords().max(o.nwords());
+        for i in (0..n).rev() {
+            let a = self.word(i);
+            let b = o.word(i);
+            if a != b {
+                return a < b;
+            }
+        }
+        false
+    }
+
+    /// Part-select `[hi:lo]` (inclusive) → a value of width `hi-lo+1`.
+    pub fn slice(&self, hi: u32, lo: u32) -> Bits2 {
+        debug_assert!(hi >= lo && hi < self.width);
+        let w = hi - lo + 1;
+        let shifted = self.shr(lo);
+        // re-width (truncate) to w
+        Self::from_words(shifted.to_words(), w)
+    }
+
+    /// Concatenation `{self, other}` — `self` is the high part.
+    pub fn concat(&self, low: &Bits2) -> Bits2 {
+        let total = self.width + low.width;
+        let hi = {
+            // zero-extend self to total, then shift up by low.width
+            let ext = Self::from_words(self.to_words(), total);
+            ext.shl(low.width)
+        };
+        let lo = Self::from_words(low.to_words(), total);
+        hi.or(&lo)
+    }
+
+    // ---- 4-state interop ----
+    /// Collapse a 4-state [`Value`] to 2-state: known 1 → 1, everything else
+    /// (0, X, Z) → 0. This is the cycle-engine entry conversion.
+    pub fn from_value(v: &Value) -> Bits2 {
+        if v.width <= 64 {
+            let (val, xz) = v.raw_bits();
+            // known-1 bits are val & !xz; X/Z → 0.
+            Self::from_u64(val & !xz, v.width)
+        } else {
+            let mut b = Bits2::zero(v.width);
+            for i in 0..v.width {
+                if v.get_bit(i as usize) == LogicBit::One {
+                    b.set_bit(i, true);
+                }
+            }
+            b
+        }
+    }
+
+    /// Lift back to a (fully-known) 4-state [`Value`].
+    pub fn to_value(&self) -> Value {
+        if self.width <= 64 {
+            return Value::from_u64(self.word(0), self.width);
+        }
+        let mut v = Value::zero(self.width);
+        for i in 0..self.width {
+            if self.get_bit(i) {
+                v.set_bit(i as usize, LogicBit::One);
+            }
+        }
+        v
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn width_mask_and_basic() {
+        let a = Bits2::from_u64(0xFF, 4); // masked to 4 bits
+        assert_eq!(a.to_u64(), 0xF);
+        assert_eq!(a.width, 4);
+        assert!(Bits2::zero(8).is_zero());
+        assert!(a.get_bit(3));
+        assert!(!a.get_bit(4));
+    }
+
+    #[test]
+    fn logic_ops() {
+        let a = Bits2::from_u64(0b1100, 4);
+        let b = Bits2::from_u64(0b1010, 4);
+        assert_eq!(a.and(&b).to_u64(), 0b1000);
+        assert_eq!(a.or(&b).to_u64(), 0b1110);
+        assert_eq!(a.xor(&b).to_u64(), 0b0110);
+        assert_eq!(a.not().to_u64(), 0b0011); // masked to 4 bits
+    }
+
+    #[test]
+    fn arithmetic_wraps() {
+        let a = Bits2::from_u64(200, 8);
+        let b = Bits2::from_u64(100, 8);
+        assert_eq!(a.add(&b).to_u64(), (300u64) & 0xFF); // 44
+        assert_eq!(b.sub(&a).to_u64(), (100u64.wrapping_sub(200)) & 0xFF); // 156
+        let m = Bits2::from_u64(0xFF, 8);
+        assert_eq!(m.add(&Bits2::from_u64(1, 8)).to_u64(), 0); // wrap
+    }
+
+    #[test]
+    fn shifts() {
+        let a = Bits2::from_u64(0b0001, 4);
+        assert_eq!(a.shl(2).to_u64(), 0b0100);
+        assert_eq!(a.shl(4).to_u64(), 0); // out of width
+        let b = Bits2::from_u64(0b1000, 4);
+        assert_eq!(b.shr(3).to_u64(), 0b0001);
+    }
+
+    #[test]
+    fn compare() {
+        assert!(Bits2::from_u64(5, 8).ult(&Bits2::from_u64(6, 8)));
+        assert!(!Bits2::from_u64(6, 8).ult(&Bits2::from_u64(6, 8)));
+    }
+
+    #[test]
+    fn slice_concat() {
+        let a = Bits2::from_u64(0b1011_0010, 8);
+        assert_eq!(a.slice(7, 4).to_u64(), 0b1011);
+        assert_eq!(a.slice(3, 0).to_u64(), 0b0010);
+        let hi = Bits2::from_u64(0xA, 4);
+        let lo = Bits2::from_u64(0x5, 4);
+        let c = hi.concat(&lo);
+        assert_eq!(c.width, 8);
+        assert_eq!(c.to_u64(), 0xA5);
+    }
+
+    #[test]
+    fn wide_values() {
+        // 100-bit: set bit 99 and bit 0
+        let mut w = Bits2::zero(100);
+        w.set_bit(99, true);
+        w.set_bit(0, true);
+        assert!(w.get_bit(99));
+        assert!(w.get_bit(0));
+        assert_eq!(w.nwords(), 2);
+        // shift bit 0 up to bit 64 (crosses word boundary)
+        let s = Bits2::from_u64(1, 100).shl(64);
+        assert!(s.get_bit(64));
+        assert_eq!(s.word(1), 1);
+        // wide add carry across word boundary
+        let lo_max = Bits2::from_u64(u64::MAX, 100);
+        let one = Bits2::from_u64(1, 100);
+        let sum = lo_max.add(&one);
+        assert_eq!(sum.word(0), 0);
+        assert_eq!(sum.word(1), 1);
+        // wide and/not
+        assert!(lo_max.and(&one).get_bit(0));
+        // wide slice across boundary
+        assert_eq!(s.slice(64, 64).to_u64(), 1);
+    }
+
+    #[test]
+    fn value_interop() {
+        let v = Value::from_u64(0xDEAD, 16);
+        let b = Bits2::from_value(&v);
+        assert_eq!(b.to_u64(), 0xDEAD);
+        assert_eq!(b.to_value().to_u64(), Some(0xDEAD));
+        // X collapses to 0
+        let x = Value::new(8); // all-X
+        assert!(Bits2::from_value(&x).is_zero());
+    }
+}
