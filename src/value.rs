@@ -1024,20 +1024,31 @@ impl Value {
     /// says "either operand". A hard mismatch on a non-wildcard bit
     /// forces the result to 0; otherwise the result is 1.
     pub fn wildcard_eq(&self, other: &Value) -> Value {
+        // SV §11.4.6: only x/z bits in the RIGHT operand (the pattern) are
+        // wildcards (don't-cares). An x/z in the LEFT operand at a non-masked
+        // position is NOT a wildcard — it makes the result x, unless some
+        // other position definitely mismatches (which forces 0).
         let w = self.width.max(other.width) as usize;
+        let mut saw_unknown = false;
         for i in 0..w {
             let l = self.get_bit(i);
             let r = other.get_bit(i);
-            if matches!(l, LogicBit::X | LogicBit::Z)
-                || matches!(r, LogicBit::X | LogicBit::Z)
-            {
+            if matches!(r, LogicBit::X | LogicBit::Z) {
+                continue; // wildcard position — excluded from comparison
+            }
+            if matches!(l, LogicBit::X | LogicBit::Z) {
+                saw_unknown = true; // unknown here, but keep scanning for a 0
                 continue;
             }
             if l != r {
                 return Value::from_u64(0, 1);
             }
         }
-        Value::from_u64(1, 1)
+        if saw_unknown {
+            Value::new(1) // 1-bit x
+        } else {
+            Value::from_u64(1, 1)
+        }
     }
 
     /// SV §11.4.6 wildcard inequality (`!=?`) — `wildcard_eq` inverted;

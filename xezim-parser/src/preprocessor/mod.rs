@@ -1033,7 +1033,19 @@ impl Preprocessor {
                                 {
                                     let mut i = 0;
                                     while i < body_bytes.len() {
-                                        if body_bytes[i] == b'"' {
+                                        // A `"` preceded by a backtick is the
+                                        // preprocessor stringify-quote delimiter
+                                        // (`\`"..."\``), NOT a regular string
+                                        // literal. Per IEEE 1800-2017 §22.5.1,
+                                        // macro formals inside `\`"..."\`` MUST be
+                                        // substituted (then stringized), so do not
+                                        // open an opaque string range here — else
+                                        // `uvm_type_name_decl(\`"T\`")` leaves `T`
+                                        // unsubstituted and get_type_name returns
+                                        // the literal "T" instead of the class name.
+                                        if body_bytes[i] == b'"'
+                                            && !(i > 0 && body_bytes[i - 1] == b'`')
+                                        {
                                             let start = i;
                                             i += 1;
                                             while i < body_bytes.len() {

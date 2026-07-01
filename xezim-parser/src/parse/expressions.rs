@@ -427,23 +427,35 @@ impl Parser {
                 // `pkg::Class#(params)::method` (UVM's
                 // `uvm_pkg::uvm_config_db#(virtual if)::get/set`). The bare
                 // primary consumes a trailing `#(...)`, but after a `::` it must
-                // be consumed here too. Discard the balanced parameter list.
+                // be consumed here too. Capture the canonical param-list text so
+                // a `Specialization` node can key per-specialization statics
+                // (PURE_SV_LRM); the simulator treats it as `base` otherwise.
+                let mut member_expr = Expression::new(ExprKind::MemberAccess {
+                    expr: Box::new(lhs), member,
+                }, self.span_from(start));
                 if self.at(TokenKind::Hash) && self.peek_kind() == TokenKind::LParen {
                     self.bump(); // #
                     self.bump(); // (
                     let mut depth = 1;
+                    let mut text = String::new();
                     while depth > 0 && !self.at(TokenKind::Eof) {
                         match self.current_kind() {
                             TokenKind::LParen => depth += 1,
                             TokenKind::RParen => depth -= 1,
                             _ => {}
                         }
+                        if depth > 0 {
+                            if !text.is_empty() { text.push(' '); }
+                            text.push_str(&self.current().text);
+                        }
                         self.bump();
                     }
+                    member_expr = Expression::new(ExprKind::Specialization {
+                        base: Box::new(member_expr),
+                        type_args_text: text,
+                    }, self.span_from(start));
                 }
-                lhs = Expression::new(ExprKind::MemberAccess {
-                    expr: Box::new(lhs), member,
-                }, self.span_from(start));
+                lhs = member_expr;
                 continue;
             }
 
@@ -900,15 +912,25 @@ impl Parser {
             // Identifier (possibly followed by function call or class scope)
             TokenKind::Identifier | TokenKind::EscapedIdentifier => {
                 let id = self.parse_identifier();
-                // Skip optional parameterized type list #(...) for class scope
+                // Optional parameterized type list #(...) for class scope.
+                // Capture the canonical param text so a `Specialization` node
+                // can key per-specialization statics (PURE_SV_LRM); shape is
+                // unchanged for dispatch (the simulator strips it).
+                let mut spec_text: Option<String> = None;
                 if self.eat(TokenKind::Hash).is_some() {
                     if self.eat(TokenKind::LParen).is_some() {
                         let mut depth = 1;
+                        let mut text = String::new();
                         while depth > 0 && !self.at(TokenKind::Eof) {
                             if self.at(TokenKind::LParen) { depth += 1; }
                             else if self.at(TokenKind::RParen) { depth -= 1; }
+                            if depth > 0 {
+                                if !text.is_empty() { text.push(' '); }
+                                text.push_str(&self.current().text);
+                            }
                             self.bump();
                         }
+                        spec_text = Some(text);
                     }
                 }
                 let hier = HierarchicalIdentifier {
@@ -918,7 +940,13 @@ impl Parser {
                     cached_signal_id: std::cell::Cell::new(None),
                     cached_resolved_name: std::cell::OnceCell::new(),
                 };
-                let expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
+                let mut expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
+                if let Some(text) = spec_text {
+                    expr = Expression::new(ExprKind::Specialization {
+                        base: Box::new(expr),
+                        type_args_text: text,
+                    }, self.span_from(start));
+                }
                 // Check for type cast: identifier'(expr)  e.g. my_type'(value)
                 if self.current().text == "'" && self.peek_kind() == TokenKind::LParen {
                     self.bump(); // skip '

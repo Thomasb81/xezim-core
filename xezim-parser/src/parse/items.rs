@@ -935,18 +935,28 @@ impl Parser {
             TokenKind::KwPullup | TokenKind::KwPulldown =>
                 Some(ModuleItem::GateInstantiation(self.parse_gate_instantiation())),
             TokenKind::KwSpecify => {
-                // §28.2 specify block: timing/path declarations. xezim does not
-                // model path delays for functional simulation, and the path
-                // grammar is rich (`=>`/`*>` parallel/full, edge-sensitive,
-                // state-dependent, `if (...)` conditionals, $setup/$hold system
-                // timing checks). Rather than parse each variant, skip the whole
-                // block to `endspecify` — robust against every form.
+                // §28.2 specify block. The path grammar is rich (`=>`/`*>`
+                // parallel/full, edge-sensitive, state-dependent, `if (...)`
+                // conditional, $setup/$hold timing checks). We parse only the
+                // common SIMPLE module path — `( src => dst ) = ( d {, d} ) ;`
+                // (or a bare delay) with plain-identifier endpoints — into a
+                // SpecifyPath so the elaborator can model its delay. Every
+                // other form is skipped to the next `;`, preserving the prior
+                // robust whole-block skip behavior.
                 self.bump();
+                let mut paths = Vec::new();
                 while !self.at(TokenKind::KwEndspecify) && !self.at(TokenKind::Eof) {
-                    self.bump();
+                    if self.at(TokenKind::LParen) {
+                        if let Some(p) = self.try_parse_simple_specify_path() {
+                            paths.push(p);
+                            continue;
+                        }
+                    }
+                    // Unrecognized specify item: skip to (and past) the next ';'.
+                    self.skip_to_semi();
                 }
                 self.expect(TokenKind::KwEndspecify);
-                Some(ModuleItem::SpecifyBlock(SpecifyBlock { paths: Vec::new(), span: self.span_from(start) }))
+                Some(ModuleItem::SpecifyBlock(SpecifyBlock { paths, span: self.span_from(start) }))
             }
             TokenKind::Identifier | TokenKind::EscapedIdentifier => Some(self.parse_identifier_starting_item()),
             TokenKind::Semicolon => { self.bump(); Some(ModuleItem::Null) }
@@ -1127,6 +1137,78 @@ impl Parser {
 
     fn parse_generate_branch_items(&mut self) -> Vec<ModuleItem> {
         self.parse_generate_branch_items_named().0
+    }
+
+    /// Parse the simple specify module path `( src => dst ) = ( d {, d} ) ;`
+    /// (or `... = d ;`) with plain-identifier endpoints. Returns the path's
+    /// first delay as its `delay`. Returns None and rewinds for any other
+    /// form (edge-sensitive `( posedge a => ...)`, `*>`, conditional, bit-
+    /// selected endpoints, timing checks) so the caller skips it.
+    fn try_parse_simple_specify_path(&mut self) -> Option<SpecifyPath> {
+        let start_pos = self.pos;
+        let sp_start = self.current().span.start;
+        let is_ident = |p: &Self| {
+            matches!(
+                p.current().kind,
+                TokenKind::Identifier | TokenKind::EscapedIdentifier
+            )
+        };
+        if !self.at(TokenKind::LParen) {
+            return None;
+        }
+        self.bump();
+        if !is_ident(self) {
+            self.pos = start_pos;
+            return None;
+        }
+        let src = self.parse_identifier();
+        // Only the parallel-connection `=>` with a bare-identifier source.
+        if !self.at(TokenKind::FatArrow) {
+            self.pos = start_pos;
+            return None;
+        }
+        self.bump();
+        if !is_ident(self) {
+            self.pos = start_pos;
+            return None;
+        }
+        let dst = self.parse_identifier();
+        if !self.at(TokenKind::RParen) {
+            self.pos = start_pos;
+            return None;
+        }
+        self.bump();
+        if !self.at(TokenKind::Assign) {
+            self.pos = start_pos;
+            return None;
+        }
+        self.bump();
+        // Delay: `( d {, d} )` (use the first) or a bare expression.
+        let delay = if self.at(TokenKind::LParen) {
+            self.bump();
+            let d = self.parse_expression();
+            while self.at(TokenKind::Comma) {
+                self.bump();
+                let _ = self.parse_expression();
+            }
+            if !self.at(TokenKind::RParen) {
+                self.pos = start_pos;
+                return None;
+            }
+            self.bump();
+            d
+        } else {
+            self.parse_expression()
+        };
+        if self.at(TokenKind::Semicolon) {
+            self.bump();
+        }
+        Some(SpecifyPath {
+            src,
+            dst,
+            delay,
+            span: self.span_from(sp_start),
+        })
     }
 
     /// Like `parse_generate_branch_items` but also returns the optional

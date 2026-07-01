@@ -32,6 +32,13 @@ pub enum ExprKind {
     NamedArg { name: Identifier, expr: Option<Box<Expression>> },
     Inside { expr: Box<Expression>, ranges: Vec<Expression> },
     MemberAccess { expr: Box<Expression>, member: Identifier },
+    /// §8.25 parameterized-class specialization in a scoped reference, e.g. the
+    /// `C#(int,"a")` in `C#(int,"a")::member`. `base` is the (unparameterized)
+    /// class reference; `type_args_text` is the canonical raw text of the
+    /// `#(...)` parameter list (used to key per-specialization statics under
+    /// PURE_SV_LRM). Default mode treats this transparently as `base` — the
+    /// simulator's `eval_expr` unwraps it — so behavior is unchanged there.
+    Specialization { base: Box<Expression>, type_args_text: String },
     Index { expr: Box<Expression>, index: Box<Expression> },
     RangeSelect { expr: Box<Expression>, kind: RangeKind, left: Box<Expression>, right: Box<Expression> },
     Range(Box<Expression>, Box<Expression>),

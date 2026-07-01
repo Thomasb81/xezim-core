@@ -220,9 +220,20 @@ pub struct ElaboratedClass {
     /// Names of type parameters declared on the class.
     #[serde(default)]
     pub type_param_names: Vec<String>,
+    /// ALL parameter names (type and value), in declaration order. Needed to
+    /// map positional `#(...)` type-args to the correct param when type and
+    /// value params are interleaved (e.g. `uvm_component_registry#(type T,
+    /// string Tname)` has the type param FIRST). `type_param_names`/
+    /// `param_defaults` alone lose the combined order.
+    #[serde(default)]
+    pub param_order: Vec<String>,
     /// Typedef names declared in the class body.
     #[serde(default)]
     pub typedef_names: Vec<String>,
+    /// Typedef name -> its target DataType, captured so a later step can
+    /// resolve e.g. `MyClass::type_id` to its target type.
+    #[serde(default)]
+    pub typedef_targets: HashMap<String, crate::ast::types::DataType>,
     /// Properties declared with the `static` qualifier — shared across all
     /// instances of the class (one storage cell per class).
     #[serde(default)]
@@ -487,9 +498,21 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let has_pure_virtual = c.items.iter().any(|it|
         matches!(it, ClassItem::Method(m) if matches!(m.kind, ClassMethodKind::PureVirtual(_))));
     let mut type_param_names = Vec::new();
+    let mut param_order: Vec<String> = Vec::new();
     for p in &c.params {
-        if let crate::ast::decl::ParameterKind::Type { assignments } = &p.kind {
-            for a in assignments { type_param_names.push(a.name.name.clone()); }
+        match &p.kind {
+            crate::ast::decl::ParameterKind::Type { assignments } => {
+                for a in assignments {
+                    type_param_names.push(a.name.name.clone());
+                    param_order.push(a.name.name.clone());
+                }
+            }
+            crate::ast::decl::ParameterKind::Data { assignments, .. } => {
+                for a in assignments {
+                    param_order.push(a.name.name.clone());
+                }
+            }
+            _ => {}
         }
     }
     ElaboratedClass {
@@ -508,8 +531,13 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         has_pure_virtual,
         implements: c.implements.iter().map(|i| i.name.clone()).collect(),
         type_param_names,
+        param_order,
         typedef_names: c.items.iter().filter_map(|it| match it {
             ClassItem::Typedef(td) => Some(td.name.name.clone()),
+            _ => None,
+        }).collect(),
+        typedef_targets: c.items.iter().filter_map(|it| match it {
+            ClassItem::Typedef(td) => Some((td.name.name.clone(), td.data_type.clone())),
             _ => None,
         }).collect(),
         static_properties,

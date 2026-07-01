@@ -154,6 +154,40 @@ impl Parser {
                                         type_args.push(self.parse_expression());
                                     }
                                     self.expect(TokenKind::RParen);
+                                } else if self.is_data_type_keyword() {
+                                    // A builtin/keyword TYPE as a `#(...)` type
+                                    // parameter arg (e.g. `uvm_resource#(int)`).
+                                    // `parse_expression` can't represent a type
+                                    // keyword — it yields an Empty expr, losing
+                                    // the specialization — so capture the type's
+                                    // leaf name as an Ident expression. Downstream
+                                    // per-spec keying (type_bindings / current_spec)
+                                    // then recovers the signature, matching the
+                                    // expression-context `Specialization`'s
+                                    // `type_args_text`. Class-name args already
+                                    // parse as an Ident via `parse_expression`.
+                                    let tok_text = self.current().text.clone();
+                                    let tsp = self.current().span;
+                                    let _dt = self.parse_data_type();
+                                    let sp = self.span_from(start);
+                                    let id = crate::ast::Identifier {
+                                        name: tok_text,
+                                        span: crate::ast::Span { start: tsp.start, end: tsp.end },
+                                    };
+                                    let hier = crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: id,
+                                            selects: Vec::new(),
+                                        }],
+                                        span: sp,
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    };
+                                    type_args.push(crate::ast::expr::Expression::new(
+                                        crate::ast::expr::ExprKind::Ident(hier),
+                                        sp,
+                                    ));
                                 } else {
                                     type_args.push(self.parse_expression());
                                 }
