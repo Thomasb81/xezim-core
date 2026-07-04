@@ -2330,7 +2330,17 @@ pub fn elaborate_module_with_defs(
                         if let Some(fields) = flatten_subfields(dt_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
                             if !fields.is_empty() {
                                 tls_register_struct_layout(&decl.name.name, &fields);
-                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                                // Only register packed-struct layouts in
+                                // `packed_struct_fields`. Unpacked structs
+                                // store members as separate signals (see the
+                                // !su.packed arm below) and writing through
+                                // bit-slice offsets into the parent signal
+                                // would clobber unrelated state.
+                                if let DataType::Struct(su) = dt_resolved {
+                                    if su.packed {
+                                        elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                                    }
+                                }
                             }
                         }
                         // Per-field packed-array element widths so that
@@ -2369,6 +2379,7 @@ pub fn elaborate_module_with_defs(
                                 for member in &su.members {
                                     let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                                     let ms = is_type_signed(&member.data_type);
+                                    let mr = is_type_real(&member.data_type);
                                     for mdecl in &member.declarators {
                                         let sname = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         elab.signals.entry(sname.clone()).or_insert(Signal {
@@ -2376,7 +2387,7 @@ pub fn elaborate_module_with_defs(
                                             name: sname,
                                             width: mw,
                                             is_signed: ms,
-                                            is_real: false,
+                                            is_real: mr,
                                             direction: None,
                                             value: Value::new(mw),
                                             type_name: None,
