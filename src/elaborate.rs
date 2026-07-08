@@ -53,6 +53,19 @@ pub struct AlwaysBlock {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct InitialBlock {
     pub stmt: Statement,
+    /// Instance scope this block belongs to (e.g. `"TB.p1"`), empty for the
+    /// top module. The simulator sets it as the name-resolution hint while the
+    /// block's process runs, so AST-evaluated bare names (e.g. a
+    /// `std::randomize(sig)` target) resolve to THIS instance's signal rather
+    /// than the first instance of a multiply-instantiated module.
+    #[serde(default)]
+    pub scope: String,
+}
+
+impl InitialBlock {
+    pub fn new(stmt: Statement) -> Self {
+        InitialBlock { stmt, scope: String::new() }
+    }
 }
 
 // ----------------------------------------------------------------------------
@@ -150,7 +163,10 @@ impl PendingInitial {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        InitialBlock { stmt }
+        // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
+        // record it (dot-trimmed) as the block's scope for name resolution.
+        let scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        InitialBlock { stmt, scope }
     }
 }
 
@@ -2250,15 +2266,13 @@ pub fn elaborate_module_with_defs(
                                     elab.signals.insert(size_name, size_sig);
                                 }
                                 elab.initial_blocks.push(InitialBlock {
-                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
-                                });
+                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
                             } else if !is_dynamic_dim {
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(StatementKind::BlockingAssign {
                                         lvalue: make_ident_expr(&decl.name.name),
                                         rvalue: init_expr.clone(),
-                                    }, Span::dummy()),
-                                });
+                                    }, Span::dummy()), scope: String::new(), });
                             }
                         }
                     } else {
@@ -2306,8 +2320,7 @@ pub fn elaborate_module_with_defs(
                                 stmt: Statement::new(StatementKind::BlockingAssign {
                                     lvalue: make_ident_expr(&decl.name.name),
                                     rvalue: expr,
-                                }, decl.name.span),
-                            });
+                                }, decl.name.span), scope: String::new(), });
                         }
                         // Unpacked-struct member default initializers:
                         //   struct { bit [3:0] lo = c; ... } p1;
@@ -2433,8 +2446,7 @@ pub fn elaborate_module_with_defs(
                                 }
                                 if !stmts.is_empty() {
                                     elab.initial_blocks.push(InitialBlock {
-                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
-                                    });
+                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
                                 }
                             }
                         }
@@ -2696,7 +2708,7 @@ pub fn elaborate_module_with_defs(
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                     eprintln!("[xezim][elab] elaborate_items: pushing initial (top-level path)");
                 }
-                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
+                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone(), scope: String::new(), });
             }
             // LRM §16.5: module-level `assert/assume/cover property (…)`.
             // Previously the elaborator ignored AssertionItem entirely,
@@ -2710,14 +2722,13 @@ pub fn elaborate_module_with_defs(
                     stmt: crate::ast::stmt::Statement::new(
                         crate::ast::stmt::StatementKind::Assertion(a.clone()),
                         a.span,
-                    ),
-                });
+                    ), scope: String::new(), });
             }
             ModuleItem::FinalConstruct(fc) => {
                 // LRM §9.2.3 — `final` executes once after the event loop
                 // exits (e.g. on $finish). Collected here; the simulator drains
                 // `final_blocks` before VCD/coverage flush.
-                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone() });
+                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone(), scope: String::new(), });
             }
             ModuleItem::GenerateRegion(gr) => {
                 // Recursively process generate region items
@@ -4624,8 +4635,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                     elab.signals.insert(size_name, size_sig);
                                 }
                                 elab.initial_blocks.push(InitialBlock {
-                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
-                                });
+                                    stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
                             }
                         }
                     } else {
@@ -4685,7 +4695,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                     eprintln!("[xezim][elab] @2453 pushing initial (other path)");
                 }
-                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone() });
+                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone(), scope: String::new(), });
             }
             // Mirror the AssertionItem hoist in elaborate_module_with_defs
             // so module-level `assert/assume/cover property (…)` inside
@@ -4695,11 +4705,10 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     stmt: crate::ast::stmt::Statement::new(
                         crate::ast::stmt::StatementKind::Assertion(a.clone()),
                         a.span,
-                    ),
-                });
+                    ), scope: String::new(), });
             }
             ModuleItem::FinalConstruct(fc) => {
-                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone() });
+                elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone(), scope: String::new(), });
             }
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &inst.instances {
@@ -6501,16 +6510,14 @@ pub fn inline_instantiations(
                                         elab.signals.insert(size_name.clone(), Signal { is_const: false, name: size_name, width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None });
                                     }
                                     elab.static_init_blocks.push(InitialBlock {
-                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()),
-                                    });
+                                        stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
                                 } else if decl.dimensions.is_empty() {
                                     let _ = (width, is_signed);
                                     elab.static_init_blocks.push(InitialBlock {
                                         stmt: Statement::new(StatementKind::BlockingAssign {
                                             lvalue: make_ident_expr(&decl.name.name),
                                             rvalue: init_expr.clone(),
-                                        }, Span::dummy()),
-                                    });
+                                        }, Span::dummy()), scope: String::new(), });
                                 }
                             }
                         }
