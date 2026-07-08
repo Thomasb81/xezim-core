@@ -5894,6 +5894,25 @@ fn eval_param_value(
 
 /// assigned LSB-first by walking members in reverse. Returns None if `dt`
 /// does not resolve to a struct/union.
+/// Bit-slice layout (name, offset, width) of a *packed* struct type, or `None`
+/// for a non-struct or an *unpacked* struct. An unpacked struct's members are
+/// separate storage, not bit-packed, so their offsets are meaningless and must
+/// never be registered as a packed slice layout. Used by the simulator to give
+/// a local packed-struct variable the same whole/member aliasing that
+/// module-level packed-struct signals get.
+pub fn packed_struct_field_layout(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<(String, u32, u32)>> {
+    match resolve_typedef_chain(dt, typedef_types) {
+        DataType::Struct(su) if su.packed => {}
+        _ => return None,
+    }
+    flatten_struct_fields(dt, params, typedefs, typedef_types)
+}
+
 fn flatten_struct_fields(
     dt: &DataType,
     params: &HashMap<String, Value>,
