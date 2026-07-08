@@ -356,10 +356,31 @@ fn parse_and_elaborate(
         }
     }
 
-    // IEEE 1800-2023 §23.11: apply each compilation-unit-scope `bind` by
-    // appending the bound instantiation to its target module's items. This
-    // runs before top_level_functions/tasks/nettypes injection so a bound
-    // monitor module sees the same top-level helpers as native modules.
+    // §23.11: a `bind` written as a module item (not at compilation-unit
+    // scope) is applied identically. Lift every `ModuleItem::Bind` out of the
+    // module bodies (replacing it with `Null` so it is not re-processed as a
+    // real instantiation) and fold it into `top_level_binds`.
+    let mut inmodule_binds: Vec<ast::decl::BindDirective> = Vec::new();
+    for def in definitions.values_mut() {
+        if let SourceDefinition::Module(m) = def {
+            if !m.items.iter().any(|it| matches!(it, ast::decl::ModuleItem::Bind(_))) {
+                continue;
+            }
+            let m = Rc::make_mut(m);
+            for it in m.items.iter_mut() {
+                if let ast::decl::ModuleItem::Bind(b) = it {
+                    inmodule_binds.push(b.clone());
+                    *it = ast::decl::ModuleItem::Null;
+                }
+            }
+        }
+    }
+    top_level_binds.extend(inmodule_binds);
+
+    // IEEE 1800-2023 §23.11: apply each `bind` by appending the bound
+    // instantiation to its target module's items. This runs before
+    // top_level_functions/tasks/nettypes injection so a bound monitor module
+    // sees the same top-level helpers as native modules.
     for b in &top_level_binds {
         let tname = b.target_module.name.clone();
         let Some(def) = definitions.get_mut(&tname) else { continue };
