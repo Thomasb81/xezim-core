@@ -617,6 +617,16 @@ fn resolve_library_modules(
         }
     }
 
+    // Index every library file's module/interface/program definitions (and
+    // non-forward typedefs) by name WITHOUT adopting them yet. §23.3.2: a
+    // library directory supplies definitions only to satisfy *unresolved*
+    // instantiations. Adopting everything poisons the primary design's global
+    // scope — sv-tests points `-I` at ivltests/ (~1000 unrelated single-file
+    // tests), whose modules carry internal typedefs/enums (e.g. an unrelated
+    // `typedef word word_darray[];`) that then fail the §6.18 base-type check
+    // in a test that never mentions them.
+    let mut lib: crate::hasher::HashMap<String, SourceDefinition> = Default::default();
+    let mut lib_typedefs: Vec<Rc<ast::decl::TypedefDeclaration>> = Vec::new();
     for path in files {
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
@@ -634,53 +644,73 @@ fn resolve_library_modules(
         for desc in result.source.descriptions {
             match desc {
                 ast::Description::Module(m) => {
-                    let name = m.name.name.clone();
-                    definitions.entry(name).or_insert_with(|| SourceDefinition::Module(Rc::new(m)));
+                    lib.entry(m.name.name.clone())
+                        .or_insert_with(|| SourceDefinition::Module(Rc::new(m)));
                 }
                 ast::Description::Interface(i) => {
-                    let name = i.name.name.clone();
-                    definitions.entry(name).or_insert_with(|| SourceDefinition::Interface(Rc::new(i)));
+                    lib.entry(i.name.name.clone())
+                        .or_insert_with(|| SourceDefinition::Interface(Rc::new(i)));
                 }
                 ast::Description::Program(p) => {
-                    let name = p.name.name.clone();
-                    definitions.entry(name).or_insert_with(|| SourceDefinition::Program(Rc::new(p)));
+                    lib.entry(p.name.name.clone())
+                        .or_insert_with(|| SourceDefinition::Program(Rc::new(p)));
                 }
-                // §23.3.2 library-directory semantics: an incdir/libdir supplies
-                // *module* (and interface/program) definitions to satisfy
-                // unresolved instantiations — it does NOT auto-import packages or
-                // classes into the primary design's scope. Blanket-importing them
-                // poisons global elaboration: sv-tests aims `-I` at ivltests/,
-                // whose ~1000 unrelated files define packages/classes whose enum
-                // members and params (`A`, `B`, …) then collide with a primary
-                // module's own declarations. A package/class must be explicitly
-                // compiled (listed in the file set) to be visible.
-                ast::Description::Class(_c) => {}
-                ast::Description::Package(_p) => {}
-                ast::Description::TypedefDecl(t) => {
-                    // §6.18: a bare forward typedef is a scope-local promise; a
-                    // *library* file's forward typedef is irrelevant to the
-                    // primary design and must not be imported (else its
-                    // unresolved-forward check would false-positive on an
-                    // unrelated incdir sibling). Only real typedefs are imported.
-                    if t.forward { continue; }
-                    let name = t.name.name.clone();
-                    // Only adopt a library file's typedef when the primary design
-                    // already declared it as a forward typedef (i.e. it is
-                    // genuinely referenced). Blanket-importing every typedef from
-                    // an incdir poisons the global scope — e.g. sv-tests points
-                    // `-I` at ivltests/, whose ~1000 unrelated files each define
-                    // typedefs/enums; their enum members (`A`, `B`, …) then
-                    // collide with a primary module's own localparams. A library
-                    // directory satisfies module instantiations, not type names.
-                    let replace_forward = matches!(
-                        definitions.get(&name),
-                        Some(SourceDefinition::Typedef(e)) if e.forward);
-                    if replace_forward {
-                        definitions.insert(name, SourceDefinition::Typedef(Rc::new(t)));
-                    }
+                // A non-forward typedef may fill a forward typedef the primary
+                // design actually declared; adopted below, never blanket. A
+                // forward typedef, class or package is never pulled from a
+                // library dir (that is the scope-poisoning we avoid).
+                ast::Description::TypedefDecl(t) if !t.forward => {
+                    lib_typedefs.push(Rc::new(t));
                 }
                 _ => {}
             }
+        }
+    }
+
+    // Instantiated module/interface/program names inside a definition's body.
+    fn instantiations(def: &SourceDefinition, out: &mut std::collections::HashSet<String>) {
+        let items = match def {
+            SourceDefinition::Module(m) => &m.items,
+            SourceDefinition::Interface(i) => &i.items,
+            SourceDefinition::Program(p) => &p.items,
+            _ => return,
+        };
+        collect_instantiated_modules(items, out);
+    }
+
+    // Adopt only library modules that satisfy an unresolved instantiation
+    // reachable from the explicitly-compiled design, transitively (a pulled-in
+    // library module may itself instantiate further library modules).
+    let mut seed = std::collections::HashSet::new();
+    for def in definitions.values() {
+        instantiations(def, &mut seed);
+    }
+    let mut work: Vec<String> = seed.into_iter().collect();
+    while let Some(name) = work.pop() {
+        if definitions.contains_key(&name) {
+            continue;
+        }
+        if let Some(def) = lib.get(&name) {
+            let mut more = std::collections::HashSet::new();
+            instantiations(def, &mut more);
+            definitions.insert(name.clone(), def.clone());
+            for n in more {
+                if !definitions.contains_key(&n) {
+                    work.push(n);
+                }
+            }
+        }
+    }
+
+    // §6.18: fill a forward typedef the primary design declared (`typedef
+    // name;`) from a library file's real typedef — only those, never blanket.
+    for t in lib_typedefs {
+        let name = t.name.name.clone();
+        let replace_forward = matches!(
+            definitions.get(&name),
+            Some(SourceDefinition::Typedef(e)) if e.forward);
+        if replace_forward {
+            definitions.insert(name, SourceDefinition::Typedef(t));
         }
     }
     Ok(())
