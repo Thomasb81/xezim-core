@@ -982,10 +982,23 @@ fn dpi_proto_sv_name(proto: &DPIProto) -> String {
 
 fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<(), String> {
     let sv_name = dpi_proto_sv_name(&di.proto);
-    if elab.dpi_imports.contains_key(&sv_name) {
-        return Err(format!("Duplicate DPI import declaration '{}'", sv_name));
-    }
     let c_name = di.c_name.clone().unwrap_or_else(|| sv_name.clone());
+    // LRM §35.5.2: the same foreign function may be imported more than once,
+    // as long as the declarations are consistent (same C binding and import
+    // property). This is common in real libraries — UVM re-imports helpers
+    // such as `uvm_hdl_check_path` from headers pulled into more than one
+    // scope. Accept a consistent re-import as a no-op; only a genuine
+    // mismatch (different c_identifier or context/pure property) is illegal.
+    if let Some(existing) = elab.dpi_imports.get(&sv_name) {
+        if existing.c_name == c_name && existing.property == di.property {
+            return Ok(());
+        }
+        return Err(format!(
+            "Conflicting DPI import declaration '{}': already imported as \
+             (c=\"{}\", {:?}), redeclared as (c=\"{}\", {:?})",
+            sv_name, existing.c_name, existing.property, c_name, di.property
+        ));
+    }
     elab.dpi_imports.insert(sv_name, DpiImportSpec {
         c_name,
         property: di.property,
@@ -1993,12 +2006,21 @@ pub fn elaborate_module_with_defs(
                 for decl in &dd.declarators {
                     elab.note_explicit_type(&decl.name.name, &dd.data_type)?;
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
-                        // Demoted to a warning so DataDeclaration-vs-existing
-                        // collisions (e.g. cv32e40p UVM TB's `bit tp;`
-                        // colliding with a same-named class-function local
-                        // that was wrongly merged into module scope) don't
-                        // block elaboration. The real fix is to keep class
-                        // function locals out of the module scope map.
+                        // LRM §6.x: re-declaring a name already declared in the
+                        // same scope is illegal. In strict mode (the default)
+                        // this is a hard error. It stays a warning under
+                        // --no-strict because xezim sometimes merges class-
+                        // function locals into module scope (e.g. cv32e40p UVM
+                        // TB's `bit tp;` colliding with a same-named function
+                        // local), which would otherwise be a false-positive
+                        // collision; --no-strict keeps those designs elaborating
+                        // until that scope-merge is fixed.
+                        if sv_parser::strict_checks() {
+                            return Err(format!(
+                                "duplicate declaration of '{}' in the same scope",
+                                decl.name.name
+                            ));
+                        }
                         eprintln!("[xezim][warning] duplicate declaration of '{}' (data); keeping first definition", decl.name.name);
                         continue;
                     }

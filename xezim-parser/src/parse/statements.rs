@@ -863,10 +863,29 @@ impl Parser {
                     TokenKind::KwEdge => { self.bump(); Some(Edge::Edge) }
                     _ => None,
                 };
-                let expr = self.parse_expression();
-                let iff = if self.eat(TokenKind::KwIff).is_some() {
-                    Some(self.parse_expression())
-                } else { None };
+                // LRM §9.4.2.3 `@(posedge clk iff guard)`. `parse_expression`
+                // treats `iff` as a low-precedence binary operator
+                // (`BinaryOp::Iff`), so it slurps the whole tail into
+                // `Binary(Iff, clk, guard)` and the dedicated `KwIff` eat
+                // below never fires. Peel that back out into the `iff` field
+                // so the edge expression is just the signal (otherwise the
+                // signal is buried inside a Binary node and the sensitivity
+                // list comes up empty — the `@` never suspends). The explicit
+                // `KwIff` eat is kept as a fallback in case expression
+                // precedence ever stops treating `iff` as an operator.
+                let parsed = self.parse_expression();
+                let (expr, iff) = match parsed.kind {
+                    ExprKind::Binary { op: BinaryOp::Iff, left, right } => {
+                        (*left, Some(*right))
+                    }
+                    other => {
+                        let expr = Expression { kind: other, span: parsed.span };
+                        let iff = if self.eat(TokenKind::KwIff).is_some() {
+                            Some(self.parse_expression())
+                        } else { None };
+                        (expr, iff)
+                    }
+                };
                 events.push(EventExpr { edge, expr, iff, span: self.span_from(estart) });
                 if self.eat(TokenKind::KwOr).is_some() || self.eat(TokenKind::Comma).is_some() {
                     continue;
