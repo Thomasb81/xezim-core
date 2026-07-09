@@ -2124,6 +2124,48 @@ pub fn elaborate_module_with_defs(
                         let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
                         if n >= 0 { elab.queue_max_sizes.insert(decl.name.name.clone(), (n + 1) as u32); }
                     }
+                    // IEEE 1800-2017 §7.4.5: an unpacked array OF QUEUES —
+                    // `int q[3][$]`, `int q[2][3][$]`. The trailing `[$]` makes
+                    // every ELEMENT a queue of its own; the leading dimensions
+                    // give the (fixed) shape. Without this the `[$]` was simply
+                    // dropped and `q[i]` was a plain int.
+                    if !is_dynamic_dim && effective_dims.len() >= 2 {
+                        if let Some(qd) = effective_dims.last() {
+                            if matches!(qd, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }) {
+                                let outer = &effective_dims[..effective_dims.len() - 1];
+                                let shape: Option<Vec<(i64, i64)>> = outer
+                                    .iter()
+                                    .map(|d| extract_array_range(std::slice::from_ref(d), &elab.parameters))
+                                    .collect();
+                                if let Some(shape) = shape.filter(|sh| {
+                                    sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                }) {
+                                    let name = decl.name.name.clone();
+                                    match shape.len() {
+                                        1 => { elab.arrays.insert(name.clone(), (shape[0].0, shape[0].1, width)); }
+                                        2 => { elab.arrays_2d.insert(name.clone(), (shape[0], shape[1], width)); }
+                                        _ => { elab.arrays_nd.insert(name.clone(), (shape.clone(), width)); }
+                                    }
+                                    let qmax = if let UnpackedDimension::Queue { max_size: Some(ms), .. } = qd {
+                                        const_eval_i64_with_params(ms, Some(&elab.parameters))
+                                            .filter(|n| *n >= 0).map(|n| (n + 1) as u32)
+                                    } else { None };
+                                    // Each element is a queue: same registration a
+                                    // standalone `int q[$]` gets.
+                                    for suffix in index_tuples(&shape) {
+                                        let en = format!("{}{}", name, suffix);
+                                        elab.dynamic_arrays.insert(en.clone());
+                                        if let Some(m) = qmax {
+                                            elab.queue_max_sizes.insert(en.clone(), m);
+                                        }
+                                        elab.arrays.insert(en, (0, 63, width));
+                                    }
+                                    elab.var_decl_types.insert(name, dd.data_type.clone());
+                                    continue;
+                                }
+                            }
+                        }
+                    }
                     // Helper: if the element type resolves to a packed struct,
                     // register the FLATTENED field layout (including nested
                     // dotted paths like `outer.inner.leaf`) under the array
@@ -5765,6 +5807,21 @@ pub fn with_arrays<R>(arrays: &HashMap<String, (i64, i64, u32)>, f: impl FnOnce(
 
 /// Extract array range from unpacked dimensions. Returns Some((lo, hi)) for
 /// `[lo:hi]` or `[size]` (which means [0:size-1]).
+/// Every `[i]`/`[i][j]` suffix of a fixed shape, in row-major order.
+fn index_tuples(shape: &[(i64, i64)]) -> Vec<String> {
+    let mut out = vec![String::new()];
+    for &(lo, hi) in shape {
+        let mut next = Vec::with_capacity(out.len() * ((hi - lo + 1) as usize));
+        for prefix in &out {
+            for i in lo..=hi {
+                next.push(format!("{}[{}]", prefix, i));
+            }
+        }
+        out = next;
+    }
+    out
+}
+
 fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
     if dims.is_empty() { return None; }
     match &dims[0] {
