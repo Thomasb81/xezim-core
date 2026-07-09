@@ -196,9 +196,18 @@ pub struct ElaboratedClass {
     pub name: String,
     pub extends: Option<String>,
     pub properties: HashMap<String, Signal>,
+    /// Property names in DECLARATION order. `properties` is a HashMap and so
+    /// loses source order; `%p` (LRM §21.2.1.7) must print a class object as
+    /// `'{prop:value, ...}` in declaration order.
+    #[serde(default)]
+    pub property_order: Vec<String>,
     pub methods: HashMap<String, ClassMethod>,
     /// Properties marked as 'rand' or 'randc'.
     pub random_properties: HashSet<String>,
+    /// Properties declared with type `string`, so `%p` renders them as text
+    /// rather than the packed byte value (LRM §21.2.1.7).
+    #[serde(default)]
+    pub string_properties: HashSet<String>,
     /// LRM §25.8 — properties declared as `virtual <iface_t>` or
     /// `virtual <iface_t>.<modport>`. For each such property the
     /// simulator captures a binding (an interface instance name) at the
@@ -300,6 +309,8 @@ pub struct DpiImportSpec {
 
 pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut properties = HashMap::default();
+    let mut property_order: Vec<String> = Vec::new();
+    let mut string_properties: HashSet<String> = HashSet::default();
     let mut methods = HashMap::default();
     let mut random_properties = HashSet::default();
     let mut randc_properties = HashSet::default();
@@ -464,6 +475,13 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                         default_value_for_type(&p.data_type, width)
                     };
                     if is_signed { v.is_signed = true; }
+                    // Track source order for `%p` (§21.2.1.7).
+                    if !property_order.contains(&decl.name.name) {
+                        property_order.push(decl.name.name.clone());
+                    }
+                    if matches!(&p.data_type, DataType::Simple { kind: SimpleType::String, .. }) {
+                        string_properties.insert(decl.name.name.clone());
+                    }
                     properties.insert(decl.name.name.clone(), Signal { is_const: false,
                         name: decl.name.name.clone(),
                         width,
@@ -535,6 +553,8 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         name: c.name.name.clone(),
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
         properties,
+        property_order,
+        string_properties,
         methods,
         random_properties,
         virtual_iface_properties,
@@ -656,6 +676,13 @@ pub struct ElaboratedModule {
     /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
     /// Members are stored by bit offset so MemberAccess can slice the container.
     pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
+    /// Struct variable -> its top-level member names in DECLARATION order, for
+    /// packed and unpacked alike. `packed_struct_fields` is ordered by bit
+    /// offset (i.e. reversed) and unpacked members live in separate signals, so
+    /// neither preserves source order. Used by `%p` (LRM §21.2.1.7), which must
+    /// print `'{member:value, ...}` in declaration order.
+    #[serde(default)]
+    pub struct_members: HashMap<String, Vec<String>>,
     /// Packed multi-dimensional signal element width: signal_name -> element_width.
     /// For `logic [3:0][7:0] words;` stores `"words" -> 8` so that `words[i]`
     /// resolves to an 8-bit slice rather than a 1-bit select. Also keyed for
@@ -839,6 +866,7 @@ impl ElaboratedModule {
             packages: HashSet::default(),
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
+            struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
@@ -2376,6 +2404,20 @@ pub fn elaborate_module_with_defs(
                                         elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
                                     }
                                 }
+                            }
+                        }
+                        // Record top-level member names in DECLARATION order for
+                        // `%p` (LRM §21.2.1.7). Applies to packed and unpacked
+                        // structs alike, since neither existing map preserves
+                        // source order.
+                        if let DataType::Struct(su) = dt_resolved {
+                            let names: Vec<String> = su
+                                .members
+                                .iter()
+                                .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
+                                .collect();
+                            if !names.is_empty() {
+                                elab.struct_members.insert(decl.name.name.clone(), names);
                             }
                         }
                         // Per-field packed-array element widths so that
@@ -5909,6 +5951,23 @@ fn eval_param_value(
 /// never be registered as a packed slice layout. Used by the simulator to give
 /// a local packed-struct variable the same whole/member aliasing that
 /// module-level packed-struct signals get.
+/// Top-level member names of a struct/union type in DECLARATION order (packed
+/// or unpacked). `None` for a non-struct type. Nested members are not expanded.
+pub fn struct_member_names(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<String>> {
+    match resolve_typedef_chain(dt, typedef_types) {
+        DataType::Struct(su) => Some(
+            su.members
+                .iter()
+                .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
+                .collect(),
+        ),
+        _ => None,
+    }
+}
+
 pub fn packed_struct_field_layout(
     dt: &DataType,
     params: &HashMap<String, Value>,
