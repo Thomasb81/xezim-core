@@ -2409,15 +2409,20 @@ pub fn elaborate_module_with_defs(
                         // Record top-level member names in DECLARATION order for
                         // `%p` (LRM §21.2.1.7). Applies to packed and unpacked
                         // structs alike, since neither existing map preserves
-                        // source order.
-                        if let DataType::Struct(su) = dt_resolved {
-                            let names: Vec<String> = su
-                                .members
-                                .iter()
-                                .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
-                                .collect();
-                            if !names.is_empty() {
-                                elab.struct_members.insert(decl.name.name.clone(), names);
+                        // source order. Skip declarators carrying unpacked
+                        // dimensions (`rec_t arr[N]`, `rec_t m[int]`): those are
+                        // ARRAYS of structs, and `%p` must print them as an
+                        // element list, not as a single struct.
+                        if decl.dimensions.is_empty() {
+                            if let DataType::Struct(su) = dt_resolved {
+                                let names: Vec<String> = su
+                                    .members
+                                    .iter()
+                                    .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
+                                    .collect();
+                                if !names.is_empty() {
+                                    elab.struct_members.insert(decl.name.name.clone(), names);
+                                }
                             }
                         }
                         // Per-field packed-array element widths so that
