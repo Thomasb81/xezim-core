@@ -4088,6 +4088,21 @@ fn validate_driver_conflicts(elab: &ElaboratedModule) -> Result<(), String> {
     Ok(())
 }
 
+/// Names bound by a §12.6 pattern's `.v` sub-patterns.
+fn collect_pattern_bindings(p: &crate::ast::stmt::Pattern, out: &mut Vec<String>) {
+    use crate::ast::stmt::Pattern as P;
+    match p {
+        P::Binding(id) => out.push(id.name.clone()),
+        P::Tagged { inner: Some(i), .. } => collect_pattern_bindings(i, out),
+        P::Struct(ms) => {
+            for (_, sp) in ms {
+                collect_pattern_bindings(sp, out);
+            }
+        }
+        _ => {}
+    }
+}
+
 fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut HashSet<String>) -> Result<(), String> {
     match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
@@ -4138,7 +4153,19 @@ fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut 
             validate_expr_idents(expr, elab, locals)?;
             for item in items {
                 for p in &item.patterns { validate_expr_idents(p, elab, locals)?; }
-                validate_stmt_idents(&item.stmt, elab, locals)?;
+                // §12.6.1: a pattern item's `.v` bindings are declared for the
+                // scope of that item's statement (and its `&&&` guard). Add
+                // them, validate, then remove so they don't leak to siblings.
+                let mut bound: Vec<String> = Vec::new();
+                if let Some(pat) = &item.pattern {
+                    collect_pattern_bindings(pat, &mut bound);
+                }
+                let fresh: Vec<String> =
+                    bound.iter().filter(|b| locals.insert((*b).clone())).cloned().collect();
+                if let Some(g) = &item.guard { validate_expr_idents(g, elab, locals)?; }
+                let r = validate_stmt_idents(&item.stmt, elab, locals);
+                for b in fresh { locals.remove(&b); }
+                r?;
             }
         }
         StatementKind::For { init, condition, step, body } => {
@@ -8525,6 +8552,36 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
     Expression::new(new_kind, expr.span)
 }
 
+/// Rewrite the constant-expression leaves of a §12.6 pattern for an instance.
+/// Tag names and `.v` binding names are not signals and are left alone.
+fn rewrite_pattern(
+    p: &crate::ast::stmt::Pattern,
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> crate::ast::stmt::Pattern {
+    use crate::ast::stmt::Pattern as P;
+    match p {
+        P::Wildcard => P::Wildcard,
+        P::Binding(id) => P::Binding(id.clone()),
+        P::Tagged { tag, inner } => P::Tagged {
+            tag: tag.clone(),
+            inner: inner
+                .as_ref()
+                .map(|i| Box::new(rewrite_pattern(i, prefix, port_map, local_names, interface_map))),
+        },
+        P::Expr(e) => P::Expr(rewrite_expr(e, prefix, port_map, local_names, interface_map)),
+        P::Struct(ms) => P::Struct(
+            ms.iter()
+                .map(|(n, sp)| {
+                    (n.clone(), rewrite_pattern(sp, prefix, port_map, local_names, interface_map))
+                })
+                .collect(),
+        ),
+    }
+}
+
 fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Statement {
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
@@ -8552,6 +8609,10 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
                 is_default: item.is_default,
                 stmt: rewrite_stmt(&item.stmt, prefix, port_map, local_names, interface_map),
                 span: item.span,
+                // §12.6: rewrite constant-expression sub-patterns and the
+                // `&&&` guard; tags and `.v` binding names are not signals.
+                pattern: item.pattern.as_ref().map(|p| rewrite_pattern(p, prefix, port_map, local_names, interface_map)),
+                guard: item.guard.as_ref().map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
             }).collect(),
         },
         StatementKind::For { init, condition, step, body } => StatementKind::For {
