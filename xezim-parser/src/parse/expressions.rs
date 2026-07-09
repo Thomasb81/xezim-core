@@ -156,7 +156,7 @@ impl Parser {
         }
     }
 
-    fn parse_expr_bp(&mut self, min_bp: u8) -> Expression {
+    pub(super) fn parse_expr_bp(&mut self, min_bp: u8) -> Expression {
         let start = self.current().span.start;
         let mut lhs = self.parse_prefix();
 
