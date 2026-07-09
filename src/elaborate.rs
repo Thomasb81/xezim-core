@@ -6118,6 +6118,25 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
     if su.packed {
         return;
     }
+    // IEEE 1800-2017 §7.3: a union is ONE piece of storage accessed through any
+    // of its member names — writing `u.a` must be readable as `u.b`. So an
+    // untagged union gets a single signal whose members all start at bit 0,
+    // exactly like a packed one. (A TAGGED union is tag-checked: §7.3.2.)
+    if matches!(su.kind, StructUnionKind::Union) && !su.tagged {
+        let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
+        elab.signals.entry(base.to_string()).or_insert(Signal {
+            is_const: false, name: base.to_string(), width: w, is_signed: false,
+            is_real: false, direction: None, value: Value::new(w), type_name: None,
+        });
+        if let Some(fields) =
+            flatten_struct_fields(dt, &elab.parameters, &elab.typedefs, &elab.typedef_types)
+        {
+            if !fields.is_empty() {
+                elab.packed_struct_fields.insert(base.to_string(), fields);
+            }
+        }
+        return;
+    }
     for member in &su.members {
         for mdecl in &member.declarators {
             let mbase = format!("{}.{}", base, mdecl.name.name);
