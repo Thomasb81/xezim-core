@@ -2155,10 +2155,21 @@ pub fn elaborate_module_with_defs(
                             if let DataType::TypeReference { name, .. } = &dd.data_type {
                                 elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
                             } else { &dd.data_type };
-                        if let Some(fields) = flatten_elem(elem_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
-                            if !fields.is_empty() {
-                                tls_register_struct_layout(&decl.name.name, &fields);
-                                elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                        // Only a PACKED struct element has a contiguous bit layout that
+                        // `arr[i].member` can slice. An UNPACKED struct element stores each
+                        // member as its own signal (`arr[i].member`); bit-slicing it drops
+                        // `real` members' is_real (they read back as raw bits) and shifts the
+                        // offsets of any member following a string / nested aggregate.
+                        let elem_is_packed = matches!(
+                            resolve_typedef_chain(elem_resolved, &elab.typedef_types),
+                            DataType::Struct(su) if su.packed
+                        );
+                        if elem_is_packed {
+                            if let Some(fields) = flatten_elem(elem_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
+                                if !fields.is_empty() {
+                                    tls_register_struct_layout(&decl.name.name, &fields);
+                                    elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                                }
                             }
                         }
                     };
@@ -2232,6 +2243,41 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // An UNPACKED struct element keeps each member in its own
+                        // signal. Pre-register `arr[i].member` with the member's
+                        // declared width / signedness / real-ness; otherwise they are
+                        // created lazily on first assignment and lose that type info
+                        // (a `real` member then reads back as raw bits).
+                        {
+                            let elem_dt: DataType =
+                                if let DataType::TypeReference { name, .. } = &dd.data_type {
+                                    elab.typedef_types.get(&name.name.name).cloned().unwrap_or_else(|| dd.data_type.clone())
+                                } else { dd.data_type.clone() };
+                            if let DataType::Struct(su) = resolve_typedef_chain(&elem_dt, &elab.typedef_types).clone() {
+                                if !su.packed && hi >= lo && (hi - lo) < 4096 {
+                                    for member in &su.members {
+                                        let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                                        let ms = is_type_signed(&member.data_type);
+                                        let mr = is_type_real(&member.data_type);
+                                        for mdecl in &member.declarators {
+                                            for i in lo..=hi {
+                                                let sname = format!("{}[{}].{}", decl.name.name, i, mdecl.name.name);
+                                                elab.signals.entry(sname.clone()).or_insert(Signal {
+                                                    is_const: false,
+                                                    name: sname,
+                                                    width: mw,
+                                                    is_signed: ms,
+                                                    is_real: mr,
+                                                    direction: None,
+                                                    value: if mr { Value::from_f64(0.0) } else { Value::new(mw) },
+                                                    type_name: None,
+                                                });
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
                         // LRM §8.4: if the array element type is a known
                         // class, stash the class name so the simulator's
                         // `arr[i] = new(...)` path can construct the right
