@@ -2090,6 +2090,10 @@ pub fn elaborate_module_with_defs(
                     } else {
                         decl.dimensions.clone()
                     };
+                    // `a[N]` (N a parameter) parses as an associative dim keyed by
+                    // "type" N; rewrite it back to a fixed size.
+                    let effective_dims =
+                        normalize_unpacked_dims(&effective_dims, &elab.parameters, &elab.typedef_types);
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = effective_dims.first() {
                         let is_string_key = key_dt.as_ref().map_or(false, |dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
@@ -6008,6 +6012,36 @@ fn eval_param_value(
 /// never be registered as a packed slice layout. Used by the simulator to give
 /// a local packed-struct variable the same whole/member aliasing that
 /// module-level packed-struct signals get.
+/// `arr[N]` where `N` is a *parameter* is indistinguishable, to the parser, from
+/// `arr[key_t]` (an associative array keyed by type `key_t`) — a bare identifier
+/// before `]` is assumed to name a type. Rewrite an associative dimension whose
+/// "key type" is really a known parameter (and not a known type) back into a
+/// fixed-size dimension. Without this, `rec_t a[N];` is registered as an
+/// associative array and never gets a size (`%p`, `$size`, `foreach` all lose).
+pub fn normalize_unpacked_dims(
+    dims: &[UnpackedDimension],
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Vec<UnpackedDimension> {
+    dims.iter()
+        .map(|d| match d {
+            UnpackedDimension::Associative { data_type: Some(dt), span } => {
+                if let DataType::TypeReference { name, .. } = dt.as_ref() {
+                    let n = &name.name.name;
+                    if !typedef_types.contains_key(n) && params.contains_key(n) {
+                        return UnpackedDimension::Expression {
+                            expr: Box::new(make_ident_expr(n)),
+                            span: *span,
+                        };
+                    }
+                }
+                d.clone()
+            }
+            other => other.clone(),
+        })
+        .collect()
+}
+
 /// Constant element indices of a declarator's (single) unpacked dimension.
 /// Empty for a scalar; empty for dynamic/queue/associative (size unknown here).
 fn const_dim_indices(
@@ -6089,7 +6123,10 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
             let mbase = format!("{}.{}", base, mdecl.name.name);
             if mdecl.dimensions.is_empty() {
                 register_member_leaf(elab, &mbase, &member.data_type);
-            } else if let Some(idxs) = const_dim_indices(&mdecl.dimensions, &elab.parameters) {
+            } else if let Some(idxs) = const_dim_indices(
+                &normalize_unpacked_dims(&mdecl.dimensions, &elab.parameters, &elab.typedef_types),
+                &elab.parameters,
+            ) {
                 for i in idxs {
                     register_member_leaf(elab, &format!("{}[{}]", mbase, i), &member.data_type);
                 }
