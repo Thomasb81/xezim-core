@@ -676,6 +676,12 @@ pub struct ElaboratedModule {
     /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
     /// Members are stored by bit offset so MemberAccess can slice the container.
     pub packed_struct_fields: HashMap<String, Vec<(String, u32, u32)>>,
+    /// Variable -> its declared (element) data type. For an array this is the
+    /// ELEMENT type; array-ness comes from `arrays`/`dynamic_arrays`/
+    /// `associative_arrays`. Drives the type-directed `%p` renderer
+    /// (LRM §21.2.1.7), which must walk nested structs/arrays/enums.
+    #[serde(default)]
+    pub var_decl_types: HashMap<String, DataType>,
     /// Struct variable -> its top-level member names in DECLARATION order, for
     /// packed and unpacked alike. `packed_struct_fields` is ordered by bit
     /// offset (i.e. reversed) and unpacked members live in separate signals, so
@@ -866,6 +872,7 @@ impl ElaboratedModule {
             packages: HashSet::default(),
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
+            var_decl_types: HashMap::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
             string_signals: HashSet::default(),
@@ -2243,6 +2250,8 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // Element type, for the type-directed `%p` renderer.
+                        elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         // An UNPACKED struct element keeps each member in its own
                         // signal (recursively: nested unpacked members expand, nested
                         // packed members get a signal + slice layout). Without this
@@ -2442,6 +2451,7 @@ pub fn elaborate_module_with_defs(
                         // dimensions (`rec_t arr[N]`, `rec_t m[int]`): those are
                         // ARRAYS of structs, and `%p` must print them as an
                         // element list, not as a single struct.
+                        elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         if decl.dimensions.is_empty() {
                             if let DataType::Struct(su) = dt_resolved {
                                 let names: Vec<String> = su
