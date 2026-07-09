@@ -2133,7 +2133,9 @@ pub fn elaborate_module_with_defs(
                     // trailing one makes every element its own collection.
                     // Without this the trailing dimension was simply dropped and
                     // `q[i]` was a plain scalar.
-                    if !is_dynamic_dim && effective_dims.len() >= 2 {
+                    // A leading dynamic dim is fine too (`int qq[$][$]`): its
+                    // backing buffer gives the outer shape.
+                    if effective_dims.len() >= 2 {
                         if let Some(qd) = effective_dims.last() {
                             if matches!(qd, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }
                                             | UnpackedDimension::Associative { .. }) {
