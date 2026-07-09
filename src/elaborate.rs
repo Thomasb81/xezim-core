@@ -2244,37 +2244,17 @@ pub fn elaborate_module_with_defs(
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
                         // An UNPACKED struct element keeps each member in its own
-                        // signal. Pre-register `arr[i].member` with the member's
-                        // declared width / signedness / real-ness; otherwise they are
-                        // created lazily on first assignment and lose that type info
-                        // (a `real` member then reads back as raw bits).
+                        // signal (recursively: nested unpacked members expand, nested
+                        // packed members get a signal + slice layout). Without this
+                        // they are created lazily on first assignment and lose their
+                        // declared type (a `real` member reads back as raw bits).
+                        if let DataType::Struct(su) =
+                            resolve_typedef_chain(&dd.data_type, &elab.typedef_types).clone()
                         {
-                            let elem_dt: DataType =
-                                if let DataType::TypeReference { name, .. } = &dd.data_type {
-                                    elab.typedef_types.get(&name.name.name).cloned().unwrap_or_else(|| dd.data_type.clone())
-                                } else { dd.data_type.clone() };
-                            if let DataType::Struct(su) = resolve_typedef_chain(&elem_dt, &elab.typedef_types).clone() {
-                                if !su.packed && hi >= lo && (hi - lo) < 4096 {
-                                    for member in &su.members {
-                                        let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                                        let ms = is_type_signed(&member.data_type);
-                                        let mr = is_type_real(&member.data_type);
-                                        for mdecl in &member.declarators {
-                                            for i in lo..=hi {
-                                                let sname = format!("{}[{}].{}", decl.name.name, i, mdecl.name.name);
-                                                elab.signals.entry(sname.clone()).or_insert(Signal {
-                                                    is_const: false,
-                                                    name: sname,
-                                                    width: mw,
-                                                    is_signed: ms,
-                                                    is_real: mr,
-                                                    direction: None,
-                                                    value: if mr { Value::from_f64(0.0) } else { Value::new(mw) },
-                                                    type_name: None,
-                                                });
-                                            }
-                                        }
-                                    }
+                            if !su.packed && hi >= lo && (hi - lo) < 4096 {
+                                for i in lo..=hi {
+                                    let ebase = format!("{}[{}]", decl.name.name, i);
+                                    register_unpacked_aggregate(&mut elab, &ebase, &dd.data_type);
                                 }
                             }
                         }
@@ -2399,9 +2379,12 @@ pub fn elaborate_module_with_defs(
                         // Unpacked-struct member default initializers:
                         //   struct { bit [3:0] lo = c; ... } p1;
                         // Packed structs forbid member defaults (IEEE 7.2.2).
-                        let dt_resolved: &DataType = if let DataType::TypeReference { name, .. } = &dd.data_type {
-                            elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
-                        } else { &dd.data_type };
+                        // Owned so later `&mut elab` calls (member pre-registration)
+                        // don't conflict with a borrow of `elab.typedef_types`.
+                        let dt_resolved_owned: DataType = if let DataType::TypeReference { name, .. } = &dd.data_type {
+                            elab.typedef_types.get(&name.name.name).cloned().unwrap_or_else(|| dd.data_type.clone())
+                        } else { dd.data_type.clone() };
+                        let dt_resolved: &DataType = &dt_resolved_owned;
                         // Recursively flatten nested struct/union members so multi-segment
                         // paths like u.s.a resolve via a single packed_struct_fields lookup.
                         fn flatten_subfields(dt: &DataType, params: &HashMap<String, Value>, typedefs: &HashMap<String, u32>, typedef_types: &HashMap<String, DataType>) -> Option<Vec<(String, u32, u32)>> {
@@ -2504,24 +2487,10 @@ pub fn elaborate_module_with_defs(
                             if !su.packed {
                                 // Pre-register member signals with their declared widths,
                                 // so later assignments from wider rvalues don't widen them.
-                                for member in &su.members {
-                                    let mw = resolve_type_width(&member.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                                    let ms = is_type_signed(&member.data_type);
-                                    let mr = is_type_real(&member.data_type);
-                                    for mdecl in &member.declarators {
-                                        let sname = format!("{}.{}", decl.name.name, mdecl.name.name);
-                                        elab.signals.entry(sname.clone()).or_insert(Signal {
-                                            is_const: false,
-                                            name: sname,
-                                            width: mw,
-                                            is_signed: ms,
-                                            is_real: mr,
-                                            direction: None,
-                                            value: Value::new(mw),
-                                            type_name: None,
-                                        });
-                                    }
-                                }
+                                // Recursive: an array member expands per element and a
+                                // nested packed member gets its own slice layout, so
+                                // `c.nodes[1].status` addresses its own signal.
+                                register_unpacked_aggregate(&mut elab, &decl.name.name, &dd.data_type);
                                 let mut stmts: Vec<Statement> = Vec::new();
                                 for member in &su.members {
                                     for mdecl in &member.declarators {
@@ -6029,6 +5998,97 @@ fn eval_param_value(
 /// never be registered as a packed slice layout. Used by the simulator to give
 /// a local packed-struct variable the same whole/member aliasing that
 /// module-level packed-struct signals get.
+/// Constant element indices of a declarator's (single) unpacked dimension.
+/// Empty for a scalar; empty for dynamic/queue/associative (size unknown here).
+fn const_dim_indices(
+    dims: &[UnpackedDimension],
+    params: &HashMap<String, Value>,
+) -> Option<Vec<i64>> {
+    match dims.first() {
+        None => Some(Vec::new()),
+        Some(UnpackedDimension::Expression { expr, .. }) => {
+            match const_eval_i64_with_params(expr, Some(params)) {
+                Some(n) if n > 0 && n <= 4096 => Some((0..n).collect()),
+                _ => None,
+            }
+        }
+        Some(UnpackedDimension::Range { left, right, .. }) => {
+            match (
+                const_eval_i64_with_params(left, Some(params)),
+                const_eval_i64_with_params(right, Some(params)),
+            ) {
+                (Some(l), Some(r)) => {
+                    let (lo, hi) = if l <= r { (l, r) } else { (r, l) };
+                    if hi - lo < 4096 { Some((lo..=hi).collect()) } else { None }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) {
+    let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs)).max(1);
+    let signed = is_type_signed(dt);
+    let real = is_type_real(dt);
+    let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
+    match &resolved {
+        // A nested PACKED struct member keeps a contiguous bit layout: give it
+        // its own signal plus the field offsets so `base.m.f` can slice it.
+        DataType::Struct(su) if su.packed => {
+            elab.signals.entry(name.to_string()).or_insert(Signal {
+                is_const: false, name: name.to_string(), width: w, is_signed: signed,
+                is_real: false, direction: None, value: Value::new(w), type_name: None,
+            });
+            if let Some(fields) =
+                flatten_struct_fields(dt, &elab.parameters, &elab.typedefs, &elab.typedef_types)
+            {
+                if !fields.is_empty() {
+                    elab.packed_struct_fields.insert(name.to_string(), fields);
+                }
+            }
+        }
+        // A nested UNPACKED struct member: recurse into its own members.
+        DataType::Struct(_) => register_unpacked_aggregate(elab, name, dt),
+        _ => {
+            elab.signals.entry(name.to_string()).or_insert(Signal {
+                is_const: false, name: name.to_string(), width: w, is_signed: signed,
+                is_real: real, direction: None,
+                value: if real { Value::from_f64(0.0) } else { Value::new(w) },
+                type_name: None,
+            });
+        }
+    }
+}
+
+/// Recursively pre-register the per-member signals of an UNPACKED aggregate
+/// rooted at `base` (e.g. `arr[3]`, `c`). Each leaf keeps its declared width /
+/// signedness / real-ness, array members expand per element, and nested packed
+/// members get their own signal + bit-slice layout. Without this, elements are
+/// created lazily on first assignment and lose their type (a `real` reads back
+/// as raw bits) or alias each other through a bogus packed layout.
+fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &DataType) {
+    let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
+    let DataType::Struct(su) = resolved else { return };
+    if su.packed {
+        return;
+    }
+    for member in &su.members {
+        for mdecl in &member.declarators {
+            let mbase = format!("{}.{}", base, mdecl.name.name);
+            if mdecl.dimensions.is_empty() {
+                register_member_leaf(elab, &mbase, &member.data_type);
+            } else if let Some(idxs) = const_dim_indices(&mdecl.dimensions, &elab.parameters) {
+                for i in idxs {
+                    register_member_leaf(elab, &format!("{}[{}]", mbase, i), &member.data_type);
+                }
+            }
+            // Dynamic / queue / associative members stay lazily created.
+        }
+    }
+}
+
 /// Top-level member names of a struct/union type in DECLARATION order (packed
 /// or unpacked). `None` for a non-struct type. Nested members are not expanded.
 pub fn struct_member_names(
