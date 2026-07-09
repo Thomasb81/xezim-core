@@ -1681,6 +1681,15 @@ pub fn elaborate_module_with_defs(
                         }
                     }
                 }
+                // §6.20.2 unpacked-array parameter: `u32_t A[N] = {a, b}`.
+                if !assign.dimensions.is_empty() {
+                    let ov = param_overrides.get(&assign.name.name).cloned();
+                    let params_snapshot = elab.parameters.clone();
+                    if register_array_param(&mut elab, "", &assign.name.name, &assign.dimensions,
+                        assign.init.as_ref(), ov.as_ref(), data_type, &params_snapshot) {
+                        continue;
+                    }
+                }
                 let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let mut signed = is_type_signed(data_type);
                 let mut is_real = is_type_real(data_type);
@@ -6112,6 +6121,75 @@ fn register_member_leaf(elab: &mut ElaboratedModule, name: &str, dt: &DataType) 
 /// members get their own signal + bit-slice layout. Without this, elements are
 /// created lazily on first assignment and lose their type (a `real` reads back
 /// as raw bits) or alias each other through a bogus packed layout.
+/// IEEE 1800-2017 §6.20.2: an UNPACKED-ARRAY parameter — `u32_t A[N] = {a, b}`.
+/// Give each element its own const signal (`<prefix>A[i]`) so `A[i]` reads at
+/// run time, and register the array so `A[i]` is an element select rather than
+/// a bit-select of a scalar.
+///
+/// An OVERRIDE arrives already collapsed to one packed value, so slice it:
+/// `{a, b}` puts `a` in the high bits (§11.4.12) and `a` is element 0.
+/// Returns false when the size or the element values can't be resolved, so the
+/// caller falls back to treating the parameter as a scalar.
+fn register_array_param(
+    elab: &mut ElaboratedModule,
+    prefix: &str,
+    name: &str,
+    dims: &[UnpackedDimension],
+    init: Option<&Expression>,
+    override_val: Option<&Value>,
+    data_type: &DataType,
+    params: &HashMap<String, Value>,
+) -> bool {
+    let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
+    let Some(idxs) = const_dim_indices(&dims, params) else { return false };
+    let n = idxs.len();
+    if n == 0 {
+        return false;
+    }
+    let elem_w = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+    let mut vals: Vec<Value> = Vec::new();
+    if let Some(p) = override_val {
+        if (p.width as usize) < n * elem_w as usize {
+            return false;
+        }
+        for i in 0..n {
+            let off = (n - 1 - i) * elem_w as usize;
+            let mut v = Value::zero(elem_w);
+            for b in 0..elem_w as usize {
+                v.set_bit(b, p.get_bit(off + b));
+            }
+            vals.push(v);
+        }
+    } else if let Some(init) = init {
+        let items: Vec<&Expression> = match &init.kind {
+            ExprKind::Concatenation(v) => v.iter().collect(),
+            ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
+            _ => return false,
+        };
+        if items.len() != n {
+            return false;
+        }
+        for it in items {
+            vals.push(eval_init_for_width(it, params, elem_w));
+        }
+    } else {
+        return false;
+    }
+    let signed = is_type_signed(data_type);
+    let full = format!("{}{}", prefix, name);
+    // Needed so `A[i]` is an ELEMENT select, not a bit-select of a scalar.
+    // Simulator::new seeds each element from the signal written just below.
+    elab.arrays.insert(full, (0, n as i64 - 1, elem_w));
+    for (i, v) in idxs.iter().zip(vals) {
+        let sn = format!("{}{}[{}]", prefix, name, i);
+        elab.signals.insert(sn.clone(), Signal {
+            is_const: true, name: sn, width: elem_w, is_signed: signed,
+            is_real: false, direction: None, value: v, type_name: None,
+        });
+    }
+    true
+}
+
 fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &DataType) {
     let resolved = resolve_typedef_chain(dt, &elab.typedef_types).clone();
     let DataType::Struct(su) = resolved else { return };
@@ -7873,6 +7951,20 @@ fn inline_module_items(
                 for p_decl in sub_mod.params() {
                     if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
                         for assign in assignments {
+                            // §6.20.2 unpacked-array parameter. This runs even when the
+                            // parameter is OVERRIDDEN: the override arrives as a single
+                            // packed value, so without slicing it here no element ever
+                            // gets a value and `A[i]` reads 0.
+                            if !assign.dimensions.is_empty() {
+                                let ov = sub_local_params.get(&assign.name.name).cloned();
+                                let snapshot = sub_local_params.clone();
+                                if register_array_param(elab, &inst_prefix, &assign.name.name,
+                                    &assign.dimensions, assign.init.as_ref(), ov.as_ref(),
+                                    data_type, &snapshot)
+                                {
+                                    continue;
+                                }
+                            }
                             if !sub_local_params.contains_key(&assign.name.name) {
                                 if let Some(init) = &assign.init {
                                     // IEEE 1800-2023: associative-array
