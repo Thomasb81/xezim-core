@@ -2124,14 +2124,19 @@ pub fn elaborate_module_with_defs(
                         let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
                         if n >= 0 { elab.queue_max_sizes.insert(decl.name.name.clone(), (n + 1) as u32); }
                     }
-                    // IEEE 1800-2017 §7.4.5: an unpacked array OF QUEUES —
-                    // `int q[3][$]`, `int q[2][3][$]`. The trailing `[$]` makes
-                    // every ELEMENT a queue of its own; the leading dimensions
-                    // give the (fixed) shape. Without this the `[$]` was simply
-                    // dropped and `q[i]` was a plain int.
+                    // IEEE 1800-2017 §7.4.5 / §7.8: an unpacked array whose
+                    // ELEMENT is itself a dynamic collection —
+                    //   `int q[3][$]`      array of queues
+                    //   `int d[3][]`       array of dynamic arrays
+                    //   `int a[2][u8_t]`   array of associative arrays
+                    // The leading dimensions give the (fixed) shape; the
+                    // trailing one makes every element its own collection.
+                    // Without this the trailing dimension was simply dropped and
+                    // `q[i]` was a plain scalar.
                     if !is_dynamic_dim && effective_dims.len() >= 2 {
                         if let Some(qd) = effective_dims.last() {
-                            if matches!(qd, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }) {
+                            if matches!(qd, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }
+                                            | UnpackedDimension::Associative { .. }) {
                                 let outer = &effective_dims[..effective_dims.len() - 1];
                                 let shape: Option<Vec<(i64, i64)>> = outer
                                     .iter()
@@ -2150,10 +2155,24 @@ pub fn elaborate_module_with_defs(
                                         const_eval_i64_with_params(ms, Some(&elab.parameters))
                                             .filter(|n| *n >= 0).map(|n| (n + 1) as u32)
                                     } else { None };
-                                    // Each element is a queue: same registration a
-                                    // standalone `int q[$]` gets.
+                                    // Each element gets exactly the registration a
+                                    // standalone `int q[$]` / `int a[key_t]` gets.
+                                    let assoc_key = match qd {
+                                        UnpackedDimension::Associative { data_type: kdt, .. } => Some(
+                                            kdt.as_ref().map_or(false, |dt| {
+                                                matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
+                                            }),
+                                        ),
+                                        _ => None,
+                                    };
                                     for suffix in index_tuples(&shape) {
                                         let en = format!("{}{}", name, suffix);
+                                        if let Some(is_str) = assoc_key {
+                                            // Associative elements are sparse: no
+                                            // backing buffer, no `.size` shadow.
+                                            elab.associative_arrays.insert(en, is_str);
+                                            continue;
+                                        }
                                         elab.dynamic_arrays.insert(en.clone());
                                         if let Some(m) = qmax {
                                             elab.queue_max_sizes.insert(en.clone(), m);
@@ -2237,18 +2256,30 @@ pub fn elaborate_module_with_defs(
                     };
                     // Check for 2D unpacked array (e.g., mem [0:1023][0:3])
                     if effective_dims.len() == 2 {
-                        let r1 = if let UnpackedDimension::Range { left, right, .. } = &effective_dims[0] {
-                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
-                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
-                            Some((l.min(r), l.max(r)))
-                        } else { None };
-                        let r2 = if let UnpackedDimension::Range { left, right, .. } = &effective_dims[1] {
-                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
-                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
-                            Some((l.min(r), l.max(r)))
-                        } else { None };
+                        // Both `[0:1][0:2]` (range) and `[2][3]` (size) spell the
+                        // same 2-D array. Only the range form was recognised, so
+                        // `int m[2][3]` fell through to the 1-D path and every
+                        // `m[i][j]` was a bit-select that read X. The N-D branch
+                        // below already accepted both forms.
+                        let dim_range = |d: &UnpackedDimension, params: &HashMap<String, Value>| {
+                            extract_array_range(std::slice::from_ref(d), params)
+                        };
+                        let r1 = match &effective_dims[0] {
+                            d @ (UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }) => {
+                                dim_range(d, &elab.parameters)
+                            }
+                            _ => None,
+                        };
+                        let r2 = match &effective_dims[1] {
+                            d @ (UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }) => {
+                                dim_range(d, &elab.parameters)
+                            }
+                            _ => None,
+                        };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                            // Element type, for the type-directed `%p` renderer.
+                            elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                             // LRM §8.4 (2D class arrays). Same as the 1D
                             // path: record the element class so the
                             // simulator's `arr[i][j] = new(...)` route
@@ -2289,6 +2320,7 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         if let DataType::TypeReference { name, .. } = &dd.data_type {
                             elab.array_elem_class
                                 .insert(decl.name.name.clone(), name.name.name.clone());
