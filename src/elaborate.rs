@@ -586,6 +586,23 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     }
 }
 
+/// One module/interface instance in the design hierarchy.
+///
+/// The design is flattened into a single `ElaboratedModule` with dotted
+/// signal names, so this is the only surviving record of the instance
+/// tree. VPI's `vpi_iterate(vpiModule, ...)` and `vpi_handle(vpiScope, ..)`
+/// walk it, and `vpi_get_str(vpiDefName, ..)` reads `def_name` from it.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ElabInstance {
+    /// Dotted path below the top module, e.g. `u_sub_block` or `a.b`.
+    /// Never carries the top module's own name.
+    pub path: String,
+    /// The module (or interface) definition this instantiates.
+    pub def_name: String,
+    /// Dotted path of the containing scope; empty for a child of the top.
+    pub parent: String,
+}
+
 /// Elaborated module ready for simulation.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct ElaboratedModule {
@@ -753,6 +770,12 @@ pub struct ElaboratedModule {
     /// Used to enforce §6.5 driver-conflict rules only against variables.
     #[serde(default)]
     pub nets: HashSet<String>,
+    /// The design's instance tree, in elaboration order. Inlining flattens
+    /// every module into this one, so without this the hierarchy is only
+    /// implicit in dotted signal names — enough to resolve a name, not
+    /// enough to enumerate a scope's children. Drives the VPI object model.
+    #[serde(default)]
+    pub instances: Vec<ElabInstance>,
     /// Out-of-class constraint definitions: `(class_name, constraint_name)`.
     #[serde(default)]
     pub out_of_class_constraints: HashSet<(String, String)>,
@@ -901,6 +924,7 @@ impl ElaboratedModule {
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
+            instances: Vec::new(),
             out_of_class_constraints: HashSet::default(),
             timeunit_exp: default_timeunit_exp(),
             timeprecision_exp: default_timeunit_exp(),
@@ -8626,6 +8650,15 @@ fn inline_module_items(
                         }
                     }
                 }
+
+                // Record the instance before descending. Inlining is about to
+                // dissolve this module into the parent, so this is the only
+                // place the (path, definition) pair still exists.
+                elab.instances.push(ElabInstance {
+                    path: inst_prefix.trim_end_matches('.').to_string(),
+                    def_name: sub_mod_name.clone(),
+                    parent: prefix.trim_end_matches('.').to_string(),
+                });
 
                 // Recurse into sub-module instantiations
                 inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache)?;
