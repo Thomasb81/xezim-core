@@ -4568,8 +4568,8 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
     for pending in &elab.pending_cont_assign {
         let prefix = &pending.ctx.prefix;
         let mut bare = Vec::new();
-        collect_ident_names(&pending.lhs_source, &mut bare);
-        collect_ident_names(&pending.rhs_source, &mut bare);
+        collect_implicit_net_candidates(&pending.lhs_source, &mut bare);
+        collect_implicit_net_candidates(&pending.rhs_source, &mut bare);
         for name in bare {
             // If the bare name is a port (in port_map), it gets rewritten
             // to the parent's signal — don't create an implicit net here.
@@ -4637,6 +4637,39 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Names that §6.10 may implicitly declare as 1-bit nets. Unlike
+/// `collect_ident_names` this does NOT descend into a `MemberAccess` base: a
+/// dotted reference (`testbench.chip_inst.dqs`) is a HIERARCHICAL path, and its
+/// first segment names an instance, not an undeclared net. Descending created a
+/// bogus `<prefix>.testbench` net that then drove the real one to X.
+fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
+    match &expr.kind {
+        ExprKind::Ident(hier) => {
+            if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                out.push(hier.path[0].name.name.clone());
+            }
+        }
+        ExprKind::MemberAccess { .. } => {}
+        ExprKind::Unary { operand, .. } => collect_implicit_net_candidates(operand, out),
+        ExprKind::Binary { left, right, .. } => {
+            collect_implicit_net_candidates(left, out);
+            collect_implicit_net_candidates(right, out);
+        }
+        ExprKind::Paren(i) => collect_implicit_net_candidates(i, out),
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                collect_implicit_net_candidates(p, out);
+            }
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            collect_implicit_net_candidates(condition, out);
+            collect_implicit_net_candidates(then_expr, out);
+            collect_implicit_net_candidates(else_expr, out);
+        }
+        _ => {}
+    }
 }
 
 /// Collect all plain identifier names from an expression tree.
@@ -8643,10 +8676,15 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                     pairs.push((out, make_tristate(cond, in1, sp)));
                 }
             }
-            // §28 bidirectional switches: model as a one-directional connection
-            // so simulation runs (functional value flow only, no real bidi).
+            // §28 bidirectional switches. Model as a pair of opposing
+            // continuous assigns: each side drives the other. A driver that is
+            // high-impedance does not overwrite the far side's value, so the
+            // settle loop converges to the resolved net value in both
+            // directions. A one-directional `assign out = in1` (what this used
+            // to emit) left the second terminal permanently undriven.
             GateType::Tran | GateType::Rtran => {
-                pairs.push((out, in1));
+                pairs.push((out.clone(), in1.clone()));
+                pairs.push((in1, out));
             }
             GateType::Tranif1 | GateType::Rtranif1 | GateType::Tranif0 | GateType::Rtranif0 => {
                 if inst.terminals.len() >= 3 {
