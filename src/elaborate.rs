@@ -7719,12 +7719,17 @@ fn prepare_module_items(
             match item {
                 ModuleItem::ContinuousAssign(ca) => {
                     for (lhs, _) in &ca.assignments {
-                        collect_ident_names(lhs, &mut implicit);
+                        // A dotted lvalue (`top.inst.net`) is a HIERARCHICAL
+                        // reference, not an undeclared net. Registering its root
+                        // here made `rewrite_expr` prefix it with the instance
+                        // path (`wr.top.inst.net`), so the assign wrote a name
+                        // that resolves to nothing.
+                        collect_implicit_net_candidates(lhs, &mut implicit);
                     }
                 }
                 ModuleItem::GateInstantiation(gi) => {
                     for (lhs, _) in gate_inst_to_assign_pairs(gi) {
-                        collect_ident_names(&lhs, &mut implicit);
+                        collect_implicit_net_candidates(&lhs, &mut implicit);
                     }
                 }
                 _ => {}
@@ -8549,7 +8554,18 @@ fn inline_module_items(
                             }
                         }
                     }
-                    if matches!(sub_item, ModuleItem::GateInstantiation(_)) {
+                    if let ModuleItem::GateInstantiation(gi) = sub_item {
+                        // §28.8 switches produce no assign pairs; record them
+                        // with terminals rewritten into this instance's scope.
+                        record_tran_switches(gi, elab, |e| {
+                            rewrite_expr(
+                                e,
+                                &pend_ctx.prefix,
+                                &pend_ctx.port_map,
+                                &pend_ctx.local_names,
+                                &pend_ctx.interface_map,
+                            )
+                        });
                         if let BodySource::GateInst(pairs) = body_src {
                             for (lhs_rc, rhs_rc) in pairs {
                                 elab.pending_cont_assign.push(PendingContAssign {
@@ -8899,17 +8915,34 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
     if switches.is_empty() {
         return;
     }
+    // A terminal's drivers may live in a sub-module and still be pending. The
+    // pass needs every driver of every terminal in hand, so materialize them.
+    // Only designs that actually contain a switch pay for this.
+    let pending = std::mem::take(&mut elab.pending_cont_assign);
+    for p in pending {
+        elab.continuous_assigns.push(p.materialize());
+    }
+    // A cross-module terminal names the top module explicitly; signals and
+    // driver lvalues are keyed without that root.
+    let root = format!("{}.", elab.name);
+    let norm = |n: String| -> String {
+        n.strip_prefix(root.as_str()).map(|r| r.to_string()).unwrap_or(n)
+    };
     for sw in switches {
-        let (Some(na), Some(nb)) = (ident_flat_name(&sw.a), ident_flat_name(&sw.b)) else {
+        let (Some(na), Some(nb)) = (
+            ident_flat_name(&sw.a).map(&norm),
+            ident_flat_name(&sw.b).map(&norm),
+        ) else {
             continue;
         };
+        let (term_a, term_b) = (make_ident_expr(&na), make_ident_expr(&nb));
         let span = sw.a.span;
 
         // Each terminal's OWN drivers, folded with the wired-net resolution.
         let mut take_drivers = |name: &str| -> Option<Expression> {
             let mut rhs: Vec<Expression> = Vec::new();
             elab.continuous_assigns.retain(|ca| {
-                if ident_flat_name(&ca.lhs).as_deref() == Some(name) {
+                if ident_flat_name(&ca.lhs).map(&norm).as_deref() == Some(name) {
                     rhs.push(ca.rhs.clone());
                     false
                 } else {
@@ -8941,7 +8974,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
         );
 
         elab.continuous_assigns.push(ContinuousAssignment {
-            lhs: sw.a.clone(),
+            lhs: term_a,
             rhs: make_syscall(
                 "$__tranif",
                 vec![own_a.clone(), own_b.clone(), ctl.clone(), active.clone()],
@@ -8950,45 +8983,58 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
             delay: 0,
         });
         elab.continuous_assigns.push(ContinuousAssignment {
-            lhs: sw.b.clone(),
+            lhs: term_b,
             rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
             delay: 0,
         });
     }
 }
 
-fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
-    // §28.8 bidirectional switches: record, don't lower to an assign.
-    if matches!(
+/// Record a `tran`/`tranif0`/`tranif1` instantiation. `map` brings each terminal
+/// into the enclosing scope (identity at the top level, `rewrite_expr` when the
+/// gate lives in an inlined sub-module). Returns true if `gi` was a switch.
+fn record_tran_switches<F>(gi: &GateInstantiation, elab: &mut ElaboratedModule, map: F) -> bool
+where
+    F: Fn(&Expression) -> Expression,
+{
+    if !matches!(
         gi.gate_type,
         GateType::Tran | GateType::Rtran | GateType::Tranif0
             | GateType::Rtranif0 | GateType::Tranif1 | GateType::Rtranif1
     ) {
-        let conditional = !matches!(gi.gate_type, GateType::Tran | GateType::Rtran);
-        // An unconditional `tran` always conducts: it is modelled with a
-        // synthetic control of 1, so it must be ACTIVE HIGH. Treating it like a
-        // `tranif0` left the switch permanently open.
-        let active_high = !conditional
-            || matches!(gi.gate_type, GateType::Tranif1 | GateType::Rtranif1);
-        for inst in &gi.instances {
-            if inst.terminals.len() < 2 {
-                continue;
-            }
-            let ctl = if conditional {
-                match inst.terminals.get(2) {
-                    Some(c) => Some(c.clone()),
-                    None => continue,
-                }
-            } else {
-                None
-            };
-            elab.tran_switches.push(TranSwitch {
-                a: inst.terminals[0].clone(),
-                b: inst.terminals[1].clone(),
-                ctl,
-                active_high,
-            });
+        return false;
+    }
+    let conditional = !matches!(gi.gate_type, GateType::Tran | GateType::Rtran);
+    // An unconditional `tran` always conducts: it is modelled with a synthetic
+    // control of 1, so it must be ACTIVE HIGH. Treating it like a `tranif0`
+    // left the switch permanently open.
+    let active_high =
+        !conditional || matches!(gi.gate_type, GateType::Tranif1 | GateType::Rtranif1);
+    for inst in &gi.instances {
+        if inst.terminals.len() < 2 {
+            continue;
         }
+        let ctl = if conditional {
+            match inst.terminals.get(2) {
+                Some(c) => Some(map(c)),
+                None => continue,
+            }
+        } else {
+            None
+        };
+        elab.tran_switches.push(TranSwitch {
+            a: map(&inst.terminals[0]),
+            b: map(&inst.terminals[1]),
+            ctl,
+            active_high,
+        });
+    }
+    true
+}
+
+fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
+    // §28.8 bidirectional switches: record, don't lower to an assign.
+    if record_tran_switches(gi, elab, |e| e.clone()) {
         return;
     }
     let pairs = gate_inst_to_assign_pairs(gi);
