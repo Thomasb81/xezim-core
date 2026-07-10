@@ -307,6 +307,14 @@ pub struct DpiImportSpec {
     pub proto: DPIProto,
 }
 
+/// Run `f` with the current thread-local typedef table, if one has been
+/// installed. `elaborate_class` takes no typedef parameter and has eight
+/// call sites; this reads the snapshot the typedef registration already
+/// maintains rather than threading a table through all of them.
+fn typedefs_snapshot<R>(f: impl FnOnce(Option<&HashMap<String, u32>>) -> R) -> R {
+    TYPEDEFS_TLS.with(|cell| f(cell.borrow().as_ref()))
+}
+
 pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut properties = HashMap::default();
     let mut property_order: Vec<String> = Vec::new();
@@ -339,7 +347,12 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     for item in &c.items {
         match item {
             ClassItem::Property(p) => {
-                let width = resolve_type_width(&p.data_type, None, None);
+                // Resolve against the typedef table, not `None`. A property
+                // declared with a typedef'd type (`u2_t v;`) hits
+                // `resolve_type_width`'s TypeReference branch, which returns a
+                // flat 32 when it has no table — so every such property was
+                // recorded 32 bits wide however narrow its type.
+                let width = typedefs_snapshot(|td| resolve_type_width(&p.data_type, None, td));
                 let is_signed = is_type_signed(&p.data_type);
                 let is_rand = p.qualifiers.contains(&ClassQualifier::Rand) || p.qualifiers.contains(&ClassQualifier::Randc);
                 let is_randc = p.qualifiers.contains(&ClassQualifier::Randc);
