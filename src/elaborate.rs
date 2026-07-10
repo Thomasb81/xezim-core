@@ -605,6 +605,10 @@ pub struct ElaboratedModule {
     pub typed_decls: HashMap<String, bool>,
     pub port_order: Vec<String>,
     pub continuous_assigns: Vec<ContinuousAssignment>,
+    /// §28.8 bidirectional switches (`tran`/`tranif0`/`tranif1`), pending
+    /// resolution against each terminal's own drivers.
+    #[serde(default)]
+    pub tran_switches: Vec<TranSwitch>,
     pub always_blocks: Vec<AlwaysBlock>,
     pub initial_blocks: Vec<InitialBlock>,
     /// `final` blocks — LRM §9.2.3. Identical AST shape to `initial`, but
@@ -799,6 +803,17 @@ pub struct ElaboratedModule {
     pub events: HashSet<String>,
 }
 
+/// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
+/// control. `active_high` distinguishes `tranif1` from `tranif0`.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TranSwitch {
+    pub a: Expression,
+    pub b: Expression,
+    pub ctl: Option<Expression>,
+    pub active_high: bool,
+}
+
+
 impl ElaboratedModule {
     /// Record an *explicit* data-type declaration for `name`. Returns Err if
     /// `name` was already explicitly typed — a §23.2.2.1 redeclaration with
@@ -842,6 +857,7 @@ impl ElaboratedModule {
             typed_decls: HashMap::default(),
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
+            tran_switches: Vec::new(),
             always_blocks: Vec::new(),
             initial_blocks: Vec::new(),
             final_blocks: Vec::new(),
@@ -8676,26 +8692,11 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                     pairs.push((out, make_tristate(cond, in1, sp)));
                 }
             }
-            // §28 bidirectional switches. Model as a pair of opposing
-            // continuous assigns: each side drives the other. A driver that is
-            // high-impedance does not overwrite the far side's value, so the
-            // settle loop converges to the resolved net value in both
-            // directions. A one-directional `assign out = in1` (what this used
-            // to emit) left the second terminal permanently undriven.
-            GateType::Tran | GateType::Rtran => {
-                pairs.push((out.clone(), in1.clone()));
-                pairs.push((in1, out));
-            }
-            GateType::Tranif1 | GateType::Rtranif1 | GateType::Tranif0 | GateType::Rtranif0 => {
-                if inst.terminals.len() >= 3 {
-                    let ctl = inst.terminals[2].clone();
-                    let active_high = matches!(gi.gate_type, GateType::Tranif1 | GateType::Rtranif1);
-                    let cond = if active_high { ctl } else {
-                        Expression::new(ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(ctl) }, sp)
-                    };
-                    pairs.push((out, make_tristate(cond, in1, sp)));
-                }
-            }
+            // §28.8 bidirectional switches are not one-directional assigns.
+            // They are recorded and resolved against each terminal's own
+            // drivers by `resolve_bidirectional_switches`.
+            GateType::Tran | GateType::Rtran => {}
+            GateType::Tranif1 | GateType::Rtranif1 | GateType::Tranif0 | GateType::Rtranif0 => {}
             GateType::And => {
                 let mut rhs = in1;
                 for i in 2..inst.terminals.len() {
@@ -8808,7 +8809,133 @@ fn rewrite_module_item_subst(
     }
 }
 
+/// Flat dotted name of an identifier expression, if it is one.
+fn ident_flat_name(e: &Expression) -> Option<String> {
+    match &e.kind {
+        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(
+            h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."),
+        ),
+        _ => None,
+    }
+}
+
+fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
+    Expression::new(ExprKind::SystemCall { name: name.to_string(), args }, span)
+}
+
+/// IEEE 1800-2017 §28.8. A bidirectional switch is not a one-directional
+/// assign: both terminals settle to the resolution of BOTH sides' drivers when
+/// the switch conducts, and keep their own driver when it does not.
+///
+/// Rewrite each terminal's own continuous drivers into a single bridged assign:
+///
+///     assign a = $__tranif(own_a, own_b, ctl, active);
+///     assign b = $__tranif(own_b, own_a, ctl, active);
+///
+/// `$__tranif` resolves the two sides when the switch conducts (`z` yields to a
+/// driven value; conflicting values give `x`), passes the terminal's own value
+/// through when it does not, and gives `x` per differing bit when the control
+/// is unknown. An unconditional `tran` always conducts.
+///
+/// Only terminals that are plain (possibly dotted) names are handled; a switch
+/// whose terminal is an expression is left unconnected, as before.
+pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
+    let switches = std::mem::take(&mut elab.tran_switches);
+    if switches.is_empty() {
+        return;
+    }
+    for sw in switches {
+        let (Some(na), Some(nb)) = (ident_flat_name(&sw.a), ident_flat_name(&sw.b)) else {
+            continue;
+        };
+        let span = sw.a.span;
+
+        // Each terminal's OWN drivers, folded with the wired-net resolution.
+        let mut take_drivers = |name: &str| -> Option<Expression> {
+            let mut rhs: Vec<Expression> = Vec::new();
+            elab.continuous_assigns.retain(|ca| {
+                if ident_flat_name(&ca.lhs).as_deref() == Some(name) {
+                    rhs.push(ca.rhs.clone());
+                    false
+                } else {
+                    true
+                }
+            });
+            let mut it = rhs.into_iter();
+            let first = it.next()?;
+            Some(it.fold(first, |acc, r| make_syscall("$__wres", vec![acc, r], span)))
+        };
+        let own_a = take_drivers(&na);
+        let own_b = take_drivers(&nb);
+        // A terminal with no driver of its own contributes high impedance.
+        let z = || make_z_expr(span);
+        let own_a = own_a.unwrap_or_else(z);
+        let own_b = own_b.unwrap_or_else(z);
+
+        let ctl = sw.ctl.clone().unwrap_or_else(|| {
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('1')),
+                span,
+            )
+        });
+        let active = Expression::new(
+            ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(
+                if sw.active_high { '1' } else { '0' },
+            )),
+            span,
+        );
+
+        elab.continuous_assigns.push(ContinuousAssignment {
+            lhs: sw.a.clone(),
+            rhs: make_syscall(
+                "$__tranif",
+                vec![own_a.clone(), own_b.clone(), ctl.clone(), active.clone()],
+                span,
+            ),
+            delay: 0,
+        });
+        elab.continuous_assigns.push(ContinuousAssignment {
+            lhs: sw.b.clone(),
+            rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
+            delay: 0,
+        });
+    }
+}
+
 fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
+    // §28.8 bidirectional switches: record, don't lower to an assign.
+    if matches!(
+        gi.gate_type,
+        GateType::Tran | GateType::Rtran | GateType::Tranif0
+            | GateType::Rtranif0 | GateType::Tranif1 | GateType::Rtranif1
+    ) {
+        let conditional = !matches!(gi.gate_type, GateType::Tran | GateType::Rtran);
+        // An unconditional `tran` always conducts: it is modelled with a
+        // synthetic control of 1, so it must be ACTIVE HIGH. Treating it like a
+        // `tranif0` left the switch permanently open.
+        let active_high = !conditional
+            || matches!(gi.gate_type, GateType::Tranif1 | GateType::Rtranif1);
+        for inst in &gi.instances {
+            if inst.terminals.len() < 2 {
+                continue;
+            }
+            let ctl = if conditional {
+                match inst.terminals.get(2) {
+                    Some(c) => Some(c.clone()),
+                    None => continue,
+                }
+            } else {
+                None
+            };
+            elab.tran_switches.push(TranSwitch {
+                a: inst.terminals[0].clone(),
+                b: inst.terminals[1].clone(),
+                ctl,
+                active_high,
+            });
+        }
+        return;
+    }
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
         elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay: 0 });
