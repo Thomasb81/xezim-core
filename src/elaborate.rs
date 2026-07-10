@@ -8809,12 +8809,17 @@ fn rewrite_module_item_subst(
     }
 }
 
-/// Flat dotted name of an identifier expression, if it is one.
+/// Flat dotted name of an identifier expression. A hierarchical reference may
+/// parse as an `Ident` with several path segments OR as a `MemberAccess` chain
+/// (`top.inst.net`), so fold both shapes.
 fn ident_flat_name(e: &Expression) -> Option<String> {
     match &e.kind {
         ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(
             h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."),
         ),
+        ExprKind::MemberAccess { expr, member } => {
+            Some(format!("{}.{}", ident_flat_name(expr)?, member.name))
+        }
         _ => None,
     }
 }
@@ -8839,6 +8844,56 @@ fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
 ///
 /// Only terminals that are plain (possibly dotted) names are handled; a switch
 /// whose terminal is an expression is left unconnected, as before.
+/// IEEE 1800-2017 §6.6.1: a NET with more than one continuous driver takes the
+/// wired-net resolution of all of them, not whichever assign happened to run
+/// last. Fold the drivers of each such net into a single `$__wres` chain.
+///
+/// Only whole-net drivers (`assign w = ...`) participate; a driver of a slice
+/// (`assign w[3:0] = ...`) is left alone, and variables are untouched — they
+/// legitimately have one driver.
+pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
+    let mut counts: HashMap<String, usize> = HashMap::default();
+    for ca in &elab.continuous_assigns {
+        if let Some(n) = ident_flat_name(&ca.lhs) {
+            *counts.entry(n).or_insert(0) += 1;
+        }
+    }
+    let multi: HashSet<String> = counts
+        .into_iter()
+        .filter(|(n, c)| *c > 1 && elab.nets.contains(n))
+        .map(|(n, _)| n)
+        .collect();
+    if multi.is_empty() {
+        return;
+    }
+    let all = std::mem::take(&mut elab.continuous_assigns);
+    let mut folded: HashMap<String, (Expression, Expression, u64)> = HashMap::default();
+    let mut order: Vec<String> = Vec::new();
+    for ca in all {
+        let name = ident_flat_name(&ca.lhs).filter(|n| multi.contains(n));
+        let Some(name) = name else {
+            elab.continuous_assigns.push(ca);
+            continue;
+        };
+        match folded.get_mut(&name) {
+            Some((_, rhs, _)) => {
+                let span = ca.rhs.span;
+                let acc = std::mem::replace(rhs, make_z_expr(span));
+                *rhs = make_syscall("$__wres", vec![acc, ca.rhs], span);
+            }
+            None => {
+                order.push(name.clone());
+                folded.insert(name, (ca.lhs, ca.rhs, ca.delay));
+            }
+        }
+    }
+    for name in order {
+        if let Some((lhs, rhs, delay)) = folded.remove(&name) {
+            elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay });
+        }
+    }
+}
+
 pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
     let switches = std::mem::take(&mut elab.tran_switches);
     if switches.is_empty() {
