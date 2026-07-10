@@ -168,13 +168,12 @@ impl Parser {
             if self.at(TokenKind::KwMatches) {
                 if 15 < min_bp { break; }
                 self.bump();
-                self.parse_pattern();
+                let pattern = self.parse_pattern();
                 lhs = Expression::new(
-                    ExprKind::Number(NumberLiteral::Integer {
-                        size: Some(1), signed: false, base: NumberBase::Binary,
-                        value: "0".to_string(),
-                        cached_val: std::cell::Cell::new(Some((0u64, 0u64, 1u32))),
-                    }),
+                    ExprKind::Matches {
+                        expr: Box::new(lhs),
+                        pattern: Box::new(pattern),
+                    },
                     self.span_from(start),
                 );
                 continue;

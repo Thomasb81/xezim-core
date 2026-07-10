@@ -4260,7 +4260,17 @@ fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut 
         }
         StatementKind::If { condition, then_stmt, else_stmt, .. } => {
             validate_expr_idents(condition, elab, locals)?;
-            validate_stmt_idents(then_stmt, elab, locals)?;
+            // §12.6.2: `if (e matches p)` declares the pattern's `.v` bindings
+            // for the then-branch (not the else-branch).
+            let mut bound: Vec<String> = Vec::new();
+            if let ExprKind::Matches { pattern, .. } = &condition.kind {
+                collect_pattern_bindings(pattern, &mut bound);
+            }
+            let fresh: Vec<String> =
+                bound.iter().filter(|b| locals.insert((*b).clone())).cloned().collect();
+            let r = validate_stmt_idents(then_stmt, elab, locals);
+            for b in fresh { locals.remove(&b); }
+            r?;
             if let Some(eb) = else_stmt { validate_stmt_idents(eb, elab, locals)?; }
         }
         StatementKind::Case { expr, items, .. } => {
