@@ -8850,8 +8850,10 @@ fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
 ///
 /// Rewrite each terminal's own continuous drivers into a single bridged assign:
 ///
-///     assign a = $__tranif(own_a, own_b, ctl, active);
-///     assign b = $__tranif(own_b, own_a, ctl, active);
+/// ```text
+/// assign a = $__tranif(own_a, own_b, ctl, active);
+/// assign b = $__tranif(own_b, own_a, ctl, active);
+/// ```
 ///
 /// `$__tranif` resolves the two sides when the switch conducts (`z` yields to a
 /// driven value; conflicting values give `x`), passes the terminal's own value
