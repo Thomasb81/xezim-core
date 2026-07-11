@@ -790,6 +790,10 @@ impl Preprocessor {
                         "`resetall is illegal inside a design element \
                          (IEEE 1800-2017 §22.3)".into());
                 }
+                // §22.3: `\`resetall` resets all compiler directives to their
+                // defaults, including clearing the active `\`timescale`, so a
+                // module declared after it has no explicit source-level timescale.
+                self.timescale = None;
                 output.push('\n');
                 continue;
             }
@@ -839,8 +843,15 @@ impl Preprocessor {
                 // the keyword. Standard one-declaration-per-line form (which
                 // black-parrot uses); good enough for timescale association.
                 if let Some(name) = Self::design_element_name(&expanded) {
-                    let ts = self.timescale.unwrap_or((1e-9, 1e-9));
-                    self.module_timescales.entry(name).or_insert(ts);
+                    // Only record a design element when a `\`timescale` directive
+                    // is actually ACTIVE. An entry therefore means "has an
+                    // explicit source-level timescale", which the
+                    // `--module-timescale` extension keys off. A module with no
+                    // active directive is absent from the map (and defaults to
+                    // 1 ns / 1 ns downstream, unchanged).
+                    if let Some(ts) = self.timescale {
+                        self.module_timescales.entry(name).or_insert(ts);
+                    }
                 }
                 output.push_str(&expanded);
                 output.push('\n');

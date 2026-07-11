@@ -146,6 +146,34 @@ pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, 
 
 use std::rc::Rc;
 
+/// Implementation-defined `--module-timescale` command-line extension.
+/// `global` applies to every module with no explicit source-level timescale;
+/// `named` applies to the listed modules likewise. Exponents are powers of ten
+/// in seconds (e.g. `1ns` = -9). Never overrides an explicit timescale.
+#[derive(Clone, Default)]
+pub struct ModuleTimescaleCli {
+    pub global: Option<(i32, i32)>,
+    pub named: std::collections::HashMap<String, (i32, i32)>,
+}
+
+static MODULE_TIMESCALE_CLI: std::sync::OnceLock<std::sync::Mutex<ModuleTimescaleCli>> =
+    std::sync::OnceLock::new();
+
+fn module_timescale_cli_cell() -> &'static std::sync::Mutex<ModuleTimescaleCli> {
+    MODULE_TIMESCALE_CLI.get_or_init(|| std::sync::Mutex::new(ModuleTimescaleCli::default()))
+}
+
+/// Install the parsed `--module-timescale` configuration before elaboration.
+pub fn set_module_timescale_cli(cli: ModuleTimescaleCli) {
+    if let Ok(mut g) = module_timescale_cli_cell().lock() {
+        *g = cli;
+    }
+}
+
+fn module_timescale_cli() -> ModuleTimescaleCli {
+    module_timescale_cli_cell().lock().map(|g| g.clone()).unwrap_or_default()
+}
+
 #[derive(Debug, Clone)]
 pub enum SourceDefinition {
     Module(Rc<ast::module::ModuleDeclaration>),
@@ -251,26 +279,65 @@ fn parse_and_elaborate(
     // the preprocessor) with in-body `timeunit`/`timeprecision` declarations
     // (§3.14.2). A `timeunit` decl was previously ignored here, so its module's
     // delays were never scaled — `#5` in a `timeunit 1us` module ran as 5 ns.
-    let mut eff_ts: std::collections::HashMap<String, (f64, f64)> =
-        module_timescales.clone();
+    // Precedence, highest first (implementation-defined --module-timescale
+    // extension): local timeunit/timeprecision decl > active `\`timescale`
+    // directive > named --module-timescale > global --module-timescale >
+    // 1 ns / 1 ns default. The command-line forms never override an explicit
+    // source-level timescale (a local decl OR an active directive).
+    let cli = module_timescale_cli();
+    let mut eff_ts: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new();
+    let mut named_matched: std::collections::HashSet<String> = std::collections::HashSet::new();
     for desc in &all_descriptions {
         if let ast::Description::Module(m) = desc {
-            let mut unit_s = eff_ts.get(&m.name.name).map(|&(u, _)| u);
-            let mut prec_s = eff_ts.get(&m.name.name).map(|&(_, p)| p);
+            let name = &m.name.name;
+            // Explicit source-level declarations.
+            let mut local_u: Option<i32> = None;
+            let mut local_p: Option<i32> = None;
             for it in &m.items {
                 if let ast::decl::ModuleItem::TimeunitsDecl(td) = it {
                     if let Some(u) = &td.unit {
-                        unit_s = Some(elaborate::exp_to_secs(elaborate::time_literal_to_exp(u)));
+                        local_u = Some(elaborate::time_literal_to_exp(u));
                     }
                     if let Some(p) = &td.precision {
-                        prec_s = Some(elaborate::exp_to_secs(elaborate::time_literal_to_exp(p)));
+                        local_p = Some(elaborate::time_literal_to_exp(p));
                     }
                 }
             }
-            if unit_s.is_some() || prec_s.is_some() {
-                let u = unit_s.unwrap_or(1e-9);
-                eff_ts.insert(m.name.name.clone(), (u, prec_s.unwrap_or(u)));
+            let directive = module_timescales
+                .get(name)
+                .map(|&(u, p)| (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)));
+            let is_explicit = local_u.is_some() || local_p.is_some() || directive.is_some();
+            let named = cli.named.get(name).copied();
+            if named.is_some() {
+                named_matched.insert(name.clone());
             }
+
+            let eff_exp: Option<(i32, i32)> = if is_explicit {
+                // A local decl overrides the directive field by field; a missing
+                // field falls back to the directive, then to 1 ns.
+                let (du, dp) = directive.unwrap_or((-9, -9));
+                let u = local_u.unwrap_or(du);
+                let p = local_p.unwrap_or(dp);
+                if named.is_some() {
+                    eprintln!(
+                        "[warn] --module-timescale for module '{}' ignored; it has an explicit source-level timescale",
+                        name
+                    );
+                }
+                Some((u, p))
+            } else {
+                // No explicit timescale: named CLI wins over global CLI.
+                named.or(cli.global)
+            };
+            if let Some((u, p)) = eff_exp {
+                eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
+            }
+        }
+    }
+    // §10: warn on a named assignment that matched no module definition.
+    for name in cli.named.keys() {
+        if !named_matched.contains(name) {
+            eprintln!("[warn] --module-timescale did not match module '{}'", name);
         }
     }
 
@@ -306,9 +373,13 @@ fn parse_and_elaborate(
                 }
                 // Pre-scale this module's delays from its own timeunit to the
                 // global tick (no-op when both are 1 ns).
-                if let Some(&(unit_s, _prec_s)) = eff_ts.get(&name) {
-                    elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
-                }
+                // Every module's delays are pre-scaled to the global tick, even
+                // those with no explicit or CLI timescale — the simulator
+                // consumes tick-denominated delays. A module with no effective
+                // timescale uses the tick unit, making the rewrite a numeric
+                // no-op but still converting the delay form.
+                let unit_s = eff_ts.get(&name).map(|&(u, _)| u).unwrap_or(tick_s);
+                elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Module(Rc::new(m)));
             }
