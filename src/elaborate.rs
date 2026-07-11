@@ -838,6 +838,13 @@ pub struct ElaboratedModule {
     pub timeunit_exp: i32,
     #[serde(default = "default_timeunit_exp")]
     pub timeprecision_exp: i32,
+    /// Per-module-DEFINITION timescale as `(unit_exp, precision_exp)` powers of
+    /// ten in seconds. Covers both `\`timescale` directives and in-body
+    /// `timeunit`/`timeprecision` declarations. The simulator scales `$time` /
+    /// `$realtime` in each scope to its own module's unit (§20.3) and reports
+    /// `$printtimescale` from it. Keyed by module name (= definition name).
+    #[serde(default)]
+    pub module_timescale_exp: HashMap<String, (i32, i32)>,
     /// IEEE 1800-2017 §6.19: enum typedef members in declaration order.
     /// Keyed by typedef name; each entry is `(member_name, value)`.
     /// Used to resolve `.name()` / `.next()` / `.first()` etc.
@@ -981,6 +988,7 @@ impl ElaboratedModule {
             out_of_class_constraints: HashSet::default(),
             timeunit_exp: default_timeunit_exp(),
             timeprecision_exp: default_timeunit_exp(),
+            module_timescale_exp: HashMap::default(),
             enum_members: HashMap::default(),
             two_state_signals: HashSet::default(),
             pending_always: Vec::new(),
@@ -3837,6 +3845,18 @@ fn default_timeunit_exp() -> i32 { -9 }
 
 /// Decode a SystemVerilog time literal (e.g. "10ns", "100ps") into a
 /// log10-second exponent. Returns -9 (1ns) on unparseable input.
+/// Seconds -> power-of-ten exponent (1e-6 -> -6). Rounds, so float drift in
+/// the seconds value does not shift the exponent.
+pub fn secs_to_exp(s: f64) -> i32 {
+    if s <= 0.0 { return -9; }
+    s.log10().round() as i32
+}
+
+/// Power-of-ten exponent -> seconds (-6 -> 1e-6).
+pub fn exp_to_secs(e: i32) -> f64 {
+    10f64.powi(e)
+}
+
 pub fn time_literal_to_exp(s: &str) -> i32 {
     let s = s.trim();
     let split = s

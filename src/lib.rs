@@ -247,9 +247,41 @@ fn parse_and_elaborate(
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
     module_timescales: &std::collections::HashMap<String, (f64, f64)>,
 ) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
-    // Global simulation tick = the finest `timescale` precision across the
-    // design (default 1 ns). All module delays are then pre-scaled to this unit.
-    let tick_s = module_timescales.values().map(|&(_, p)| p).fold(1e-9_f64, f64::min);
+    // Effective per-module timescale, unifying `\`timescale` directives (from
+    // the preprocessor) with in-body `timeunit`/`timeprecision` declarations
+    // (§3.14.2). A `timeunit` decl was previously ignored here, so its module's
+    // delays were never scaled — `#5` in a `timeunit 1us` module ran as 5 ns.
+    let mut eff_ts: std::collections::HashMap<String, (f64, f64)> =
+        module_timescales.clone();
+    for desc in &all_descriptions {
+        if let ast::Description::Module(m) = desc {
+            let mut unit_s = eff_ts.get(&m.name.name).map(|&(u, _)| u);
+            let mut prec_s = eff_ts.get(&m.name.name).map(|&(_, p)| p);
+            for it in &m.items {
+                if let ast::decl::ModuleItem::TimeunitsDecl(td) = it {
+                    if let Some(u) = &td.unit {
+                        unit_s = Some(elaborate::exp_to_secs(elaborate::time_literal_to_exp(u)));
+                    }
+                    if let Some(p) = &td.precision {
+                        prec_s = Some(elaborate::exp_to_secs(elaborate::time_literal_to_exp(p)));
+                    }
+                }
+            }
+            if unit_s.is_some() || prec_s.is_some() {
+                let u = unit_s.unwrap_or(1e-9);
+                eff_ts.insert(m.name.name.clone(), (u, prec_s.unwrap_or(u)));
+            }
+        }
+    }
+
+    // Global simulation tick = the finest precision across the design
+    // (default 1 ns). All module delays are then pre-scaled to this unit.
+    let tick_s = eff_ts.values().map(|&(_, p)| p).fold(1e-9_f64, f64::min);
+    let mut module_timescale_exp: crate::hasher::HashMap<String, (i32, i32)> =
+        crate::hasher::HashMap::default();
+    for (n, &(u, p)) in &eff_ts {
+        module_timescale_exp.insert(n.clone(), (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)));
+    }
     let mut definitions: crate::hasher::HashMap<String, SourceDefinition> = crate::hasher::HashMap::default();
     let mut top_module = None;
     let mut top_level_imports = Vec::new();
@@ -274,7 +306,7 @@ fn parse_and_elaborate(
                 }
                 // Pre-scale this module's delays from its own timeunit to the
                 // global tick (no-op when both are 1 ns).
-                if let Some(&(unit_s, _prec_s)) = module_timescales.get(&name) {
+                if let Some(&(unit_s, _prec_s)) = eff_ts.get(&name) {
                     elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
                 }
                 top_module = Some(name.clone());
@@ -544,6 +576,13 @@ fn parse_and_elaborate(
         &top_level_ooc_constraints,
     )?;
     elab.tick_s = tick_s;
+    elab.module_timescale_exp = module_timescale_exp;
+    // The top module's own unit/precision drives the default $time scaling and
+    // $printtimescale when no per-scope entry is found.
+    if let Some(&(u, p)) = elab.module_timescale_exp.get(&elab.name) {
+        elab.timeunit_exp = u;
+        elab.timeprecision_exp = p;
+    }
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
     // §28.8: bidirectional switches need every terminal's drivers in hand.
