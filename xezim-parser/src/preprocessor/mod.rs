@@ -384,7 +384,102 @@ impl Preprocessor {
         result
     }
 
+    /// Length of a conditional-compilation directive at the start of `s`
+    /// (including the backtick), and whether it takes a macro-name argument.
+    /// Requires a word boundary after the keyword so `\`endiff` / `\`elsewhere`
+    /// do not match.
+    fn conditional_directive_len(s: &str) -> Option<(usize, bool)> {
+        for (kw, takes_name) in [
+            ("`ifdef", true),
+            ("`ifndef", true),
+            ("`elsif", true),
+            ("`endif", false),
+            ("`else", false),
+        ] {
+            if let Some(rest) = s.strip_prefix(kw) {
+                if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
+                    return Some((kw.len(), takes_name));
+                }
+            }
+        }
+        None
+    }
+
+    /// IEEE 1800-2017 §22.6: `\`ifdef`/`\`ifndef`/`\`elsif`/`\`else`/`\`endif`
+    /// may appear MID-LINE, not only at the start of a line. UVM 2020 writes
+    /// `static \`ifndef UVM_ENABLE_DEPRECATED_API local \`endif bit m;`. The
+    /// resolver below is line-based, so lift every inline conditional directive
+    /// onto its own line first. String literals are respected; comments are
+    /// already stripped. A `\`define` and its backslash-continued body are left
+    /// untouched — an `\`ifdef` there belongs to the macro body and must survive
+    /// to expansion time.
+    fn split_inline_conditionals(source: &str) -> String {
+        if !source.contains('`') {
+            return source.to_string();
+        }
+        let mut out = String::with_capacity(source.len() + 64);
+        let mut in_define_cont = false;
+        for line in source.lines() {
+            let trimmed = line.trim_start();
+            if in_define_cont || trimmed.starts_with("`define") {
+                in_define_cont = line.trim_end().ends_with('\\');
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            if trimmed.starts_with('`') || !line.contains('`') {
+                out.push_str(line);
+                out.push('\n');
+                continue;
+            }
+            let b = line.as_bytes();
+            let mut i = 0usize;
+            let mut seg = 0usize;
+            let mut in_str = false;
+            while i < b.len() {
+                let c = b[i];
+                if c == b'"' && (i == 0 || b[i - 1] != b'\\') {
+                    in_str = !in_str;
+                    i += 1;
+                    continue;
+                }
+                if !in_str && c == b'`' {
+                    if let Some((dir_len, takes_name)) =
+                        Self::conditional_directive_len(&line[i..])
+                    {
+                        let mut j = i + dir_len;
+                        if takes_name {
+                            let rest = &line[j..];
+                            j += rest.len() - rest.trim_start().len();
+                            j += line[j..]
+                                .chars()
+                                .take_while(|ch| ch.is_alphanumeric() || *ch == '_' || *ch == '$')
+                                .map(|ch| ch.len_utf8())
+                                .sum::<usize>();
+                        }
+                        let before = &line[seg..i];
+                        if !before.trim().is_empty() {
+                            out.push_str(before);
+                            out.push('\n');
+                        }
+                        out.push_str(line[i..j].trim());
+                        out.push('\n');
+                        seg = j;
+                        i = j;
+                        continue;
+                    }
+                }
+                i += 1;
+            }
+            out.push_str(&line[seg..]);
+            out.push('\n');
+        }
+        out
+    }
+
     fn resolve_directives(&mut self, source: &str, source_path: Option<&Path>) -> String {
+        let source = Self::split_inline_conditionals(source);
+        let source = source.as_str();
         let mut output = String::with_capacity(source.len());
         let mut lines = source.lines().peekable();
         let mut ifdef_stack: Vec<IfdefState> = Vec::new();
