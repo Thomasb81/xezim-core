@@ -34,13 +34,11 @@ pub struct Preprocessor {
     /// invalid version strings can be reported and (future) per-region
     /// keyword sets can be wired in. SV-2023 §22.14.
     keywords_stack: Vec<String>,
-    /// Most-recently-seen `timescale` directive parsed to (unit_s, prec_s)
-    /// where each is in seconds (e.g. 1ns → 1e-9). The simulator currently
-    /// runs at a fixed 1ns tick, so anything finer is silently truncated
-    /// — we warn once per distinct timescale instead of dropping it.
+    /// Most-recently-seen `\`timescale` directive parsed to (unit_s, prec_s)
+    /// in seconds (e.g. 1ns → 1e-9). The simulation tick is the finest
+    /// precision declared in the design, so any precision is honoured.
     /// LRM §22.7.
     timescale: Option<(f64, f64)>,
-    timescale_warned: std::collections::HashSet<(String, String)>,
     /// Per-design-element timescale: `module/interface/program/package name →
     /// (unit_s, prec_s)`, captured as each declaration is emitted so the
     /// elaborator/simulator can scale that scope's delays by its own timeunit
@@ -110,7 +108,6 @@ impl Preprocessor {
             current_line: 0,
             keywords_stack: Vec::new(),
             timescale: None,
-            timescale_warned: std::collections::HashSet::new(),
             module_timescales: std::collections::HashMap::new(),
             errors: Vec::new(),
             design_element_depth: 0,
@@ -744,17 +741,11 @@ impl Preprocessor {
                     let unit = Self::parse_time_literal(unit_str);
                     let prec = Self::parse_time_literal(prec_str);
                     if let (Some(u), Some(p)) = (unit, prec) {
+                        // The global simulation tick is the finest precision
+                        // declared anywhere in the design, so sub-nanosecond
+                        // precision (down to fs) is honoured; delays scale to
+                        // that tick. No truncation, no warning.
                         self.timescale = Some((u, p));
-                        // Sim runs at 1ns ticks; finer precision is silently
-                        // truncated by `#delay` evaluation. Warn once per
-                        // distinct directive so the user knows.
-                        if p < 1e-9 - 1e-18 {
-                            let key = (unit_str.to_string(), prec_str.to_string());
-                            if self.timescale_warned.insert(key) {
-                                eprintln!("[warn] `timescale {}/{}` declares precision finer than 1ns; sim ticks are 1ns",
-                                    unit_str, prec_str);
-                            }
-                        }
                     }
                 }
                 output.push('\n');
