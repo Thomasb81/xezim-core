@@ -47,6 +47,13 @@ pub struct ContinuousAssignment {
 pub struct AlwaysBlock {
     pub kind: AlwaysKind,
     pub stmt: Statement,
+    /// Instance scope this block was inlined under (e.g. "u_a.u_b"), empty
+    /// for the top module. The simulator uses it to resolve the block's
+    /// module timescale for $time/%t — deriving it from a sensitivity
+    /// signal's name fails when a port-connected clock collapses to the
+    /// parent's signal.
+    #[serde(default)]
+    pub scope: String,
 }
 
 /// An initial block for testbench.
@@ -150,7 +157,10 @@ impl PendingAlways {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        AlwaysBlock { kind: self.kind, stmt }
+        // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
+        // record it (dot-trimmed) as the block's scope, like PendingInitial.
+        let scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        AlwaysBlock { kind: self.kind, stmt, scope }
     }
 }
 
@@ -3033,7 +3043,7 @@ pub fn elaborate_module_with_defs(
                 gate_inst_to_assigns(gi, &mut elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
-                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
+                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: String::new() });
             }
             ModuleItem::InitialConstruct(ic) => {
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
@@ -5123,7 +5133,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 gate_inst_to_assigns(gi, elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
-                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
+                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: String::new() });
             }
             ModuleItem::InitialConstruct(ic) => {
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
