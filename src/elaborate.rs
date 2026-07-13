@@ -8636,9 +8636,13 @@ fn inline_module_items(
                                     // Simulator::new from arrays metadata.
                                     let _ = is_signed;
                                 } else {
+                                    // §6.8: 2-state types (bit/int/…) default to
+                                    // 0, not X — same as the top-level decl path.
+                                    // `Value::new` left a submodule's `bit` counter
+                                    // at X, so `cnt++` stayed X forever (issue #22).
                                     let init_val = if let Some(init_expr) = &decl.init {
                                         eval_init_for_width(init_expr, &sub_merged_params, width)
-                                    } else { Value::new(width) };
+                                    } else { default_value_for_type(&dd.data_type, width) };
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: dd.const_kw,
                                         name: sig_name, width, is_signed,
                                         direction: None, value: init_val,
@@ -8811,6 +8815,24 @@ fn inline_module_items(
                                 ctx: std::rc::Rc::clone(&pend_ctx),
                             });
                         }
+                    }
+                    if let ModuleItem::FinalConstruct(fc) = sub_item {
+                        // §9.2.3: a submodule's `final` blocks run at
+                        // simulation end just like the top module's, but
+                        // inlining dropped them — only top-level finals ever
+                        // executed (issue #22). They are few and run once, so
+                        // rewrite eagerly instead of adding a pending lane.
+                        let stmt = rewrite_stmt(
+                            &fc.stmt,
+                            &pend_ctx.prefix,
+                            &pend_ctx.port_map,
+                            &pend_ctx.local_names,
+                            &pend_ctx.interface_map,
+                        );
+                        elab.final_blocks.push(InitialBlock {
+                            stmt,
+                            scope: pend_ctx.prefix.trim_end_matches('.').to_string(),
+                        });
                     }
                 }
 
