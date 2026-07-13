@@ -2439,6 +2439,12 @@ pub fn elaborate_module_with_defs(
                         };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                             // Element type, for the type-directed `%p` renderer.
                             elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                             // LRM §8.4 (2D class arrays). Same as the 1D
@@ -2481,6 +2487,12 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                         elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         if let DataType::TypeReference { name, .. } = &dd.data_type {
                             elab.array_elem_class
@@ -2498,6 +2510,12 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                         // Element type, for the type-directed `%p` renderer.
                         elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         // An UNPACKED struct element keeps each member in its own
@@ -5024,6 +5042,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                         if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
@@ -6112,7 +6136,7 @@ fn index_tuples(shape: &[(i64, i64)]) -> Vec<String> {
     out
 }
 
-fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
+pub fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
     if dims.is_empty() { return None; }
     match &dims[0] {
         crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
@@ -7166,6 +7190,12 @@ pub fn inline_instantiations(
                                 // `extract_array_range` (dynamic/queue → 0..63).
                                 if let Some((lo, hi)) = extract_array_range(&decl.dimensions, &elab.parameters) {
                                     elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                                     if let Some(UnpackedDimension::Range { left, right, .. }) = first_dim {
                                         let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                                         let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
@@ -7556,6 +7586,12 @@ fn substitute_in_module_item(
         ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
             stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
             span: ic.span,
+        }),
+        // §9.2.3: a `final` inside a generate-for must see the genvar's
+        // per-iteration constant, like initial/always do.
+        ModuleItem::FinalConstruct(fc) => ModuleItem::FinalConstruct(FinalConstruct {
+            stmt: rewrite_stmt(&fc.stmt, "", port_map, local_names, interface_map),
+            span: fc.span,
         }),
         ModuleItem::ContinuousAssign(ca) => {
             let mut new_ca = ca.clone();
@@ -8640,8 +8676,28 @@ fn inline_module_items(
                                         sig_name, width, array_range, inst_prefix, sub_merged_params.len(),
                                         p.iter().map(|(k, v)| format!("{}={}", k, v.to_u64().unwrap_or(0))).collect::<Vec<_>>());
                                 }
+                                // A queue / dynamic / associative dim on a
+                                // SUBMODULE or interface decl must register
+                                // like a top-level one — `tif.q.push_back(x)`
+                                // read a phantom 64-slot fixed array before.
+                                match decl.dimensions.first() {
+                                    Some(UnpackedDimension::Unsized(_))
+                                    | Some(UnpackedDimension::Queue { .. }) => {
+                                        elab.dynamic_arrays.insert(sig_name.clone());
+                                    }
+                                    Some(UnpackedDimension::Associative { data_type: kdt, .. }) => {
+                                        let is_str = kdt.as_ref().map_or(false, |dt| {
+                                            matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
+                                        });
+                                        elab.associative_arrays.insert(sig_name.clone(), is_str);
+                                    }
+                                    _ => {}
+                                }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
+                                    if is_type_two_state(&dd.data_type) {
+                                        elab.two_state_signals.insert(sig_name.clone());
+                                    }
                                     // Per-element Signals synthesized by
                                     // Simulator::new from arrays metadata.
                                     let _ = is_signed;
