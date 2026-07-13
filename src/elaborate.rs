@@ -728,6 +728,11 @@ pub struct ElaboratedModule {
     pub assoc_defaults: HashMap<String, Expression>,
     /// Dynamic arrays / queues (size starts at 0, not pre-allocated range).
     pub dynamic_arrays: HashSet<String>,
+    /// §10.3.1 drive strength of a continuous assign's target net, keyed by
+    /// net name: (strength-when-1, strength-when-0), e.g. ("pull1", "pull0").
+    /// Consumed by `%v` (§21.2.1.5); absent nets display as strong.
+    #[serde(default)]
+    pub net_strengths: HashMap<String, (String, String)>,
     /// Arrays declared with descending range (e.g. [7:0])
     pub descending_arrays: HashSet<String>,
     /// Packed vectors declared with an ASCENDING range (`logic [0:7]`), mapped
@@ -963,6 +968,7 @@ impl ElaboratedModule {
             specify_delays: HashMap::default(),
             assoc_defaults: HashMap::default(),
             dynamic_arrays: HashSet::default(),
+            net_strengths: HashMap::default(),
             descending_arrays: HashSet::default(),
             ascending_packed: HashMap::default(),
             typedef_unpacked_dims: HashMap::default(),
@@ -2357,6 +2363,48 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     };
+                    // IEEE 1800-2017 §7.4.5: a DYNAMIC outer dimension with
+                    // FIXED trailing dimensions — `mailbox mbx[][16]`,
+                    // `int a[$][2][3]`. The trailing dims were dropped, so the
+                    // variable elaborated as a plain 1-D dynamic array and
+                    // `a[i][j]` was a bit-select of element `a[i]`. Register a
+                    // 2-D/N-D backing buffer whose outer dim is the standard
+                    // 64-slot dynamic buffer (same buffer `extract_array_range`
+                    // gives a 1-D dynamic array); the runtime size still lives
+                    // in the `.size` shadow, and foreach clamps the outer dim
+                    // to it. Elements resolve at `a[i][j]` like any fixed
+                    // multi-D array's.
+                    if effective_dims.len() >= 2
+                        && effective_dims.first().map_or(false, |d| {
+                            matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. })
+                        })
+                        && effective_dims[1..].iter().all(|d| {
+                            matches!(d, UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. })
+                        })
+                    {
+                        let inner: Option<Vec<(i64, i64)>> = effective_dims[1..]
+                            .iter()
+                            .map(|d| extract_array_range(std::slice::from_ref(d), &elab.parameters))
+                            .collect();
+                        if let Some(inner) = inner.filter(|sh| {
+                            sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                        }) {
+                            let name = decl.name.name.clone();
+                            if inner.len() == 1 {
+                                elab.arrays_2d.insert(name.clone(), ((0, 63), inner[0], width));
+                            } else {
+                                let mut shape = vec![(0i64, 63i64)];
+                                shape.extend(inner.iter().cloned());
+                                elab.arrays_nd.insert(name.clone(), (shape, width));
+                            }
+                            elab.var_decl_types.insert(name.clone(), dd.data_type.clone());
+                            if let DataType::TypeReference { name: tn, .. } = &dd.data_type {
+                                elab.array_elem_class.insert(name.clone(), tn.name.name.clone());
+                            }
+                            register_packed_for_array(&mut elab);
+                            continue;
+                        }
+                    }
                     // Check for 2D unpacked array (e.g., mem [0:1023][0:3])
                     if effective_dims.len() == 2 {
                         // Both `[0:1][0:2]` (range) and `[2][3]` (size) spell the
@@ -2953,6 +3001,27 @@ pub fn elaborate_module_with_defs(
             ModuleItem::ContinuousAssign(ca) => {
                 let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
                 for (lhs, rhs) in &ca.assignments {
+                    // §10.3.1 / §21.2.1.5: record the drive strength pair on
+                    // the target net so `%v` can report it (e.g. "Pu0").
+                    if let Some(s) = &ca.strength {
+                        if let ExprKind::Ident(h) = &lhs.kind {
+                            if h.path.len() == 1 {
+                                let mut s1 = String::new();
+                                let mut s0 = String::new();
+                                for tok in s.split(',') {
+                                    if tok.ends_with('1') {
+                                        s1 = tok.to_string();
+                                    } else if tok.ends_with('0') {
+                                        s0 = tok.to_string();
+                                    }
+                                }
+                                if !s1.is_empty() || !s0.is_empty() {
+                                    elab.net_strengths
+                                        .insert(h.path[0].name.name.clone(), (s1, s0));
+                                }
+                            }
+                        }
+                    }
                     elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
                 }
             }
@@ -5026,6 +5095,27 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             ModuleItem::ContinuousAssign(ca) => {
                 let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
                 for (lhs, rhs) in &ca.assignments {
+                    // §10.3.1 / §21.2.1.5: record the drive strength pair on
+                    // the target net so `%v` can report it (e.g. "Pu0").
+                    if let Some(s) = &ca.strength {
+                        if let ExprKind::Ident(h) = &lhs.kind {
+                            if h.path.len() == 1 {
+                                let mut s1 = String::new();
+                                let mut s0 = String::new();
+                                for tok in s.split(',') {
+                                    if tok.ends_with('1') {
+                                        s1 = tok.to_string();
+                                    } else if tok.ends_with('0') {
+                                        s0 = tok.to_string();
+                                    }
+                                }
+                                if !s1.is_empty() || !s0.is_empty() {
+                                    elab.net_strengths
+                                        .insert(h.path[0].name.name.clone(), (s1, s0));
+                                }
+                            }
+                        }
+                    }
                     elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
                 }
             }

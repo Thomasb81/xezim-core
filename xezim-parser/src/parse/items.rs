@@ -388,12 +388,21 @@ impl Parser {
                 Some(ModuleItem::FinalConstruct(FinalConstruct { stmt: st, span: self.span_from(start) })) }
             TokenKind::KwAssign => {
                 self.bump();
-                // Optional drive_strength `(strong1, weak0)` (§10.3.1). xezim
-                // doesn't model strengths; consume the group when present.
+                // Optional drive_strength `(strong1, weak0)` (§10.3.1).
+                // Retained as a comma-joined keyword list so `%v` (§21.2.1.5)
+                // can report the driven strength; otherwise unmodelled.
+                let mut strength: Option<String> = None;
                 if self.at(TokenKind::LParen) && self.peek_kind().is_strength_keyword() {
                     self.bump();
-                    while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) { self.bump(); }
+                    let mut parts: Vec<String> = Vec::new();
+                    while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
+                        let t = self.bump();
+                        if t.kind != TokenKind::Comma {
+                            parts.push(t.text.clone());
+                        }
+                    }
                     self.expect(TokenKind::RParen);
+                    strength = Some(parts.join(","));
                 }
                 let delay = if self.eat(TokenKind::Hash).is_some() {
                     if self.eat(TokenKind::LParen).is_some() {
@@ -410,7 +419,7 @@ impl Parser {
                 loop { let l = self.parse_expression(); self.expect(TokenKind::Assign); let r = self.parse_expression();
                     asgns.push((l, r)); if self.eat(TokenKind::Comma).is_none() { break; } }
                 self.expect(TokenKind::Semicolon);
-                Some(ModuleItem::ContinuousAssign(ContinuousAssign { strength: None, delay, assignments: asgns, span: self.span_from(start) }))
+                Some(ModuleItem::ContinuousAssign(ContinuousAssign { strength, delay, assignments: asgns, span: self.span_from(start) }))
             }
             TokenKind::KwGenerate => {
                 self.bump();

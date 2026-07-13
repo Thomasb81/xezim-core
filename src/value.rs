@@ -189,7 +189,18 @@ impl Value {
     }
 
     pub fn from_string(s: &str) -> Self {
-        let bytes = s.as_bytes();
+        // A SystemVerilog string is a BYTE string. ASCII maps 1:1; any char
+        // above 0x7F is taken as its Latin-1 byte (one byte per char, the
+        // inverse of `to_sv_string`) so raw-byte content — §21.2.1.4
+        // unformatted `%u`/`%z` dumps — round-trips instead of expanding
+        // into multi-byte UTF-8.
+        let latin1: Vec<u8>;
+        let bytes: &[u8] = if s.is_ascii() {
+            s.as_bytes()
+        } else {
+            latin1 = s.chars().map(|c| (c as u32) as u8).collect();
+            &latin1
+        };
         let width = (bytes.len() * 8) as u32;
         if width <= 64 {
             let mut val_bits = 0u64;
@@ -1602,15 +1613,15 @@ impl Value {
         s
     }
 
-    /// Convert packed bytes to a SystemVerilog-style string.
-    /// Interprets the value as big-endian bytes (MSB first) and
-    /// trims leading NUL bytes introduced by widening.
-    pub fn to_sv_string(&self) -> String {
+    /// The value's bytes as string content, big-endian (MSB first), with the
+    /// LEADING NUL bytes introduced by widening trimmed. Zero bytes at or
+    /// below the first nonzero byte are kept: they are genuine content —
+    /// §21.2.1.4 unformatted `%u`/`%z` dumps end in alignment NULs that
+    /// `len()`/`getc()` must observe.
+    pub fn sv_string_bytes(&self) -> Vec<u8> {
         let num_bytes = ((self.width + 7) / 8) as usize;
-        if num_bytes == 0 {
-            return String::new();
-        }
         let mut out: Vec<u8> = Vec::new();
+        let mut started = false;
         for bi in (0..num_bytes).rev() {
             let mut byte = 0u8;
             for b in 0..8usize {
@@ -1623,10 +1634,20 @@ impl Value {
                 }
             }
             if byte != 0 {
+                started = true;
+            }
+            if started {
                 out.push(byte);
             }
         }
-        String::from_utf8_lossy(&out).to_string()
+        out
+    }
+
+    /// Convert packed bytes to a SystemVerilog-style string. Each byte maps
+    /// to one char (Latin-1, the inverse of `from_string`), so raw bytes
+    /// above 0x7F survive a round-trip instead of becoming U+FFFD.
+    pub fn to_sv_string(&self) -> String {
+        self.sv_string_bytes().into_iter().map(|b| b as char).collect()
     }
 
     /// Hex string representation
