@@ -1080,11 +1080,12 @@ impl Parser {
                 }
             }
 
-            // Data type keywords used as expressions (e.g. $bits(int))
+            // Data type keywords used as expressions (e.g. $bits(int),
+            // $size(logic [7:0])) — §20.6. The parsed type is RETAINED; the
+            // packed range was previously thrown away with the expression.
             k if self.is_data_type_keyword() || k == TokenKind::KwVoid => {
-                let _dt = self.parse_data_type();
-                // Treat as empty expression for now, but we've consumed the type
-                Expression::new(ExprKind::Empty, self.span_from(start))
+                let dt = self.parse_data_type();
+                Expression::new(ExprKind::TypeLiteral(Box::new(dt)), self.span_from(start))
             }
 
             // LRM §16.12.6 strong temporal operators in property context.

@@ -20,6 +20,10 @@ impl Expression {
 pub enum ExprKind {
     Number(NumberLiteral),
     StringLiteral(String),
+    /// A DATA TYPE used as an expression operand — `$bits(logic [7:0])`,
+    /// `$size(byte)` (§20.6). Previously parsed and discarded (as `Empty`),
+    /// so any ranged type collapsed to width 1.
+    TypeLiteral(Box<crate::ast::types::DataType>),
     Ident(HierarchicalIdentifier),
     Unary { op: UnaryOp, operand: Box<Expression> },
     Binary { op: BinaryOp, left: Box<Expression>, right: Box<Expression> },
