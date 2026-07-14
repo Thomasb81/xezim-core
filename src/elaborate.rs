@@ -47,6 +47,13 @@ pub struct ContinuousAssignment {
 pub struct AlwaysBlock {
     pub kind: AlwaysKind,
     pub stmt: Statement,
+    /// Instance scope this block was inlined under (e.g. "u_a.u_b"), empty
+    /// for the top module. The simulator uses it to resolve the block's
+    /// module timescale for $time/%t — deriving it from a sensitivity
+    /// signal's name fails when a port-connected clock collapses to the
+    /// parent's signal.
+    #[serde(default)]
+    pub scope: String,
 }
 
 /// An initial block for testbench.
@@ -150,7 +157,10 @@ impl PendingAlways {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        AlwaysBlock { kind: self.kind, stmt }
+        // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
+        // record it (dot-trimmed) as the block's scope, like PendingInitial.
+        let scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        AlwaysBlock { kind: self.kind, stmt, scope }
     }
 }
 
@@ -728,6 +738,11 @@ pub struct ElaboratedModule {
     pub assoc_defaults: HashMap<String, Expression>,
     /// Dynamic arrays / queues (size starts at 0, not pre-allocated range).
     pub dynamic_arrays: HashSet<String>,
+    /// §10.3.1 drive strength of a continuous assign's target net, keyed by
+    /// net name: (strength-when-1, strength-when-0), e.g. ("pull1", "pull0").
+    /// Consumed by `%v` (§21.2.1.5); absent nets display as strong.
+    #[serde(default)]
+    pub net_strengths: HashMap<String, (String, String)>,
     /// Arrays declared with descending range (e.g. [7:0])
     pub descending_arrays: HashSet<String>,
     /// Packed vectors declared with an ASCENDING range (`logic [0:7]`), mapped
@@ -963,6 +978,7 @@ impl ElaboratedModule {
             specify_delays: HashMap::default(),
             assoc_defaults: HashMap::default(),
             dynamic_arrays: HashSet::default(),
+            net_strengths: HashMap::default(),
             descending_arrays: HashSet::default(),
             ascending_packed: HashMap::default(),
             typedef_unpacked_dims: HashMap::default(),
@@ -2357,6 +2373,48 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     };
+                    // IEEE 1800-2017 §7.4.5: a DYNAMIC outer dimension with
+                    // FIXED trailing dimensions — `mailbox mbx[][16]`,
+                    // `int a[$][2][3]`. The trailing dims were dropped, so the
+                    // variable elaborated as a plain 1-D dynamic array and
+                    // `a[i][j]` was a bit-select of element `a[i]`. Register a
+                    // 2-D/N-D backing buffer whose outer dim is the standard
+                    // 64-slot dynamic buffer (same buffer `extract_array_range`
+                    // gives a 1-D dynamic array); the runtime size still lives
+                    // in the `.size` shadow, and foreach clamps the outer dim
+                    // to it. Elements resolve at `a[i][j]` like any fixed
+                    // multi-D array's.
+                    if effective_dims.len() >= 2
+                        && effective_dims.first().map_or(false, |d| {
+                            matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. })
+                        })
+                        && effective_dims[1..].iter().all(|d| {
+                            matches!(d, UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. })
+                        })
+                    {
+                        let inner: Option<Vec<(i64, i64)>> = effective_dims[1..]
+                            .iter()
+                            .map(|d| extract_array_range(std::slice::from_ref(d), &elab.parameters))
+                            .collect();
+                        if let Some(inner) = inner.filter(|sh| {
+                            sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                        }) {
+                            let name = decl.name.name.clone();
+                            if inner.len() == 1 {
+                                elab.arrays_2d.insert(name.clone(), ((0, 63), inner[0], width));
+                            } else {
+                                let mut shape = vec![(0i64, 63i64)];
+                                shape.extend(inner.iter().cloned());
+                                elab.arrays_nd.insert(name.clone(), (shape, width));
+                            }
+                            elab.var_decl_types.insert(name.clone(), dd.data_type.clone());
+                            if let DataType::TypeReference { name: tn, .. } = &dd.data_type {
+                                elab.array_elem_class.insert(name.clone(), tn.name.name.clone());
+                            }
+                            register_packed_for_array(&mut elab);
+                            continue;
+                        }
+                    }
                     // Check for 2D unpacked array (e.g., mem [0:1023][0:3])
                     if effective_dims.len() == 2 {
                         // Both `[0:1][0:2]` (range) and `[2][3]` (size) spell the
@@ -2381,6 +2439,12 @@ pub fn elaborate_module_with_defs(
                         };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                             // Element type, for the type-directed `%p` renderer.
                             elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                             // LRM §8.4 (2D class arrays). Same as the 1D
@@ -2423,6 +2487,12 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                         elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         if let DataType::TypeReference { name, .. } = &dd.data_type {
                             elab.array_elem_class
@@ -2440,6 +2510,12 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                         // Element type, for the type-directed `%p` renderer.
                         elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         // An UNPACKED struct element keeps each member in its own
@@ -2953,6 +3029,27 @@ pub fn elaborate_module_with_defs(
             ModuleItem::ContinuousAssign(ca) => {
                 let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
                 for (lhs, rhs) in &ca.assignments {
+                    // §10.3.1 / §21.2.1.5: record the drive strength pair on
+                    // the target net so `%v` can report it (e.g. "Pu0").
+                    if let Some(s) = &ca.strength {
+                        if let ExprKind::Ident(h) = &lhs.kind {
+                            if h.path.len() == 1 {
+                                let mut s1 = String::new();
+                                let mut s0 = String::new();
+                                for tok in s.split(',') {
+                                    if tok.ends_with('1') {
+                                        s1 = tok.to_string();
+                                    } else if tok.ends_with('0') {
+                                        s0 = tok.to_string();
+                                    }
+                                }
+                                if !s1.is_empty() || !s0.is_empty() {
+                                    elab.net_strengths
+                                        .insert(h.path[0].name.name.clone(), (s1, s0));
+                                }
+                            }
+                        }
+                    }
                     elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
                 }
             }
@@ -2964,7 +3061,7 @@ pub fn elaborate_module_with_defs(
                 gate_inst_to_assigns(gi, &mut elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
-                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
+                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: String::new() });
             }
             ModuleItem::InitialConstruct(ic) => {
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
@@ -4945,6 +5042,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     let array_range = extract_array_range(&decl.dimensions, &elab.parameters);
                     if let Some((lo, hi)) = array_range {
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                         if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
@@ -5026,6 +5129,27 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             ModuleItem::ContinuousAssign(ca) => {
                 let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
                 for (lhs, rhs) in &ca.assignments {
+                    // §10.3.1 / §21.2.1.5: record the drive strength pair on
+                    // the target net so `%v` can report it (e.g. "Pu0").
+                    if let Some(s) = &ca.strength {
+                        if let ExprKind::Ident(h) = &lhs.kind {
+                            if h.path.len() == 1 {
+                                let mut s1 = String::new();
+                                let mut s0 = String::new();
+                                for tok in s.split(',') {
+                                    if tok.ends_with('1') {
+                                        s1 = tok.to_string();
+                                    } else if tok.ends_with('0') {
+                                        s0 = tok.to_string();
+                                    }
+                                }
+                                if !s1.is_empty() || !s0.is_empty() {
+                                    elab.net_strengths
+                                        .insert(h.path[0].name.name.clone(), (s1, s0));
+                                }
+                            }
+                        }
+                    }
                     elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
                 }
             }
@@ -5033,7 +5157,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 gate_inst_to_assigns(gi, elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
-                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone() });
+                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: String::new() });
             }
             ModuleItem::InitialConstruct(ic) => {
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
@@ -6012,7 +6136,7 @@ fn index_tuples(shape: &[(i64, i64)]) -> Vec<String> {
     out
 }
 
-fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
+pub fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
     if dims.is_empty() { return None; }
     match &dims[0] {
         crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
@@ -7066,6 +7190,12 @@ pub fn inline_instantiations(
                                 // `extract_array_range` (dynamic/queue → 0..63).
                                 if let Some((lo, hi)) = extract_array_range(&decl.dimensions, &elab.parameters) {
                                     elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        // §6.8: a 2-state ELEMENT type means the array's
+                        // slots default to 0 (the simulator consults this
+                        // when it builds the element storage).
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
                                     if let Some(UnpackedDimension::Range { left, right, .. }) = first_dim {
                                         let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                                         let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
@@ -7456,6 +7586,12 @@ fn substitute_in_module_item(
         ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
             stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
             span: ic.span,
+        }),
+        // §9.2.3: a `final` inside a generate-for must see the genvar's
+        // per-iteration constant, like initial/always do.
+        ModuleItem::FinalConstruct(fc) => ModuleItem::FinalConstruct(FinalConstruct {
+            stmt: rewrite_stmt(&fc.stmt, "", port_map, local_names, interface_map),
+            span: fc.span,
         }),
         ModuleItem::ContinuousAssign(ca) => {
             let mut new_ca = ca.clone();
@@ -8540,15 +8676,39 @@ fn inline_module_items(
                                         sig_name, width, array_range, inst_prefix, sub_merged_params.len(),
                                         p.iter().map(|(k, v)| format!("{}={}", k, v.to_u64().unwrap_or(0))).collect::<Vec<_>>());
                                 }
+                                // A queue / dynamic / associative dim on a
+                                // SUBMODULE or interface decl must register
+                                // like a top-level one — `tif.q.push_back(x)`
+                                // read a phantom 64-slot fixed array before.
+                                match decl.dimensions.first() {
+                                    Some(UnpackedDimension::Unsized(_))
+                                    | Some(UnpackedDimension::Queue { .. }) => {
+                                        elab.dynamic_arrays.insert(sig_name.clone());
+                                    }
+                                    Some(UnpackedDimension::Associative { data_type: kdt, .. }) => {
+                                        let is_str = kdt.as_ref().map_or(false, |dt| {
+                                            matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
+                                        });
+                                        elab.associative_arrays.insert(sig_name.clone(), is_str);
+                                    }
+                                    _ => {}
+                                }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
+                                    if is_type_two_state(&dd.data_type) {
+                                        elab.two_state_signals.insert(sig_name.clone());
+                                    }
                                     // Per-element Signals synthesized by
                                     // Simulator::new from arrays metadata.
                                     let _ = is_signed;
                                 } else {
+                                    // §6.8: 2-state types (bit/int/…) default to
+                                    // 0, not X — same as the top-level decl path.
+                                    // `Value::new` left a submodule's `bit` counter
+                                    // at X, so `cnt++` stayed X forever (issue #22).
                                     let init_val = if let Some(init_expr) = &decl.init {
                                         eval_init_for_width(init_expr, &sub_merged_params, width)
-                                    } else { Value::new(width) };
+                                    } else { default_value_for_type(&dd.data_type, width) };
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: dd.const_kw,
                                         name: sig_name, width, is_signed,
                                         direction: None, value: init_val,
@@ -8721,6 +8881,24 @@ fn inline_module_items(
                                 ctx: std::rc::Rc::clone(&pend_ctx),
                             });
                         }
+                    }
+                    if let ModuleItem::FinalConstruct(fc) = sub_item {
+                        // §9.2.3: a submodule's `final` blocks run at
+                        // simulation end just like the top module's, but
+                        // inlining dropped them — only top-level finals ever
+                        // executed (issue #22). They are few and run once, so
+                        // rewrite eagerly instead of adding a pending lane.
+                        let stmt = rewrite_stmt(
+                            &fc.stmt,
+                            &pend_ctx.prefix,
+                            &pend_ctx.port_map,
+                            &pend_ctx.local_names,
+                            &pend_ctx.interface_map,
+                        );
+                        elab.final_blocks.push(InitialBlock {
+                            stmt,
+                            scope: pend_ctx.prefix.trim_end_matches('.').to_string(),
+                        });
                     }
                 }
 

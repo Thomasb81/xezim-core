@@ -54,6 +54,11 @@ pub enum StatementKind {
     Assertion(AssertionStatement),
     ProceduralContinuous(ProceduralContinuous),
     VarDecl { data_type: DataType, lifetime: Option<Lifetime>, declarators: Vec<VarDeclarator> },
+    /// Block-local `typedef ...;` (§6.18). Registered when the enclosing
+    /// process first executes it, so later VarDecls in the block resolve
+    /// the name. Was parsed and DISCARDED before, which broke member access
+    /// on locals of block-local packed-struct typedefs.
+    Typedef(Box<crate::ast::decl::TypedefDeclaration>),
     Coverpoint { name: Option<Identifier>, expr: Expression, span: Span },
     Cross { name: Option<Identifier>, items: Vec<Expression>, span: Span },
     /// Randsequence action-block boundary. Catches an `RsReturn` raised

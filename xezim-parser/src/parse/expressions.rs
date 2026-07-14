@@ -618,7 +618,19 @@ impl Parser {
                 self.bump(); // skip (
                 let inner = self.parse_expression();
                 self.expect(TokenKind::RParen);
-                lhs = Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
+                // §6.24.1: a LITERAL casting size (`4'(x)`) resizes the
+                // operand — lower it to an internal resize call so the width
+                // survives (it was dropped, so `4'(8'hAB)` kept all 8 bits).
+                // Non-literal casting types (pkg::type'(v), id'(v)) stay a
+                // pass-through width/type hint as before.
+                if matches!(lhs.kind, ExprKind::Number(_)) {
+                    lhs = Expression::new(ExprKind::SystemCall {
+                        name: "$__xz_size_cast".to_string(),
+                        args: vec![lhs, inner],
+                    }, self.span_from(start));
+                } else {
+                    lhs = Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
+                }
                 continue;
             }
 
@@ -858,7 +870,13 @@ impl Parser {
                     self.expect(TokenKind::LParen);
                     let inner = self.parse_expression();
                     self.expect(TokenKind::RParen);
-                    Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
+                    // §6.24.1: a literal casting size RESIZES the operand —
+                    // lowered to an internal resize call (the width was
+                    // dropped before, so `4'(8'hAB)` kept all 8 bits).
+                    Expression::new(ExprKind::SystemCall {
+                        name: "$__xz_size_cast".to_string(),
+                        args: vec![expr, inner],
+                    }, self.span_from(start))
                 } else {
                     expr
                 }
@@ -1076,11 +1094,12 @@ impl Parser {
                 }
             }
 
-            // Data type keywords used as expressions (e.g. $bits(int))
+            // Data type keywords used as expressions (e.g. $bits(int),
+            // $size(logic [7:0])) — §20.6. The parsed type is RETAINED; the
+            // packed range was previously thrown away with the expression.
             k if self.is_data_type_keyword() || k == TokenKind::KwVoid => {
-                let _dt = self.parse_data_type();
-                // Treat as empty expression for now, but we've consumed the type
-                Expression::new(ExprKind::Empty, self.span_from(start))
+                let dt = self.parse_data_type();
+                Expression::new(ExprKind::TypeLiteral(Box::new(dt)), self.span_from(start))
             }
 
             // LRM §16.12.6 strong temporal operators in property context.

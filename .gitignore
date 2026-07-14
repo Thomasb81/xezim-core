@@ -4,3 +4,4 @@ target/
 Cargo.lock
 **/Cargo.lock
 CHANGELOG*
+.claude/
