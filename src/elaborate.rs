@@ -919,6 +919,23 @@ pub struct ElaboratedModule {
     /// combinational block — the simulator uses this set to route it correctly.
     #[serde(default)]
     pub events: HashSet<String>,
+    /// Instance-port net collapsing, for the dump writers only.
+    ///
+    /// `<inst>.<formal>` → the parent net the port's actual names, recorded ONLY
+    /// when the actual is a SIMPLE WHOLE-NET identifier (`.din(src_bus)`). A
+    /// bit-select, part-select, concatenation or expression actual
+    /// (`.din(bus[3:0])`, `.din({a,b})`, `.din(w+1)`) is a distinct object and is
+    /// NOT recorded — Verilator and Icarus keep those separate too.
+    ///
+    /// Inlining gives the formal its own signal-table entry, kept in step with
+    /// the actual by a port continuous-assign, so a dump that treats the two as
+    /// independent signals writes every change TWICE and shows one physical net
+    /// as two. Both reference tools give the two names ONE identifier code (each
+    /// still gets its own `$var` line in its own `$scope`). Chains through
+    /// multiple levels (a port bound to a port), so consumers must resolve to a
+    /// root.
+    #[serde(default)]
+    pub port_aliases: HashMap<String, String>,
 }
 
 /// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
@@ -1033,6 +1050,7 @@ impl ElaboratedModule {
             const_decl_inits: HashSet::default(),
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
+            port_aliases: HashMap::default(),
         }
     }
 
@@ -8783,6 +8801,14 @@ fn inline_module_items(
                 for (port_name, parent_expr) in &port_map {
                     if prepared_sub.interface_ports.contains(port_name) { continue; }
                     let sub_sig_name = format!("{}{}", inst_prefix, port_name);
+                    // Dump-only net collapsing: the formal and a whole-net actual
+                    // are ONE physical net (see `ElaboratedModule::port_aliases`).
+                    // Anything that is not a plain hierarchical identifier — a
+                    // bit/part-select, a concat, an expression, a literal — is a
+                    // separate object and gets no alias.
+                    if let Some(actual) = whole_net_ident_name(parent_expr) {
+                        elab.port_aliases.insert(sub_sig_name.clone(), actual);
+                    }
                     let sub_expr = make_ident_expr(&sub_sig_name);
                     match prepared_sub.port_directions.get(port_name) {
                         Some(PortDirection::Input) | Some(PortDirection::Inout) => {
@@ -9396,6 +9422,32 @@ fn make_ident_expr(name: &str) -> Expression {
         cached_signal_id: std::cell::Cell::new(None),
                     cached_resolved_name: std::cell::OnceCell::new(),
     }), Span::dummy())
+}
+
+/// The dotted name of `expr` when it is a WHOLE net/variable reference — a plain
+/// hierarchical identifier with no selects anywhere (`src_bus`, `u_a.q`). Returns
+/// `None` for a bit-select, part-select, array index, concat, literal or any other
+/// expression: those name a *part of* (or a *function of*) a net, not the net, and
+/// must stay a distinct object in a dump.
+fn whole_net_ident_name(expr: &Expression) -> Option<String> {
+    match &expr.kind {
+        ExprKind::Ident(hier) => {
+            if hier.root.is_some() || hier.path.is_empty() {
+                return None;
+            }
+            if hier.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            Some(
+                hier.path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            )
+        }
+        _ => None,
+    }
 }
 
 fn rewrite_expr(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {

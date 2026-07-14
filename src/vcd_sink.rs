@@ -254,14 +254,19 @@ pub fn vcd_real_string(v: f64) -> String {
 }
 
 /// The binary digit string of a vector value, MSB first, with §21.7.2.1-legal
-/// leading-zero suppression.
+/// leading-run suppression — the same spelling Icarus Verilog emits.
 ///
 /// A reader LEFT-EXTENDS a value shorter than the `$var` width using the
-/// leftmost emitted character (`x` extends with x, `z` with z, otherwise 0).
-/// So the zeros of `8'b000000x1` may NOT be dropped down to `bx1` — that reads
-/// back as `8'bxxxxxxx1`. Zeros are only suppressed while the first RETAINED
-/// character is `1`; when the first significant bit is x or z a single explicit
-/// leading `0` is kept so the reader 0-extends.
+/// leftmost emitted character: `x` extends with x, `z` with z, and anything else
+/// (`0`/`1`) with `0`. So:
+///
+///   * a leading run of `x` collapses to ONE `x` (`8'bxxxx0011` → `bx0011`), and
+///     likewise a leading run of `z` (`8'bzzzz0011` → `bz0011`) — the reader
+///     re-extends with that same character.
+///   * a leading run of `0` collapses only while the first RETAINED character is
+///     `1` (`8'b00001111` → `b1111`). `8'b000000x1` may NOT collapse to `bx1` —
+///     that reads back as `8'bxxxxxxx1` — so one explicit `0` is kept: `b0x1`.
+///   * a leading `1` extends with `0`, so nothing may be dropped in front of it.
 pub fn vcd_vector_bits(val: &Value) -> String {
     let w = val.width as usize;
     let mut s = String::with_capacity(w + 1);
@@ -273,23 +278,38 @@ pub fn vcd_vector_bits(val: &Value) -> String {
             LogicBit::Z => 'z',
         });
     }
-    match s.find(|c| c != '0') {
-        // All zeros collapse to a single `0` (0-extended back to full width).
-        None => "0".to_string(),
-        // Nothing to suppress.
-        Some(0) => s,
-        Some(i) => {
-            if s.as_bytes()[i] == b'1' {
-                s.split_off(i)
-            } else {
-                // First significant bit is x/z — keep one `0` in front.
-                let mut out = String::with_capacity(w - i + 1);
-                out.push('0');
-                out.push_str(&s[i..]);
-                out
-            }
-        }
+    let lead = match s.as_bytes().first() {
+        Some(&c) => c,
+        None => return "0".to_string(),
+    };
+    // `1` left-extends as `0`: the leading run is significant, keep it all.
+    if lead == b'1' {
+        return s;
     }
+    // Index of the first character that differs from the leading one.
+    let end = match s.bytes().position(|c| c != lead) {
+        // Uniform vector: one character stands for all of it (`bx`, `bz`, `b0`).
+        None => return (lead as char).to_string(),
+        Some(i) => i,
+    };
+    if lead == b'0' {
+        if s.as_bytes()[end] == b'1' {
+            // 0-extension restores the dropped zeros.
+            return s.split_off(end);
+        }
+        // First significant bit is x/z: keep ONE `0` so the reader 0-extends
+        // instead of x/z-extending.
+        let mut out = String::with_capacity(w - end + 1);
+        out.push('0');
+        out.push_str(&s[end..]);
+        return out;
+    }
+    // Leading run of x (or z): the reader re-extends with that same character,
+    // so one instance carries the whole run.
+    let mut out = String::with_capacity(w - end + 1);
+    out.push(lead as char);
+    out.push_str(&s[end..]);
+    out
 }
 
 /// Format a single `Value` as a VCD value-change record (real, scalar or
