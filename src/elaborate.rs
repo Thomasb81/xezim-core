@@ -742,6 +742,12 @@ pub struct ElaboratedModule {
     pub functions: HashMap<String, FunctionDeclaration>,
     /// Module-level task declarations.
     pub tasks: HashMap<String, TaskDeclaration>,
+    /// Declaring scope (package name) for package-level functions/tasks, so
+    /// `%m` inside a package subroutine yields `<pkg>.<name>` — matching
+    /// real simulators — instead of the top-module name. Keyed by the
+    /// function/task simple name (mirrors the `functions`/`tasks` maps).
+    #[serde(default)]
+    pub func_decl_scope: HashMap<String, String>,
     /// DPI imports by SV-visible symbol name.
     pub dpi_imports: HashMap<String, DpiImportSpec>,
     /// Clocking block definitions: name -> AST declaration.
@@ -990,6 +996,7 @@ impl ElaboratedModule {
             covergroups: HashMap::default(),
             functions: HashMap::default(),
             tasks: HashMap::default(),
+            func_decl_scope: HashMap::default(),
             dpi_imports: HashMap::default(),
             clocking_blocks: HashMap::default(),
             lets: HashMap::default(),
@@ -9712,12 +9719,14 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         PackageItem::Function(fd) => {
                             if &fd.name.name.name == sym_name {
                                 elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                                elab.func_decl_scope.insert(fd.name.name.name.clone(), pkg_name.clone());
                                 found = true;
                             }
                         }
                         PackageItem::Task(td) => {
                             if &td.name.name.name == sym_name {
                                 elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                                elab.func_decl_scope.insert(td.name.name.name.clone(), pkg_name.clone());
                                 found = true;
                             }
                         }
@@ -9842,9 +9851,11 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             process_typedef(td, elab);
                         }
                         PackageItem::Function(fd) => {
+                            elab.func_decl_scope.insert(fd.name.name.name.clone(), pkg_name.clone());
                             elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                         }
                         PackageItem::Task(td) => {
+                            elab.func_decl_scope.insert(td.name.name.name.clone(), pkg_name.clone());
                             elab.tasks.insert(td.name.name.name.clone(), td.clone());
                         }
                         PackageItem::DPIImport(di) => {
