@@ -240,10 +240,69 @@ impl Drop for VcdSink {
     }
 }
 
-/// Format a single `Value` as a VCD value-change record (scalar or vector).
-/// Shared by the inline path and the background writer thread.
+/// Render a `real` value as a VCD decimal number (IEEE 1800-2017 §21.7.2.1:
+/// the value of a `real` variable is written as `r<decimal_number>`).
+/// Rust's `{}` for `f64` is the shortest round-trip form, which is exactly
+/// what a VCD reader needs; NaN/±inf have no VCD spelling, so they degrade
+/// to `0` rather than emitting an unparsable token.
+pub fn vcd_real_string(v: f64) -> String {
+    if v.is_finite() {
+        format!("{}", v)
+    } else {
+        "0".to_string()
+    }
+}
+
+/// The binary digit string of a vector value, MSB first, with §21.7.2.1-legal
+/// leading-zero suppression.
+///
+/// A reader LEFT-EXTENDS a value shorter than the `$var` width using the
+/// leftmost emitted character (`x` extends with x, `z` with z, otherwise 0).
+/// So the zeros of `8'b000000x1` may NOT be dropped down to `bx1` — that reads
+/// back as `8'bxxxxxxx1`. Zeros are only suppressed while the first RETAINED
+/// character is `1`; when the first significant bit is x or z a single explicit
+/// leading `0` is kept so the reader 0-extends.
+pub fn vcd_vector_bits(val: &Value) -> String {
+    let w = val.width as usize;
+    let mut s = String::with_capacity(w + 1);
+    for i in (0..w).rev() {
+        s.push(match val.get_bit(i) {
+            LogicBit::Zero => '0',
+            LogicBit::One => '1',
+            LogicBit::X => 'x',
+            LogicBit::Z => 'z',
+        });
+    }
+    match s.find(|c| c != '0') {
+        // All zeros collapse to a single `0` (0-extended back to full width).
+        None => "0".to_string(),
+        // Nothing to suppress.
+        Some(0) => s,
+        Some(i) => {
+            if s.as_bytes()[i] == b'1' {
+                s.split_off(i)
+            } else {
+                // First significant bit is x/z — keep one `0` in front.
+                let mut out = String::with_capacity(w - i + 1);
+                out.push('0');
+                out.push_str(&s[i..]);
+                out
+            }
+        }
+    }
+}
+
+/// Format a single `Value` as a VCD value-change record (real, scalar or
+/// vector) — IEEE 1800-2017 §21.7.2.1. Shared by the inline path, the
+/// background writer thread AND `Simulator`'s header/checkpoint paths, which
+/// used to carry a second, divergent copy of this logic.
 pub fn write_vcd_value<W: Write>(w: &mut W, val: &Value, id: &str) {
-    if val.width == 1 {
+    if val.is_real {
+        // `real` is a `$var real 64` and its changes are `r<decimal> <id>`.
+        // Emitting the raw IEEE-754 bit pattern as a 64-bit binary vector
+        // (the old behaviour) makes every real read back as a nonsense integer.
+        let _ = writeln!(w, "r{} {}", vcd_real_string(val.to_f64()), id);
+    } else if val.width == 1 {
         let ch = match val.bits_first() {
             LogicBit::Zero => '0',
             LogicBit::One => '1',
@@ -252,20 +311,6 @@ pub fn write_vcd_value<W: Write>(w: &mut W, val: &Value, id: &str) {
         };
         let _ = writeln!(w, "{}{}", ch, id);
     } else {
-        let mut s = String::with_capacity(val.width as usize + 2);
-        s.push('b');
-        let mut all_zero = true;
-        for i in (0..val.width as usize).rev() {
-            match val.get_bit(i) {
-                LogicBit::Zero => {
-                    if !all_zero { s.push('0'); }
-                }
-                LogicBit::One => { all_zero = false; s.push('1'); }
-                LogicBit::X => { all_zero = false; s.push('x'); }
-                LogicBit::Z => { all_zero = false; s.push('z'); }
-            }
-        }
-        if all_zero { s.push('0'); }
-        let _ = writeln!(w, "{} {}", s, id);
+        let _ = writeln!(w, "b{} {}", vcd_vector_bits(val), id);
     }
 }

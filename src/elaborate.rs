@@ -2117,7 +2117,21 @@ pub fn elaborate_module_with_defs(
                         }
                         return Err(format!("Duplicate declaration of '{}'", decl.name.name));
                     }
-                    let w = width_with_unpacked_dims(&decl.dimensions, width);
+                    // §7.4.2: an unpacked NET array (`wire [3:0] outs [0:1];`) is
+                    // an ARRAY OF NETS, exactly like the variable form
+                    // (`logic [3:0] outs [0:1];`) — not one `width * n` wide net.
+                    // Flattening it made `outs[0]` a plain bit-select of that wide
+                    // vector (so `assign outs[0] = 4'd5;` drove a single bit) and
+                    // dumped the whole array as one wide VCD vector instead of
+                    // element-wise `outs[0]`/`outs[1]` vars. Register the same
+                    // `arrays` metadata the variable path does; `Simulator::new`
+                    // synthesizes the per-element signals from it.
+                    let net_array_range = extract_array_range(&decl.dimensions, &elab.parameters);
+                    let w = if net_array_range.is_some() {
+                        width
+                    } else {
+                        width_with_unpacked_dims(&decl.dimensions, width)
+                    };
                     // supply0 → constant 0, supply1 → constant 1
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(w),
@@ -2135,6 +2149,17 @@ pub fn elaborate_module_with_defs(
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     elab.nets.insert(decl.name.name.clone());
+                    if let Some((lo, hi)) = net_array_range {
+                        elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        elab.var_decl_types.insert(decl.name.name.clone(), nd.data_type.clone());
+                        if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
+                            let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
+                            let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
+                            if l > r {
+                                elab.descending_arrays.insert(decl.name.name.clone());
+                            }
+                        }
+                    }
                     // Wire with initializer → continuous assign (not constant eval)
                     if let Some(init_expr) = &decl.init {
                         elab.continuous_assigns.push(ContinuousAssignment {
