@@ -617,7 +617,19 @@ impl Parser {
                 self.bump(); // skip (
                 let inner = self.parse_expression();
                 self.expect(TokenKind::RParen);
-                lhs = Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
+                // §6.24.1: a LITERAL casting size (`4'(x)`) resizes the
+                // operand — lower it to an internal resize call so the width
+                // survives (it was dropped, so `4'(8'hAB)` kept all 8 bits).
+                // Non-literal casting types (pkg::type'(v), id'(v)) stay a
+                // pass-through width/type hint as before.
+                if matches!(lhs.kind, ExprKind::Number(_)) {
+                    lhs = Expression::new(ExprKind::SystemCall {
+                        name: "$__xz_size_cast".to_string(),
+                        args: vec![lhs, inner],
+                    }, self.span_from(start));
+                } else {
+                    lhs = Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
+                }
                 continue;
             }
 
@@ -844,7 +856,13 @@ impl Parser {
                     self.expect(TokenKind::LParen);
                     let inner = self.parse_expression();
                     self.expect(TokenKind::RParen);
-                    Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
+                    // §6.24.1: a literal casting size RESIZES the operand —
+                    // lowered to an internal resize call (the width was
+                    // dropped before, so `4'(8'hAB)` kept all 8 bits).
+                    Expression::new(ExprKind::SystemCall {
+                        name: "$__xz_size_cast".to_string(),
+                        args: vec![expr, inner],
+                    }, self.span_from(start))
                 } else {
                     expr
                 }

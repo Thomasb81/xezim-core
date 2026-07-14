@@ -3,7 +3,7 @@
 use super::Parser;
 use crate::ast::stmt::*;
 use crate::ast::expr::{ExprKind, BinaryOp, Expression, NumberLiteral, NumberBase};
-use crate::ast::types::{DataType, Lifetime};
+use crate::ast::types::{DataType, Lifetime, SimpleType};
 use crate::lexer::token::TokenKind;
 use std::cell::Cell;
 use std::collections::HashMap;
@@ -125,8 +125,8 @@ impl Parser {
                 Statement::new(StatementKind::VarDecl { data_type, lifetime, declarators }, self.span_from(start))
             }
             TokenKind::KwTypedef => {
-                let _ = self.parse_typedef_declaration();
-                Statement::new(StatementKind::Null, self.span_from(start))
+                let td = self.parse_typedef_declaration();
+                Statement::new(StatementKind::Typedef(Box::new(td)), self.span_from(start))
             }
             TokenKind::KwDisable => {
                 self.bump();
@@ -354,14 +354,34 @@ impl Parser {
             }
             // Event declaration
             TokenKind::KwEvent => {
+                // §6.17/§15.5: block-local `event e;` declares a real event —
+                // it was parsed and DISCARDED, so a later `->e` errored.
+                let ev_span = self.current().span;
                 self.bump();
-                let mut names = Vec::new();
+                let mut declarators = Vec::new();
                 loop {
-                    names.push(self.parse_identifier());
+                    let name = self.parse_identifier();
+                    let ds = name.span.start;
+                    declarators.push(VarDeclarator {
+                        name,
+                        dimensions: Vec::new(),
+                        init: None,
+                        span: self.span_from(ds),
+                    });
                     if self.eat(TokenKind::Comma).is_none() { break; }
                 }
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::Null, self.span_from(start)) // Skip for now
+                Statement::new(
+                    StatementKind::VarDecl {
+                        data_type: DataType::Simple {
+                            kind: SimpleType::Event,
+                            span: ev_span,
+                        },
+                        lifetime: None,
+                        declarators,
+                    },
+                    self.span_from(start),
+                )
             }
             // User-defined type variable declaration: TypeName var [= expr];
             // Detected by: Identifier followed by Identifier, Hash (if followed by identifier),
@@ -678,6 +698,10 @@ impl Parser {
         // Used by macros like svlib's `foreach_line` that expand to
         //   for (int x =(fid), int y=(start), string z="" ; ... ; ...)
         let mut init = Vec::new();
+        // §12.7.1: `for (int j = 0, k = 10; …)` — a bare `name = expr` after
+        // a typed entry CONTINUES that declaration with the same data type
+        // (the grammar forbids mixing declarations and plain assignments).
+        let mut decl_dt: Option<DataType> = None;
         if !self.at(TokenKind::Semicolon) {
             loop {
                 // Optional `var`/`const` lifetime/qualifier prefix on a typed
@@ -693,7 +717,20 @@ impl Parser {
                     let name = self.parse_identifier();
                     self.expect(TokenKind::Assign);
                     let val = self.parse_expression();
+                    decl_dt = Some(dt.clone());
                     init.push(ForInit::VarDecl { data_type: dt, name, init: val });
+                } else if decl_dt.is_some()
+                    && self.at(TokenKind::Identifier)
+                    && self.peek_kind() == TokenKind::Assign
+                {
+                    let name = self.parse_identifier();
+                    self.expect(TokenKind::Assign);
+                    let val = self.parse_expression();
+                    init.push(ForInit::VarDecl {
+                        data_type: decl_dt.clone().unwrap(),
+                        name,
+                        init: val,
+                    });
                 } else {
                     let lv = self.parse_expression();
                     self.expect(TokenKind::Assign);
