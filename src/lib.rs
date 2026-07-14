@@ -853,7 +853,5 @@ fn resolve_library_modules(
 }
 
 /// Set the log file for simulation output. Placeholder.
-pub fn set_log_file(_path: &str) -> Result<(), String> { Ok(()) }
-
 pub fn log_println(s: &str) { println!("{}", s); }
 pub fn log_eprintln(s: &str) { eprintln!("{}", s); }
