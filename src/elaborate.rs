@@ -2192,11 +2192,20 @@ pub fn elaborate_module_with_defs(
                     // parent net — mirroring the variable (line ~2793) and port
                     // (line ~9002) paths, which the net arm previously omitted
                     // (member access read x).
-                    if net_array_range.is_none() {
-                        if let DataType::Struct(su) = resolve_typedef_chain(&nd.data_type, &elab.typedef_types) {
+                    if net_array_range.is_none() && decl.dimensions.is_empty() {
+                        let chain = resolve_typedef_chain(&nd.data_type, &elab.typedef_types).clone();
+                        if let DataType::Struct(su) = &chain {
                             if su.packed {
                                 if let Some(fields) = flatten_struct_fields(&nd.data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
                                     if !fields.is_empty() {
+                                        let struct_w = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                        // §7.4.2: a packed ARRAY of packed struct
+                                        // net (`wire dword foo;`) is one vector of
+                                        // N structs; register the element width so
+                                        // `foo[i].field` addresses `i*elem_w+off`.
+                                        if struct_w > 0 && w > struct_w && w % struct_w == 0 {
+                                            elab.packed_signal_elem_widths.insert(decl.name.name.clone(), struct_w);
+                                        }
                                         tls_register_struct_layout(&decl.name.name, &fields);
                                         elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
                                     }
@@ -2820,6 +2829,31 @@ pub fn elaborate_module_with_defs(
                                 if let DataType::Struct(su) = dt_resolved {
                                     if su.packed {
                                         elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                                    }
+                                }
+                            }
+                        }
+                        // §7.4.2: a PACKED ARRAY of packed struct
+                        // (`typedef word [1:0] dword; dword foo;`) is one
+                        // contiguous vector of N structs. `dt_resolved` is a
+                        // TypeReference (not a bare Struct), so the block above
+                        // does not register it. Register the element's field
+                        // layout (element-relative offsets) under `foo` plus the
+                        // element width, so `foo[i].field` resolves to
+                        // `i*elem_w + field_off` in the single backing signal.
+                        if !elab.packed_struct_fields.contains_key(&decl.name.name)
+                            && decl.dimensions.is_empty()
+                        {
+                            let chain = resolve_typedef_chain(dt_resolved, &elab.typedef_types).clone();
+                            if let DataType::Struct(su) = &chain {
+                                if su.packed {
+                                    if let Some(fields) = flatten_struct_fields(&chain, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
+                                        let struct_w = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
+                                        if struct_w > 0 && width > struct_w && width % struct_w == 0 {
+                                            elab.packed_signal_elem_widths.insert(decl.name.name.clone(), struct_w);
+                                            tls_register_struct_layout(&decl.name.name, &fields);
+                                            elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                                        }
                                     }
                                 }
                             }
