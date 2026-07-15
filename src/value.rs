@@ -1253,17 +1253,39 @@ impl Value {
         let ndigits = ((self.width + 3) / 4) as usize;
         let mut s = String::with_capacity(ndigits);
         for d in (0..ndigits).rev() {
+            // §21.2.1.2 unknown casing, per hex digit (matches Icarus/commercial
+            // tools): a nibble that is entirely x prints `x`, entirely z prints
+            // `z`, and one that MIXES unknown bits with known bits (or x with z)
+            // prints uppercase `X` (any x) or `Z` (some z, no x). Only a fully
+            // known nibble is a hex digit. The old code collapsed every unknown
+            // nibble to lowercase `x`, losing z and mis-casing partials.
             let mut digit = 0u8;
-            let mut has_x = false;
+            let (mut n_x, mut n_z, mut n_bits) = (0u32, 0u32, 0u32);
             for b in 0..4 {
                 let bit_idx = d * 4 + b;
+                if bit_idx >= self.width as usize {
+                    continue;
+                }
+                n_bits += 1;
                 match self.get_bit(bit_idx) {
                     LogicBit::One => digit |= 1 << b,
-                    LogicBit::X | LogicBit::Z => has_x = true,
+                    LogicBit::X => n_x += 1,
+                    LogicBit::Z => n_z += 1,
                     _ => {}
                 }
             }
-            if has_x { s.push('x'); } else { s.push(char::from_digit(digit as u32, 16).unwrap()); }
+            let ch = if n_x == 0 && n_z == 0 {
+                char::from_digit(digit as u32, 16).unwrap()
+            } else if n_x == n_bits {
+                'x'
+            } else if n_z == n_bits {
+                'z'
+            } else if n_x > 0 {
+                'X'
+            } else {
+                'Z'
+            };
+            s.push(ch);
         }
         s
     }
@@ -1389,6 +1411,47 @@ mod tests {
         let v = Value::from_u64(0x0F, 8);
         assert_eq!(v.shift_left(&Value::from_u64(4, 8)).to_u64(), Some(0xF0));
         assert_eq!(v.shift_right(&Value::from_u64(2, 8)).to_u64(), Some(3));
+    }
+
+    // IEEE 1800-2017 §5.7.1: a single-`x` decimal literal is all-X and a
+    // single-`z`/`?` decimal literal is all-Z (previously mis-rendered as
+    // all-X). Higher radices are unaffected.
+    #[test]
+    fn test_decimal_single_x_z_render() {
+        let dx = Value::from_str_radix("x", 10, 8);
+        assert_eq!(dx.to_bin(), "xxxxxxxx", "8'dx must be all-X");
+        for i in 0..8 { assert_eq!(dx.get_bit(i), LogicBit::X); }
+
+        let dz = Value::from_str_radix("z", 10, 8);
+        assert_eq!(dz.to_bin(), "zzzzzzzz", "8'dz must be all-Z, not all-X");
+        for i in 0..8 { assert_eq!(dz.get_bit(i), LogicBit::Z); }
+
+        let dq = Value::from_str_radix("?", 10, 8);
+        for i in 0..8 { assert_eq!(dq.get_bit(i), LogicBit::Z, "8'd? is all-Z"); }
+
+        // Sanity: hex x/z paths unchanged.
+        assert_eq!(Value::from_str_radix("xx", 16, 8).to_bin(), "xxxxxxxx");
+        assert_eq!(Value::from_str_radix("zz", 16, 8).to_bin(), "zzzzzzzz");
+    }
+
+    // §21.2.1.2 unknown-value casing for `%h` and `%d` (matches Icarus): an
+    // all-x group prints lowercase `x`, all-z prints `z`, and a group MIXING
+    // unknown with known bits (or x with z) prints uppercase `X`/`Z`. The old
+    // code collapsed every unknown to lowercase `x`, losing z entirely.
+    #[test]
+    fn test_hex_dec_unknown_casing() {
+        let h = |b: &str| Value::from_str_radix(b, 2, 8).to_hex();
+        assert_eq!(h("1010xx01"), "aX", "partial-x nibble is uppercase X");
+        assert_eq!(h("1010zz01"), "aZ", "partial-z nibble is uppercase Z");
+        assert_eq!(h("xxxxxxxx"), "xx", "all-x nibble is lowercase x");
+        assert_eq!(h("zzzzzzzz"), "zz", "all-z nibble is lowercase z (not x)");
+        assert_eq!(h("1010xz01"), "aX", "x+z in one nibble favours X");
+        assert_eq!(h("10101010"), "aa", "fully known nibble is a hex digit");
+
+        let d = |b: &str| Value::from_str_radix(b, 2, 8).to_dec_string();
+        assert_eq!(d("1010xx01"), "X", "partially-unknown %d is uppercase X");
+        assert_eq!(d("xxxxxxxx"), "x", "all-x %d is lowercase x");
+        assert_eq!(d("zzzzzzzz"), "z", "all-z %d is lowercase z (not x)");
     }
 
     #[test]
@@ -1548,7 +1611,29 @@ impl Value {
             return format!("{:?}", self.to_f64());
         }
         if self.has_unknown() {
-            return "x".to_string();
+            // §21.2.1.2 unknown casing for `%d`: a value that is entirely x
+            // prints `x`, entirely z prints `z`, and one that mixes unknown with
+            // known bits (or x with z) prints uppercase `X`/`Z`. The old code
+            // always returned lowercase `x`, losing z and mis-casing partials.
+            let (mut n_x, mut n_z) = (0u32, 0u32);
+            for i in 0..self.width as usize {
+                match self.get_bit(i) {
+                    LogicBit::X => n_x += 1,
+                    LogicBit::Z => n_z += 1,
+                    _ => {}
+                }
+            }
+            let w = self.width as u32;
+            let ch = if n_x == w {
+                'x'
+            } else if n_z == w {
+                'z'
+            } else if n_x > 0 {
+                'X'
+            } else {
+                'Z'
+            };
+            return ch.to_string();
         }
         if self.width <= 64 {
             if self.is_signed {
@@ -1696,7 +1781,27 @@ impl Value {
             let bits_per_digit = match radix {
                 2 => 1, 8 => 3, 16 => 4,
                 _ => {
-                    // For decimal, can't have x/z
+                    // IEEE 1800-2017 §5.7.1: a decimal literal's value may be a
+                    // SINGLE `x` or a SINGLE `z`/`?` (underscores already
+                    // stripped) standing for a whole all-unknown/all-hi-Z value —
+                    // never multiple such digits, never mixed with numeric
+                    // digits, never a mix of x and z. The parser rejects those
+                    // malformed forms (see validate_number_literal); here we only
+                    // render the two legal single-digit cases. A lone `z`/`?`
+                    // fills all bits with Z (previously mis-rendered as all-X).
+                    if s.len() == 1 {
+                        match s.as_bytes()[0] {
+                            b'x' | b'X' => return Self::new(width),
+                            b'z' | b'Z' | b'?' => {
+                                let mut v = Self::zero(width);
+                                for b in 0..width as usize { v.set_bit(b, LogicBit::Z); }
+                                return v;
+                            }
+                            _ => {}
+                        }
+                    }
+                    // Malformed decimal (multi/mixed x/z): the parser should have
+                    // already reported this. Fall back to all-X defensively.
                     return Self::new(width);
                 }
             };
