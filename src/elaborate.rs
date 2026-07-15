@@ -2258,7 +2258,7 @@ pub fn elaborate_module_with_defs(
                         }
                     }
                 }
-                let is_signed = is_type_signed(&dd.data_type);
+                let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                 for decl in &dd.declarators {
                     elab.note_explicit_type(&decl.name.name, &dd.data_type)?;
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
@@ -2987,6 +2987,16 @@ pub fn elaborate_module_with_defs(
 
                         if current_is_real {
                             val = Value::from_f64(val.to_f64());
+                        } else {
+                            // §10.7: the parameter's declared type governs the
+                            // stored value — force its signedness (so a signed
+                            // source in an UNSIGNED param reads unsigned, e.g.
+                            // `bit unsigned [3:0] p = -7` is 9, not -7) and drop
+                            // X/Z for a 2-state parameter type.
+                            val.is_signed = current_signed;
+                            if is_type_two_state(data_type) {
+                                val = val.to_two_state();
+                            }
                         }
 
                         if let Some(fields) = struct_fields {
@@ -6124,6 +6134,26 @@ pub fn is_type_real(dt: &DataType) -> bool {
     matches!(dt, DataType::Real { .. })
 }
 
+/// `is_type_signed` that resolves a typedef reference (`typedef logic signed
+/// [7:0] t; t v;`) against the typedef table so `v` inherits the underlying
+/// type's signedness. Without this a signed typedef var read as unsigned,
+/// e.g. `t'(-16) !== -16` failed on the high bits.
+pub fn is_type_signed_resolved(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> bool {
+    if let DataType::TypeReference { name, .. } = dt {
+        let key = &name.name.name;
+        if let Some(inner) = typedef_types.get(key) {
+            // Guard against a self-referential name.
+            if !matches!(inner, DataType::TypeReference { name: n, .. } if &n.name.name == key) {
+                return is_type_signed_resolved(inner, typedef_types);
+            }
+        }
+    }
+    is_type_signed(dt)
+}
+
 /// Returns the default value for a type: 0 for 2-state types, X for 4-state types.
 fn default_value_for_type(dt: &DataType, width: u32) -> Value {
     if is_type_real(dt) { return Value::from_f64(0.0); }
@@ -7153,7 +7183,9 @@ fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width
             _ => Value::new(width),
         };
     }
-    eval_const_expr_val(expr, params).resize(width)
+    // §10.7 assignment resize: a signed source with an X/Z MSB widens with X/Z
+    // (resize_for_assign), matching a procedural assignment to the same target.
+    eval_const_expr_val(expr, params).resize_for_assign(width)
 }
 
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).

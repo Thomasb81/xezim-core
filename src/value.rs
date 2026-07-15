@@ -301,6 +301,39 @@ impl Value {
         }
     }
 
+    /// §6.11.1 / §10.7: coerce to a 2-state value by mapping every X and Z
+    /// bit to 0. A 2-state object (`bit`/`byte`/`int`/…) can never hold X or Z,
+    /// so an implicit conversion of a 4-state RHS drops the unknowns before the
+    /// bits land in the destination. Known bits are preserved; the result is
+    /// fully defined (xz cleared).
+    pub fn to_two_state(&self) -> Value {
+        if self.is_real || !self.has_xz() {
+            return self.clone();
+        }
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => Value {
+                storage: ValueStorage::Inline {
+                    val_bits: *val_bits & !*xz_bits,
+                    xz_bits: 0,
+                },
+                width: self.width,
+                is_signed: self.is_signed,
+                is_real: false,
+            },
+            ValueStorage::Wide(bits) => {
+                let mut out = self.clone();
+                if let ValueStorage::Wide(ob) = &mut out.storage {
+                    for b in ob.iter_mut() {
+                        if matches!(b, LogicBit::X | LogicBit::Z) {
+                            *b = LogicBit::Zero;
+                        }
+                    }
+                }
+                out
+            }
+        }
+    }
+
     /// Get bit at position i.
     /// Hot-path; called per gate input from `exec_fused_gate` on
     /// gate-level netlists (>1 billion calls on picorv32 test_synth).
@@ -442,9 +475,15 @@ impl Value {
         if target == 0 { return Value::zero(0); }
         if self.is_real {
             if target == 64 { return self.clone(); }
-            // convert the real value to an integer (rounding to nearest)
+            // convert the real value to an integer (rounding to nearest,
+            // ties away from zero). Cast via i64 so a negative real keeps its
+            // two's-complement low bits — a direct `as u64` saturates any
+            // negative value to 0 (§10.7 real→integral, e.g. -7.0 -> 4'd9).
             let f = self.to_f64();
-            return Value::from_u64(f.round() as u64, target);
+            if !f.is_finite() {
+                return Value::zero(target);
+            }
+            return Value::from_u64(f.round() as i64 as u64, target);
         }
         if target == self.width {
             return self.clone();
@@ -534,7 +573,11 @@ impl Value {
             return self.resize(target);
         }
         let msb = self.get_bit(self.width.saturating_sub(1) as usize);
-        if msb != LogicBit::X && msb != LogicBit::Z {
+        // §10.7: the RHS is padded to the LHS width using its OWN signedness.
+        // Only a signed source replicates its MSB — and when that MSB is X or Z
+        // the extension bits take X/Z. An unsigned source always zero-extends,
+        // even when its MSB (or any lower bit) is X/Z.
+        if !self.is_signed || (msb != LogicBit::X && msb != LogicBit::Z) {
             return self.resize(target);
         }
         // X/Z extend
@@ -996,10 +1039,21 @@ impl Value {
     }
 
     pub fn case_eq(&self, other: &Value) -> Value {
-        // === operator: compares including X/Z
+        // === operator: compares including X/Z. §11.4.5/§11.6.1: operands of
+        // unequal size are extended to the common width; the comparison is
+        // signed (MSB-replicated, including an X/Z MSB) only when BOTH operands
+        // are signed, otherwise zero-extended. Without this a 64-bit signed
+        // value compared to a 32-bit signed `-16` mismatched in the top 32 bits.
         let w = self.width.max(other.width) as usize;
+        let both_signed = self.is_signed && other.is_signed;
+        let sign_a = both_signed && (self.width as usize) < w;
+        let sign_b = both_signed && (other.width as usize) < w;
+        let top_a = if self.width > 0 { self.get_bit((self.width - 1) as usize) } else { LogicBit::Zero };
+        let top_b = if other.width > 0 { other.get_bit((other.width - 1) as usize) } else { LogicBit::Zero };
         for i in 0..w {
-            if self.get_bit(i) != other.get_bit(i) { return Value::from_u64(0, 1); }
+            let a = if i < self.width as usize { self.get_bit(i) } else if sign_a { top_a } else { LogicBit::Zero };
+            let b = if i < other.width as usize { other.get_bit(i) } else if sign_b { top_b } else { LogicBit::Zero };
+            if a != b { return Value::from_u64(0, 1); }
         }
         Value::from_u64(1, 1)
     }
