@@ -255,6 +255,11 @@ pub struct ElaboratedClass {
     /// Names of type parameters declared on the class.
     #[serde(default)]
     pub type_param_names: Vec<String>,
+    /// IEEE 1800-2017 §8.7: value arguments in the `extends Base(args)` clause,
+    /// passed to the implicit `super.new(args)` when the derived constructor
+    /// does not call `super.new` explicitly.
+    #[serde(default)]
+    pub extends_args: Vec<Expression>,
     /// ALL parameter names (type and value), in declaration order. Needed to
     /// map positional `#(...)` type-args to the correct param when type and
     /// value params are interleaved (e.g. `uvm_component_registry#(type T,
@@ -635,6 +640,12 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     ElaboratedClass {
         name: c.name.name.clone(),
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
+        extends_args: c.extends.as_ref().map(|e| {
+            e.args.iter().filter_map(|a| match a {
+                ParamValue::Expr(ex) => Some(ex.clone()),
+                ParamValue::Type(_) => None,
+            }).collect()
+        }).unwrap_or_default(),
         properties,
         property_order,
         string_properties,
