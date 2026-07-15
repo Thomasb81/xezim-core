@@ -1242,6 +1242,25 @@ impl Parser {
                     self.span_from(start),
                 )
             }
+            // LRM §16.12.9 — `not property_expr`: the property holds iff the
+            // operand does NOT. For a boolean property (the common assertion
+            // form, e.g. `not (a && b)`) this is logical negation, so desugar to
+            // `!(expr)`, which the SVA executor evaluates directly. Full
+            // temporal-sequence negation is not modeled — the approximate
+            // handling matches nexttime/always above. `not` in gate-primitive
+            // position is caught at item level (items.rs) before reaching here.
+            TokenKind::KwNot => {
+                let start = self.current().span.start;
+                self.bump();
+                let operand = self.parse_expr_bp(3);
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::LogNot,
+                        operand: Box::new(operand),
+                    },
+                    self.span_from(start),
+                )
+            }
             TokenKind::HashHash => {
                 // LRM §16.8: `##N <rest>` — a cycle-delay sequence
                 // operator. Parse the cycle count, then the following
