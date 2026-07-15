@@ -7374,6 +7374,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 BinaryOp::BitXnor => l.bitwise_xor(&r).bitwise_not(),
                 BinaryOp::LogOr => l.logic_or(&r),
                 BinaryOp::LogAnd => l.logic_and(&r),
+                // §11.4.7 logical implication / equivalence in constant exprs.
+                BinaryOp::LogImplies => l.logic_impl(&r),
+                BinaryOp::LogEquiv => l.logic_equiv(&r),
                 BinaryOp::ArithShiftRight => l.arith_shift_right(&r),
                 _ => Value::zero(32),
             }
@@ -7445,7 +7448,12 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         }
         // `$unsigned`/`$signed` in const-eval — width-preserving identity.
         ExprKind::SystemCall { name, args } if name == "$unsigned" || name == "$signed" => {
-            args.first().map(|a| eval_const_expr_val(a, params)).unwrap_or_else(|| Value::zero(32))
+            let mut v = args.first().map(|a| eval_const_expr_val(a, params)).unwrap_or_else(|| Value::zero(32));
+            // §20.5: `$signed(x)` reinterprets x as signed so a later width
+            // extension sign-extends the MSB (`$signed(1'b1)` -> 2'b11), and
+            // `$unsigned(x)` forces zero-extension.
+            v.is_signed = name == "$signed";
+            v
         }
         // LRM §20.9 bit-introspection system functions in
         // value-producing const-eval position. Mirror the i64
