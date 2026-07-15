@@ -886,6 +886,19 @@ impl Parser {
                 }
                 let tok = self.bump();
                 let num = parse_number_literal(&tok.text);
+                // IEEE 1800-2017 §5.7.1: reject based literals whose value is
+                // empty or contains digits outside the base alphabet (e.g. the
+                // illegal `8'd-6`, tokenised as `8'd` `-` `6`).
+                if tok.text.contains('\'') {
+                    if let NumberLiteral::Integer { base, value, .. } = &num {
+                        if let Some(msg) = validate_based_literal_value(*base, value) {
+                            self.diagnostics.push(Diagnostic::error(
+                                format!("{}: '{}'", msg, tok.text),
+                                tok.span,
+                            ));
+                        }
+                    }
+                }
                 let expr = Expression::new(ExprKind::Number(num), self.span_from(start));
                 if self.current().kind == TokenKind::IntegerLiteral
                     && self.current().text == "'"
@@ -1632,7 +1645,18 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
             };
             (b, rest[1..].to_string())
         } else {
-            (NumberBase::Decimal, rest.to_string())
+            // `rest` is just the base specifier (e.g. "d", "b", "h", "o") with
+            // no value digits — an illegal based literal per §5.7.1. Record the
+            // base (so downstream validation reports the right alphabet) and
+            // leave the value empty; the caller flags the missing value.
+            let b = match rest.as_bytes().first().copied().unwrap_or(0) {
+                b'h' | b'H' => NumberBase::Hex,
+                b'b' | b'B' => NumberBase::Binary,
+                b'o' | b'O' => NumberBase::Octal,
+                b'd' | b'D' => NumberBase::Decimal,
+                _ => NumberBase::Decimal,
+            };
+            (b, String::new())
         };
         return NumberLiteral::Integer { size, signed, base, value, cached_val: Cell::new(None) };
     }
@@ -1693,6 +1717,31 @@ fn validate_number_literal(text: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// Validate the value digits of a *based* integer literal against its base
+/// (IEEE 1800-2017 §5.7.1). Returns `Some(message)` when the literal is
+/// illegal: an empty value (`8'd`), or a digit outside the base's alphabet
+/// (`4'b2`, `3'o8`, `8'hg`). The scanner accepts any alphanumeric/`?xz_` run as
+/// the value, so the base-specific legality check must happen here.
+///
+/// Tolerances, matching `Value::from_str_radix` and reference simulators:
+///  - whitespace between the base and the value is legal (`8'd 6`),
+///  - underscores are digit separators,
+///  - `x`/`z`/`?` (unknown / high-Z) are legal in every base, including decimal.
+fn validate_based_literal_value(base: NumberBase, value: &str) -> Option<String> {
+    let digits: String = value.chars().filter(|c| !c.is_whitespace() && *c != '_').collect();
+    if digits.is_empty() {
+        return Some("missing value digits in based number literal".to_string());
+    }
+    let in_base = |c: char| match base {
+        NumberBase::Binary  => matches!(c, '0' | '1' | 'x' | 'X' | 'z' | 'Z' | '?'),
+        NumberBase::Octal   => matches!(c, '0'..='7' | 'x' | 'X' | 'z' | 'Z' | '?'),
+        NumberBase::Decimal => matches!(c, '0'..='9' | 'x' | 'X' | 'z' | 'Z' | '?'),
+        NumberBase::Hex     => matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F' | 'x' | 'X' | 'z' | 'Z' | '?'),
+    };
+    digits.chars().find(|&c| !in_base(c))
+        .map(|bad| format!("invalid digit '{}' for {:?} base in number literal", bad, base))
 }
 
 /// Decode SystemVerilog string-literal escape sequences (IEEE 1800-2017 §5.9).
