@@ -742,6 +742,12 @@ pub struct ElaboratedModule {
     pub functions: HashMap<String, FunctionDeclaration>,
     /// Module-level task declarations.
     pub tasks: HashMap<String, TaskDeclaration>,
+    /// Declaring scope (package name) for package-level functions/tasks, so
+    /// `%m` inside a package subroutine yields `<pkg>.<name>` — matching
+    /// real simulators — instead of the top-module name. Keyed by the
+    /// function/task simple name (mirrors the `functions`/`tasks` maps).
+    #[serde(default)]
+    pub func_decl_scope: HashMap<String, String>,
     /// DPI imports by SV-visible symbol name.
     pub dpi_imports: HashMap<String, DpiImportSpec>,
     /// Clocking block definitions: name -> AST declaration.
@@ -1007,6 +1013,7 @@ impl ElaboratedModule {
             covergroups: HashMap::default(),
             functions: HashMap::default(),
             tasks: HashMap::default(),
+            func_decl_scope: HashMap::default(),
             dpi_imports: HashMap::default(),
             clocking_blocks: HashMap::default(),
             lets: HashMap::default(),
@@ -3480,43 +3487,101 @@ pub fn link_extern_methods(
     definitions: &HashMap<String, Definition>,
 ) {
     use crate::ast::decl::{ClassMethod, ClassMethodKind, PackageItem};
+    // Attach a single out-of-body method body to its class (replacing the
+    // `extern`/pure prototype, or inserting if none). Returns true if it was
+    // an out-of-body method (had a `ClassName::` scope).
+    let mut attach = |class_name: String,
+                      method_name: String,
+                      kind: ClassMethodKind,
+                      span: _| {
+        if let Some(cls) = elab.classes.get_mut(&class_name) {
+            if let Some(existing) = cls.methods.get_mut(&method_name) {
+                existing.kind = kind;
+            } else {
+                cls.methods.insert(
+                    method_name,
+                    ClassMethod { qualifiers: Vec::new(), kind, span },
+                );
+            }
+        }
+    };
     for def in definitions.values() {
-        let items: &[PackageItem] = match def {
-            Definition::Package(p) => &p.items,
-            _ => continue,
-        };
-        for item in items {
-            let (class_name, method_name, kind, span) = match item {
-                PackageItem::Function(f) => match &f.name.scope {
-                    Some(scope) => (
-                        scope.name.clone(),
-                        f.name.name.name.clone(),
-                        ClassMethodKind::Function(f.clone()),
-                        f.span,
-                    ),
-                    None => continue,
-                },
-                PackageItem::Task(t) => match &t.name.scope {
-                    Some(scope) => (
-                        scope.name.clone(),
-                        t.name.name.name.clone(),
-                        ClassMethodKind::Task(t.clone()),
-                        t.span,
-                    ),
-                    None => continue,
-                },
-                _ => continue,
-            };
-            if let Some(cls) = elab.classes.get_mut(&class_name) {
-                if let Some(existing) = cls.methods.get_mut(&method_name) {
-                    existing.kind = kind;
-                } else {
-                    cls.methods.insert(
-                        method_name,
-                        ClassMethod { qualifiers: Vec::new(), kind, span },
-                    );
+        // Out-of-body method definitions (`function Class::m(); ...`) appear
+        // in TWO places depending on where the source wrote them:
+        //   * `Definition::Package` items (a function inside a `package ... endpackage`),
+        //   * `Definition::Module/Interface/Program` items — compilation-unit-
+        //     scope (`$unit`) functions are injected into EVERY module by the
+        //     driver (see lib.rs), and UVM's `uvm_sequencer::new` etc. are
+        //     written this way. Scanning only packages (the old behaviour)
+        //     left `$unit` out-of-body bodies unlinked, so `new`/methods kept
+        //     their empty `extern` prototype and field initializers like
+        //     `seq_item_export = new(...)` never ran — every handle field
+        //     stayed null, surfacing as "Cannot connect to null port handle".
+        match def {
+            Definition::Package(p) => {
+                for item in &p.items {
+                    match item {
+                        PackageItem::Function(f) if f.name.scope.is_some() => {
+                            let scope = f.name.scope.as_ref().unwrap();
+                            attach(
+                                scope.name.clone(),
+                                f.name.name.name.clone(),
+                                ClassMethodKind::Function(f.clone()),
+                                f.span,
+                            );
+                        }
+                        PackageItem::Task(t) if t.name.scope.is_some() => {
+                            let scope = t.name.scope.as_ref().unwrap();
+                            attach(
+                                scope.name.clone(),
+                                t.name.name.name.clone(),
+                                ClassMethodKind::Task(t.clone()),
+                                t.span,
+                            );
+                        }
+                        _ => {}
+                    }
                 }
             }
+            Definition::Module(m) => link_module_items(&m.items, &mut attach),
+            Definition::Interface(i) => link_module_items(&i.items, &mut attach),
+            Definition::Program(p) => link_module_items(&p.items, &mut attach),
+            _ => {}
+        }
+    }
+}
+
+/// Helper for `link_extern_methods`: scan a module/interface/program body's
+/// items for out-of-body class method definitions (`ModuleItem::Function` /
+/// `Task` whose name carries a `ClassName::` scope) and attach each to its
+/// class. Mirrors the package-item path; `ModuleItem` and `PackageItem` wrap
+/// the same `FunctionDeclaration`/`TaskDeclaration` types.
+fn link_module_items<F>(items: &[crate::ast::decl::ModuleItem], attach: &mut F)
+where
+    F: FnMut(String, String, crate::ast::decl::ClassMethodKind, crate::ast::Span),
+{
+    use crate::ast::decl::{ClassMethodKind, ModuleItem};
+    for item in items {
+        match item {
+            ModuleItem::FunctionDeclaration(f) if f.name.scope.is_some() => {
+                let scope = f.name.scope.as_ref().unwrap();
+                attach(
+                    scope.name.clone(),
+                    f.name.name.name.clone(),
+                    ClassMethodKind::Function(f.clone()),
+                    f.span,
+                );
+            }
+            ModuleItem::TaskDeclaration(t) if t.name.scope.is_some() => {
+                let scope = t.name.scope.as_ref().unwrap();
+                attach(
+                    scope.name.clone(),
+                    t.name.name.name.clone(),
+                    ClassMethodKind::Task(t.clone()),
+                    t.span,
+                );
+            }
+            _ => {}
         }
     }
 }
@@ -9789,12 +9854,14 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         PackageItem::Function(fd) => {
                             if &fd.name.name.name == sym_name {
                                 elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                                elab.func_decl_scope.insert(fd.name.name.name.clone(), pkg_name.clone());
                                 found = true;
                             }
                         }
                         PackageItem::Task(td) => {
                             if &td.name.name.name == sym_name {
                                 elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                                elab.func_decl_scope.insert(td.name.name.name.clone(), pkg_name.clone());
                                 found = true;
                             }
                         }
@@ -9919,9 +9986,11 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             process_typedef(td, elab);
                         }
                         PackageItem::Function(fd) => {
+                            elab.func_decl_scope.insert(fd.name.name.name.clone(), pkg_name.clone());
                             elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                         }
                         PackageItem::Task(td) => {
+                            elab.func_decl_scope.insert(td.name.name.name.clone(), pkg_name.clone());
                             elab.tasks.insert(td.name.name.name.clone(), td.clone());
                         }
                         PackageItem::DPIImport(di) => {
