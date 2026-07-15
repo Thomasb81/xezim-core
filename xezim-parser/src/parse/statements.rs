@@ -496,7 +496,11 @@ impl Parser {
             stmts.push(self.parse_statement());
         }
         self.expect(TokenKind::KwEnd);
-        let _ = self.parse_end_label();
+        // §9.3.4: an end label must match the block name (if any).
+        match name {
+            Some(ref n) => { let _ = self.parse_block_end_label_checked(&n.name); }
+            None => { let _ = self.parse_end_label(); }
+        }
         Statement::new(StatementKind::SeqBlock { name, stmts }, self.span_from(start))
     }
 
@@ -515,7 +519,11 @@ impl Parser {
             TokenKind::KwJoin_none => { self.bump(); JoinType::JoinNone }
             _ => { self.expect(TokenKind::KwJoin); JoinType::Join }
         };
-        let _ = self.parse_end_label();
+        // §9.3.4: a fork/join end label must match the fork name (if any).
+        match name {
+            Some(ref n) => { let _ = self.parse_block_end_label_checked(&n.name); }
+            None => { let _ = self.parse_end_label(); }
+        }
         Statement::new(StatementKind::ParBlock { name, join_type, stmts }, self.span_from(start))
     }
 
