@@ -530,7 +530,11 @@ pub struct HierarchicalInstance {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PortConnection {
     Ordered(Option<Expression>),
-    Named { name: Identifier, expr: Option<Expression> },
+    /// `.name(expr)`, `.name()` (explicitly unconnected) or `.name` (implicit
+    /// connection to a same-named net). `implicit` is true only for the last,
+    /// parenthesis-free form (§23.3.2.2), which requires a matching net; the
+    /// `.name()` form is an explicit no-connect and imposes no such requirement.
+    Named { name: Identifier, expr: Option<Expression>, implicit: bool },
     Wildcard,
 }
 

@@ -1338,19 +1338,26 @@ impl Parser {
         if self.at(TokenKind::RParen) { self.bump(); return conns; }
         loop {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
-            if self.at(TokenKind::Dot) {
+            if self.at(TokenKind::Comma) {
+                // Empty positional connection: `dut(, result)`. An omitted
+                // ordered port takes its declared default (§23.2.2.4) or is
+                // left unconnected.
+                conns.push(PortConnection::Ordered(None));
+            } else if self.at(TokenKind::Dot) {
                 self.bump();
                 if self.at(TokenKind::Star) { self.bump(); conns.push(PortConnection::Wildcard); }
                 else {
                     let nm = self.parse_identifier();
-                    let ex = if self.eat(TokenKind::LParen).is_some() {
+                    let (ex, had_parens) = if self.eat(TokenKind::LParen).is_some() {
                         let e = if !self.at(TokenKind::RParen) { Some(self.parse_expression()) } else { None };
-                        self.expect(TokenKind::RParen); e
-                    } else { None };
-                    conns.push(PortConnection::Named { name: nm, expr: ex });
+                        self.expect(TokenKind::RParen); (e, true)
+                    } else { (None, false) };
+                    conns.push(PortConnection::Named { name: nm, expr: ex, implicit: !had_parens });
                 }
             } else { conns.push(PortConnection::Ordered(Some(self.parse_expression()))); }
             if self.eat(TokenKind::Comma).is_none() { break; }
+            // Trailing empty positional connection: `dut(result, )`.
+            if self.at(TokenKind::RParen) { conns.push(PortConnection::Ordered(None)); break; }
         }
         self.expect(TokenKind::RParen); conns
     }

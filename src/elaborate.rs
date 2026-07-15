@@ -2053,6 +2053,7 @@ pub fn elaborate_module_with_defs(
         }
     }
 
+
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -2246,7 +2247,12 @@ pub fn elaborate_module_with_defs(
                     _ => None,
                 };
                 let width = match &dd.data_type {
-                    DataType::TypeReference { name, .. } => {
+                    // A bare typedef reference takes the registered typedef
+                    // width, but packed dimensions on the DECLARATION
+                    // (`foo_s [1:0][3:0] x`) multiply it — resolve_type_width
+                    // applies both, so only take the shortcut when there are
+                    // no such dims.
+                    DataType::TypeReference { name, dimensions, .. } if dimensions.is_empty() => {
                         elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
                     }
                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
@@ -5423,7 +5429,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     _ => None,
                 };
                 let width = match &dd.data_type {
-                    DataType::TypeReference { name, .. } => {
+                    // A bare typedef reference takes the registered typedef
+                    // width, but packed dimensions on the DECLARATION
+                    // (`foo_s [1:0][3:0] x`) multiply it — resolve_type_width
+                    // applies both, so only take the shortcut when there are
+                    // no such dims.
+                    DataType::TypeReference { name, dimensions, .. } if dimensions.is_empty() => {
                         elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
                     }
                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
@@ -8199,14 +8210,16 @@ fn collect_effective_items(items: &[ModuleItem], params: &HashMap<String, Value>
 }
 
 fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -> bool {
+    // Only an actual interface definition makes a port an interface port. A
+    // `TypeReference` whose name resolves to a struct/enum/typedef (also stored
+    // in `definitions`) is an ordinary data port — routing it as an interface
+    // stranded its connection (e.g. a `sample_t` output never drove its net).
     match dt {
         DataType::TypeReference { name, .. } => {
-            if definitions.contains_key(&name.name.name) { return true; }
-            false
+            matches!(definitions.get(&name.name.name), Some(Definition::Interface(_)))
         }
         DataType::Interface { name, .. } => {
-            if definitions.contains_key(&name.name) { return true; }
-            false
+            matches!(definitions.get(&name.name), Some(Definition::Interface(_)))
         }
         _ => false,
     }
@@ -8571,61 +8584,108 @@ fn inline_module_items(
                 let parent_local_names = &*prepared_source.local_names;
 
                 if !hi.connections.is_empty() {
-                    match &hi.connections[0] { // Simplification: check if first is wildcard
-                        PortConnection::Wildcard => {
-                            // Wildcard: connect all ports to same-named signals in parent
-                            match sub_mod.ports() {
-                                PortList::Ansi(ports) => {
-                                    for port in ports {
-                                        let name = &port.name.name;
-                                        let parent_name = format!("{}{}", prefix, name);
-                                        let is_if_port = port.data_type.as_ref()
-                                            .map(|dt| is_interface_type(dt, definitions))
-                                            .unwrap_or(false);
-                                        if is_if_port {
-                                            sub_interface_map.insert(name.clone(), parent_name.clone());
-                                        } else {
-                                            port_map.insert(name.clone(), make_ident_expr(&parent_name));
+                    // §23.3.2: a connection list is either positional (ordered)
+                    // or by-name. By-name lists may mix explicit `.p(e)`,
+                    // implicit `.p`, no-connect `.p()`, and one `.*` wildcard.
+                    // The wildcard fills every port NOT otherwise listed with a
+                    // same-named net; explicit entries always win over `.*`.
+                    let has_wildcard = hi
+                        .connections
+                        .iter()
+                        .any(|c| matches!(c, PortConnection::Wildcard));
+                    let has_named = hi
+                        .connections
+                        .iter()
+                        .any(|c| matches!(c, PortConnection::Named { .. }));
+                    if has_wildcard || has_named {
+                        let mut explicit: std::collections::HashSet<String> =
+                            std::collections::HashSet::default();
+                        for conn in &hi.connections {
+                            if let PortConnection::Named { name, expr, implicit } = conn {
+                                explicit.insert(name.name.clone());
+                                if let Some(e) = expr {
+                                    let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    if prepared_source.interface_ports.contains(&name.name) {
+                                        if let ExprKind::Ident(hier) = &rewritten_e.kind {
+                                            let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                                            sub_interface_map.insert(name.name.clone(), if_full_path);
                                         }
+                                    } else {
+                                        port_map.insert(name.name.clone(), rewritten_e);
+                                    }
+                                } else if *implicit {
+                                    // `.p` — connect to the same-named parent net.
+                                    let parent_name = format!("{}{}", prefix, name.name);
+                                    if prepared_source.interface_ports.contains(&name.name) {
+                                        sub_interface_map.insert(name.name.clone(), parent_name);
+                                    } else {
+                                        port_map.insert(name.name.clone(), make_ident_expr(&parent_name));
                                     }
                                 }
-                                _ => {}
+                                // `.p()` — explicit no-connect: leave unbound.
                             }
                         }
-                        _ => {
-                            for (i, conn) in hi.connections.iter().enumerate() {
-                                match conn {
-                                    PortConnection::Named { name, expr } => {
-                                        if let Some(e) = expr {
-                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
-                                            if prepared_source.interface_ports.contains(&name.name) {
-                                                if let ExprKind::Ident(hier) = &rewritten_e.kind {
-                                                    let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
-                                                    sub_interface_map.insert(name.name.clone(), if_full_path);
-                                                }
-                                            } else {
-                                                port_map.insert(name.name.clone(), rewritten_e);
-                                            }
-                                        }
+                        if has_wildcard {
+                            if let PortList::Ansi(ports) = sub_mod.ports() {
+                                for port in ports {
+                                    let name = &port.name.name;
+                                    if explicit.contains(name)
+                                        || port_map.contains_key(name)
+                                        || sub_interface_map.contains_key(name)
+                                    {
+                                        continue;
                                     }
-                                    PortConnection::Ordered(expr) => {
-                                        if let Some(e) = expr {
-                                            let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
-                                            if let Some(port) = sub_mod.ports().get(i) {
-                                                let port_name = port.name();
-                                                if prepared_source.interface_ports.contains(port_name) {
-                                                    if let ExprKind::Ident(hier) = &rewritten_e.kind {
-                                                        let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
-                                                        sub_interface_map.insert(port_name.to_string(), if_full_path);
-                                                    }
-                                                } else {
-                                                    port_map.insert(port_name.to_string(), rewritten_e);
-                                                }
-                                            }
-                                        }
+                                    let parent_name = format!("{}{}", prefix, name);
+                                    let is_if_port = port.data_type.as_ref()
+                                        .map(|dt| is_interface_type(dt, definitions))
+                                        .unwrap_or(false);
+                                    if is_if_port {
+                                        sub_interface_map.insert(name.clone(), parent_name);
+                                    } else {
+                                        port_map.insert(name.clone(), make_ident_expr(&parent_name));
                                     }
-                                    _ => {}
                                 }
+                            }
+                        }
+                    } else {
+                        for (i, conn) in hi.connections.iter().enumerate() {
+                            if let PortConnection::Ordered(expr) = conn {
+                                if let Some(e) = expr {
+                                    let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    if let Some(port) = sub_mod.ports().get(i) {
+                                        let port_name = port.name();
+                                        if prepared_source.interface_ports.contains(port_name) {
+                                            if let ExprKind::Ident(hier) = &rewritten_e.kind {
+                                                let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                                                sub_interface_map.insert(port_name.to_string(), if_full_path);
+                                            }
+                                        } else {
+                                            port_map.insert(port_name.to_string(), rewritten_e);
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // §23.2.2.4: an input port left unconnected (empty ordered
+                // slot `dut(,x)`, named `.i()`, or absent from a short
+                // connection list) that declares a default value is driven by
+                // that default. Its sub-scope constant is substituted verbatim
+                // for the port name throughout the inlined body.
+                if let PortList::Ansi(ports) = sub_mod.ports() {
+                    for port in ports {
+                        let name = &port.name.name;
+                        if let Some(def) = &port.default {
+                            let is_input =
+                                !matches!(port.direction, Some(PortDirection::Output)
+                                    | Some(PortDirection::Inout));
+                            if is_input
+                                && !port_map.contains_key(name)
+                                && !sub_interface_map.contains_key(name)
+                            {
+                                port_map.insert(name.clone(), def.clone());
                             }
                         }
                     }
@@ -8669,7 +8729,11 @@ fn inline_module_items(
                 // positional overrides silently dropped, leaving the sim
                 // running with default sizes (4-element memories instead of
                 // 2 M).
-                let mut sub_param_decls: Vec<&ParameterDeclaration> = sub_mod.params().iter().collect();
+                // §6.20.4: a `localparam` in the parameter port list is NOT
+                // overridable, so it occupies no positional slot. Exclude it so
+                // `#(4, 6)` against `#(parameter A, localparam B, parameter C)`
+                // binds A and C (not A and B).
+                let mut sub_param_decls: Vec<&ParameterDeclaration> = sub_mod.params().iter().filter(|p| !p.local).collect();
                 for it in sub_mod.items() {
                     if let ModuleItem::ParameterDeclaration(pd) = it {
                         sub_param_decls.push(pd);
@@ -8926,6 +8990,19 @@ fn inline_module_items(
                                 .unwrap_or(1);
                             let sig_name = format!("{}{}", inst_prefix, port.name.name);
                             let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
+                            // Register the packed-struct field layout for a
+                            // struct-typed port so a member write to the port's
+                            // internal signal (`dut.out.a` for an `output
+                            // sample_t out`) resolves the field — otherwise the
+                            // write was dropped and the output stayed X.
+                            if let Some(dt) = &port.data_type {
+                                if let Some(fields) = flatten_struct_fields(dt, &sub_merged_params, &elab.typedefs, &elab.typedef_types) {
+                                    if !fields.is_empty() {
+                                        tls_register_struct_layout(&sig_name, &fields);
+                                        elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                    }
+                                }
+                            }
                             elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                 name: sig_name, width,
                                 is_signed: port.data_type.as_ref().map(|dt| is_type_signed(dt)).unwrap_or(false),
@@ -10298,6 +10375,14 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             };
                             let is_signed = is_type_signed(&dd.data_type);
                             let is_real = is_type_real(&dd.data_type);
+                            // Register the packed-struct field layout for an
+                            // imported struct variable so a package subroutine's
+                            // member write (`s.v = ...` in an imported task)
+                            // resolves the field instead of missing the shared
+                            // storage (§26.3).
+                            let struct_fields = flatten_struct_fields(
+                                &dd.data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types,
+                            ).filter(|f| !f.is_empty());
                             for decl in &dd.declarators {
                                 let v = if let Some(init) = &decl.init {
                                     eval_init_for_width(init, &elab.parameters, width)
@@ -10307,6 +10392,10 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                     width, is_signed, is_real, direction: None,
                                     value: v, type_name: get_type_name(&dd.data_type),
                                 });
+                                if let Some(fields) = &struct_fields {
+                                    tls_register_struct_layout(&decl.name.name, fields);
+                                    elab.packed_struct_fields.insert(decl.name.name.clone(), fields.clone());
+                                }
                             }
                         }
                         _ => {}
