@@ -3995,26 +3995,73 @@ fn validate_modport_writes(elab: &ElaboratedModule) -> Result<(), String> {
     Ok(())
 }
 
+/// IEEE 1800-2017 §9.2.2: legality of `always_comb` / `always_latch` /
+/// `always_ff` bodies, and §9.2.2.1 the "an always process must advance
+/// simulation time" (no zero-delay infinite loop) rule for a plain `always`.
+///
+///  * §9.2.2.2 always_comb / §9.2.2.3 always_latch: the body may contain no
+///    blocking delay control (`#…`), no event control (`@…`), and no `wait`
+///    statement — the sensitivity list is inferred, not written.
+///  * §9.2.2.3 always_latch: the inferred sensitivity list must be non-empty
+///    (a latch with no inputs has "no event control").
+///  * §9.2.2.4 always_ff: the first statement must be a single event control;
+///    no further event/delay/wait controls may appear in the body.
+///  * §9.2.2.1 plain always: the process must be guaranteed to advance
+///    simulation time on every iteration, else it is a zero-delay livelock
+///    (Icarus: "always process does not have any delay").
 fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), String> {
     use crate::ast::decl::AlwaysKind;
-    use crate::ast::stmt::{Statement, StatementKind};
-    fn walk_no_timing(s: &Statement) -> Result<(), String> {
+    use crate::ast::expr::{ExprKind, NumberLiteral};
+    use crate::ast::stmt::{JoinType, Statement, StatementKind, TimingControl};
+
+    fn kw(k: AlwaysKind) -> &'static str {
+        match k {
+            AlwaysKind::AlwaysComb => "always_comb",
+            AlwaysKind::AlwaysLatch => "always_latch",
+            AlwaysKind::AlwaysFf => "always_ff",
+            AlwaysKind::Always => "always",
+        }
+    }
+
+    // §9.2.2.2/§9.2.2.3/§9.2.2.4: no delay/event/wait control anywhere in the
+    // body (for always_ff this is called on the body AFTER its single leading
+    // event control has been peeled off).
+    fn walk_forbid(s: &Statement, k: AlwaysKind) -> Result<(), String> {
         match &s.kind {
-            StatementKind::TimingControl { .. } => {
-                Err("`always_ff` body must not contain a nested event/timing control \
-                     (IEEE 1800-2017 §9.2.2.4)".into())
-            }
+            StatementKind::TimingControl { control, .. } => match control {
+                TimingControl::Delay(_) => Err(format!(
+                    "error: a blocking delay is not allowed in an {} process \
+                     (IEEE 1800-2017 §9.2.2)",
+                    kw(k)
+                )),
+                TimingControl::Event(_) => Err(format!(
+                    "error: an event control is not allowed in an {} process \
+                     (IEEE 1800-2017 §9.2.2)",
+                    kw(k)
+                )),
+            },
+            StatementKind::Wait { .. } | StatementKind::WaitFork => Err(format!(
+                "error: a wait statement is not allowed in an {} process \
+                 (IEEE 1800-2017 §9.2.2)",
+                kw(k)
+            )),
             StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
-                for s in stmts { walk_no_timing(s)?; }
+                for st in stmts {
+                    walk_forbid(st, k)?;
+                }
                 Ok(())
             }
             StatementKind::If { then_stmt, else_stmt, .. } => {
-                walk_no_timing(then_stmt)?;
-                if let Some(e) = else_stmt { walk_no_timing(e)?; }
+                walk_forbid(then_stmt, k)?;
+                if let Some(e) = else_stmt {
+                    walk_forbid(e, k)?;
+                }
                 Ok(())
             }
             StatementKind::Case { items, .. } => {
-                for it in items { walk_no_timing(&it.stmt)?; }
+                for it in items {
+                    walk_forbid(&it.stmt, k)?;
+                }
                 Ok(())
             }
             StatementKind::For { body, .. }
@@ -4022,19 +4069,230 @@ fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), Stri
             | StatementKind::DoWhile { body, .. }
             | StatementKind::Forever { body }
             | StatementKind::Repeat { body, .. }
-            | StatementKind::Foreach { body, .. } => walk_no_timing(body),
+            | StatementKind::Foreach { body, .. } => walk_forbid(body, k),
             _ => Ok(()),
         }
     }
+
+    // §9.2.2.3: does the body read at least one identifier (its inferred
+    // sensitivity)? A latch with an empty sensitivity list is illegal.
+    fn expr_reads_ident(e: &crate::ast::expr::Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(_) => true,
+            ExprKind::Paren(x) | ExprKind::Unary { operand: x, .. } => expr_reads_ident(x),
+            ExprKind::Binary { left, right, .. } => {
+                expr_reads_ident(left) || expr_reads_ident(right)
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                expr_reads_ident(condition)
+                    || expr_reads_ident(then_expr)
+                    || expr_reads_ident(else_expr)
+            }
+            ExprKind::Index { expr, index } => {
+                expr_reads_ident(expr) || expr_reads_ident(index)
+            }
+            ExprKind::RangeSelect { expr, left, right, .. } => {
+                expr_reads_ident(expr) || expr_reads_ident(left) || expr_reads_ident(right)
+            }
+            ExprKind::Concatenation(xs) => xs.iter().any(expr_reads_ident),
+            ExprKind::Replication { count, exprs } => {
+                expr_reads_ident(count) || exprs.iter().any(expr_reads_ident)
+            }
+            ExprKind::Call { func, args } => {
+                // A function call's return generally depends on its arguments
+                // AND on whatever module vars it reads — either way the latch
+                // has a live sensitivity. Treat any call as a read.
+                expr_reads_ident(func) || args.iter().any(expr_reads_ident) || true
+            }
+            ExprKind::MemberAccess { expr, .. } => expr_reads_ident(expr),
+            _ => false,
+        }
+    }
+    fn stmt_reads_ident(s: &Statement) -> bool {
+        match &s.kind {
+            StatementKind::BlockingAssign { rvalue, .. }
+            | StatementKind::NonblockingAssign { rvalue, .. } => expr_reads_ident(rvalue),
+            StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+                expr_reads_ident(condition)
+                    || stmt_reads_ident(then_stmt)
+                    || else_stmt.as_ref().map_or(false, |e| stmt_reads_ident(e))
+            }
+            StatementKind::Case { expr, items, .. } => {
+                expr_reads_ident(expr) || items.iter().any(|it| stmt_reads_ident(&it.stmt))
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                stmts.iter().any(stmt_reads_ident)
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Foreach { body, .. } => stmt_reads_ident(body),
+            StatementKind::Expr(e) => expr_reads_ident(e),
+            _ => false,
+        }
+    }
+
+    // §9.2.2.1: CAN this statement block the always thread (advance simulation
+    // time or wait on an event) before it loops? Deliberately OPTIMISTIC —
+    // returns true whenever we cannot PROVE the statement completes in zero
+    // time. Two things force optimism: (1) intra-assignment timing
+    // (`x = #10 y`, `q <= #1 d`) is discarded by the parser, so an assignment
+    // may carry a hidden delay; (2) an `always task();` may block inside the
+    // (un-inlined) task body. We therefore reject only the structural cases we
+    // can prove are zero-delay livelocks — chiefly `fork … join_none` and a
+    // `join_any`/`join` whose parent unblocks at time 0 — which is exactly
+    // what Icarus flags as "always process does not have any delay".
+    fn is_literal_zero(e: &crate::ast::expr::Expression) -> bool {
+        match &e.kind {
+            ExprKind::Paren(x) => is_literal_zero(x),
+            ExprKind::Number(NumberLiteral::Integer { value, .. }) => {
+                value.chars().filter(|c| *c != '_').all(|c| c == '0')
+            }
+            ExprKind::Number(NumberLiteral::Real(v))
+            | ExprKind::Number(NumberLiteral::Time(v)) => *v == 0.0,
+            _ => false,
+        }
+    }
+    fn can_block(s: &Statement) -> bool {
+        match &s.kind {
+            StatementKind::TimingControl { control, .. } => match control {
+                // `#0` is a zero delay (same time slot) — does not advance.
+                TimingControl::Delay(e) => !is_literal_zero(e),
+                TimingControl::Event(_) => true,
+            },
+            StatementKind::Wait { .. } | StatementKind::WaitFork => true,
+            StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(can_block),
+            StatementKind::ParBlock { join_type, stmts, .. } => match join_type {
+                // join: parent unblocks when the LAST child finishes.
+                JoinType::Join => stmts.iter().any(can_block),
+                // join_any: parent unblocks when the FIRST child finishes, so
+                // every child must consume time for the parent to advance.
+                JoinType::JoinAny => !stmts.is_empty() && stmts.iter().all(can_block),
+                // join_none: parent never blocks on the children.
+                JoinType::JoinNone => false,
+            },
+            StatementKind::Forever { body }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::For { body, .. }
+            | StatementKind::Foreach { body, .. } => can_block(body),
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                can_block(then_stmt) || else_stmt.as_ref().map_or(false, |e| can_block(e))
+            }
+            StatementKind::Case { items, .. } => items.iter().any(|it| can_block(&it.stmt)),
+            // Assignments may carry (parser-discarded) intra-assignment timing;
+            // an expression statement may be a time-consuming task call.
+            StatementKind::BlockingAssign { .. }
+            | StatementKind::NonblockingAssign { .. }
+            | StatementKind::Expr(_) => true,
+            _ => false,
+        }
+    }
+
+    // Only fork-based bodies are flagged as no-delay livelocks here: a plain
+    // `always` whose non-advancement comes from a bare zero-delay loop
+    // (`always begin #0; end`, `always assign x = y;`) is left to the
+    // runtime's zero-delay livelock guard, matching prior behavior. The
+    // fork/join_none / min-zero-join_any cases (always4A / always4B) cannot be
+    // caught at runtime the same way (they spawn children), so we reject them
+    // at elaboration exactly as Icarus does.
+    fn contains_fork(s: &Statement) -> bool {
+        match &s.kind {
+            StatementKind::ParBlock { .. } => true,
+            StatementKind::SeqBlock { stmts, .. } => stmts.iter().any(contains_fork),
+            StatementKind::TimingControl { stmt, .. } => contains_fork(stmt),
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                contains_fork(then_stmt)
+                    || else_stmt.as_ref().map_or(false, |e| contains_fork(e))
+            }
+            StatementKind::Case { items, .. } => items.iter().any(|it| contains_fork(&it.stmt)),
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Foreach { body, .. }
+            | StatementKind::Wait { stmt: body, .. } => contains_fork(body),
+            _ => false,
+        }
+    }
+
     for ab in &elab.always_blocks {
-        if !matches!(ab.kind, AlwaysKind::AlwaysFf) { continue; }
-        // The outermost statement is allowed to be the single event
-        // control; descend through it once before enforcing.
-        let body = match &ab.stmt.kind {
-            StatementKind::TimingControl { stmt, .. } => stmt.as_ref(),
-            _ => &ab.stmt,
-        };
-        walk_no_timing(body)?;
+        match ab.kind {
+            AlwaysKind::AlwaysFf => {
+                // §9.2.2.4: exactly ONE event control, and it must be the first
+                // statement. Two legal spellings:
+                //   (1) `always_ff @(posedge clk) begin … end`
+                //         → the outer statement IS the event control; every
+                //           statement in its body must be free of timing.
+                //   (2) `always_ff begin @(posedge clk) …; … end`
+                //         → the FIRST statement inside the block is the event
+                //           control; the remaining statements must be free of
+                //           timing.
+                // Any further `@…`/`#…`/`wait` in the body is illegal.
+                match &ab.stmt.kind {
+                    StatementKind::TimingControl {
+                        control: TimingControl::Event(_),
+                        stmt,
+                    } => {
+                        walk_forbid(stmt, AlwaysKind::AlwaysFf)?;
+                    }
+                    StatementKind::SeqBlock { stmts, .. }
+                        if matches!(
+                            stmts.first().map(|s| &s.kind),
+                            Some(StatementKind::TimingControl {
+                                control: TimingControl::Event(_),
+                                ..
+                            })
+                        ) =>
+                    {
+                        for (i, st) in stmts.iter().enumerate() {
+                            if i == 0 {
+                                // the required leading event control — peel it,
+                                // its inner statement is the real body head.
+                                if let StatementKind::TimingControl { stmt, .. } = &st.kind {
+                                    walk_forbid(stmt, AlwaysKind::AlwaysFf)?;
+                                }
+                            } else {
+                                walk_forbid(st, AlwaysKind::AlwaysFf)?;
+                            }
+                        }
+                    }
+                    _ => {
+                        return Err(
+                            "error: the first statement of an always_ff process must be an \
+                             event control statement (IEEE 1800-2017 §9.2.2.4)"
+                                .into(),
+                        )
+                    }
+                }
+            }
+            AlwaysKind::AlwaysComb => {
+                walk_forbid(&ab.stmt, AlwaysKind::AlwaysComb)?;
+            }
+            AlwaysKind::AlwaysLatch => {
+                walk_forbid(&ab.stmt, AlwaysKind::AlwaysLatch)?;
+                if !stmt_reads_ident(&ab.stmt) {
+                    return Err(
+                        "error: always_latch process has no event control — its inferred \
+                         sensitivity list is empty (IEEE 1800-2017 §9.2.2.3)"
+                            .into(),
+                    );
+                }
+            }
+            AlwaysKind::Always => {
+                if !can_block(&ab.stmt) && contains_fork(&ab.stmt) {
+                    return Err(
+                        "error: always process does not have any delay; a zero-delay infinite \
+                         loop will occur (IEEE 1800-2017 §9.2.2.1)"
+                            .into(),
+                    );
+                }
+            }
+        }
     }
     Ok(())
 }
