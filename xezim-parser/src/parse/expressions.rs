@@ -5,6 +5,7 @@ use crate::ast::expr::*;
 use crate::ast::Span;
 use crate::ast::Identifier;
 use crate::lexer::token::TokenKind;
+use crate::diagnostics::Diagnostic;
 use std::cell::Cell;
 
 impl Parser {
@@ -876,6 +877,13 @@ impl Parser {
 
             // Number literals
             TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral => {
+                // IEEE 1800-2017 §5.7: reject malformed literals that would
+                // otherwise be silently coerced to a wrong value (zero-size
+                // based literal, decimal with multiple/mixed x·z). The span of
+                // the current (pre-bump) token points at the literal itself.
+                if let Some(msg) = validate_number_literal(&self.current().text) {
+                    self.error(msg);
+                }
                 let tok = self.bump();
                 let num = parse_number_literal(&tok.text);
                 let expr = Expression::new(ExprKind::Number(num), self.span_from(start));
@@ -907,14 +915,16 @@ impl Parser {
             // String literal
             TokenKind::StringLiteral => {
                 let tok = self.bump();
-                let s = decode_string_escapes(&tok.text[1..tok.text.len()-1]);
+                let (s, diags) = decode_string_escapes_checked(&tok.text[1..tok.text.len()-1]);
+                self.push_string_escape_diags(diags, tok.span);
                 Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
             }
 
             // IEEE 1800-2023 §5.9: triple-quoted string literal.
             TokenKind::TripleStringLiteral => {
                 let tok = self.bump();
-                let s = decode_string_escapes(&tok.text[3..tok.text.len()-3]);
+                let (s, diags) = decode_string_escapes_checked(&tok.text[3..tok.text.len()-3]);
+                self.push_string_escape_diags(diags, tok.span);
                 Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
             }
 
@@ -1558,6 +1568,18 @@ impl Parser {
             _ => None,
         }
     }
+
+    /// Attach string-escape diagnostics (from `decode_string_escapes_checked`)
+    /// at the given span. `is_error == true` becomes an Error, otherwise Warning.
+    fn push_string_escape_diags(&mut self, diags: Vec<(bool, String)>, span: Span) {
+        for (is_error, msg) in diags {
+            self.diagnostics.push(if is_error {
+                Diagnostic::error(msg, span)
+            } else {
+                Diagnostic::warning(msg, span)
+            });
+        }
+    }
 }
 
 fn prefix_bp() -> u8 { 25 }
@@ -1624,9 +1646,67 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
     }
 }
 
+/// Validate a numeric literal token per IEEE 1800-2017 §5.7. Returns an error
+/// message for a malformed literal that the value layer would otherwise coerce
+/// to a wrong value; a well-formed literal returns `None`. Only based literals
+/// (`<size>'<base><value>`) carry the structure inspected here — plain
+/// decimals, reals and time literals have no apostrophe and return `None`.
+fn validate_number_literal(text: &str) -> Option<String> {
+    let apos = text.find('\'')?;
+    // §5.7.1: a size, when present, must be a positive nonzero constant.
+    let size_str = text[..apos].trim().replace('_', "");
+    if !size_str.is_empty() {
+        if let Ok(sz) = size_str.parse::<u128>() {
+            if sz == 0 {
+                return Some(format!(
+                    "size of based literal '{}' must be greater than zero (IEEE 1800-2017 §5.7.1)",
+                    text.trim()
+                ));
+            }
+        }
+    }
+    // Split off an optional signed marker, then the base specifier.
+    let rest = &text[apos + 1..];
+    let rest = if rest.starts_with('s') || rest.starts_with('S') { &rest[1..] } else { rest };
+    let base = match rest.as_bytes().first() {
+        Some(b) => *b,
+        None => return None, // bare `'` (cast operator) — nothing to validate
+    };
+    // §5.7.1: a decimal literal's value is either digits, OR a single `x`, OR a
+    // single `z`/`?` (optionally with `_`) — never multiple, never mixed with
+    // numeric digits, never a mix of x and z.
+    if matches!(base, b'd' | b'D') {
+        let value: String = rest[1..]
+            .chars()
+            .filter(|c| !c.is_whitespace() && *c != '_')
+            .collect();
+        let has_xz = value.chars().any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?'));
+        if has_xz {
+            let single_x = value.len() == 1 && matches!(value.as_bytes()[0], b'x' | b'X');
+            let single_z = value.len() == 1 && matches!(value.as_bytes()[0], b'z' | b'Z' | b'?');
+            if !single_x && !single_z {
+                return Some(format!(
+                    "malformed decimal literal '{}': a decimal x/z value must be a single 'x' or a single 'z' (IEEE 1800-2017 §5.7.1)",
+                    text.trim()
+                ));
+            }
+        }
+    }
+    None
+}
+
 /// Decode SystemVerilog string-literal escape sequences (IEEE 1800-2017 §5.9).
-/// Input is the *interior* of the literal (no surrounding quotes).
-fn decode_string_escapes(raw: &str) -> String {
+/// Input is the *interior* of the literal (no surrounding quotes). Returns the
+/// decoded bytes plus any diagnostics (an error for `\x` with no hex digit, a
+/// warning for an unknown letter escape); the caller attaches them at the
+/// string token's span.
+fn decode_string_escapes_checked(raw: &str) -> (String, Vec<(bool, String)>) {
+    let mut diags: Vec<(bool, String)> = Vec::new();
+    let s = decode_string_escapes_inner(raw, &mut diags);
+    (s, diags)
+}
+
+fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> String {
     let bytes = raw.as_bytes();
     let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
     let mut i = 0;
@@ -1661,6 +1741,10 @@ fn decode_string_escapes(raw: &str) -> String {
                 i = j;
             }
             b'x' => {
+                // IEEE 1800-2017 §5.9: `\x` MUST be followed by at least one hex
+                // digit. Previously an absent digit silently emitted a NUL and
+                // let the trailing characters through (`"\xGG"` → NUL,`GG`); that
+                // is a lexical error, not silent garbage.
                 let mut j = i + 2;
                 let mut val: u32 = 0;
                 let mut digits = 0;
@@ -1674,13 +1758,25 @@ fn decode_string_escapes(raw: &str) -> String {
                     j += 1;
                     digits += 1;
                 }
-                out.push((val & 0xff) as u8);
-                i = j;
+                if digits == 0 {
+                    diags.push((true, "invalid \\x escape in string literal: expected at least one hex digit (IEEE 1800-2017 §5.9)".to_string()));
+                    // Emit nothing for the malformed escape and skip the `\x` so
+                    // the remaining characters are still processed normally.
+                    i += 2;
+                } else {
+                    out.push((val & 0xff) as u8);
+                    i = j;
+                }
             }
             _ => {
-                // Unknown escape: per §5.9, the backslash is preserved and a
-                // warning is recommended. We drop the backslash to follow what
-                // most simulators do in practice.
+                // Unknown letter escape: §5.9 leaves this implementation-defined.
+                // Icarus (the oracle) drops the backslash and keeps the char, so
+                // we match that VALUE, but emit a warning so the mangle is not
+                // silent.
+                diags.push((false, format!(
+                    "unknown escape sequence '\\{}' in string literal (IEEE 1800-2017 §5.9)",
+                    bytes[i + 1] as char
+                )));
                 out.push(bytes[i + 1]);
                 i += 2;
             }

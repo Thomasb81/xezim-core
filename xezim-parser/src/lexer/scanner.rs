@@ -466,11 +466,21 @@ impl<'a> Lexer<'a> {
         if self.pos < self.input.len() && self.input[self.pos] == b'.' && self.input.get(self.pos + 1).map_or(false, |c| c.is_ascii_digit()) {
             self.pos += 1;
             while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') { self.pos += 1; }
-            // Optional exponent
+            // Optional exponent. IEEE 1800-2017 §5.7.2: the exponent REQUIRES
+            // at least one digit after `e[+-]`. Mirror the no-dot path below and
+            // backtrack when it is missing, so `1.0e+`/`1.0e`/`1.0e-` do not
+            // silently consume `e[+-]` into a token that later parses to 0.
+            // Leaving `e...` unconsumed re-lexes it as an identifier, yielding a
+            // real syntax error rather than silent garbage.
             if self.pos < self.input.len() && matches!(self.input[self.pos], b'e' | b'E') {
+                let exp_start = self.pos;
                 self.pos += 1;
                 if self.pos < self.input.len() && matches!(self.input[self.pos], b'+' | b'-') { self.pos += 1; }
-                while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') { self.pos += 1; }
+                if self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
+                    while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') { self.pos += 1; }
+                } else {
+                    self.pos = exp_start; // malformed exponent: no digits after e[+-]
+                }
             }
             // Time-unit suffix on a real (1800-2017 §3.14.2): treat
             // `1.250ns` as a single TimeLiteral, not Real + Ident.
