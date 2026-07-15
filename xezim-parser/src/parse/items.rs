@@ -1002,6 +1002,15 @@ impl Parser {
             }
         }
         let data_type = if self.is_data_type_keyword() { self.parse_data_type() }
+            // User-defined typedef net type — `wire dword foo;`,
+            // `wire word_t a, b;`, `wire pkg::t x;`, `wire t#(8) x;`. A bare
+            // identifier followed by another identifier / `::` / `#` is a type
+            // name, not the net name (mirrors the port path). `[` is excluded
+            // to preserve `wire foo [3:0];` (unpacked net array named foo).
+            else if self.at(TokenKind::Identifier)
+                && matches!(self.peek_kind(),
+                    TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)
+            { self.parse_data_type() }
             else if self.at(TokenKind::LBracket) {
                 let dimensions = self.parse_packed_dimensions();
                 DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }

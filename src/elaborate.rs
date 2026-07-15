@@ -2175,6 +2175,24 @@ pub fn elaborate_module_with_defs(
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     elab.nets.insert(decl.name.name.clone());
+                    // §7.2.1: a packed-struct-typed NET needs its field layout
+                    // registered in `packed_struct_fields` so member reads/writes
+                    // (`word2.high`, `assign word2.high = ...`) slice into the
+                    // parent net — mirroring the variable (line ~2793) and port
+                    // (line ~9002) paths, which the net arm previously omitted
+                    // (member access read x).
+                    if net_array_range.is_none() {
+                        if let DataType::Struct(su) = resolve_typedef_chain(&nd.data_type, &elab.typedef_types) {
+                            if su.packed {
+                                if let Some(fields) = flatten_struct_fields(&nd.data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
+                                    if !fields.is_empty() {
+                                        tls_register_struct_layout(&decl.name.name, &fields);
+                                        elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
+                                    }
+                                }
+                            }
+                        }
+                    }
                     if let Some((lo, hi)) = net_array_range {
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
                         elab.var_decl_types.insert(decl.name.name.clone(), nd.data_type.clone());
