@@ -1030,7 +1030,39 @@ impl Preprocessor {
         let mut result = String::with_capacity(line.len());
         let bytes = line.as_bytes();
         let mut i = 0;
+        // IEEE 1800.1-2023 §22.5.1: macro expansion does not occur inside
+        // string literals. Track "..." state (honoring `\"` escapes) so a
+        // backtick-prefixed macro name that appears in a message string — e.g.
+        // $display("see `uvm_object_utils here") — is left as literal text
+        // instead of being mis-expanded. Without this a *defined* parameterized
+        // macro name followed by non-'(' text inside a string was falsely
+        // rejected as "requires parentheses", breaking any testbench whose
+        // $display/$info strings mention a macro by name. A bare '"' reaching
+        // the non-backtick path always opens a regular string: stringify
+        // delimiters (`` `" ``) are backtick-prefixed and consumed by the
+        // backtick handler below, so they never reach this path.
+        let mut in_string = false;
         while i < bytes.len() {
+            if in_string {
+                let ch = line[i..].chars().next().unwrap();
+                if ch == '\\' {
+                    // Escaped char: copy verbatim, stay in the string.
+                    result.push(ch);
+                    i += ch.len_utf8();
+                    if i < bytes.len() {
+                        let n = line[i..].chars().next().unwrap();
+                        result.push(n);
+                        i += n.len_utf8();
+                    }
+                    continue;
+                }
+                if ch == '"' {
+                    in_string = false;
+                }
+                result.push(ch);
+                i += ch.len_utf8();
+                continue;
+            }
             if bytes[i] == b'`' {
                 if i + 1 < bytes.len() && bytes[i+1] == b'`' {
                     // Concatenation: skip both backticks
@@ -1195,6 +1227,9 @@ impl Preprocessor {
                 }
             } else {
                 let ch = line[i..].chars().next().unwrap();
+                if ch == '"' {
+                    in_string = true;
+                }
                 result.push(ch);
                 i += ch.len_utf8();
             }
