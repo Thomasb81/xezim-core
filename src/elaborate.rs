@@ -1306,6 +1306,29 @@ fn expand_enum_member(
     (out, val)
 }
 
+/// Compute an anonymous enum's members in declaration order (which is the LRM
+/// §6.19.6 iteration order for first/last/next/prev/num). Mirrors the value
+/// expansion in `register_anonymous_enum_members`.
+pub fn anon_enum_members_ordered(
+    dt: &DataType,
+    params: &crate::hasher::HashMap<String, Value>,
+) -> Option<Vec<(String, u64)>> {
+    if let DataType::Enum(et) = dt {
+        let mut next_val: u64 = 0;
+        let mut ordered: Vec<(String, u64)> = Vec::new();
+        for member in &et.members {
+            let (entries, nv) = expand_enum_member(member, next_val, params);
+            next_val = nv;
+            for (nm, val) in entries {
+                ordered.push((nm, val));
+            }
+        }
+        Some(ordered)
+    } else {
+        None
+    }
+}
+
 pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModule) {
     if let DataType::Enum(et) = dt {
         let base_width = et.base_type.as_ref()
@@ -2243,6 +2266,21 @@ pub fn elaborate_module_with_defs(
                 // `state_q FSM`. Helper is also called from the other
                 // DataDeclaration arms (submodule items, generate items).
                 register_anonymous_enum_members(&dd.data_type, &mut elab);
+                // §6.19.6: an anonymous `enum {...} v;` variable needs its
+                // ordered member list so `v.num/first/last/next/prev` resolve.
+                // Key enum_members by the variable name (there is no typedef
+                // name) and stamp the signal's type_name to that key.
+                if let Some(members) =
+                    anon_enum_members_ordered(&dd.data_type, &elab.parameters)
+                {
+                    for decl in &dd.declarators {
+                        elab.enum_members
+                            .insert(decl.name.name.clone(), members.clone());
+                        if let Some(sig) = elab.signals.get_mut(&decl.name.name) {
+                            sig.type_name = Some(decl.name.name.clone());
+                        }
+                    }
+                }
                 // String-typed declarations (LRM §6.16). Recorded for the
                 // bytecode compiler so concatenations involving string
                 // operands bail to the AST interpreter (which has byte-
