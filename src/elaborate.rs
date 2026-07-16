@@ -820,6 +820,14 @@ pub struct ElaboratedModule {
     /// resolves to an 8-bit slice rather than a 1-bit select. Also keyed for
     /// struct fields under `"struct_var.field"` form.
     pub packed_signal_elem_widths: HashMap<String, u32>,
+    /// Full packed dimension list (outermost first) for multi-dimensional
+    /// packed vectors: `reg [1:0][15:0][7:0] a;` stores
+    /// `"a" -> [(1,0),(15,0),(7,0)]`. Each entry is the declared
+    /// (left, right) bounds so nested selects (`a[i][j]`) can be resolved to
+    /// the correct flat bit slice with index normalization for ascending /
+    /// non-zero-based ranges (LRM §7.4.1).
+    #[serde(default)]
+    pub packed_full_dims: HashMap<String, Vec<(i64, i64)>>,
     /// Signals declared as `string` (LRM §6.16). The bytecode compiler
     /// consults this so that `{a, b}` concatenations involving any
     /// string-typed operand bail to the AST interpreter — the bit-concat
@@ -1045,6 +1053,7 @@ impl ElaboratedModule {
             var_decl_types: HashMap::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
+            packed_full_dims: HashMap::default(),
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
             class_type_args: HashMap::default(),
@@ -2298,6 +2307,11 @@ pub fn elaborate_module_with_defs(
                         elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
                     }
                 }
+                if let Some(fdims) = packed_full_dims_of(&dd.data_type, &elab.parameters) {
+                    for decl in &dd.declarators {
+                        elab.packed_full_dims.insert(decl.name.name.clone(), fdims.clone());
+                    }
+                }
                 // Ascending packed vector (`logic [0:7] pa;`): bit/part selects
                 // index from the MSB end (label 0 = MSB), so the interpreter
                 // remaps `pa[i]` → internal bit (W-1)-i (LRM §7.4.1, §11.5.1).
@@ -2927,6 +2941,12 @@ pub fn elaborate_module_with_defs(
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         elab.packed_signal_elem_widths.insert(key, ew);
+                                    }
+                                }
+                                if let Some(fdims) = packed_full_dims_of(&m.data_type, &elab.parameters) {
+                                    for mdecl in &m.declarators {
+                                        let key = format!("{}.{}", decl.name.name, mdecl.name.name);
+                                        elab.packed_full_dims.insert(key, fdims.clone());
                                     }
                                 }
                             }
@@ -5523,6 +5543,11 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
                     }
                 }
+                if let Some(fdims) = packed_full_dims_of(&dd.data_type, &elab.parameters) {
+                    for decl in &dd.declarators {
+                        elab.packed_full_dims.insert(decl.name.name.clone(), fdims.clone());
+                    }
+                }
                 let data_modport_view = match &dd.data_type {
                     DataType::Interface { name, modport: Some(mp), .. } => {
                         resolve_interface_modport_view(&name.name, &mp.name, all_defs)
@@ -6761,6 +6786,35 @@ fn packed_ascending_width(dt: &DataType, params: &HashMap<String, Value>) -> Opt
         }
     }
     None
+}
+
+/// Full packed dimension bounds (outermost first) of a multi-dimensional
+/// packed IntegerVector type — `logic [1:0][15:0][7:0]` returns
+/// `Some([(1,0),(15,0),(7,0)])`. Single-dim / non-constant shapes return
+/// None. Companion to `packed_inner_elem_width`; lets nested selects
+/// (`a[i][j]`) resolve to correct flat bit slices per LRM §7.4.1.
+pub fn packed_full_dims_of(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+) -> Option<Vec<(i64, i64)>> {
+    let dims = match dt {
+        DataType::IntegerVector { dimensions, .. } => dimensions,
+        _ => return None,
+    };
+    if dims.len() < 2 {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dims.len());
+    for d in dims {
+        if let PackedDimension::Range { left, right, .. } = d {
+            let l = const_eval_i64_with_params(left, Some(params))?;
+            let r = const_eval_i64_with_params(right, Some(params))?;
+            out.push((l, r));
+        } else {
+            return None;
+        }
+    }
+    Some(out)
 }
 
 pub fn packed_inner_elem_width(
@@ -9273,6 +9327,14 @@ fn inline_module_items(
                                     let scoped = format!("{}{}", inst_prefix, bare);
                                     elab.packed_signal_elem_widths.insert(bare, elem_w);
                                     elab.packed_signal_elem_widths.insert(scoped, elem_w);
+                                }
+                            }
+                            if let Some(fdims) = packed_full_dims_of(&dd.data_type, &sub_merged_params) {
+                                for decl in &dd.declarators {
+                                    let bare = decl.name.name.clone();
+                                    let scoped = format!("{}{}", inst_prefix, bare);
+                                    elab.packed_full_dims.insert(bare, fdims.clone());
+                                    elab.packed_full_dims.insert(scoped, fdims.clone());
                                 }
                             }
                             let width = match &dd.data_type {
