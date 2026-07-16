@@ -637,6 +637,20 @@ impl Parser {
                         name: "$__xz_type_cast".to_string(),
                         args: vec![lhs, inner],
                     }, self.span_from(start));
+                } else if matches!(&lhs.kind, ExprKind::Ident(h)
+                    if h.path.len() == 1 && h.path[0].selects.is_empty())
+                {
+                    // §6.24.1: `id'(v)` where `id` is a bare identifier is either
+                    // a TYPE cast (id is a typedef) or a SIZE cast (id is a
+                    // constant/parameter). The two are indistinguishable without
+                    // the type/parameter tables, so defer to the simulator via a
+                    // named-cast intrinsic that carries the identifier. Formerly
+                    // this dropped the cast entirely (`size1'(x)` kept x's width,
+                    // `my_t'(x)` skipped the conversion).
+                    lhs = Expression::new(ExprKind::SystemCall {
+                        name: "$__xz_named_cast".to_string(),
+                        args: vec![lhs, inner],
+                    }, self.span_from(start));
                 } else {
                     lhs = Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
                 }
@@ -1033,12 +1047,27 @@ impl Parser {
                         type_args_text: text,
                     }, self.span_from(start));
                 }
-                // Check for type cast: identifier'(expr)  e.g. my_type'(value)
+                // §6.24.1 cast: identifier'(expr) — `id` is either a typedef
+                // (TYPE cast: convert/resize/re-sign the operand) or a constant
+                // (SIZE cast: resize to that width). The two are indistinguishable
+                // at parse time, so carry the identifier into a named-cast
+                // intrinsic that the simulator resolves against its typedef and
+                // parameter tables. Formerly this dropped the cast (returned the
+                // bare operand), so `size1'(x)` kept x's width and `my_t'(x)`
+                // skipped the sign/width conversion.
                 if self.current().text == "'" && self.peek_kind() == TokenKind::LParen {
                     self.bump(); // skip '
                     self.bump(); // skip (
                     let inner = self.parse_expression();
                     self.expect(TokenKind::RParen);
+                    if matches!(&expr.kind, ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].selects.is_empty())
+                    {
+                        return Expression::new(ExprKind::SystemCall {
+                            name: "$__xz_named_cast".to_string(),
+                            args: vec![expr, inner],
+                        }, self.span_from(start));
+                    }
                     return Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
                 }
                 // Check for function call
@@ -1209,6 +1238,25 @@ impl Parser {
                         op: BinaryOp::HashHash,
                         left: Box::new(one),
                         right: Box::new(operand),
+                    },
+                    self.span_from(start),
+                )
+            }
+            // LRM §16.12.9 — `not property_expr`: the property holds iff the
+            // operand does NOT. For a boolean property (the common assertion
+            // form, e.g. `not (a && b)`) this is logical negation, so desugar to
+            // `!(expr)`, which the SVA executor evaluates directly. Full
+            // temporal-sequence negation is not modeled — the approximate
+            // handling matches nexttime/always above. `not` in gate-primitive
+            // position is caught at item level (items.rs) before reaching here.
+            TokenKind::KwNot => {
+                let start = self.current().span.start;
+                self.bump();
+                let operand = self.parse_expr_bp(3);
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::LogNot,
+                        operand: Box::new(operand),
                     },
                     self.span_from(start),
                 )

@@ -127,6 +127,26 @@ impl Parser {
         Some(spec)
     }
 
+    /// Parse an optional `: <name>` end-label on a named `begin`/`fork` block
+    /// and, under strict checks, reject a label that disagrees with the block
+    /// name (IEEE 1800-2017 §9.3.4). Unlike `parse_end_label_checked` this is
+    /// gated on `strict_checks()` (on by default) rather than SV-2023, because
+    /// block end-label matching is not a 2023-only rule.
+    pub(super) fn parse_block_end_label_checked(&mut self, expected: &str) -> Option<Identifier> {
+        let label = self.parse_end_label();
+        if crate::strict_checks() {
+            if let Some(ref l) = label {
+                if l.name != expected && l.name != "<e>" {
+                    self.error(format!(
+                        "block end label '{}' does not match block name '{}' (IEEE 1800-2017 §9.3.4)",
+                        l.name, expected
+                    ));
+                }
+            }
+        }
+        label
+    }
+
     /// Parse an optional `: <name>` end-label and, when SV-2023 is enabled,
     /// emit a diagnostic if the label disagrees with the enclosing decl's
     /// name (IEEE 1800-2023 §27.2.1).

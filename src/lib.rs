@@ -229,6 +229,17 @@ pub fn parse_and_elaborate_multi(
     defines: &[(String, Option<String>)],
 ) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
     let mut all_descriptions = Vec::new();
+    // Preprocessed text of each source, kept in parse order. Every AST
+    // `Span` is a byte offset into ITS file's preprocessed text, so these
+    // are what runtime diagnostics need to turn a span into `file:line`
+    // (see `ElaboratedModule::source_texts`).
+    let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
+    // Which file defined each module/interface/program, by name. Captured
+    // HERE — the only point where a description's originating file is still
+    // known — and handed to runtime diagnostics via
+    // `ElaboratedModule::src_file_of_module` (see that field's doc).
+    let mut src_file_of_module: crate::hasher::HashMap<String, u32> =
+        crate::hasher::HashMap::default();
     let mut pp = preprocessor::Preprocessor::new();
     for dir in include_dirs { pp.add_include_dir(std::path::PathBuf::from(dir)); }
     for (name, val) in defines {
@@ -260,12 +271,32 @@ pub fn parse_and_elaborate_multi(
         if !strict_viol.is_empty() {
             return Err(format!("Strict check failed in source {}:\n{}", i, strict_viol.join("\n")));
         }
+        for d in &source_ast.descriptions {
+            let name = match d {
+                ast::Description::Module(m) => Some(&m.name.name),
+                ast::Description::Interface(iface) => Some(&iface.name.name),
+                ast::Description::Program(p) => Some(&p.name.name),
+                ast::Description::PackageItem(ast::decl::PackageItem::Checker(c)) => {
+                    Some(&c.name.name)
+                }
+                _ => None,
+            };
+            if let Some(name) = name {
+                src_file_of_module.entry(name.clone()).or_insert(i as u32);
+            }
+        }
         all_descriptions.extend(source_ast.descriptions);
+        preprocessed_texts.push(preprocessed);
     }
 
     let lib_defines = pp.snapshot_defines();
     let module_timescales = pp.module_timescales.clone();
-    parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales)
+    let (defs, mut elab) =
+        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales)?;
+    elab.source_texts = preprocessed_texts;
+    elab.source_files = source_files.to_vec();
+    elab.src_file_of_module = src_file_of_module;
+    Ok((defs, elab))
 }
 
 fn parse_and_elaborate(

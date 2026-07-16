@@ -134,7 +134,16 @@ impl Parser {
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::DisableFork, self.span_from(start))
                 } else {
-                    let name = self.parse_identifier();
+                    // §9.6.2: the disable target may be a HIERARCHICAL block or
+                    // task name (`disable top.be_name`). Runtime resolution is by
+                    // the block LABEL (the leaf), so consume the dotted path and
+                    // keep its last segment. Previously a `.` after the first
+                    // identifier errored ("expected Semicolon, found Dot").
+                    let mut name = self.parse_identifier();
+                    while self.at(TokenKind::Dot) {
+                        self.bump();
+                        name = self.parse_identifier();
+                    }
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::Disable(name), self.span_from(start))
                 }
@@ -496,7 +505,11 @@ impl Parser {
             stmts.push(self.parse_statement());
         }
         self.expect(TokenKind::KwEnd);
-        let _ = self.parse_end_label();
+        // §9.3.4: an end label must match the block name (if any).
+        match name {
+            Some(ref n) => { let _ = self.parse_block_end_label_checked(&n.name); }
+            None => { let _ = self.parse_end_label(); }
+        }
         Statement::new(StatementKind::SeqBlock { name, stmts }, self.span_from(start))
     }
 
@@ -515,7 +528,11 @@ impl Parser {
             TokenKind::KwJoin_none => { self.bump(); JoinType::JoinNone }
             _ => { self.expect(TokenKind::KwJoin); JoinType::Join }
         };
-        let _ = self.parse_end_label();
+        // §9.3.4: a fork/join end label must match the fork name (if any).
+        match name {
+            Some(ref n) => { let _ = self.parse_block_end_label_checked(&n.name); }
+            None => { let _ = self.parse_end_label(); }
+        }
         Statement::new(StatementKind::ParBlock { name, join_type, stmts }, self.span_from(start))
     }
 
