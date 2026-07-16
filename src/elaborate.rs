@@ -274,6 +274,12 @@ pub struct ElaboratedClass {
     /// resolve e.g. `MyClass::type_id` to its target type.
     #[serde(default)]
     pub typedef_targets: HashMap<String, crate::ast::types::DataType>,
+    /// Class-local typedef name -> its UNPACKED dimensions (`typedef bit
+    /// edges_t[Node];`). Previously computed only transiently for property
+    /// width resolution, so the simulator could not tell that a `ref edges_t`
+    /// subroutine formal is an associative array (§13.5.2 writeback).
+    #[serde(default)]
+    pub typedef_unpacked_dims: HashMap<String, Vec<UnpackedDimension>>,
     /// Properties declared with the `static` qualifier — shared across all
     /// instances of the class (one storage cell per class).
     #[serde(default)]
@@ -668,6 +674,11 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         }).collect(),
         typedef_targets: c.items.iter().filter_map(|it| match it {
             ClassItem::Typedef(td) => Some((td.name.name.clone(), td.data_type.clone())),
+            _ => None,
+        }).collect(),
+        typedef_unpacked_dims: c.items.iter().filter_map(|it| match it {
+            ClassItem::Typedef(td) if !td.dimensions.is_empty() =>
+                Some((td.name.name.clone(), td.dimensions.clone())),
             _ => None,
         }).collect(),
         static_properties,
