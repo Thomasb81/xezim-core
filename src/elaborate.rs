@@ -961,6 +961,17 @@ pub struct ElaboratedModule {
     /// root.
     #[serde(default)]
     pub port_aliases: HashMap<String, String>,
+    /// Preprocessed source text of each input file, in parse order, with
+    /// `source_files` carrying the matching file names. A `Statement`'s
+    /// `Span` is a byte offset into its OWN file's preprocessed text, so
+    /// runtime diagnostics (e.g. the zero-delay stall report) resolve it
+    /// against these to print `file:line`. Not serialized: compiled
+    /// artifacts carry no sources, so artifact-driven runs simply degrade
+    /// to span-less diagnostics.
+    #[serde(skip)]
+    pub source_texts: Vec<String>,
+    #[serde(skip)]
+    pub source_files: Vec<String>,
 }
 
 /// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
@@ -1078,6 +1089,8 @@ impl ElaboratedModule {
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
             port_aliases: HashMap::default(),
+            source_texts: Vec::new(),
+            source_files: Vec::new(),
         }
     }
 

@@ -229,6 +229,11 @@ pub fn parse_and_elaborate_multi(
     defines: &[(String, Option<String>)],
 ) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
     let mut all_descriptions = Vec::new();
+    // Preprocessed text of each source, kept in parse order. Every AST
+    // `Span` is a byte offset into ITS file's preprocessed text, so these
+    // are what runtime diagnostics need to turn a span into `file:line`
+    // (see `ElaboratedModule::source_texts`).
+    let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
     let mut pp = preprocessor::Preprocessor::new();
     for dir in include_dirs { pp.add_include_dir(std::path::PathBuf::from(dir)); }
     for (name, val) in defines {
@@ -261,11 +266,16 @@ pub fn parse_and_elaborate_multi(
             return Err(format!("Strict check failed in source {}:\n{}", i, strict_viol.join("\n")));
         }
         all_descriptions.extend(source_ast.descriptions);
+        preprocessed_texts.push(preprocessed);
     }
 
     let lib_defines = pp.snapshot_defines();
     let module_timescales = pp.module_timescales.clone();
-    parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales)
+    let (defs, mut elab) =
+        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales)?;
+    elab.source_texts = preprocessed_texts;
+    elab.source_files = source_files.to_vec();
+    Ok((defs, elab))
 }
 
 fn parse_and_elaborate(
