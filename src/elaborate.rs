@@ -2861,10 +2861,77 @@ pub fn elaborate_module_with_defs(
                                         raw.push((mdecl.name.name.clone(), mw, member.data_type.clone()));
                                     }
                                 }
+                                // §7.4.2: a member that is a PACKED ARRAY of packed
+                                // struct (`row_entry_t [1:0] sub_list;`) expands into
+                                // per-element pseudo-fields `sub_list[i]` plus their
+                                // subfields `sub_list[i].f`, so indexed member paths
+                                // resolve through the parent's flat layout. Plain
+                                // recursion would mis-register `sub_list.f` aliasing
+                                // only element 0.
+                                let expand_member = |mn: &str, mw: u32, mdt: &DataType,
+                                                     base_off: u32,
+                                                     out: &mut Vec<(String, u32, u32)>| {
+                                    if let Some((dims, elem_dt)) =
+                                        packed_struct_array_info(mdt, params, typedef_types)
+                                    {
+                                        let counts: Vec<u64> = dims
+                                            .iter()
+                                            .map(|(l, r)| (l - r).unsigned_abs() + 1)
+                                            .collect();
+                                        let n: u64 = counts.iter().product();
+                                        if n > 0 && n <= 4096 && mw as u64 % n == 0 {
+                                            let elem_w = (mw as u64 / n) as u32;
+                                            let elem_subs =
+                                                flatten_subfields(&elem_dt, params, typedefs, typedef_types)
+                                                    .unwrap_or_default();
+                                            // Enumerate every index tuple (odometer).
+                                            let mut idx: Vec<i64> =
+                                                dims.iter().map(|(l, r)| *l.min(r)).collect();
+                                            loop {
+                                                if let Some(lo) =
+                                                    packed_elem_lsb_offset(&dims, &idx, elem_w)
+                                                {
+                                                    let mut nm = mn.to_string();
+                                                    for i in &idx {
+                                                        nm.push_str(&format!("[{}]", i));
+                                                    }
+                                                    out.push((nm.clone(), base_off + lo, elem_w));
+                                                    for (sn, so, sw) in &elem_subs {
+                                                        out.push((
+                                                            format!("{}.{}", nm, sn),
+                                                            base_off + lo + so,
+                                                            *sw,
+                                                        ));
+                                                    }
+                                                }
+                                                // advance odometer (innermost fastest)
+                                                let mut j = dims.len();
+                                                loop {
+                                                    if j == 0 {
+                                                        return true;
+                                                    }
+                                                    j -= 1;
+                                                    let (l, r) = dims[j];
+                                                    let hi = l.max(r);
+                                                    if idx[j] < hi {
+                                                        idx[j] += 1;
+                                                        break;
+                                                    }
+                                                    idx[j] = l.min(r);
+                                                }
+                                            }
+                                        }
+                                        return true; // array member: skip plain recursion
+                                    }
+                                    false
+                                };
                                 let mut out: Vec<(String, u32, u32)> = Vec::new();
                                 if is_union {
                                     for (mn, mw, mdt) in &raw {
                                         out.push((mn.clone(), 0, *mw));
+                                        if expand_member(mn, *mw, mdt, 0, &mut out) {
+                                            continue;
+                                        }
                                         if let Some(subs) = flatten_subfields(mdt, params, typedefs, typedef_types) {
                                             for (sn, so, sw) in subs { out.push((format!("{}.{}", mn, sn), so, sw)); }
                                         }
@@ -2873,6 +2940,10 @@ pub fn elaborate_module_with_defs(
                                     let mut offset: u32 = 0;
                                     for (mn, mw, mdt) in raw.iter().rev() {
                                         out.push((mn.clone(), offset, *mw));
+                                        if expand_member(mn, *mw, mdt, offset, &mut out) {
+                                            offset += mw;
+                                            continue;
+                                        }
                                         if let Some(subs) = flatten_subfields(mdt, params, typedefs, typedef_types) {
                                             for (sn, so, sw) in subs { out.push((format!("{}.{}", mn, sn), offset + so, sw)); }
                                         }
@@ -2960,6 +3031,46 @@ pub fn elaborate_module_with_defs(
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
                                         elab.packed_full_dims.insert(key, fdims.clone());
+                                    }
+                                }
+                                // §7.4.2: member is a packed array of packed struct
+                                // (`row_entry_t [1:0] sub_list;`). Register the
+                                // ELEMENT-relative field layout + element width +
+                                // full dims under `decl.member`, so indexed member
+                                // paths (`main.sub_list[i].f`) and element selects
+                                // (`main.sub_list[i]`) resolve at runtime.
+                                if let Some((dims, elem_dt)) = packed_struct_array_info(
+                                    &m.data_type,
+                                    &elab.parameters,
+                                    &elab.typedef_types,
+                                ) {
+                                    let elem_fields = flatten_subfields(
+                                        &elem_dt,
+                                        &elab.parameters,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    )
+                                    .unwrap_or_default();
+                                    let elem_w = elem_fields
+                                        .iter()
+                                        .map(|(_, o, w)| o + w)
+                                        .max()
+                                        .unwrap_or(0);
+                                    if elem_w > 0 {
+                                        let mut fdims = dims.clone();
+                                        fdims.push((elem_w as i64 - 1, 0));
+                                        for mdecl in &m.declarators {
+                                            let key = format!(
+                                                "{}.{}",
+                                                decl.name.name, mdecl.name.name
+                                            );
+                                            elab.packed_signal_elem_widths
+                                                .insert(key.clone(), elem_w);
+                                            elab.packed_full_dims
+                                                .insert(key.clone(), fdims.clone());
+                                            elab.packed_struct_fields
+                                                .insert(key, elem_fields.clone());
+                                        }
                                     }
                                 }
                             }
@@ -6828,6 +6939,80 @@ pub fn packed_full_dims_of(
         }
     }
     Some(out)
+}
+
+/// §7.4.2: detect a PACKED ARRAY of packed struct — `row_entry_t [1:0] x;`
+/// (TypeReference with packed dims whose typedef chain lands on a packed
+/// struct) or `struct packed {...} [1:0] x;` (body-suffix dims). Walks the
+/// typedef chain accumulating packed dims outermost-first and returns
+/// `(dims, element_struct_type)` when at least one array dim was found.
+pub fn packed_struct_array_info(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<(Vec<(i64, i64)>, DataType)> {
+    let mut dims: Vec<(i64, i64)> = Vec::new();
+    let mut cur: DataType = dt.clone();
+    for _ in 0..64 {
+        match cur {
+            DataType::TypeReference { ref name, ref dimensions, .. } => {
+                for d in dimensions {
+                    if let PackedDimension::Range { left, right, .. } = d {
+                        let l = const_eval_i64_with_params(left, Some(params))?;
+                        let r = const_eval_i64_with_params(right, Some(params))?;
+                        dims.push((l, r));
+                    } else {
+                        return None;
+                    }
+                }
+                let next = typedef_types.get(&name.name.name)?.clone();
+                cur = next;
+            }
+            DataType::Struct(ref su) => {
+                if !su.packed {
+                    return None;
+                }
+                for d in &su.dimensions {
+                    if let PackedDimension::Range { left, right, .. } = d {
+                        let l = const_eval_i64_with_params(left, Some(params))?;
+                        let r = const_eval_i64_with_params(right, Some(params))?;
+                        dims.push((l, r));
+                    } else {
+                        return None;
+                    }
+                }
+                if dims.is_empty() {
+                    return None;
+                }
+                let mut elem = su.clone();
+                elem.dimensions.clear();
+                return Some((dims, DataType::Struct(elem)));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+/// Bit offset (from the LSB of the whole packed array) of the element at
+/// `idx` (one index per dim, outermost first), given the array `dims` and
+/// per-element width. The LEFT bound of each dim labels the most-significant
+/// element (§7.4.1). Returns None when any index is out of bounds.
+pub fn packed_elem_lsb_offset(dims: &[(i64, i64)], idx: &[i64], elem_w: u32) -> Option<u32> {
+    let counts: Vec<u64> = dims.iter().map(|(l, r)| (l - r).unsigned_abs() + 1).collect();
+    let total: u64 = counts.iter().product::<u64>() * elem_w as u64;
+    let mut msb_off: u64 = 0;
+    for (j, &i) in idx.iter().enumerate() {
+        let (l, r) = dims[j];
+        let (lo_b, hi_b) = if l <= r { (l, r) } else { (r, l) };
+        if i < lo_b || i > hi_b {
+            return None;
+        }
+        let slot = if l >= r { (l - i) as u64 } else { (i - l) as u64 };
+        let w_j: u64 = counts[j + 1..].iter().product::<u64>() * elem_w as u64;
+        msb_off += slot * w_j;
+    }
+    Some((total - msb_off - elem_w as u64) as u32)
 }
 
 pub fn packed_inner_elem_width(
