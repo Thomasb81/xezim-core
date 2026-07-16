@@ -1867,6 +1867,12 @@ pub fn elaborate_module_with_defs(
                             crate::ast::decl::PackageItem::Typedef(td) => {
                                 process_typedef(td, &mut elab);
                             }
+                            // Hoist package DPI imports so calls to
+                            // `uvm_re_compexecfree` etc. resolve via
+                            // `exec_dpi_import_call`.
+                            crate::ast::decl::PackageItem::DPIImport(di) => {
+                                register_dpi_import(di, &mut elab)?;
+                            }
                             _ => {}
                         }
                     }
