@@ -983,6 +983,16 @@ pub struct ElaboratedModule {
     pub source_texts: Vec<String>,
     #[serde(skip)]
     pub source_files: Vec<String>,
+    /// Source-file index (into `source_texts`/`source_files`) of each
+    /// module/interface/program DEFINITION, by name. Filled by
+    /// `parse_and_elaborate_multi`, where the per-file parse boundary still
+    /// knows which file produced which definition. Runtime diagnostics map an
+    /// offending process's instance scope → defining module (`instances`) →
+    /// THIS file, so a span (a per-file byte offset) resolves against the
+    /// right file in multi-file designs. Not serialized, like
+    /// `source_texts`: a .xzb run carries no sources to resolve against.
+    #[serde(skip)]
+    pub src_file_of_module: HashMap<String, u32>,
 }
 
 /// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
@@ -1102,6 +1112,7 @@ impl ElaboratedModule {
             port_aliases: HashMap::default(),
             source_texts: Vec::new(),
             source_files: Vec::new(),
+            src_file_of_module: HashMap::default(),
         }
     }
 
