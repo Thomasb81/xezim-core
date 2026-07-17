@@ -260,6 +260,14 @@ pub struct ElaboratedClass {
     /// does not call `super.new` explicitly.
     #[serde(default)]
     pub extends_args: Vec<Expression>,
+    /// ALL arguments in the `extends Base#(arg1, arg2, ...)` clause as textual
+    /// fragments, preserving order (both type and value params). Used to
+    /// resolve ancestor type/value parameters: when a method of
+    /// `uvm_registry_common` references `Tregistry`, we match it against the
+    /// ancestor's `param_order` to find the extends arg at the same position
+    /// (e.g. `this_type`), then resolve it to the concrete specialization.
+    #[serde(default)]
+    pub extends_type_args: Vec<String>,
     /// ALL parameter names (type and value), in declaration order. Needed to
     /// map positional `#(...)` type-args to the correct param when type and
     /// value params are interleaved (e.g. `uvm_component_registry#(type T,
@@ -353,6 +361,38 @@ fn install_ooc_constraint_body(
             existing.items = items.to_vec();
             existing.has_body = true;
         }
+    }
+}
+
+/// Convert a DataType (from a `extends Base#(type T, ...)` clause) into a
+/// textual fragment suitable for specialization signatures. E.g.
+/// `this_type` -> `"this_type"`, a scoped type ref -> leaf name.
+fn datatype_to_spec_fragment(dt: &crate::ast::types::DataType) -> String {
+    use crate::ast::types::DataType;
+    match dt {
+        DataType::TypeReference { name, .. } => name.name.name.clone(),
+        DataType::Simple { kind, .. } => format!("{:?}", kind).to_lowercase(),
+        _ => "<unknown>".to_string(),
+    }
+}
+
+/// Convert an Expression (from an extends clause arg) into a textual
+/// fragment. Bare identifiers like `this_type` or `T` → their name.
+/// String literals → quoted text. Other exprs → best-effort string.
+fn expr_to_spec_fragment(ex: &crate::ast::expr::Expression) -> String {
+    use crate::ast::expr::{ExprKind, Expression};
+    match &ex.kind {
+        ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()).unwrap_or_default(),
+        ExprKind::StringLiteral(s) => format!("\"{}\"", s),
+        ExprKind::Specialization { base, type_args_text, .. } => {
+            if let ExprKind::Ident(h) = &base.kind {
+                if let Some(last) = h.path.last() {
+                    return format!("{}#({})", last.name.name, type_args_text);
+                }
+            }
+            "<unknown>".to_string()
+        }
+        _ => "<unknown>".to_string(),
     }
 }
 
@@ -650,6 +690,12 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
             e.args.iter().filter_map(|a| match a {
                 ParamValue::Expr(ex) => Some(ex.clone()),
                 ParamValue::Type(_) => None,
+            }).collect()
+        }).unwrap_or_default(),
+        extends_type_args: c.extends.as_ref().map(|e| {
+            e.args.iter().map(|a| match a {
+                ParamValue::Type(dt) => datatype_to_spec_fragment(dt),
+                ParamValue::Expr(ex) => expr_to_spec_fragment(ex),
             }).collect()
         }).unwrap_or_default(),
         properties,
