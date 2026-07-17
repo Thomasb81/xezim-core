@@ -872,19 +872,37 @@ fn resolve_library_modules(
         let result = sv_parser::parse(&preprocessed);
         // A half-parsed library file silently loses every definition after the
         // point of failure — the classic "-v vendor.v then Module 'X' not
-        // found". Surface it: one line per file, first error quoted.
+        // found". Surface it VCS-style: file:line:col per error (first three),
+        // resolved against the preprocessed text the spans index (line numbers
+        // can shift from the raw file where `include/macros expand).
         if !result.errors.is_empty() {
-            let first = result
-                .errors
-                .first()
-                .map(|e| format!("{}", e.message))
-                .unwrap_or_default();
+            let line_col = |off: usize| -> (usize, usize) {
+                let (mut line, mut col) = (1usize, 1usize);
+                for (i, ch) in preprocessed.char_indices() {
+                    if i >= off {
+                        break;
+                    }
+                    if ch == '\n' {
+                        line += 1;
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
+                }
+                (line, col)
+            };
             eprintln!(
-                "Warning: library file '{}': {} parse error(s) — definitions after the first error may be lost. First: {}",
+                "Warning: library file '{}': {} parse error(s) — definitions after the first error may be lost:",
                 path.display(),
-                result.errors.len(),
-                first
+                result.errors.len()
             );
+            for e in result.errors.iter().take(3) {
+                let (line, col) = line_col(e.span.start);
+                eprintln!("  {}:{}:{}: {}", path.display(), line, col, e.message);
+            }
+            if result.errors.len() > 3 {
+                eprintln!("  ... and {} more", result.errors.len() - 3);
+            }
             parse_issue_files.push(path.clone());
         }
         for desc in result.source.descriptions {
