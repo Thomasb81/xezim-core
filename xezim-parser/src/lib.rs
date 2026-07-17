@@ -34,6 +34,19 @@ static SV2023_ENABLED: AtomicBool = AtomicBool::new(false);
 
 /// Enable or disable IEEE 1800-2023 syntax extensions for subsequent
 /// lex/parse/simulate calls in this process.
+/// min:typ:max delay selection for specify-path triplets (`(2:5:9)`).
+/// 0 = min, 1 = typ (default, commercial default), 2 = max. Set from the CLI's
+/// `+mindelays`/`+typdelays`/`+maxdelays` before parsing.
+static DELAY_SELECT: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(1);
+
+pub fn set_delay_select(sel: u8) {
+    DELAY_SELECT.store(sel.min(2), std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn delay_select() -> u8 {
+    DELAY_SELECT.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_sv2023(enabled: bool) {
     SV2023_ENABLED.store(enabled, Ordering::Relaxed);
 }

@@ -1191,13 +1191,36 @@ impl Parser {
             return None;
         }
         self.bump();
-        // Delay: `( d {, d} )` (use the first) or a bare expression.
+        // Delay: `( d {, d} )` (use the first) or a bare expression. Each `d`
+        // may be a min:typ:max triplet (`2:5:9`) — pick the element chosen by
+        // `+mindelays`/`+typdelays`/`+maxdelays` (default typ, the commercial
+        // default). Previously a triplet derailed the parse and silently
+        // dropped the WHOLE path delay to zero.
+        let mut parse_delay_entry = |p: &mut Self| -> Expression {
+            let first = p.parse_expression();
+            if !p.at(TokenKind::Colon) {
+                return first;
+            }
+            p.bump();
+            let typ = p.parse_expression();
+            let max = if p.at(TokenKind::Colon) {
+                p.bump();
+                Some(p.parse_expression())
+            } else {
+                None
+            };
+            match crate::delay_select() {
+                0 => first,
+                2 => max.unwrap_or(typ),
+                _ => typ,
+            }
+        };
         let delay = if self.at(TokenKind::LParen) {
             self.bump();
-            let d = self.parse_expression();
+            let d = parse_delay_entry(self);
             while self.at(TokenKind::Comma) {
                 self.bump();
-                let _ = self.parse_expression();
+                let _ = parse_delay_entry(self);
             }
             if !self.at(TokenKind::RParen) {
                 self.pos = start_pos;
