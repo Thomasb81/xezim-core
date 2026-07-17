@@ -326,6 +326,15 @@ pub struct ElaboratedClass {
     /// `queue_properties` since the size isn't known at class-elaboration time.
     #[serde(default)]
     pub array_properties: HashMap<String, (i64, i64, u32)>,
+    /// MULTI-dimensional fixed-size unpacked-array members whose every
+    /// dimension has compile-time-constant bounds (`test_t foo[0:3][0:7]`):
+    /// name -> (per-dimension (lo, hi) shape, element width). Registered
+    /// per-instance as `<handle>#<member>` in `module.arrays_2d` /
+    /// `arrays_nd` so nested index access and multi-var `foreach` resolve —
+    /// `array_properties` only ever carried the FIRST dimension, so
+    /// `foo[i][j]` writes were dropped and `foreach (foo[i,j])` left `j` at X.
+    #[serde(default)]
+    pub array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)>,
 }
 
 /// DPI import metadata used by the simulator for foreign-call dispatch.
@@ -409,6 +418,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut assoc_properties: HashMap<String, bool> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
+    let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
@@ -503,6 +513,40 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     // Queue (`m[$]`) / dynamic-array (`m[]`) member — track so
                     // it gets independent per-instance storage. Bounded queues
                     // (`m[$:N]`) record their cap.
+                    // MULTI-dimensional fixed member (`test_t foo[0:3][0:7]`):
+                    // record the FULL shape. The single-dim match below keeps
+                    // only `effective_dims.first()`, silently dropping inner
+                    // dimensions — `foo[i][j]` writes then miss and multi-var
+                    // `foreach` never binds the inner index.
+                    let nd_shape: Option<Vec<(i64, i64)>> = if effective_dims.len() >= 2 {
+                        effective_dims
+                            .iter()
+                            .map(|dm| match dm {
+                                UnpackedDimension::Range { left, right, .. } => {
+                                    match (
+                                        const_eval_i64_with_params(left, None),
+                                        const_eval_i64_with_params(right, None),
+                                    ) {
+                                        (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
+                                        _ => None,
+                                    }
+                                }
+                                UnpackedDimension::Expression { expr, .. } => {
+                                    match const_eval_i64_with_params(expr, None) {
+                                        Some(n) if n > 0 => Some((0, n - 1)),
+                                        _ => None,
+                                    }
+                                }
+                                _ => None,
+                            })
+                            .collect()
+                    } else {
+                        None
+                    };
+                    if let Some(shape) = nd_shape {
+                        array_nd_properties
+                            .insert(decl.name.name.clone(), (shape, width.max(1)));
+                    } else {
                     match effective_dims.first() {
                         Some(UnpackedDimension::Queue { max_size, .. }) => {
                             let cap = max_size.as_ref().and_then(|e|
@@ -549,6 +593,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                         }
                         _ => {}
                     }
+                    } // end `else` (single-dim)
                     } // end `if !is_static`
                     // Remember scalar initializers so instantiation can re-eval
                     // them with the live parameter table (e.g. `= NUM_HARTS`).
@@ -734,6 +779,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         property_inits,
         static_collections,
         array_properties,
+        array_nd_properties,
     }
 }
 
@@ -2294,11 +2340,14 @@ pub fn elaborate_module_with_defs(
                     } else {
                         width_with_unpacked_dims(&decl.dimensions, width)
                     };
-                    // supply0 → constant 0, supply1 → constant 1
+                    // supply0 → constant 0, supply1 → constant 1.
+                    // §6.6.1: an undriven wire reads high-impedance — nets
+                    // default to Z, not X (bits with drivers are overwritten
+                    // at the first settle; bits nothing drives stay z).
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(w),
                         NetType::Supply1 => Value::ones(w),
-                        _ => if is_real { Value::from_f64(0.0) } else { Value::new(w) },
+                        _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(w) },
                     };
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
@@ -2336,6 +2385,18 @@ pub fn elaborate_module_with_defs(
                                     }
                                 }
                             }
+                        }
+                        // Packed multi-D NET: `wire logic [3:0][7:0] foo;` —
+                        // record the per-element width so `foo[i]` resolves to
+                        // an 8-bit slice instead of a 1-bit select (LRM §7.4.1).
+                        // The variable (DataDeclaration) arm already does this;
+                        // the net arm omitted it, so packed-element port
+                        // connections in genloops read/drove single bits.
+                        if let Some(elem_w) = packed_inner_elem_width(&nd.data_type, &elab.parameters, &elab.typedefs) {
+                            elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
+                        }
+                        if let Some(fdims) = packed_full_dims_of(&nd.data_type, &elab.parameters) {
+                            elab.packed_full_dims.insert(decl.name.name.clone(), fdims);
                         }
                     }
                     if let Some((lo, hi)) = net_array_range {

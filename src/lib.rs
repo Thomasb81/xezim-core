@@ -156,6 +156,27 @@ pub struct ModuleTimescaleCli {
     pub named: std::collections::HashMap<String, (i32, i32)>,
 }
 
+/// Library-search configuration from the CLI (`-v <file>`, `+libext+<ext>`),
+/// consumed by `resolve_library_modules`. Commercial semantics: a `-v` file's
+/// definitions are adopted only to satisfy unresolved instantiations (never
+/// top candidates); `+libext+` REPLACES the default `-y` extension list.
+#[derive(Default, Clone)]
+pub struct LibraryCli {
+    pub lib_files: Vec<String>,
+    /// `None` = default extensions (v, sv, V); `Some(list)` = exactly `list`.
+    pub lib_exts: Option<Vec<String>>,
+}
+
+static LIBRARY_CLI: std::sync::OnceLock<std::sync::Mutex<LibraryCli>> = std::sync::OnceLock::new();
+
+fn library_cli_cell() -> &'static std::sync::Mutex<LibraryCli> {
+    LIBRARY_CLI.get_or_init(|| std::sync::Mutex::new(LibraryCli::default()))
+}
+
+pub fn set_library_cli(cfg: LibraryCli) {
+    *library_cli_cell().lock().unwrap() = cfg;
+}
+
 static MODULE_TIMESCALE_CLI: std::sync::OnceLock<std::sync::Mutex<ModuleTimescaleCli>> =
     std::sync::OnceLock::new();
 
@@ -584,7 +605,10 @@ fn parse_and_elaborate(
     // as the top and run. An include dir is a search path, not a compile list.
     let explicit_def_names: std::collections::HashSet<String> =
         definitions.keys().cloned().collect();
-    if !include_dirs.is_empty() { resolve_library_modules(&mut definitions, include_dirs, lib_defines)?; }
+    let lib_cli = library_cli_cell().lock().unwrap().clone();
+    if !include_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
+        resolve_library_modules(&mut definitions, include_dirs, lib_defines, &lib_cli)?;
+    }
 
     let named_top_found = top_module_name.map_or(false, |n| definitions.contains_key(n));
     if let (Some(name), true) = (top_module_name, named_top_found) {
@@ -757,31 +781,52 @@ fn resolve_library_modules(
     definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+    lib_cli: &LibraryCli,
 ) -> Result<(), String> {
-    fn collect_sv_files(dir: &std::path::Path, out: &mut Vec<std::path::PathBuf>) -> Result<(), String> {
+    fn collect_sv_files(
+        dir: &std::path::Path,
+        exts: &[String],
+        out: &mut Vec<std::path::PathBuf>,
+    ) -> Result<(), String> {
         let entries = std::fs::read_dir(dir)
             .map_err(|e| format!("read_dir '{}': {}", dir.display(), e))?;
         for entry in entries {
             let entry = entry.map_err(|e| format!("read_dir '{}': {}", dir.display(), e))?;
             let path = entry.path();
             if path.is_dir() {
-                collect_sv_files(&path, out)?;
+                collect_sv_files(&path, exts, out)?;
                 continue;
             }
             let Some(ext) = path.extension().and_then(|s| s.to_str()) else { continue };
-            if matches!(ext, "v" | "sv" | "V") {
+            if exts.iter().any(|e| e == ext) {
                 out.push(path);
             }
         }
         Ok(())
     }
 
+    // `+libext+<ext>` REPLACES the default extension list (commercial
+    // semantics); without it, `-y` searches .v/.sv/.V as before.
+    let exts: Vec<String> = match &lib_cli.lib_exts {
+        Some(list) => list.clone(),
+        None => vec!["v".into(), "sv".into(), "V".into()],
+    };
+
     let mut files = Vec::new();
     for dir in include_dirs {
         let path = std::path::Path::new(dir);
         if path.is_dir() {
-            collect_sv_files(path, &mut files)?;
+            collect_sv_files(path, &exts, &mut files)?;
         }
+    }
+    // `-v <file>`: an explicit library FILE (any extension). Indexed like a
+    // `-y` hit — its modules are adopted only when needed, never tops.
+    for f in &lib_cli.lib_files {
+        let path = std::path::PathBuf::from(f);
+        if !path.is_file() {
+            return Err(format!("-v library file not found: {}", f));
+        }
+        files.push(path);
     }
 
     // Index every library file's module/interface/program definitions (and
