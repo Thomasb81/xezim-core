@@ -772,6 +772,17 @@ fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::
                 for (_cond, items) in &gi.branches { collect_instantiated_modules(items, set); }
             }
             ast::decl::ModuleItem::GenerateFor(gf) => collect_instantiated_modules(&gf.items, set),
+            // A stdcell netlist routinely instantiates cells inside generate
+            // regions, named generate blocks, and generate-case arms — these
+            // were invisible to the library resolver, so `-v`/`-y` never
+            // adopted the cell and elaboration failed with
+            // "Module 'X' instantiated but not found".
+            ast::decl::ModuleItem::GenerateRegion(gr) => {
+                collect_instantiated_modules(&gr.items, set)
+            }
+            ast::decl::ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms { collect_instantiated_modules(&arm.items, set); }
+            }
             _ => {}
         }
     }
@@ -839,11 +850,17 @@ fn resolve_library_modules(
     // in a test that never mentions them.
     let mut lib: crate::hasher::HashMap<String, SourceDefinition> = Default::default();
     let mut lib_typedefs: Vec<Rc<ast::decl::TypedefDeclaration>> = Vec::new();
+    let mut scanned_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut parse_issue_files: Vec<std::path::PathBuf> = Vec::new();
     for path in files {
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("Warning: library file '{}' unreadable: {}", path.display(), e);
+                continue;
+            }
         };
+        scanned_paths.push(path.clone());
         let mut pp = preprocessor::Preprocessor::new();
         for dir in include_dirs {
             pp.add_include_dir(std::path::PathBuf::from(dir));
@@ -853,6 +870,23 @@ fn resolve_library_modules(
         }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
         let result = sv_parser::parse(&preprocessed);
+        // A half-parsed library file silently loses every definition after the
+        // point of failure — the classic "-v vendor.v then Module 'X' not
+        // found". Surface it: one line per file, first error quoted.
+        if !result.errors.is_empty() {
+            let first = result
+                .errors
+                .first()
+                .map(|e| format!("{}", e.message))
+                .unwrap_or_default();
+            eprintln!(
+                "Warning: library file '{}': {} parse error(s) — definitions after the first error may be lost. First: {}",
+                path.display(),
+                result.errors.len(),
+                first
+            );
+            parse_issue_files.push(path.clone());
+        }
         for desc in result.source.descriptions {
             match desc {
                 ast::Description::Module(m) => {
@@ -898,6 +932,7 @@ fn resolve_library_modules(
         instantiations(def, &mut seed);
     }
     let mut work: Vec<String> = seed.into_iter().collect();
+    let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     while let Some(name) = work.pop() {
         if definitions.contains_key(&name) {
             continue;
@@ -911,6 +946,52 @@ fn resolve_library_modules(
                     work.push(n);
                 }
             }
+        } else {
+            unresolved.insert(name);
+        }
+    }
+    // Detailed context for names the libraries could not supply — printed here,
+    // where the library scan is in scope, so the eventual "instantiated but not
+    // found" elaboration error arrives with its cause already on the terminal.
+    if !unresolved.is_empty() && (!lib.is_empty() || !lib_cli.lib_files.is_empty()) {
+        for name in unresolved.iter().take(8) {
+            let mut line = format!(
+                "note: module '{}' not defined in the design and not found among {} definition(s) indexed from {} library file(s)",
+                name,
+                lib.len(),
+                scanned_paths.len()
+            );
+            // Case mismatch is a classic netlist/lib mismatch.
+            if let Some(close) = lib
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(name) && k.as_str() != name.as_str())
+            {
+                line.push_str(&format!(
+                    " — did you mean '{}'? (module names are case-sensitive)",
+                    close
+                ));
+            }
+            // A UDP with this name explains everything: xezim indexes modules,
+            // not primitives. Error path only — re-reads the files.
+            let prim_pat = format!("primitive {}", name);
+            let prim_pat2 = format!("primitive  {}", name);
+            if let Some(f) = scanned_paths.iter().find(|p| {
+                std::fs::read_to_string(p)
+                    .map(|s| s.contains(&prim_pat) || s.contains(&prim_pat2))
+                    .unwrap_or(false)
+            }) {
+                line.push_str(&format!(
+                    " — '{}' defines it as a UDP `primitive`, which xezim does not yet support",
+                    f.display()
+                ));
+            }
+            eprintln!("{}", line);
+        }
+        for f in parse_issue_files.iter().take(3) {
+            eprintln!(
+                "note: '{}' had parse errors (see warnings above) — its definitions may be incomplete",
+                f.display()
+            );
         }
     }
 
