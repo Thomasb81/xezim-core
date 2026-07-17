@@ -2282,11 +2282,14 @@ pub fn elaborate_module_with_defs(
                     } else {
                         width_with_unpacked_dims(&decl.dimensions, width)
                     };
-                    // supply0 → constant 0, supply1 → constant 1
+                    // supply0 → constant 0, supply1 → constant 1.
+                    // §6.6.1: an undriven wire reads high-impedance — nets
+                    // default to Z, not X (bits with drivers are overwritten
+                    // at the first settle; bits nothing drives stay z).
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(w),
                         NetType::Supply1 => Value::ones(w),
-                        _ => if is_real { Value::from_f64(0.0) } else { Value::new(w) },
+                        _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(w) },
                     };
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
@@ -2324,6 +2327,18 @@ pub fn elaborate_module_with_defs(
                                     }
                                 }
                             }
+                        }
+                        // Packed multi-D NET: `wire logic [3:0][7:0] foo;` —
+                        // record the per-element width so `foo[i]` resolves to
+                        // an 8-bit slice instead of a 1-bit select (LRM §7.4.1).
+                        // The variable (DataDeclaration) arm already does this;
+                        // the net arm omitted it, so packed-element port
+                        // connections in genloops read/drove single bits.
+                        if let Some(elem_w) = packed_inner_elem_width(&nd.data_type, &elab.parameters, &elab.typedefs) {
+                            elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
+                        }
+                        if let Some(fdims) = packed_full_dims_of(&nd.data_type, &elab.parameters) {
+                            elab.packed_full_dims.insert(decl.name.name.clone(), fdims);
                         }
                     }
                     if let Some((lo, hi)) = net_array_range {
