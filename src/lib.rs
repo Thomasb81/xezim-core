@@ -203,6 +203,8 @@ pub enum SourceDefinition {
     Class(Rc<ast::decl::ClassDeclaration>),
     Package(Rc<ast::module::PackageDeclaration>),
     Typedef(Rc<ast::decl::TypedefDeclaration>),
+    /// IEEE 1800-2017 §29 User-Defined Primitive.
+    Udp(Rc<ast::decl::UdpDecl>),
 }
 
 impl SourceDefinition {
@@ -214,6 +216,7 @@ impl SourceDefinition {
             SourceDefinition::Class(c) => c.name.name.clone(),
             SourceDefinition::Package(p) => p.name.name.clone(),
             SourceDefinition::Typedef(t) => t.name.name.clone(),
+            SourceDefinition::Udp(u) => u.name.name.clone(),
         }
     }
 
@@ -222,7 +225,8 @@ impl SourceDefinition {
             SourceDefinition::Module(m) => &m.items,
             SourceDefinition::Interface(i) => &i.items,
             SourceDefinition::Program(p) => &p.items,
-            SourceDefinition::Class(_) | SourceDefinition::Package(_) | SourceDefinition::Typedef(_) => &[],
+            SourceDefinition::Class(_) | SourceDefinition::Package(_)
+            | SourceDefinition::Typedef(_) | SourceDefinition::Udp(_) => &[],
         }
     }
 }
@@ -508,6 +512,13 @@ fn parse_and_elaborate(
             ast::Description::OutOfClassConstraint { class_name, constraint_name, items } => {
                 top_level_ooc_constraints.push((class_name, constraint_name, items));
             }
+            ast::Description::Udp(u) => {
+                // IEEE 1800-2017 §29: register the UDP in the definition map so
+                // instantiations resolve to it (elaboration lowers each
+                // instance into a runtime truth-table evaluator).
+                let name = u.name.name.clone();
+                definitions.insert(name, SourceDefinition::Udp(Rc::new(u)));
+            }
             _ => {}
         }
     }
@@ -682,6 +693,7 @@ fn parse_and_elaborate(
                 SourceDefinition::Class(c) => elaborate::Definition::Class(&**c),
                 SourceDefinition::Package(p) => elaborate::Definition::Package(&**p),
                 SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(&**t),
+                SourceDefinition::Udp(u) => elaborate::Definition::Udp(&**u),
             };
             Some((k.clone(), def))
         }).collect();
@@ -925,6 +937,12 @@ fn resolve_library_modules(
                 // library dir (that is the scope-poisoning we avoid).
                 ast::Description::TypedefDecl(t) if !t.forward => {
                     lib_typedefs.push(Rc::new(t));
+                }
+                // §29: a UDP defined in a `-v`/`-y` library file (vendor
+                // stdcell). Adopted on demand like a library module.
+                ast::Description::Udp(u) => {
+                    lib.entry(u.name.name.clone())
+                        .or_insert_with(|| SourceDefinition::Udp(Rc::new(u)));
                 }
                 _ => {}
             }

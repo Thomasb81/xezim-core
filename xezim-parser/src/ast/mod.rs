@@ -69,6 +69,8 @@ pub enum Description {
     /// Resolved during elaboration: the wrapped instantiation is appended
     /// to the named target module's items.
     Bind(decl::BindDirective),
+    /// IEEE 1800-2017 §29 User-Defined Primitive declaration.
+    Udp(decl::UdpDecl),
     /// §18.5.1 compilation-unit-scope out-of-class constraint definition
     /// `constraint ClassName::name { ... }`. Records that the class's
     /// `extern constraint name;` has an external body.

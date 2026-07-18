@@ -42,6 +42,33 @@ pub struct ContinuousAssignment {
     pub delay: u64,
 }
 
+/// IEEE 1800-2017 §29 User-Defined Primitive instance, flattened during
+/// elaboration. Terminal expressions are already rewritten into parent scope,
+/// so the simulator resolves them to signal IDs the same way it resolves a
+/// continuous-assign LHS/RHS.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct UdpInstance {
+    /// Primitive (UDP) name, for diagnostics.
+    pub udp_name: String,
+    /// Full instance path (e.g. `top.u_dff`), for diagnostics.
+    pub inst_path: String,
+    /// Output terminal net (the single UDP output).
+    pub output: Expression,
+    /// Input terminal nets, declaration order.
+    pub inputs: Vec<Expression>,
+    /// `reg out;` ⇒ sequential UDP.
+    pub is_sequential: bool,
+    /// §29.6 initial start state ('0'/'1'/'x'); default 'x'.
+    pub init: Option<char>,
+    /// Truth table.
+    pub rows: Vec<crate::ast::decl::UdpTableRow>,
+    /// Instance delay in simulation ticks (0 = none). Single delay applied to
+    /// all transitions (rise==fall==turn-off).
+    #[serde(default)]
+    pub delay: u64,
+    pub span: crate::ast::Span,
+}
+
 /// An always block for combinatorial logic.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AlwaysBlock {
@@ -777,6 +804,9 @@ pub struct ElaboratedModule {
     /// resolution against each terminal's own drivers.
     #[serde(default)]
     pub tran_switches: Vec<TranSwitch>,
+    /// §29 User-Defined Primitive instances (flattened).
+    #[serde(default)]
+    pub udp_instances: Vec<UdpInstance>,
     pub always_blocks: Vec<AlwaysBlock>,
     pub initial_blocks: Vec<InitialBlock>,
     /// `final` blocks — LRM §9.2.3. Identical AST shape to `initial`, but
@@ -1096,6 +1126,7 @@ impl ElaboratedModule {
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
             tran_switches: Vec::new(),
+            udp_instances: Vec::new(),
             always_blocks: Vec::new(),
             initial_blocks: Vec::new(),
             final_blocks: Vec::new(),
@@ -1236,6 +1267,8 @@ pub enum Definition<'a> {
     Covergroup(&'a crate::ast::decl::CovergroupDeclaration),
     Package(&'a crate::ast::module::PackageDeclaration),
     Typedef(&'a crate::ast::decl::TypedefDeclaration),
+    /// IEEE 1800-2017 §29 User-Defined Primitive.
+    Udp(&'a crate::ast::decl::UdpDecl),
 }
 
 impl<'a> Definition<'a> {
@@ -1248,6 +1281,7 @@ impl<'a> Definition<'a> {
             Definition::Covergroup(cg) => &cg.name.name,
             Definition::Package(p) => &p.name.name,
             Definition::Typedef(t) => &t.name.name,
+            Definition::Udp(u) => &u.name.name,
         }
     }
 
@@ -1257,7 +1291,8 @@ impl<'a> Definition<'a> {
             Definition::Interface(i) => &i.params,
             Definition::Program(p) => &p.params,
             Definition::Class(c) => &c.params,
-            Definition::Covergroup(_) | Definition::Package(_) | Definition::Typedef(_) => &[],
+            Definition::Covergroup(_) | Definition::Package(_) | Definition::Typedef(_)
+            | Definition::Udp(_) => &[],
         }
     }
 
@@ -1266,7 +1301,8 @@ impl<'a> Definition<'a> {
             Definition::Module(m) => &m.ports,
             Definition::Interface(i) => &i.ports,
             Definition::Program(p) => &p.ports,
-            Definition::Class(_) | Definition::Covergroup(_) | Definition::Package(_) | Definition::Typedef(_) => &PortList::Empty,
+            Definition::Class(_) | Definition::Covergroup(_) | Definition::Package(_)
+            | Definition::Typedef(_) | Definition::Udp(_) => &PortList::Empty,
         }
     }
         pub fn items(&self) -> &[ModuleItem] {
@@ -1274,7 +1310,8 @@ impl<'a> Definition<'a> {
         Definition::Module(m) => &m.items,
         Definition::Interface(i) => &i.items,
         Definition::Program(p) => &p.items,
-        Definition::Class(_) | Definition::Covergroup(_) | Definition::Package(_) | Definition::Typedef(_) => &[],
+        Definition::Class(_) | Definition::Covergroup(_) | Definition::Package(_)
+        | Definition::Typedef(_) | Definition::Udp(_) => &[],
         }
         }
         }
@@ -8924,6 +8961,14 @@ fn inline_module_items(
                     inst.instances.len()
                 );
             }
+            // IEEE 1800-2017 §29: a UDP instance looks exactly like a module
+            // instantiation. Lower it into a flattened `UdpInstance` (truth
+            // table + resolved terminal nets) instead of inlining module items.
+            if let Some(Definition::Udp(udp)) = definitions.get(sub_mod_name).copied() {
+                lower_udp_instances(elab, udp, inst, prefix,
+                    &*prepared_source.local_names, interface_map);
+                continue;
+            }
             let sub_mod = match definitions.get(sub_mod_name) {
                 Some(m) => *m,
                 None => {
@@ -10300,6 +10345,124 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
     for (lhs, rhs) in pairs {
         elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay: 0 });
     }
+}
+
+/// IEEE 1800-2017 §29: lower each UDP instance in `inst` into a flattened
+/// `UdpInstance` on `elab`. Terminals are positional; supports instance arrays
+/// (`u[hi:lo](...)`, bit-selecting each terminal) and a scalar `#(delay)`.
+fn lower_udp_instances(
+    elab: &mut ElaboratedModule,
+    udp: &crate::ast::decl::UdpDecl,
+    inst: &ModuleInstantiation,
+    prefix: &str,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) {
+    use crate::ast::decl::PortConnection;
+    let n_ports = udp.ports.len();
+    // Instance delay: `#(d)` before the instance — a scalar time literal in the
+    // enclosing module's time units. (Rise/fall pairs collapse to the first.)
+    let delay: u64 = inst.params.as_ref()
+        .and_then(|ps| ps.first())
+        .and_then(|p| match p {
+            crate::ast::decl::ParamConnection::Ordered(Some(crate::ast::decl::ParamValue::Expr(e)))
+                => const_eval_i64_with_params(e, Some(&elab.parameters)),
+            _ => None,
+        })
+        .filter(|d| *d > 0)
+        .map(|d| d as u64)
+        .unwrap_or(0);
+
+    for hi in &inst.instances {
+        // Positional terminals only (§29.7).
+        let mut terms: Vec<Expression> = Vec::with_capacity(n_ports);
+        let mut bad = false;
+        for conn in &hi.connections {
+            match conn {
+                PortConnection::Ordered(Some(e)) => terms.push(
+                    rewrite_expr(e, prefix, &HashMap::default(), local_names, interface_map)),
+                _ => { bad = true; break; }
+            }
+        }
+        let inst_path = format!("{}{}", prefix, hi.name.name);
+        if bad || terms.len() != n_ports {
+            eprintln!(
+                "\n========================================================================\n\
+                 Warning: UDP INSTANCE PORT MISMATCH — '{}' instance '{}'\n\
+                 primitive '{}' expects {} positional terminals (1 output + {} inputs)\n\
+                 but the instantiation supplied {}{}.\n\
+                 Consequence: this instance is SKIPPED; its output net is left UNDRIVEN.\n\
+                 ========================================================================\n",
+                udp.name.name, inst_path, udp.name.name, n_ports, n_ports.saturating_sub(1),
+                hi.connections.len(),
+                if bad { " (non-positional/unconnected terminal)" } else { "" },
+            );
+            continue;
+        }
+
+        // Instance array `u[hi:lo]` — expand to one UdpInstance per element,
+        // bit-selecting the matching wire bit of every terminal.
+        let arr_range = hi.dimensions.iter().rev().find_map(|d| match d {
+            crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
+                let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
+                let r = const_eval_i64_with_params(right, Some(&elab.parameters))?;
+                Some((l, r))
+            }
+            _ => None,
+        });
+
+        match arr_range {
+            None => {
+                elab.udp_instances.push(UdpInstance {
+                    udp_name: udp.name.name.clone(),
+                    inst_path,
+                    output: terms[0].clone(),
+                    inputs: terms[1..].to_vec(),
+                    is_sequential: udp.is_sequential,
+                    init: udp.init,
+                    rows: udp.rows.clone(),
+                    delay,
+                    span: udp.span,
+                });
+            }
+            Some((l, r)) => {
+                let (lo, hi_b) = if l <= r { (l, r) } else { (r, l) };
+                for idx in lo..=hi_b {
+                    let sel = |e: &Expression| Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(e.clone()),
+                            index: Box::new(make_udp_int_expr(idx)),
+                        }, Span::dummy());
+                    elab.udp_instances.push(UdpInstance {
+                        udp_name: udp.name.name.clone(),
+                        inst_path: format!("{}[{}]", inst_path, idx),
+                        output: sel(&terms[0]),
+                        inputs: terms[1..].iter().map(sel).collect(),
+                        is_sequential: udp.is_sequential,
+                        init: udp.init,
+                        rows: udp.rows.clone(),
+                        delay,
+                        span: udp.span,
+                    });
+                }
+            }
+        }
+    }
+}
+
+/// A plain decimal integer-literal expression (for synthesized bit-selects).
+fn make_udp_int_expr(v: i64) -> Expression {
+    use crate::ast::expr::{NumberLiteral, NumberBase};
+    Expression::new(
+        ExprKind::Number(NumberLiteral::Integer {
+            size: None,
+            signed: true,
+            base: NumberBase::Decimal,
+            value: v.to_string(),
+            cached_val: std::cell::Cell::new(None),
+        }),
+        Span::dummy(),
+    )
 }
 
 fn make_ident_expr(name: &str) -> Expression {
