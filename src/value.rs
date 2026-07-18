@@ -1226,7 +1226,7 @@ impl Value {
         if self.is_real {
             return Some(self.to_f64() != 0.0);
         }
-        // Matches iverilog's reduce-to-bool (NetEBLogic, eval_tree.cc):
+        // Matches a reference simulator's reduce-to-bool (NetEBLogic, eval_tree.cc):
         // a *definite* 1 anywhere makes the value truthy even if other
         // bits are X/Z. Only return None (unknown) when there are X/Z
         // bits and no definite 1 — i.e. the truth could still go either
@@ -1307,7 +1307,7 @@ impl Value {
         let ndigits = ((self.width + 3) / 4) as usize;
         let mut s = String::with_capacity(ndigits);
         for d in (0..ndigits).rev() {
-            // §21.2.1.2 unknown casing, per hex digit (matches Icarus/commercial
+            // §21.2.1.2 unknown casing, per hex digit (matches reference/commercial
             // tools): a nibble that is entirely x prints `x`, entirely z prints
             // `z`, and one that MIXES unknown bits with known bits (or x with z)
             // prints uppercase `X` (any x) or `Z` (some z, no x). Only a fully
@@ -1488,7 +1488,7 @@ mod tests {
         assert_eq!(Value::from_str_radix("zz", 16, 8).to_bin(), "zzzzzzzz");
     }
 
-    // §21.2.1.2 unknown-value casing for `%h` and `%d` (matches Icarus): an
+    // §21.2.1.2 unknown-value casing for `%h` and `%d` (matches a reference simulator): an
     // all-x group prints lowercase `x`, all-z prints `z`, and a group MIXING
     // unknown with known bits (or x with z) prints uppercase `X`/`Z`. The old
     // code collapsed every unknown to lowercase `x`, losing z entirely.

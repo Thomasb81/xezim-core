@@ -232,12 +232,6 @@ impl PendingContAssign {
 pub struct ElaboratedClass {
     pub name: String,
     pub extends: Option<String>,
-    /// Positional args of the `extends Base #(a0, a1, ...)` clause, each
-    /// stringified — type args as their bare type/param name, value args as
-    /// their expression text. Indexed against the BASE class `param_order`
-    /// (type+value params interleaved) to resolve an inherited type parameter
-    /// up the specialization chain (parameterized-class static dispatch).
-    pub extends_type_args: Vec<String>,
     pub properties: HashMap<String, Signal>,
     /// Property names in DECLARATION order. `properties` is a HashMap and so
     /// loses source order; `%p` (LRM §21.2.1.7) must print a class object as
@@ -296,6 +290,11 @@ pub struct ElaboratedClass {
     /// ALL arguments in the `extends Base#(arg1, arg2, ...)` clause as textual
     /// fragments, preserving order (both type and value params). Used to
     /// resolve ancestor type/value parameters: when a method of
+    /// `uvm_registry_common` references `Tregistry`, we match it against the
+    /// ancestor's `param_order` to find the extends arg at the same position
+    /// (e.g. `this_type`), then resolve it to the concrete specialization.
+    #[serde(default)]
+    pub extends_type_args: Vec<String>,
     /// ALL parameter names (type and value), in declaration order. Needed to
     /// map positional `#(...)` type-args to the correct param when type and
     /// value params are interleaved (e.g. `uvm_component_registry#(type T,
@@ -1049,7 +1048,7 @@ pub struct ElaboratedModule {
     /// when the actual is a SIMPLE WHOLE-NET identifier (`.din(src_bus)`). A
     /// bit-select, part-select, concatenation or expression actual
     /// (`.din(bus[3:0])`, `.din({a,b})`, `.din(w+1)`) is a distinct object and is
-    /// NOT recorded — Verilator and Icarus keep those separate too.
+    /// NOT recorded — Verilator and a reference simulator keep those separate too.
     ///
     /// Inlining gives the formal its own signal-table entry, kept in step with
     /// the actual by a port continuous-assign, so a dump that treats the two as
@@ -3534,7 +3533,12 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     }
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
+                    let rhs_final = if ca.strength.as_deref().map(strength_is_weak).unwrap_or(false) {
+                        make_syscall("$__pull", vec![rhs.clone()], rhs.span)
+                    } else {
+                        rhs.clone()
+                    };
+                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -3642,6 +3646,15 @@ pub fn elaborate_module_with_defs(
                 for p in &sb.paths {
                     let d = eval_const_expr(&p.delay, &elab.parameters);
                     elab.specify_delays.insert(p.dst.name.clone(), d);
+                }
+                // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
+                // so a top-level cell's functional path through them works.
+                for (delayed, source) in &sb.delayed_nets {
+                    elab.continuous_assigns.push(ContinuousAssignment {
+                        lhs: make_ident_expr(delayed),
+                        rhs: make_ident_expr(source),
+                        delay: 0,
+                    });
                 }
             }
             ModuleItem::ModuleInstantiation(inst) => {
@@ -4413,7 +4426,7 @@ fn validate_modport_writes(elab: &ElaboratedModule) -> Result<(), String> {
 ///    no further event/delay/wait controls may appear in the body.
 ///  * §9.2.2.1 plain always: the process must be guaranteed to advance
 ///    simulation time on every iteration, else it is a zero-delay livelock
-///    (Icarus: "always process does not have any delay").
+///    (a reference simulator: "always process does not have any delay").
 fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), String> {
     use crate::ast::decl::AlwaysKind;
     use crate::ast::expr::{ExprKind, NumberLiteral};
@@ -4548,7 +4561,7 @@ fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), Stri
     // (un-inlined) task body. We therefore reject only the structural cases we
     // can prove are zero-delay livelocks — chiefly `fork … join_none` and a
     // `join_any`/`join` whose parent unblocks at time 0 — which is exactly
-    // what Icarus flags as "always process does not have any delay".
+    // what a reference simulator flags as "always process does not have any delay".
     fn is_literal_zero(e: &crate::ast::expr::Expression) -> bool {
         match &e.kind {
             ExprKind::Paren(x) => is_literal_zero(x),
@@ -4603,7 +4616,7 @@ fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), Stri
     // runtime's zero-delay livelock guard, matching prior behavior. The
     // fork/join_none / min-zero-join_any cases (always4A / always4B) cannot be
     // caught at runtime the same way (they spawn children), so we reject them
-    // at elaboration exactly as Icarus does.
+    // at elaboration exactly as a reference simulator does.
     fn contains_fork(s: &Statement) -> bool {
         match &s.kind {
             StatementKind::ParBlock { .. } => true,
@@ -6022,7 +6035,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             }
                         }
                     }
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
+                    let rhs_final = if ca.strength.as_deref().map(strength_is_weak).unwrap_or(false) {
+                        make_syscall("$__pull", vec![rhs.clone()], rhs.span)
+                    } else {
+                        rhs.clone()
+                    };
+                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -6126,6 +6144,15 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 for p in &sb.paths {
                     let d = eval_const_expr(&p.delay, &elab.parameters);
                     elab.specify_delays.insert(p.dst.name.clone(), d);
+                }
+                // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
+                // so a top-level cell's functional path through them works.
+                for (delayed, source) in &sb.delayed_nets {
+                    elab.continuous_assigns.push(ContinuousAssignment {
+                        lhs: make_ident_expr(delayed),
+                        rhs: make_ident_expr(source),
+                        delay: 0,
+                    });
                 }
             }
             ModuleItem::FunctionDeclaration(fd) => {
@@ -8936,6 +8963,48 @@ fn prepare_module_items(
                         local_names.insert(hi.name.name.clone());
                     }
                 }
+                // §6.10: a bare undeclared identifier used as an instance PORT
+                // CONNECTION is an implicit net local to THIS module. It must be
+                // in local_names so every reference to it (this connection, a
+                // gate terminal, a cont-assign) prefixes to the SAME net during
+                // inlining — otherwise the net splits and the value never
+                // propagates (e.g. a cell clock driven by a buf but read undriven).
+                let mut cand = Vec::new();
+                for hi in &inst.instances {
+                    for conn in &hi.connections {
+                        match conn {
+                            PortConnection::Ordered(Some(e))
+                            | PortConnection::Named { expr: Some(e), .. } => {
+                                collect_implicit_net_candidates(e, &mut cand);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for c in cand {
+                    local_names.insert(c);
+                }
+            }
+            ModuleItem::GateInstantiation(gi) => {
+                // §6.10: a bare undeclared gate terminal (e.g. a `buf` output) is
+                // an implicit local net — register it so it prefixes consistently.
+                let mut cand = Vec::new();
+                for gi_inst in &gi.instances {
+                    for term in &gi_inst.terminals {
+                        collect_implicit_net_candidates(term, &mut cand);
+                    }
+                }
+                for c in cand {
+                    local_names.insert(c);
+                }
+            }
+            ModuleItem::SpecifyBlock(sb) => {
+                // Delayed-net targets/sources are local nets driven by the
+                // injected zero-delay assigns; keep them in the same scope.
+                for (delayed, source) in &sb.delayed_nets {
+                    local_names.insert(delayed.clone());
+                    local_names.insert(source.clone());
+                }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
                 if let ParameterKind::Data { assignments, .. } = &pd.kind {
@@ -9956,6 +10025,32 @@ fn inline_module_items(
                                 elab.specify_delays.insert(dst_name, d);
                             }
                         }
+                        // §15.6 delayed nets: drive `delayed_net = source` as a
+                        // zero-delay continuous assign in the instance scope so
+                        // the cell's functional clock/data path (which reads
+                        // these nets) works even though the timing check itself
+                        // is not modeled.
+                        for (delayed, source) in &sb.delayed_nets {
+                            let lhs = rewrite_expr(
+                                &make_ident_expr(delayed),
+                                &inst_prefix,
+                                &rewrite_port_map,
+                                &*prepared_sub.local_names,
+                                &sub_interface_map,
+                            );
+                            let rhs = rewrite_expr(
+                                &make_ident_expr(source),
+                                &inst_prefix,
+                                &rewrite_port_map,
+                                &*prepared_sub.local_names,
+                                &sub_interface_map,
+                            );
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                lhs,
+                                rhs,
+                                delay: 0,
+                            });
+                        }
                     }
                     if matches!(sub_item, ModuleItem::AlwaysConstruct(_)) {
                         if let BodySource::Always(kind, stmt_rc) = body_src {
@@ -10040,7 +10135,13 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                     let v = if matches!(gi.gate_type, GateType::Pullup) { '1' } else { '0' };
                     let lit = Expression::new(
                         ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(v)), net.span);
-                    pairs.push((net.clone(), lit));
+                    // §28.4: pullup/pulldown are WEAK (pull strength). Tag the
+                    // driver so multi-driver resolution lets a strong driver win
+                    // and only falls back to the pull where the net is otherwise
+                    // z. A lone pull driver evaluates to its value ($__pull is
+                    // identity in the simulator).
+                    let weak = make_syscall("$__pull", vec![lit], net.span);
+                    pairs.push((net.clone(), weak));
                 }
                 continue;
             }
@@ -10219,6 +10320,19 @@ fn ident_flat_name(e: &Expression) -> Option<String> {
     }
 }
 
+/// True when a continuous-assign drive strength is entirely WEAK (pull/weak/
+/// highz on both the 1 and 0 sides) — such a driver behaves like a pullup/
+/// pulldown and loses to any strong driver. A mixed strength (e.g. strong1,
+/// pull0) is not treated as weak (approximated as strong).
+fn strength_is_weak(s: &str) -> bool {
+    let toks: Vec<&str> = s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    !toks.is_empty()
+        && toks.iter().all(|t| {
+            let base = t.trim_end_matches(|c: char| c == '0' || c == '1');
+            matches!(base, "pull" | "weak" | "highz")
+        })
+}
+
 fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
     Expression::new(ExprKind::SystemCall { name: name.to_string(), args }, span)
 }
@@ -10264,29 +10378,57 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         return;
     }
     let all = std::mem::take(&mut elab.continuous_assigns);
-    let mut folded: HashMap<String, (Expression, Expression, u64)> = HashMap::default();
+    // Per multi-driven net: keep the lhs/delay, and accumulate STRONG drivers
+    // and WEAK (pull) drivers into separate `$__wres` chains. A pull driver's
+    // rhs is `$__pull(v)`; unwrap it into the weak chain. Final rhs resolves
+    // strong first and only falls back to the pull where strong is z.
+    struct Acc {
+        lhs: Expression,
+        delay: u64,
+        strong: Option<Expression>,
+        weak: Option<Expression>,
+    }
+    let mut folded: HashMap<String, Acc> = HashMap::default();
     let mut order: Vec<String> = Vec::new();
+    let is_pull = |e: &Expression| matches!(&e.kind,
+        ExprKind::SystemCall { name, .. } if name == "$__pull");
     for ca in all {
         let name = ident_flat_name(&ca.lhs).filter(|n| multi.contains(n));
         let Some(name) = name else {
             elab.continuous_assigns.push(ca);
             continue;
         };
-        match folded.get_mut(&name) {
-            Some((_, rhs, _)) => {
-                let span = ca.rhs.span;
-                let acc = std::mem::replace(rhs, make_z_expr(span));
-                *rhs = make_syscall("$__wres", vec![acc, ca.rhs], span);
-            }
-            None => {
-                order.push(name.clone());
-                folded.insert(name, (ca.lhs, ca.rhs, ca.delay));
-            }
-        }
+        let span = ca.rhs.span;
+        // Unwrap a $__pull marker into the raw value for the weak chain.
+        let (rhs, weak) = if is_pull(&ca.rhs) {
+            let inner = if let ExprKind::SystemCall { args, .. } = ca.rhs.kind {
+                args.into_iter().next().unwrap_or_else(|| make_z_expr(span))
+            } else { make_z_expr(span) };
+            (inner, true)
+        } else {
+            (ca.rhs, false)
+        };
+        let slot = folded.entry(name.clone()).or_insert_with(|| {
+            order.push(name.clone());
+            Acc { lhs: ca.lhs.clone(), delay: ca.delay, strong: None, weak: None }
+        });
+        let chain = if weak { &mut slot.weak } else { &mut slot.strong };
+        *chain = Some(match chain.take() {
+            Some(acc) => make_syscall("$__wres", vec![acc, rhs], span),
+            None => rhs,
+        });
     }
     for name in order {
-        if let Some((lhs, rhs, delay)) = folded.remove(&name) {
-            elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay });
+        if let Some(acc) = folded.remove(&name) {
+            let span = acc.lhs.span;
+            let rhs = match (acc.strong, acc.weak) {
+                // Strong wins; pull fills only the bits where strong is z.
+                (Some(st), Some(wk)) => make_syscall("$__wres_pull", vec![st, wk], span),
+                (Some(st), None) => st,
+                (None, Some(wk)) => wk,
+                (None, None) => make_z_expr(span),
+            };
+            elab.continuous_assigns.push(ContinuousAssignment { lhs: acc.lhs, rhs, delay: acc.delay });
         }
     }
 }

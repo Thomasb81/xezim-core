@@ -166,6 +166,14 @@ pub struct NettypeDeclaration {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SpecifyBlock {
     pub paths: Vec<SpecifyPath>,
+    /// IEEE 1364 §15.6 negative-timing-check DELAYED nets: the trailing
+    /// `delayed_reference`/`delayed_data` arguments of `$setuphold`/`$recrem`
+    /// (etc.). Each entry is (delayed_net, source_signal). Vendor cells route
+    /// their functional clock/data path through these nets, so a functional
+    /// simulator that does not model the check must still drive them —
+    /// zero-delay, i.e. `assign delayed_net = source_signal`. Without this the
+    /// cell's clock is undriven (x) and its flops never evaluate.
+    pub delayed_nets: Vec<(String, String)>,
     pub span: Span,
 }
 

@@ -1867,7 +1867,7 @@ fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> St
             }
             _ => {
                 // Unknown letter escape: §5.9 leaves this implementation-defined.
-                // Icarus (the oracle) drops the backslash and keeps the char, so
+                // a reference simulator (the oracle) drops the backslash and keeps the char, so
                 // we match that VALUE, but emit a warning so the mangle is not
                 // silent.
                 diags.push((false, format!(

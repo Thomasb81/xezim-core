@@ -254,7 +254,7 @@ pub fn vcd_real_string(v: f64) -> String {
 }
 
 /// The binary digit string of a vector value, MSB first, with §21.7.2.1-legal
-/// leading-run suppression — the same spelling Icarus Verilog emits.
+/// leading-run suppression — the same spelling a reference simulator Verilog emits.
 ///
 /// A reader LEFT-EXTENDS a value shorter than the `$var` width using the
 /// leftmost emitted character: `x` extends with x, `z` with z, and anything else
