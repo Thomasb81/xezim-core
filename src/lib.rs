@@ -203,6 +203,8 @@ pub enum SourceDefinition {
     Class(Rc<ast::decl::ClassDeclaration>),
     Package(Rc<ast::module::PackageDeclaration>),
     Typedef(Rc<ast::decl::TypedefDeclaration>),
+    /// IEEE 1800-2017 §29 User-Defined Primitive.
+    Udp(Rc<ast::decl::UdpDecl>),
 }
 
 impl SourceDefinition {
@@ -214,6 +216,7 @@ impl SourceDefinition {
             SourceDefinition::Class(c) => c.name.name.clone(),
             SourceDefinition::Package(p) => p.name.name.clone(),
             SourceDefinition::Typedef(t) => t.name.name.clone(),
+            SourceDefinition::Udp(u) => u.name.name.clone(),
         }
     }
 
@@ -222,7 +225,8 @@ impl SourceDefinition {
             SourceDefinition::Module(m) => &m.items,
             SourceDefinition::Interface(i) => &i.items,
             SourceDefinition::Program(p) => &p.items,
-            SourceDefinition::Class(_) | SourceDefinition::Package(_) | SourceDefinition::Typedef(_) => &[],
+            SourceDefinition::Class(_) | SourceDefinition::Package(_)
+            | SourceDefinition::Typedef(_) | SourceDefinition::Udp(_) => &[],
         }
     }
 }
@@ -508,6 +512,22 @@ fn parse_and_elaborate(
             ast::Description::OutOfClassConstraint { class_name, constraint_name, items } => {
                 top_level_ooc_constraints.push((class_name, constraint_name, items));
             }
+            ast::Description::Udp(u) => {
+                // IEEE 1800-2017 §29: register the UDP in the definition map so
+                // instantiations resolve to it (elaboration lowers each
+                // instance into a runtime truth-table evaluator).
+                let name = u.name.name.clone();
+                // Mirror the historical behavior where a UDP parsed as an empty
+                // `Description::Module` advanced the source-order `top_module`
+                // cursor. A UDP is never a real hierarchy root, but keeping this
+                // cursor identical preserves auto-top-detection: a following
+                // heuristic re-selects a proper module/program candidate, and
+                // leaving the cursor on a trailing UDP (an instantiated,
+                // non-candidate name) correctly forces that heuristic instead of
+                // pinning a trivial trailing program/package.
+                top_module = Some(name.clone());
+                definitions.insert(name, SourceDefinition::Udp(Rc::new(u)));
+            }
             _ => {}
         }
     }
@@ -633,7 +653,10 @@ fn parse_and_elaborate(
                 // elaboration ("not a module or program"). Packages stay
                 // eligible: a package-only design (e.g. uvm_pkg) legitimately
                 // elaborates the package as the root.
-                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Typedef(_))))
+                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Typedef(_)))
+                // §29: a UDP is never a hierarchy root — exclude it so a
+                // trailing/unused primitive can't pin auto-top-detection.
+                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Udp(_))))
             .cloned().collect();
         // Sort to make top-module selection deterministic when more than one
         // module is uninstantiated. Without this, ahash's random seed picks
@@ -682,6 +705,7 @@ fn parse_and_elaborate(
                 SourceDefinition::Class(c) => elaborate::Definition::Class(&**c),
                 SourceDefinition::Package(p) => elaborate::Definition::Package(&**p),
                 SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(&**t),
+                SourceDefinition::Udp(u) => elaborate::Definition::Udp(&**u),
             };
             Some((k.clone(), def))
         }).collect();
@@ -772,6 +796,17 @@ fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::
                 for (_cond, items) in &gi.branches { collect_instantiated_modules(items, set); }
             }
             ast::decl::ModuleItem::GenerateFor(gf) => collect_instantiated_modules(&gf.items, set),
+            // A stdcell netlist routinely instantiates cells inside generate
+            // regions, named generate blocks, and generate-case arms — these
+            // were invisible to the library resolver, so `-v`/`-y` never
+            // adopted the cell and elaboration failed with
+            // "Module 'X' instantiated but not found".
+            ast::decl::ModuleItem::GenerateRegion(gr) => {
+                collect_instantiated_modules(&gr.items, set)
+            }
+            ast::decl::ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms { collect_instantiated_modules(&arm.items, set); }
+            }
             _ => {}
         }
     }
@@ -839,11 +874,17 @@ fn resolve_library_modules(
     // in a test that never mentions them.
     let mut lib: crate::hasher::HashMap<String, SourceDefinition> = Default::default();
     let mut lib_typedefs: Vec<Rc<ast::decl::TypedefDeclaration>> = Vec::new();
+    let mut scanned_paths: Vec<std::path::PathBuf> = Vec::new();
+    let mut parse_issue_files: Vec<std::path::PathBuf> = Vec::new();
     for path in files {
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
-            Err(_) => continue,
+            Err(e) => {
+                eprintln!("Warning: library file '{}' unreadable: {}", path.display(), e);
+                continue;
+            }
         };
+        scanned_paths.push(path.clone());
         let mut pp = preprocessor::Preprocessor::new();
         for dir in include_dirs {
             pp.add_include_dir(std::path::PathBuf::from(dir));
@@ -853,6 +894,41 @@ fn resolve_library_modules(
         }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
         let result = sv_parser::parse(&preprocessed);
+        // A half-parsed library file silently loses every definition after the
+        // point of failure — the classic "-v vendor.v then Module 'X' not
+        // found". Surface it VCS-style: file:line:col per error (first three),
+        // resolved against the preprocessed text the spans index (line numbers
+        // can shift from the raw file where `include/macros expand).
+        if !result.errors.is_empty() {
+            let line_col = |off: usize| -> (usize, usize) {
+                let (mut line, mut col) = (1usize, 1usize);
+                for (i, ch) in preprocessed.char_indices() {
+                    if i >= off {
+                        break;
+                    }
+                    if ch == '\n' {
+                        line += 1;
+                        col = 1;
+                    } else {
+                        col += 1;
+                    }
+                }
+                (line, col)
+            };
+            eprintln!(
+                "Warning: library file '{}': {} parse error(s) — definitions after the first error may be lost:",
+                path.display(),
+                result.errors.len()
+            );
+            for e in result.errors.iter().take(3) {
+                let (line, col) = line_col(e.span.start);
+                eprintln!("  {}:{}:{}: {}", path.display(), line, col, e.message);
+            }
+            if result.errors.len() > 3 {
+                eprintln!("  ... and {} more", result.errors.len() - 3);
+            }
+            parse_issue_files.push(path.clone());
+        }
         for desc in result.source.descriptions {
             match desc {
                 ast::Description::Module(m) => {
@@ -873,6 +949,12 @@ fn resolve_library_modules(
                 // library dir (that is the scope-poisoning we avoid).
                 ast::Description::TypedefDecl(t) if !t.forward => {
                     lib_typedefs.push(Rc::new(t));
+                }
+                // §29: a UDP defined in a `-v`/`-y` library file (vendor
+                // stdcell). Adopted on demand like a library module.
+                ast::Description::Udp(u) => {
+                    lib.entry(u.name.name.clone())
+                        .or_insert_with(|| SourceDefinition::Udp(Rc::new(u)));
                 }
                 _ => {}
             }
@@ -898,6 +980,7 @@ fn resolve_library_modules(
         instantiations(def, &mut seed);
     }
     let mut work: Vec<String> = seed.into_iter().collect();
+    let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     while let Some(name) = work.pop() {
         if definitions.contains_key(&name) {
             continue;
@@ -911,6 +994,52 @@ fn resolve_library_modules(
                     work.push(n);
                 }
             }
+        } else {
+            unresolved.insert(name);
+        }
+    }
+    // Detailed context for names the libraries could not supply — printed here,
+    // where the library scan is in scope, so the eventual "instantiated but not
+    // found" elaboration error arrives with its cause already on the terminal.
+    if !unresolved.is_empty() && (!lib.is_empty() || !lib_cli.lib_files.is_empty()) {
+        for name in unresolved.iter().take(8) {
+            let mut line = format!(
+                "note: module '{}' not defined in the design and not found among {} definition(s) indexed from {} library file(s)",
+                name,
+                lib.len(),
+                scanned_paths.len()
+            );
+            // Case mismatch is a classic netlist/lib mismatch.
+            if let Some(close) = lib
+                .keys()
+                .find(|k| k.eq_ignore_ascii_case(name) && k.as_str() != name.as_str())
+            {
+                line.push_str(&format!(
+                    " — did you mean '{}'? (module names are case-sensitive)",
+                    close
+                ));
+            }
+            // A UDP with this name explains everything: xezim indexes modules,
+            // not primitives. Error path only — re-reads the files.
+            let prim_pat = format!("primitive {}", name);
+            let prim_pat2 = format!("primitive  {}", name);
+            if let Some(f) = scanned_paths.iter().find(|p| {
+                std::fs::read_to_string(p)
+                    .map(|s| s.contains(&prim_pat) || s.contains(&prim_pat2))
+                    .unwrap_or(false)
+            }) {
+                line.push_str(&format!(
+                    " — '{}' defines it as a UDP `primitive`, which xezim does not yet support",
+                    f.display()
+                ));
+            }
+            eprintln!("{}", line);
+        }
+        for f in parse_issue_files.iter().take(3) {
+            eprintln!(
+                "note: '{}' had parse errors (see warnings above) — its definitions may be incomplete",
+                f.display()
+            );
         }
     }
 

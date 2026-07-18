@@ -6,6 +6,61 @@ use super::expr::Expression;
 use super::stmt::{Statement, VarDeclarator};
 use super::types::*;
 
+/// IEEE 1800-2017 §29 User-Defined Primitive declaration.
+/// `primitive name(out, in..); ... table ... endtable endprimitive`
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct UdpDecl {
+    pub name: Identifier,
+    /// Port names in declaration order; `ports[0]` is the single output.
+    pub ports: Vec<Identifier>,
+    /// `reg out;` (or ANSI `output reg`) ⇒ sequential UDP.
+    pub is_sequential: bool,
+    /// §29.6 `initial out = 1'bX;` — start state ('0','1','x'); default 'x'.
+    pub init: Option<char>,
+    pub rows: Vec<UdpTableRow>,
+    pub span: Span,
+}
+
+/// One row of a UDP truth table.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct UdpTableRow {
+    /// One symbol per input port, declaration order. For edge-sequential rows
+    /// exactly one entry is an `Edge`/`EdgeShort`.
+    pub inputs: Vec<UdpSym>,
+    /// Sequential middle field (current state); `None` for combinational rows.
+    pub state: Option<UdpSym>,
+    /// Output field.
+    pub output: UdpOut,
+    pub span: Span,
+}
+
+/// A UDP table input/state symbol (IEEE 1800-2017 Table 29-1/29-2).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum UdpSym {
+    /// Level `0` `1` `x` (input `z` normalized to `x`).
+    Level(char),
+    /// `?` — matches 0, 1, or x (no edge).
+    AnyQ,
+    /// `b` — matches 0 or 1.
+    B,
+    /// Explicit edge `(vw)`, v,w ∈ {0,1,x,?} (`?` expands over levels).
+    Edge { from: char, to: char },
+    /// Edge shorthand: 'r'=(01), 'f'=(10), 'p'=(01)(0x)(x1),
+    /// 'n'=(10)(1x)(x0), '*'=(??)=any change.
+    EdgeShort(char),
+}
+
+/// A UDP output-field symbol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum UdpOut {
+    Level(char), // '0' '1' 'x'
+    NoChange,    // '-' (sequential hold)
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ModuleItem {

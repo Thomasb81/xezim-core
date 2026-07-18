@@ -125,49 +125,11 @@ impl Parser {
                 Some(Description::Interface(self.parse_interface_declaration())),
             TokenKind::KwProgram =>
                 Some(Description::Program(self.parse_program_declaration())),
-            // §28.3 User-Defined Primitive. xezim doesn't model UDP truth
-            // tables; surface it as an empty module with the same port list so
-            // instantiations resolve and simulation completes (the output net
-            // is simply left undriven). Robust against combinational and
-            // sequential (`reg`/`table`) UDP bodies alike.
-            TokenKind::KwPrimitive => {
-                let start = self.current().span.start;
-                self.bump();
-                let name = self.parse_identifier();
-                // Collect bare port identifiers from the header `(...)`,
-                // skipping ANSI direction keywords / punctuation.
-                let mut ports: Vec<crate::ast::Identifier> = Vec::new();
-                if self.eat(TokenKind::LParen).is_some() {
-                    let mut depth = 1i32;
-                    while depth > 0 && !self.at(TokenKind::Eof) {
-                        match self.current_kind() {
-                            TokenKind::LParen => { depth += 1; self.bump(); }
-                            TokenKind::RParen => { depth -= 1; self.bump(); }
-                            TokenKind::Identifier | TokenKind::EscapedIdentifier
-                                if depth == 1 => { ports.push(self.parse_identifier()); }
-                            _ => { self.bump(); }
-                        }
-                    }
-                }
-                self.eat(TokenKind::Semicolon);
-                // Skip the body up to `endprimitive`.
-                while !self.at(TokenKind::KwEndprimitive) && !self.at(TokenKind::Eof) {
-                    self.bump();
-                }
-                self.expect(TokenKind::KwEndprimitive);
-                if self.eat(TokenKind::Colon).is_some() { let _ = self.parse_identifier(); }
-                Some(Description::Module(crate::ast::module::ModuleDeclaration {
-                    attrs: Vec::new(),
-                    kind: crate::ast::module::ModuleKind::Module,
-                    lifetime: None,
-                    name,
-                    params: Vec::new(),
-                    ports: crate::ast::module::PortList::NonAnsi(ports),
-                    items: Vec::new(),
-                    endlabel: None,
-                    span: self.span_from(start),
-                }))
-            }
+            // IEEE 1800-2017 §29 User-Defined Primitive. Parsed into a real
+            // `Description::Udp` carrying the truth table; on any table-row it
+            // cannot parse, `parse_primitive` emits a loud warning and falls
+            // back to the historical empty-module stub for that UDP only.
+            TokenKind::KwPrimitive => Some(self.parse_primitive()),
             TokenKind::KwPackage =>
                 Some(Description::Package(self.parse_package_declaration())),
             TokenKind::KwNettype => {
@@ -307,6 +269,290 @@ impl Parser {
                 }
                 None
             }
+        }
+    }
+
+    /// IEEE 1800-2017 §29 user-defined primitive. Produces a real
+    /// `Description::Udp` with the parsed truth table. If the header or any
+    /// table row cannot be understood, emits a loud multi-line warning and
+    /// falls back to the historical empty-module stub for THIS udp only, so a
+    /// malformed table never crashes the parse nor silently mis-simulates.
+    fn parse_primitive(&mut self) -> Description {
+        use crate::ast::decl::{UdpDecl, UdpTableRow, UdpSym, UdpOut};
+        let start = self.current().span.start;
+        self.bump(); // `primitive`
+        let name = self.parse_identifier();
+
+        // --- Header: collect port names (depth-1 identifiers, in order) and
+        // detect an ANSI `output reg` (=> sequential). Works for ANSI and
+        // non-ANSI headers alike since port names are always identifiers.
+        let mut ports: Vec<crate::ast::Identifier> = Vec::new();
+        let mut is_sequential = false;
+        if self.eat(TokenKind::LParen).is_some() {
+            let mut depth = 1i32;
+            while depth > 0 && !self.at(TokenKind::Eof) {
+                match self.current_kind() {
+                    TokenKind::LParen => { depth += 1; self.bump(); }
+                    TokenKind::RParen => { depth -= 1; self.bump(); }
+                    TokenKind::KwReg if depth == 1 => { is_sequential = true; self.bump(); }
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier if depth == 1 => {
+                        ports.push(self.parse_identifier());
+                    }
+                    _ => { self.bump(); }
+                }
+            }
+        }
+        self.eat(TokenKind::Semicolon);
+
+        // --- Body declarations up to `table`: pick up `reg` (=> sequential)
+        // and `initial out = 1'bX;` (start state).
+        let mut init: Option<char> = None;
+        while !self.at(TokenKind::KwTable) && !self.at(TokenKind::KwEndprimitive)
+            && !self.at(TokenKind::Eof)
+        {
+            match self.current_kind() {
+                TokenKind::KwReg => { is_sequential = true; self.skip_udp_to_semi(); }
+                TokenKind::KwInitial => {
+                    self.bump(); // `initial`
+                    // out = <value> ;  — collect value tokens after `=`.
+                    let mut seen_eq = false;
+                    let mut val = String::new();
+                    while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof)
+                        && !self.at(TokenKind::KwTable)
+                    {
+                        let k = self.current_kind();
+                        if k == TokenKind::Assign || k == TokenKind::Eq {
+                            seen_eq = true;
+                        } else if seen_eq {
+                            val.push_str(&self.current().text);
+                        }
+                        self.bump();
+                    }
+                    self.eat(TokenKind::Semicolon);
+                    let low = val.to_ascii_lowercase();
+                    init = Some(if low.contains('x') || low.contains('z') {
+                        'x'
+                    } else if low.ends_with('1') {
+                        '1'
+                    } else if low.ends_with('0') {
+                        '0'
+                    } else {
+                        'x'
+                    });
+                }
+                _ => { self.skip_udp_to_semi(); }
+            }
+        }
+
+        // --- Table.
+        let n_inputs = ports.len().saturating_sub(1);
+        let mut rows: Vec<UdpTableRow> = Vec::new();
+        let mut table_ok = true;
+        let mut fail_detail = String::new();
+        let table_line = self.current_line();
+        if self.eat(TokenKind::KwTable).is_some() {
+            // Gather raw table tokens up to `endtable`.
+            let mut toks: Vec<Token> = Vec::new();
+            while !self.at(TokenKind::KwEndtable) && !self.at(TokenKind::Eof)
+                && !self.at(TokenKind::KwEndprimitive)
+            {
+                toks.push(self.current().clone());
+                self.bump();
+            }
+            self.eat(TokenKind::KwEndtable);
+            // Split into rows on `;`.
+            let mut row_start = 0usize;
+            for i in 0..=toks.len() {
+                let at_end = i == toks.len();
+                if at_end || toks[i].kind == TokenKind::Semicolon {
+                    let slice = &toks[row_start..i];
+                    row_start = i + 1;
+                    if slice.iter().all(|t| t.kind == TokenKind::Semicolon) || slice.is_empty() {
+                        continue;
+                    }
+                    match Self::parse_udp_row(slice, n_inputs) {
+                        Some(r) => rows.push(r),
+                        None => {
+                            table_ok = false;
+                            let txt: String = slice.iter()
+                                .map(|t| t.text.clone())
+                                .collect::<Vec<_>>()
+                                .join(" ");
+                            fail_detail = txt;
+                            break;
+                        }
+                    }
+                }
+            }
+        } else {
+            table_ok = false;
+            fail_detail = "missing `table` … `endtable`".to_string();
+        }
+
+        // Consume `endprimitive` and optional `: label`.
+        while !self.at(TokenKind::KwEndprimitive) && !self.at(TokenKind::Eof) {
+            self.bump();
+        }
+        self.expect(TokenKind::KwEndprimitive);
+        if self.eat(TokenKind::Colon).is_some() { let _ = self.parse_identifier(); }
+
+        let span = self.span_from(start);
+        let _ = UdpOut::NoChange; // (variant use silence if unused paths)
+        let _ = UdpSym::AnyQ;
+
+        if table_ok && !rows.is_empty() {
+            Description::Udp(UdpDecl {
+                name, ports, is_sequential, init, rows, span,
+            })
+        } else {
+            // FAIL LOUD: name exactly what could not be parsed and the
+            // consequence, then fall back to an empty-module stub (output
+            // net left undriven) for this UDP only.
+            eprintln!(
+                "\n========================================================================\n\
+                 Warning: UNSUPPORTED UDP TABLE — primitive '{}' (near source byte {})\n\
+                 xezim could not parse the truth-table row: `{}`\n\
+                 Consequence: this primitive is treated as an EMPTY module; every\n\
+                 instance's output net is left UNDRIVEN (floats to x/z).\n\
+                 (IEEE 1800-2017 §29 — please report this table to the xezim authors.)\n\
+                 ========================================================================\n",
+                name.name, table_line, fail_detail
+            );
+            self.diagnostics.push(crate::diagnostics::Diagnostic::warning(
+                format!("unsupported UDP truth-table in primitive '{}' (row: {}); \
+                         instances left undriven", name.name, fail_detail),
+                span,
+            ));
+            Description::Module(crate::ast::module::ModuleDeclaration {
+                attrs: Vec::new(),
+                kind: crate::ast::module::ModuleKind::Module,
+                lifetime: None,
+                name,
+                params: Vec::new(),
+                ports: crate::ast::module::PortList::NonAnsi(ports),
+                items: Vec::new(),
+                endlabel: None,
+                span,
+            })
+        }
+    }
+
+    /// Consume tokens up to and including the next `;` (UDP body decls).
+    fn skip_udp_to_semi(&mut self) {
+        while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof)
+            && !self.at(TokenKind::KwTable) && !self.at(TokenKind::KwEndprimitive)
+        {
+            self.bump();
+        }
+        self.eat(TokenKind::Semicolon);
+    }
+
+    /// 1-based source line of the current token (best-effort).
+    fn current_line(&self) -> usize {
+        let off = self.current().span.start;
+        // We don't have the source here; approximate with byte offset so the
+        // message is still actionable. Kept small to avoid pulling source in.
+        off
+    }
+
+    /// Parse one truth-table row from a raw token slice (columns are
+    /// `:`-separated; combinational = 2 fields, sequential = 3). Returns
+    /// `None` on any unrecognised symbol or shape so the caller can fall back.
+    fn parse_udp_row(slice: &[Token], n_inputs: usize) -> Option<crate::ast::decl::UdpTableRow> {
+        use crate::ast::decl::{UdpTableRow, UdpOut};
+        // Split fields on `:`.
+        let mut fields: Vec<&[Token]> = Vec::new();
+        let mut fs = 0usize;
+        for i in 0..=slice.len() {
+            if i == slice.len() || slice[i].kind == TokenKind::Colon {
+                fields.push(&slice[fs..i]);
+                fs = i + 1;
+            }
+        }
+        let (input_f, state_f, out_f) = match fields.len() {
+            2 => (fields[0], None, fields[1]),
+            3 => (fields[0], Some(fields[1]), fields[2]),
+            _ => return None,
+        };
+        let inputs = Self::parse_udp_syms(input_f)?;
+        if inputs.len() != n_inputs { return None; }
+        let state = match state_f {
+            Some(f) => {
+                let mut s = Self::parse_udp_syms(f)?;
+                if s.len() != 1 { return None; }
+                Some(s.remove(0))
+            }
+            None => None,
+        };
+        // Output field: single symbol 0/1/x, or `-` (sequential no-change).
+        if out_f.len() != 1 { return None; }
+        let output = match out_f[0].text.as_str() {
+            "0" => UdpOut::Level('0'),
+            "1" => UdpOut::Level('1'),
+            "x" | "X" => UdpOut::Level('x'),
+            "-" => UdpOut::NoChange,
+            _ => return None,
+        };
+        let span = slice.first().map(|t| t.span).unwrap_or(crate::ast::Span::dummy());
+        Some(UdpTableRow { inputs, state, output, span })
+    }
+
+    /// Parse a sequence of input/state symbols from a token slice.
+    fn parse_udp_syms(field: &[Token]) -> Option<Vec<crate::ast::decl::UdpSym>> {
+        use crate::ast::decl::UdpSym;
+        let mut out = Vec::new();
+        let mut i = 0usize;
+        while i < field.len() {
+            let t = &field[i];
+            match t.kind {
+                TokenKind::LParen => {
+                    // Edge `(vw)` — concatenate token text until `)`.
+                    let mut j = i + 1;
+                    let mut txt = String::new();
+                    while j < field.len() && field[j].kind != TokenKind::RParen {
+                        txt.push_str(&field[j].text);
+                        j += 1;
+                    }
+                    if j >= field.len() { return None; } // unmatched `(`
+                    i = j + 1;
+                    let chars: Vec<char> =
+                        txt.chars().filter(|c| !c.is_whitespace()).collect();
+                    if chars.len() != 2 { return None; }
+                    let from = Self::udp_norm_level(chars[0])?;
+                    let to = Self::udp_norm_level(chars[1])?;
+                    out.push(UdpSym::Edge { from, to });
+                }
+                _ => {
+                    let sym = match t.text.as_str() {
+                        "0" => UdpSym::Level('0'),
+                        "1" => UdpSym::Level('1'),
+                        "x" | "X" => UdpSym::Level('x'),
+                        "z" | "Z" => UdpSym::Level('x'), // input z ⇒ x
+                        "?" => UdpSym::AnyQ,
+                        "b" | "B" => UdpSym::B,
+                        "r" | "R" => UdpSym::EdgeShort('r'),
+                        "f" | "F" => UdpSym::EdgeShort('f'),
+                        "p" | "P" => UdpSym::EdgeShort('p'),
+                        "n" | "N" => UdpSym::EdgeShort('n'),
+                        "*" => UdpSym::EdgeShort('*'),
+                        _ => return None,
+                    };
+                    out.push(sym);
+                    i += 1;
+                }
+            }
+        }
+        Some(out)
+    }
+
+    fn udp_norm_level(c: char) -> Option<char> {
+        match c {
+            '0' => Some('0'),
+            '1' => Some('1'),
+            'x' | 'X' => Some('x'),
+            'z' | 'Z' => Some('x'),
+            '?' => Some('?'),
+            _ => None,
         }
     }
 }
