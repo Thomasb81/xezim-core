@@ -3568,7 +3568,12 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     }
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
+                    let rhs_final = if ca.strength.as_deref().map(strength_is_weak).unwrap_or(false) {
+                        make_syscall("$__pull", vec![rhs.clone()], rhs.span)
+                    } else {
+                        rhs.clone()
+                    };
+                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -6012,7 +6017,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             }
                         }
                     }
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs.clone(), delay });
+                    let rhs_final = if ca.strength.as_deref().map(strength_is_weak).unwrap_or(false) {
+                        make_syscall("$__pull", vec![rhs.clone()], rhs.span)
+                    } else {
+                        rhs.clone()
+                    };
+                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -10107,7 +10117,13 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                     let v = if matches!(gi.gate_type, GateType::Pullup) { '1' } else { '0' };
                     let lit = Expression::new(
                         ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(v)), net.span);
-                    pairs.push((net.clone(), lit));
+                    // §28.4: pullup/pulldown are WEAK (pull strength). Tag the
+                    // driver so multi-driver resolution lets a strong driver win
+                    // and only falls back to the pull where the net is otherwise
+                    // z. A lone pull driver evaluates to its value ($__pull is
+                    // identity in the simulator).
+                    let weak = make_syscall("$__pull", vec![lit], net.span);
+                    pairs.push((net.clone(), weak));
                 }
                 continue;
             }
@@ -10286,6 +10302,19 @@ fn ident_flat_name(e: &Expression) -> Option<String> {
     }
 }
 
+/// True when a continuous-assign drive strength is entirely WEAK (pull/weak/
+/// highz on both the 1 and 0 sides) — such a driver behaves like a pullup/
+/// pulldown and loses to any strong driver. A mixed strength (e.g. strong1,
+/// pull0) is not treated as weak (approximated as strong).
+fn strength_is_weak(s: &str) -> bool {
+    let toks: Vec<&str> = s.split(',').map(|t| t.trim()).filter(|t| !t.is_empty()).collect();
+    !toks.is_empty()
+        && toks.iter().all(|t| {
+            let base = t.trim_end_matches(|c: char| c == '0' || c == '1');
+            matches!(base, "pull" | "weak" | "highz")
+        })
+}
+
 fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
     Expression::new(ExprKind::SystemCall { name: name.to_string(), args }, span)
 }
@@ -10331,29 +10360,57 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         return;
     }
     let all = std::mem::take(&mut elab.continuous_assigns);
-    let mut folded: HashMap<String, (Expression, Expression, u64)> = HashMap::default();
+    // Per multi-driven net: keep the lhs/delay, and accumulate STRONG drivers
+    // and WEAK (pull) drivers into separate `$__wres` chains. A pull driver's
+    // rhs is `$__pull(v)`; unwrap it into the weak chain. Final rhs resolves
+    // strong first and only falls back to the pull where strong is z.
+    struct Acc {
+        lhs: Expression,
+        delay: u64,
+        strong: Option<Expression>,
+        weak: Option<Expression>,
+    }
+    let mut folded: HashMap<String, Acc> = HashMap::default();
     let mut order: Vec<String> = Vec::new();
+    let is_pull = |e: &Expression| matches!(&e.kind,
+        ExprKind::SystemCall { name, .. } if name == "$__pull");
     for ca in all {
         let name = ident_flat_name(&ca.lhs).filter(|n| multi.contains(n));
         let Some(name) = name else {
             elab.continuous_assigns.push(ca);
             continue;
         };
-        match folded.get_mut(&name) {
-            Some((_, rhs, _)) => {
-                let span = ca.rhs.span;
-                let acc = std::mem::replace(rhs, make_z_expr(span));
-                *rhs = make_syscall("$__wres", vec![acc, ca.rhs], span);
-            }
-            None => {
-                order.push(name.clone());
-                folded.insert(name, (ca.lhs, ca.rhs, ca.delay));
-            }
-        }
+        let span = ca.rhs.span;
+        // Unwrap a $__pull marker into the raw value for the weak chain.
+        let (rhs, weak) = if is_pull(&ca.rhs) {
+            let inner = if let ExprKind::SystemCall { args, .. } = ca.rhs.kind {
+                args.into_iter().next().unwrap_or_else(|| make_z_expr(span))
+            } else { make_z_expr(span) };
+            (inner, true)
+        } else {
+            (ca.rhs, false)
+        };
+        let slot = folded.entry(name.clone()).or_insert_with(|| {
+            order.push(name.clone());
+            Acc { lhs: ca.lhs.clone(), delay: ca.delay, strong: None, weak: None }
+        });
+        let chain = if weak { &mut slot.weak } else { &mut slot.strong };
+        *chain = Some(match chain.take() {
+            Some(acc) => make_syscall("$__wres", vec![acc, rhs], span),
+            None => rhs,
+        });
     }
     for name in order {
-        if let Some((lhs, rhs, delay)) = folded.remove(&name) {
-            elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay });
+        if let Some(acc) = folded.remove(&name) {
+            let span = acc.lhs.span;
+            let rhs = match (acc.strong, acc.weak) {
+                // Strong wins; pull fills only the bits where strong is z.
+                (Some(st), Some(wk)) => make_syscall("$__wres_pull", vec![st, wk], span),
+                (Some(st), None) => st,
+                (None, Some(wk)) => wk,
+                (None, None) => make_z_expr(span),
+            };
+            elab.continuous_assigns.push(ContinuousAssignment { lhs: acc.lhs, rhs, delay: acc.delay });
         }
     }
 }
