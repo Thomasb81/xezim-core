@@ -517,6 +517,15 @@ fn parse_and_elaborate(
                 // instantiations resolve to it (elaboration lowers each
                 // instance into a runtime truth-table evaluator).
                 let name = u.name.name.clone();
+                // Mirror the historical behavior where a UDP parsed as an empty
+                // `Description::Module` advanced the source-order `top_module`
+                // cursor. A UDP is never a real hierarchy root, but keeping this
+                // cursor identical preserves auto-top-detection: a following
+                // heuristic re-selects a proper module/program candidate, and
+                // leaving the cursor on a trailing UDP (an instantiated,
+                // non-candidate name) correctly forces that heuristic instead of
+                // pinning a trivial trailing program/package.
+                top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Udp(Rc::new(u)));
             }
             _ => {}
@@ -644,7 +653,10 @@ fn parse_and_elaborate(
                 // elaboration ("not a module or program"). Packages stay
                 // eligible: a package-only design (e.g. uvm_pkg) legitimately
                 // elaborates the package as the root.
-                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Typedef(_))))
+                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Typedef(_)))
+                // §29: a UDP is never a hierarchy root — exclude it so a
+                // trailing/unused primitive can't pin auto-top-detection.
+                && !matches!(definitions.get(n.as_str()), Some(SourceDefinition::Udp(_))))
             .cloned().collect();
         // Sort to make top-module selection deterministic when more than one
         // module is uninstantiated. Without this, ahash's random seed picks
