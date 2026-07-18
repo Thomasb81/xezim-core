@@ -232,12 +232,6 @@ impl PendingContAssign {
 pub struct ElaboratedClass {
     pub name: String,
     pub extends: Option<String>,
-    /// Positional args of the `extends Base #(a0, a1, ...)` clause, each
-    /// stringified — type args as their bare type/param name, value args as
-    /// their expression text. Indexed against the BASE class `param_order`
-    /// (type+value params interleaved) to resolve an inherited type parameter
-    /// up the specialization chain (parameterized-class static dispatch).
-    pub extends_type_args: Vec<String>,
     pub properties: HashMap<String, Signal>,
     /// Property names in DECLARATION order. `properties` is a HashMap and so
     /// loses source order; `%p` (LRM §21.2.1.7) must print a class object as
@@ -729,9 +723,6 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 ParamValue::Expr(ex) => Some(ex.clone()),
                 ParamValue::Type(_) => None,
             }).collect()
-        }).unwrap_or_default(),
-        extends_type_args: c.extends.as_ref().map(|e| {
-            e.args.iter().map(param_value_to_arg_string).collect()
         }).unwrap_or_default(),
         properties,
         property_order,
@@ -4877,47 +4868,6 @@ fn walk_stmt_for_class_new(stmt: &Statement, elab: &ElaboratedModule) -> Result<
         _ => {}
     }
     Ok(())
-}
-
-/// Stringify one `extends Base #(arg)` positional argument for
-/// `ElaboratedClass.extends_type_args`. Type args become their bare type or
-/// type-parameter name (e.g. `this_type`, `T`, a concrete class name); value
-/// args become their expression text (a bare identifier or an integer
-/// literal). Anything we cannot render simply becomes "<unknown>", which the
-/// specialization-chain resolver treats as "give up on this arg".
-fn param_value_to_arg_string(pv: &ParamValue) -> String {
-    match pv {
-        ParamValue::Type(dt) => match dt {
-            DataType::TypeReference { name, .. } => name.name.name.clone(),
-            DataType::Simple { kind, .. } => format!("{:?}", kind).to_lowercase(),
-            _ => "<unknown>".to_string(),
-        },
-        ParamValue::Expr(ex) => expr_to_arg_string(ex),
-    }
-}
-
-/// Render the small set of expression shapes that appear as class parameter
-/// arguments: a (possibly hierarchical) identifier and an integer literal.
-fn expr_to_arg_string(ex: &Expression) -> String {
-    use crate::ast::expr::{ExprKind, NumberLiteral};
-    match &ex.kind {
-        ExprKind::Ident(h) => {
-            if h.path.len() == 1 && h.root.is_none() {
-                h.path[0].name.name.clone()
-            } else {
-                let mut parts: Vec<String> =
-                    h.root.iter().cloned().collect();
-                parts.extend(h.path.iter().map(|seg| seg.name.name.clone()));
-                parts.join("::")
-            }
-        }
-        ExprKind::TypeLiteral(dt) => match dt.as_ref() {
-            DataType::TypeReference { name, .. } => name.name.name.clone(),
-            _ => "<unknown>".to_string(),
-        },
-        ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
-        _ => "<unknown>".to_string(),
-    }
 }
 
 fn data_type_kind_name(dt: &DataType) -> String {
