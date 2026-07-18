@@ -735,11 +735,31 @@ impl Value {
             return Value::from_f64(self.to_f64().powf(other.to_f64()));
         }
         if self.has_xz() || other.has_xz() { return Value::new(self.width); }
-        let base = self.to_u64().unwrap_or(0);
-        let exp = other.to_u64().unwrap_or(0);
-        let mut result: u64 = 1;
-        for _ in 0..exp.min(64) { result = result.wrapping_mul(base); }
-        Value::from_u64(result, self.width)
+        // §11.8.1: the result of `**` is signed iff BOTH operands are signed.
+        // (Without this the two's-complement bits are right but the result reads
+        // as unsigned — `(-2)**3` prints 4294967288 instead of -8.)
+        let result_signed = self.is_signed && other.is_signed;
+        // §11.4.3: a negative integer exponent yields 0 for |base|>1, and 1 or
+        // -1 for base == 1 / -1 — not a huge unsigned loop count. Detect it via
+        // the signed operand rather than the wrapped u64.
+        let neg_exp = other.is_signed && other.to_i64().unwrap_or(0) < 0;
+        let result: u64 = if neg_exp {
+            match self.to_i64().unwrap_or(0) {
+                1 => 1,
+                // base -1: 1 for even exp, all-ones (-1 in the result width) for odd
+                -1 => if other.to_i64().unwrap_or(0) % 2 == 0 { 1 } else { u64::MAX },
+                _ => 0,
+            }
+        } else {
+            let base = self.to_u64().unwrap_or(0);
+            let exp = other.to_u64().unwrap_or(0);
+            let mut r: u64 = 1;
+            for _ in 0..exp.min(64) { r = r.wrapping_mul(base); }
+            r
+        };
+        let mut v = Value::from_u64(result, self.width);
+        v.is_signed = result_signed;
+        v
     }
 
     // === Bitwise ===
