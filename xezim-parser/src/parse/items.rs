@@ -965,6 +965,11 @@ impl Parser {
                     self.skip_to_semi();
                 }
                 self.expect(TokenKind::KwEndspecify);
+                // A delayed net is typically named as the delayed_data/ref of
+                // MANY checks on the same source — dedup so it gets exactly one
+                // zero-delay driver (redundant identical drivers churn settle).
+                delayed_nets.sort();
+                delayed_nets.dedup();
                 Some(ModuleItem::SpecifyBlock(SpecifyBlock {
                     paths,
                     delayed_nets,
