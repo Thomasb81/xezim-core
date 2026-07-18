@@ -3677,6 +3677,15 @@ pub fn elaborate_module_with_defs(
                     let d = eval_const_expr(&p.delay, &elab.parameters);
                     elab.specify_delays.insert(p.dst.name.clone(), d);
                 }
+                // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
+                // so a top-level cell's functional path through them works.
+                for (delayed, source) in &sb.delayed_nets {
+                    elab.continuous_assigns.push(ContinuousAssignment {
+                        lhs: make_ident_expr(delayed),
+                        rhs: make_ident_expr(source),
+                        delay: 0,
+                    });
+                }
             }
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &inst.instances {
@@ -6107,6 +6116,15 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 for p in &sb.paths {
                     let d = eval_const_expr(&p.delay, &elab.parameters);
                     elab.specify_delays.insert(p.dst.name.clone(), d);
+                }
+                // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
+                // so a top-level cell's functional path through them works.
+                for (delayed, source) in &sb.delayed_nets {
+                    elab.continuous_assigns.push(ContinuousAssignment {
+                        lhs: make_ident_expr(delayed),
+                        rhs: make_ident_expr(source),
+                        delay: 0,
+                    });
                 }
             }
             ModuleItem::FunctionDeclaration(fd) => {
@@ -9936,6 +9954,32 @@ fn inline_module_items(
                                 let d = eval_const_expr(&p.delay, &elab.parameters);
                                 elab.specify_delays.insert(dst_name, d);
                             }
+                        }
+                        // §15.6 delayed nets: drive `delayed_net = source` as a
+                        // zero-delay continuous assign in the instance scope so
+                        // the cell's functional clock/data path (which reads
+                        // these nets) works even though the timing check itself
+                        // is not modeled.
+                        for (delayed, source) in &sb.delayed_nets {
+                            let lhs = rewrite_expr(
+                                &make_ident_expr(delayed),
+                                &inst_prefix,
+                                &rewrite_port_map,
+                                &*prepared_sub.local_names,
+                                &sub_interface_map,
+                            );
+                            let rhs = rewrite_expr(
+                                &make_ident_expr(source),
+                                &inst_prefix,
+                                &rewrite_port_map,
+                                &*prepared_sub.local_names,
+                                &sub_interface_map,
+                            );
+                            elab.continuous_assigns.push(ContinuousAssignment {
+                                lhs,
+                                rhs,
+                                delay: 0,
+                            });
                         }
                     }
                     if matches!(sub_item, ModuleItem::AlwaysConstruct(_)) {

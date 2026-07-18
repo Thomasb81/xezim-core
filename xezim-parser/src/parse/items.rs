@@ -944,6 +944,7 @@ impl Parser {
                 // robust whole-block skip behavior.
                 self.bump();
                 let mut paths = Vec::new();
+                let mut delayed_nets: Vec<(String, String)> = Vec::new();
                 while !self.at(TokenKind::KwEndspecify) && !self.at(TokenKind::Eof) {
                     if self.at(TokenKind::LParen) {
                         if let Some(p) = self.try_parse_simple_specify_path() {
@@ -951,11 +952,24 @@ impl Parser {
                             continue;
                         }
                     }
+                    // §15.6 negative-timing-check tasks carry `delayed_reference`
+                    // / `delayed_data` OUTPUT nets that the cell's functional
+                    // path uses — extract those so the elaborator can drive them.
+                    if self.at(TokenKind::SystemIdentifier)
+                        && Self::is_timing_check_name(self.current().text.as_str())
+                    {
+                        self.parse_timing_check_delayed_nets(&mut delayed_nets);
+                        continue;
+                    }
                     // Unrecognized specify item: skip to (and past) the next ';'.
                     self.skip_to_semi();
                 }
                 self.expect(TokenKind::KwEndspecify);
-                Some(ModuleItem::SpecifyBlock(SpecifyBlock { paths, span: self.span_from(start) }))
+                Some(ModuleItem::SpecifyBlock(SpecifyBlock {
+                    paths,
+                    delayed_nets,
+                    span: self.span_from(start),
+                }))
             }
             TokenKind::Identifier | TokenKind::EscapedIdentifier => Some(self.parse_identifier_starting_item()),
             TokenKind::Semicolon => { self.bump(); Some(ModuleItem::Null) }
@@ -1152,6 +1166,111 @@ impl Parser {
     /// first delay as its `delay`. Returns None and rewinds for any other
     /// form (edge-sensitive `( posedge a => ...)`, `*>`, conditional, bit-
     /// selected endpoints, timing checks) so the caller skips it.
+    /// System-task names whose argument list carries `delayed_reference` /
+    /// `delayed_data` output nets (IEEE 1364 §15.6).
+    fn is_timing_check_name(name: &str) -> bool {
+        matches!(
+            name,
+            "$setuphold" | "$recrem" | "$setup" | "$hold" | "$recovery" | "$removal"
+        )
+    }
+
+    /// Parse a `$setuphold(...)` / `$recrem(...)` timing check ONLY to recover
+    /// its delayed nets. The full arg list is `(ref_event, data_event, limit1,
+    /// limit2, [notifier], [tstamp], [tcheck], [delayed_ref], [delayed_data])`;
+    /// only `$setuphold`/`$recrem` carry the two delayed-net outputs (args 8,9).
+    /// We split on top-level commas, take the reference/data SIGNAL from the
+    /// first two edge-event args, and pair each present delayed net with its
+    /// source signal → `(delayed_ref, ref_sig)`, `(delayed_data, data_sig)`.
+    /// Everything is then consumed to the terminating `;`.
+    fn parse_timing_check_delayed_nets(&mut self, out: &mut Vec<(String, String)>) {
+        let is_recrem_or_setuphold =
+            matches!(self.current().text.as_str(), "$setuphold" | "$recrem");
+        self.bump(); // the $name
+        if !self.at(TokenKind::LParen) {
+            self.skip_to_semi();
+            return;
+        }
+        self.bump(); // '('
+        // Collect each top-level (paren-depth-0) comma-separated arg as the
+        // list of its tokens' texts, plus whether it began with posedge/negedge.
+        let mut args: Vec<Vec<String>> = Vec::new();
+        let mut cur: Vec<String> = Vec::new();
+        let mut depth = 0i32;
+        while !self.at(TokenKind::Eof) {
+            match self.current().kind {
+                TokenKind::LParen => {
+                    depth += 1;
+                    cur.push(self.bump().text.clone());
+                }
+                TokenKind::RParen => {
+                    if depth == 0 {
+                        self.bump(); // closing ')'
+                        break;
+                    }
+                    depth -= 1;
+                    cur.push(self.bump().text.clone());
+                }
+                TokenKind::Comma if depth == 0 => {
+                    self.bump();
+                    args.push(std::mem::take(&mut cur));
+                }
+                _ => cur.push(self.bump().text.clone()),
+            }
+        }
+        args.push(cur);
+        self.eat(TokenKind::Semicolon);
+
+        // The SIGNAL of an edge-event arg is the first identifier after a
+        // posedge/negedge (or the first identifier); a `&&& cond` tail is
+        // ignored. A plain delayed-net arg is a single identifier.
+        fn signal_of(arg: &[String]) -> Option<String> {
+            let mut it = arg.iter();
+            while let Some(t) = it.next() {
+                if t == "posedge" || t == "negedge" || t == "edge" {
+                    if let Some(n) = it.next() {
+                        return Some(n.clone());
+                    }
+                }
+            }
+            // no edge keyword: first identifier-looking token
+            arg.iter()
+                .find(|t| {
+                    t.chars()
+                        .next()
+                        .map(|c| c.is_alphabetic() || c == '_')
+                        .unwrap_or(false)
+                })
+                .cloned()
+        }
+        fn plain_net(arg: &[String]) -> Option<String> {
+            let toks: Vec<&String> = arg.iter().filter(|t| !t.trim().is_empty()).collect();
+            if toks.len() == 1
+                && toks[0]
+                    .chars()
+                    .next()
+                    .map(|c| c.is_alphabetic() || c == '_')
+                    .unwrap_or(false)
+            {
+                Some(toks[0].clone())
+            } else {
+                None
+            }
+        }
+
+        if !is_recrem_or_setuphold || args.len() < 9 {
+            return; // $setup/$hold and short forms have no delayed nets
+        }
+        let ref_sig = signal_of(&args[0]);
+        let data_sig = signal_of(&args[1]);
+        if let (Some(dref), Some(src)) = (plain_net(&args[7]), ref_sig) {
+            out.push((dref, src));
+        }
+        if let (Some(ddata), Some(src)) = (plain_net(&args[8]), data_sig) {
+            out.push((ddata, src));
+        }
+    }
+
     fn try_parse_simple_specify_path(&mut self) -> Option<SpecifyPath> {
         let start_pos = self.pos;
         let sp_start = self.current().span.start;
