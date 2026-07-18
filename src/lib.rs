@@ -628,6 +628,34 @@ fn parse_and_elaborate(
     let lib_cli = library_cli_cell().lock().unwrap().clone();
     if !include_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(&mut definitions, include_dirs, lib_defines, &lib_cli)?;
+
+        // A `-v`/`-y` library module is adopted AFTER the primary-source delay
+        // rewrite (above), so it never received a timescale — its `#delay`s
+        // stayed raw tick-unit values while the same module compiled as a
+        // primary source would be scaled. Apply `--module-timescale` (named,
+        // else global) to each newly-adopted library module so its delays scale
+        // consistently. Library modules with no CLI timescale keep tick units
+        // (their own `` `timescale `` directive is a separate, not-yet-captured
+        // path).
+        if cli.global.is_some() || !cli.named.is_empty() {
+            let lib_names: Vec<String> = definitions
+                .keys()
+                .filter(|n| !explicit_def_names.contains(*n))
+                .cloned()
+                .collect();
+            for name in lib_names {
+                let ts = cli.named.get(&name).copied().or(cli.global);
+                let Some((u, p)) = ts else { continue };
+                let unit_s = elaborate::exp_to_secs(u);
+                let _ = p; // precision folds into the global tick, already fixed
+                if let Some(SourceDefinition::Module(rc)) = definitions.get_mut(&name) {
+                    let m = Rc::make_mut(rc);
+                    elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
+                    module_timescale_exp
+                        .insert(name.clone(), (elaborate::secs_to_exp(unit_s), elaborate::secs_to_exp(elaborate::exp_to_secs(p))));
+                }
+            }
+        }
     }
 
     let named_top_found = top_module_name.map_or(false, |n| definitions.contains_key(n));
