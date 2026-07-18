@@ -13,24 +13,52 @@ impl Parser {
         let start = self.current().span.start;
 
         // IEEE 1800-2023 §9.3.1: optional statement label
-        //   <label> : <statement_item> ;
-        // Most common in test/coverage code as a name for assert / cover /
-        // assume sites. We discard the label (no AST node hosts it today)
-        // and parse the underlying statement.
+        //   <label> : <statement_item>
+        // For a labelled control-flow statement (for/while/repeat/forever/
+        // foreach/do/if/case*) the label is a `disable` target (§9.6.2):
+        // `disable L` must terminate that statement and resume AFTER it. The
+        // `disable` runtime clears its unwind flags only at a NAMED SeqBlock
+        // (see `exec_statement`'s SeqBlock arm), so we WRAP such a labelled
+        // statement in a single-statement named SeqBlock — `L: for(...)` →
+        // `begin : L for(...) end`. A labelled assert/cover/assume/expect keeps
+        // its label discarded (it is a coverage/report name, not a disable
+        // target); `begin`/`fork` carry their own optional `: name` after the
+        // keyword (parse_seq_block/par_block), so the label-before form is
+        // likewise left to them.
         if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
             && self.peek_kind() == TokenKind::Colon
         {
             let after_colon = self.peek_kind_n(2);
-            let stmt_starter = matches!(
+            // Statements whose label is a `disable` target — wrap in a named
+            // SeqBlock so `disable <label>` can unwind to it.
+            let disable_target = matches!(
                 after_colon,
-                TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover
-                    | TokenKind::KwExpect | TokenKind::KwBegin | TokenKind::KwFork
-                    | TokenKind::KwIf | TokenKind::KwCase | TokenKind::KwCasex
+                TokenKind::KwIf | TokenKind::KwCase | TokenKind::KwCasex
                     | TokenKind::KwCasez | TokenKind::KwFor | TokenKind::KwForeach
                     | TokenKind::KwWhile | TokenKind::KwDo | TokenKind::KwRepeat
                     | TokenKind::KwForever
             );
-            if stmt_starter {
+            // Labelled assert/cover/assume/expect/begin/fork — discard the
+            // label (pre-existing behaviour) and parse the underlying statement.
+            let labelled_other = matches!(
+                after_colon,
+                TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover
+                    | TokenKind::KwExpect | TokenKind::KwBegin | TokenKind::KwFork
+            );
+            if disable_target {
+                let start = self.current().span.start;
+                let label = self.parse_identifier();
+                self.expect(TokenKind::Colon);
+                let inner = self.parse_statement();
+                return Statement::new(
+                    StatementKind::SeqBlock {
+                        name: Some(label),
+                        stmts: vec![inner],
+                    },
+                    self.span_from(start),
+                );
+            }
+            if labelled_other {
                 let _ = self.parse_identifier();
                 self.expect(TokenKind::Colon);
                 return self.parse_statement();
