@@ -8935,6 +8935,48 @@ fn prepare_module_items(
                         local_names.insert(hi.name.name.clone());
                     }
                 }
+                // §6.10: a bare undeclared identifier used as an instance PORT
+                // CONNECTION is an implicit net local to THIS module. It must be
+                // in local_names so every reference to it (this connection, a
+                // gate terminal, a cont-assign) prefixes to the SAME net during
+                // inlining — otherwise the net splits and the value never
+                // propagates (e.g. a cell clock driven by a buf but read undriven).
+                let mut cand = Vec::new();
+                for hi in &inst.instances {
+                    for conn in &hi.connections {
+                        match conn {
+                            PortConnection::Ordered(Some(e))
+                            | PortConnection::Named { expr: Some(e), .. } => {
+                                collect_implicit_net_candidates(e, &mut cand);
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                for c in cand {
+                    local_names.insert(c);
+                }
+            }
+            ModuleItem::GateInstantiation(gi) => {
+                // §6.10: a bare undeclared gate terminal (e.g. a `buf` output) is
+                // an implicit local net — register it so it prefixes consistently.
+                let mut cand = Vec::new();
+                for gi_inst in &gi.instances {
+                    for term in &gi_inst.terminals {
+                        collect_implicit_net_candidates(term, &mut cand);
+                    }
+                }
+                for c in cand {
+                    local_names.insert(c);
+                }
+            }
+            ModuleItem::SpecifyBlock(sb) => {
+                // Delayed-net targets/sources are local nets driven by the
+                // injected zero-delay assigns; keep them in the same scope.
+                for (delayed, source) in &sb.delayed_nets {
+                    local_names.insert(delayed.clone());
+                    local_names.insert(source.clone());
+                }
             }
             ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
                 if let ParameterKind::Data { assignments, .. } = &pd.kind {
