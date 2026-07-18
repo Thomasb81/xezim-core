@@ -31,9 +31,29 @@ impl Parser {
                     | TokenKind::KwForever
             );
             if stmt_starter {
-                let _ = self.parse_identifier();
+                let label = self.parse_identifier();
                 self.expect(TokenKind::Colon);
-                return self.parse_statement();
+                let inner = self.parse_statement();
+                // `begin`/`fork` host their own name (`begin : L`), so leave
+                // them to that path. A prefix label on a loop/case/if has no
+                // host node, so wrap the statement in a named block. This makes
+                // `disable <label>` (§9.6.2 / §12.7) resume AFTER the labelled
+                // statement — e.g. a labelled loop exits and control continues
+                // past it, instead of the whole process terminating.
+                if matches!(
+                    after_colon,
+                    TokenKind::KwBegin | TokenKind::KwFork
+                ) {
+                    return inner;
+                }
+                let span = self.span_from(start);
+                return Statement::new(
+                    StatementKind::SeqBlock {
+                        name: Some(label),
+                        stmts: vec![inner],
+                    },
+                    span,
+                );
             }
         }
 
