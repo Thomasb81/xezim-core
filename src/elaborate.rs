@@ -287,6 +287,14 @@ pub struct ElaboratedClass {
     /// does not call `super.new` explicitly.
     #[serde(default)]
     pub extends_args: Vec<Expression>,
+    /// ALL arguments in the `extends Base#(arg1, arg2, ...)` clause as textual
+    /// fragments, preserving order (both type and value params). Used to
+    /// resolve ancestor type/value parameters: when a method of
+    /// `uvm_registry_common` references `Tregistry`, we match it against the
+    /// ancestor's `param_order` to find the extends arg at the same position
+    /// (e.g. `this_type`), then resolve it to the concrete specialization.
+    #[serde(default)]
+    pub extends_type_args: Vec<String>,
     /// ALL parameter names (type and value), in declaration order. Needed to
     /// map positional `#(...)` type-args to the correct param when type and
     /// value params are interleaved (e.g. `uvm_component_registry#(type T,
@@ -389,6 +397,38 @@ fn install_ooc_constraint_body(
             existing.items = items.to_vec();
             existing.has_body = true;
         }
+    }
+}
+
+/// Convert a DataType (from a `extends Base#(type T, ...)` clause) into a
+/// textual fragment suitable for specialization signatures. E.g.
+/// `this_type` -> `"this_type"`, a scoped type ref -> leaf name.
+fn datatype_to_spec_fragment(dt: &crate::ast::types::DataType) -> String {
+    use crate::ast::types::DataType;
+    match dt {
+        DataType::TypeReference { name, .. } => name.name.name.clone(),
+        DataType::Simple { kind, .. } => format!("{:?}", kind).to_lowercase(),
+        _ => "<unknown>".to_string(),
+    }
+}
+
+/// Convert an Expression (from an extends clause arg) into a textual
+/// fragment. Bare identifiers like `this_type` or `T` → their name.
+/// String literals → quoted text. Other exprs → best-effort string.
+fn expr_to_spec_fragment(ex: &crate::ast::expr::Expression) -> String {
+    use crate::ast::expr::{ExprKind, Expression};
+    match &ex.kind {
+        ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()).unwrap_or_default(),
+        ExprKind::StringLiteral(s) => format!("\"{}\"", s),
+        ExprKind::Specialization { base, type_args_text, .. } => {
+            if let ExprKind::Ident(h) = &base.kind {
+                if let Some(last) = h.path.last() {
+                    return format!("{}#({})", last.name.name, type_args_text);
+                }
+            }
+            "<unknown>".to_string()
+        }
+        _ => "<unknown>".to_string(),
     }
 }
 
@@ -722,6 +762,12 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
             e.args.iter().filter_map(|a| match a {
                 ParamValue::Expr(ex) => Some(ex.clone()),
                 ParamValue::Type(_) => None,
+            }).collect()
+        }).unwrap_or_default(),
+        extends_type_args: c.extends.as_ref().map(|e| {
+            e.args.iter().map(|a| match a {
+                ParamValue::Type(dt) => datatype_to_spec_fragment(dt),
+                ParamValue::Expr(ex) => expr_to_spec_fragment(ex),
             }).collect()
         }).unwrap_or_default(),
         properties,
@@ -1483,17 +1529,23 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
     }
 }
 
-/// Register a class's CLASS-LOCAL `typedef enum {...}` members as resolvable
-/// bare-name constants (parameters/signals), like module/package enums.
-/// Without this, a class-local enum member (e.g. uvm_sequencer_base's
-/// `SEQ_TYPE_REQ` from `typedef enum {SEQ_TYPE_REQ,...} seq_req_t;`) resolves
-/// to X at eval time, so `req.request = SEQ_TYPE_REQ` stores X and the
-/// sequencer arbitration's `request == SEQ_TYPE_REQ` is always false (4-state).
-/// Uses or_insert semantics so module/package enums are never clobbered.
+/// Register a class's CLASS-LOCAL typedefs. Two responsibilities:
+///  * `typedef enum {...}` members become resolvable bare-name constants
+///    (like module/package enums), so `req.request = SEQ_TYPE_REQ` doesn't
+///    store X.
+///  * ALL class-local typedefs get their full registration via `process_typedef`
+///    — type, width, unpacked dimensions, and (for enums) member values. This
+///    is required so that (a) a `ref edges_t` formal is detected as an
+///    associative array — UVM's `typedef bit edges_t[uvm_phase]` lives INSIDE
+///    class uvm_phase and was invisible to `port_is_assoc_array`; and (b)
+///    config_db / type-handle equality resolves the class-local type.
+///    Without it the phase-DAG successor writeback was silently lost and every
+///    UVM test stalled at t=0.
 pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedModule) {
     for item in &c.items {
         if let ClassItem::Typedef(td) = item {
             register_anonymous_enum_members(&td.data_type, elab);
+            process_typedef(td, elab);
         }
     }
 }
@@ -1943,6 +1995,12 @@ pub fn elaborate_module_with_defs(
                             // inline_instantiations, after the top body.
                             crate::ast::decl::PackageItem::Typedef(td) => {
                                 process_typedef(td, &mut elab);
+                            }
+                            // Hoist package DPI imports so calls to
+                            // `uvm_re_compexecfree` etc. resolve via
+                            // `exec_dpi_import_call`.
+                            crate::ast::decl::PackageItem::DPIImport(di) => {
+                                register_dpi_import(di, &mut elab)?;
                             }
                             _ => {}
                         }
