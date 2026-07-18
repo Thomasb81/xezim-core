@@ -1083,7 +1083,7 @@ pub struct ElaboratedModule {
     /// when the actual is a SIMPLE WHOLE-NET identifier (`.din(src_bus)`). A
     /// bit-select, part-select, concatenation or expression actual
     /// (`.din(bus[3:0])`, `.din({a,b})`, `.din(w+1)`) is a distinct object and is
-    /// NOT recorded — Verilator and Icarus keep those separate too.
+    /// NOT recorded — Verilator and a reference simulator keep those separate too.
     ///
     /// Inlining gives the formal its own signal-table entry, kept in step with
     /// the actual by a port continuous-assign, so a dump that treats the two as
@@ -4456,7 +4456,7 @@ fn validate_modport_writes(elab: &ElaboratedModule) -> Result<(), String> {
 ///    no further event/delay/wait controls may appear in the body.
 ///  * §9.2.2.1 plain always: the process must be guaranteed to advance
 ///    simulation time on every iteration, else it is a zero-delay livelock
-///    (Icarus: "always process does not have any delay").
+///    (a reference simulator: "always process does not have any delay").
 fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), String> {
     use crate::ast::decl::AlwaysKind;
     use crate::ast::expr::{ExprKind, NumberLiteral};
@@ -4591,7 +4591,7 @@ fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), Stri
     // (un-inlined) task body. We therefore reject only the structural cases we
     // can prove are zero-delay livelocks — chiefly `fork … join_none` and a
     // `join_any`/`join` whose parent unblocks at time 0 — which is exactly
-    // what Icarus flags as "always process does not have any delay".
+    // what a reference simulator flags as "always process does not have any delay".
     fn is_literal_zero(e: &crate::ast::expr::Expression) -> bool {
         match &e.kind {
             ExprKind::Paren(x) => is_literal_zero(x),
@@ -4646,7 +4646,7 @@ fn validate_always_ff_event_controls(elab: &ElaboratedModule) -> Result<(), Stri
     // runtime's zero-delay livelock guard, matching prior behavior. The
     // fork/join_none / min-zero-join_any cases (always4A / always4B) cannot be
     // caught at runtime the same way (they spawn children), so we reject them
-    // at elaboration exactly as Icarus does.
+    // at elaboration exactly as a reference simulator does.
     fn contains_fork(s: &Statement) -> bool {
         match &s.kind {
             StatementKind::ParBlock { .. } => true,
