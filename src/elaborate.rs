@@ -5425,6 +5425,10 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                     | "$coverage_control" | "$coverage_get" | "$coverage_get_max"
                     | "$coverage_merge" | "$coverage_save" | "$get_coverage"
                     | "$set_coverage_db_name" | "$load_coverage_db"
+                    // Verdi/VCS waveform tasks: scope args like $dumpvars.
+                    | "$fsdbDumpvars" | "$fsdbDumpfile" | "$vcdpluson" | "$vcdplusoff"
+                    // §20.16: second argument is an instance scope.
+                    | "$sdf_annotate"
             );
             if !skip {
                 for a in args { validate_expr_idents(a, elab, locals)?; }
