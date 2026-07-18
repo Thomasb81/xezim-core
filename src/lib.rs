@@ -343,6 +343,11 @@ fn parse_and_elaborate(
     let cli = module_timescale_cli();
     let mut eff_ts: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new();
     let mut named_matched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // §3.14.2.2 — track modules that carry NO `timescale (no source-level
+    // decl, no preceding directive, no CLI override) so a mixed design (some
+    // modules timed, some not) can be warned about after the pass.
+    let mut any_explicit_ts = false;
+    let mut modules_without_ts: Vec<String> = Vec::new();
     for desc in &all_descriptions {
         if let ast::Description::Module(m) = desc {
             let name = &m.name.name;
@@ -367,6 +372,11 @@ fn parse_and_elaborate(
             if named.is_some() {
                 named_matched.insert(name.clone());
             }
+            if is_explicit {
+                any_explicit_ts = true;
+            } else if named.is_none() && cli.global.is_none() {
+                modules_without_ts.push(name.clone());
+            }
 
             let eff_exp: Option<(i32, i32)> = if is_explicit {
                 // A local decl overrides the directive field by field; a missing
@@ -388,6 +398,18 @@ fn parse_and_elaborate(
             if let Some((u, p)) = eff_exp {
                 eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
             }
+        }
+    }
+    // §3.14.2.2 — a design that MIXES timed and untimed modules is a common
+    // source of surprise (the untimed module falls back to the default unit).
+    // Warn once per untimed module, but only in the mixed case (a fully
+    // untimed design has a uniform default and needs no warning).
+    if any_explicit_ts {
+        for name in &modules_without_ts {
+            eprintln!(
+                "[warn] module '{}' has no timescale directive; defaulting its reported timescale to 1s/1s",
+                name
+            );
         }
     }
     // §10: warn on a named assignment that matched no module definition.
