@@ -8814,6 +8814,40 @@ fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -
     }
 }
 
+/// LRM §25.4: an interface actual may be written `instance.modport`
+/// (`m u(bus.mp)`), selecting a modport VIEW of the instance. The modport
+/// segment is not part of the instance path — inlined interface tasks are
+/// keyed by the instance name (`bus.put`) and members resolve to `bus.<m>`,
+/// so a stray `.mp` left in the interface_map strands both (task dispatch
+/// falls through, member reads hit a phantom `bus.mp.<m>` signal). If the
+/// last path segment names a modport of ANY interface definition, drop it.
+fn strip_modport_suffix(
+    full_path: &str,
+    definitions: &HashMap<String, Definition>,
+) -> String {
+    let Some((head, last)) = full_path.rsplit_once('.') else {
+        return full_path.to_string();
+    };
+    let is_modport = definitions.values().any(|def| {
+        if let Definition::Interface(idef) = def {
+            idef.items.iter().any(|item| {
+                if let ModuleItem::ModportDeclaration(md) = item {
+                    md.items.iter().any(|mp| mp.name.name == last)
+                } else {
+                    false
+                }
+            })
+        } else {
+            false
+        }
+    });
+    if is_modport {
+        head.to_string()
+    } else {
+        full_path.to_string()
+    }
+}
+
 /// Pre-built `Rc`-shared sources for the deferred-rewrite kinds (#7).
 /// Built once per `(module, params)` cache hit; sibling instances share
 /// via `Rc::clone` (refcount bump) instead of cloning the AST per push.
@@ -9222,6 +9256,27 @@ fn inline_module_items(
                 // the sub-module would insert a bare (unresolvable) name.
                 let parent_local_names = &*prepared_source.local_names;
 
+                // Interface ports of the SUB-module being instantiated. The
+                // connection code below must route interface actuals through
+                // `sub_interface_map` (not `port_map`) so `<port>.<member>`
+                // resolves to the bound instance's members and inlined
+                // interface tasks dispatch. `prepared_source` is the PARENT
+                // (whose interface_ports is empty for a top instantiation), so
+                // it can't answer this — compute it from `sub_mod` directly.
+                let sub_iface_ports: std::collections::HashSet<String> = {
+                    let mut s = std::collections::HashSet::default();
+                    if let PortList::Ansi(ports) = sub_mod.ports() {
+                        for port in ports {
+                            if let Some(dt) = &port.data_type {
+                                if is_interface_type(dt, definitions) {
+                                    s.insert(port.name.name.clone());
+                                }
+                            }
+                        }
+                    }
+                    s
+                };
+
                 if !hi.connections.is_empty() {
                     // §23.3.2: a connection list is either positional (ordered)
                     // or by-name. By-name lists may mix explicit `.p(e)`,
@@ -9244,9 +9299,10 @@ fn inline_module_items(
                                 explicit.insert(name.name.clone());
                                 if let Some(e) = expr {
                                     let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
-                                    if prepared_source.interface_ports.contains(&name.name) {
+                                    if sub_iface_ports.contains(&name.name) {
                                         if let ExprKind::Ident(hier) = &rewritten_e.kind {
                                             let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                                            let if_full_path = strip_modport_suffix(&if_full_path, definitions);
                                             sub_interface_map.insert(name.name.clone(), if_full_path);
                                         }
                                     } else {
@@ -9255,7 +9311,7 @@ fn inline_module_items(
                                 } else if *implicit {
                                     // `.p` — connect to the same-named parent net.
                                     let parent_name = format!("{}{}", prefix, name.name);
-                                    if prepared_source.interface_ports.contains(&name.name) {
+                                    if sub_iface_ports.contains(&name.name) {
                                         sub_interface_map.insert(name.name.clone(), parent_name);
                                     } else {
                                         port_map.insert(name.name.clone(), make_ident_expr(&parent_name));
@@ -9293,9 +9349,10 @@ fn inline_module_items(
                                     let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
                                     if let Some(port) = sub_mod.ports().get(i) {
                                         let port_name = port.name();
-                                        if prepared_source.interface_ports.contains(port_name) {
+                                        if sub_iface_ports.contains(port_name) {
                                             if let ExprKind::Ident(hier) = &rewritten_e.kind {
                                                 let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+                                                let if_full_path = strip_modport_suffix(&if_full_path, definitions);
                                                 sub_interface_map.insert(port_name.to_string(), if_full_path);
                                             }
                                         } else {
