@@ -270,6 +270,11 @@ pub struct Coverpoint {
     /// "every distinct sampled value is its own bin" model.
     #[cfg_attr(feature = "serde", serde(default))]
     pub bins: Vec<CoverBin>,
+    /// LRM §19.7 coverpoint-level options — `option.at_least = N`,
+    /// `option.weight = W` declared inside the coverpoint body. Stored as
+    /// (option_name, value_expr) pairs; empty when none.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub options: Vec<(String, Expression)>,
     pub span: Span,
 }
 

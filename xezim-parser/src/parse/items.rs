@@ -1809,6 +1809,7 @@ impl Parser {
                     }
                 }
                 let mut bins: Vec<crate::ast::decl::CoverBin> = Vec::new();
+                let mut cp_options: Vec<(String, crate::ast::expr::Expression)> = Vec::new();
                 if self.at(TokenKind::LBrace) {
                     self.bump();
                     // Parse a sequence of bin declarations until matching `}`.
@@ -1916,6 +1917,20 @@ impl Parser {
                                 self.skip_bin_body_to_semicolon();
                             }
                             if self.at(TokenKind::Semicolon) { self.bump(); }
+                        } else if self.at(TokenKind::Identifier)
+                            && (self.current().text == "option"
+                                || self.current().text == "type_option")
+                        {
+                            // §19.7 coverpoint-level `option.NAME = expr;`.
+                            self.bump(); // option / type_option
+                            if self.eat(TokenKind::Dot).is_some() {
+                                let opt_name = self.parse_identifier().name;
+                                if self.eat(TokenKind::Assign).is_some() {
+                                    let val = self.parse_expression();
+                                    cp_options.push((opt_name, val));
+                                }
+                            }
+                            if self.at(TokenKind::Semicolon) { self.bump(); }
                         } else {
                             // Not a bin keyword — skip token to make progress.
                             self.bump();
@@ -1925,7 +1940,7 @@ impl Parser {
                 } else {
                     self.expect(TokenKind::Semicolon);
                 }
-                CovergroupItem::Coverpoint(Coverpoint { name, expr, iff_guard, bins, span: self.span_from(start) })
+                CovergroupItem::Coverpoint(Coverpoint { name, expr, iff_guard, bins, options: cp_options, span: self.span_from(start) })
             }
             TokenKind::KwCross => {
                 self.bump();
