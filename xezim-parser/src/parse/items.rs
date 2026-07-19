@@ -528,6 +528,26 @@ impl Parser {
                                 name: cb_name,
                                 span: self.span_from(pstart),
                             });
+                        } else if self.at(TokenKind::KwImport) || self.at(TokenKind::KwExport) {
+                            // §25.5 modport import/export of a task/function.
+                            // Record the imported NAME as a synthetic Input port
+                            // (so it parses and stays reachable via the interface),
+                            // then skip any method prototype up to the separator.
+                            self.bump(); // import / export
+                            if self.at(TokenKind::Identifier) {
+                                let name = self.parse_identifier();
+                                ports.push(ModportPort {
+                                    direction: PortDirection::Input,
+                                    name,
+                                    span: self.span_from(pstart),
+                                });
+                            }
+                            while !self.at(TokenKind::Comma)
+                                && !self.at(TokenKind::RParen)
+                                && !self.at(TokenKind::Eof)
+                            {
+                                self.bump();
+                            }
                         } else {
                             if let Some(d) = self.parse_optional_direction() { last_dir = d; }
                             let port_name = self.parse_identifier();
