@@ -45,6 +45,15 @@ pub struct Preprocessor {
     /// (LRM §22.7 — a `timescale` applies to all following declarations until the
     /// next directive, persisting across files in compilation order).
     pub module_timescales: std::collections::HashMap<String, (f64, f64)>,
+    /// Modules whose active `\`timescale` was declared in their OWN top-level
+    /// file (vs. inherited sticky from a prior file). `--module-timescale`
+    /// overrides a cross-file-INHERITED directive but NOT an own-file one, so
+    /// the driver needs to tell the two apart. Reset per top-level file via
+    /// `begin_top_level_file`.
+    pub module_ts_own_file: std::collections::HashSet<String>,
+    /// True once a `\`timescale` directive has been seen in the CURRENT
+    /// top-level file (set by the directive handler, cleared per file).
+    current_file_ts: bool,
     /// §22 strict-mode directive errors (bad `\`line`/`\`define`/`\`pragma`/
     /// `\`resetall`). Collected only when `strict_checks()` is on; the driver
     /// treats a non-empty list as a hard failure (non-zero exit).
@@ -109,6 +118,8 @@ impl Preprocessor {
             keywords_stack: Vec::new(),
             timescale: None,
             module_timescales: std::collections::HashMap::new(),
+            module_ts_own_file: std::collections::HashSet::new(),
+            current_file_ts: false,
             errors: Vec::new(),
             design_element_depth: 0,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
@@ -201,6 +212,14 @@ impl Preprocessor {
     /// Return the most recent `timescale` (unit_s, prec_s) seen, if any.
     pub fn timescale(&self) -> Option<(f64, f64)> {
         self.timescale
+    }
+
+    /// Call before preprocessing each TOP-LEVEL source file. Marks the start of
+    /// a new file so a `\`timescale` inherited (sticky) from a PRIOR file is not
+    /// counted as declared in this file — which is what lets `--module-timescale`
+    /// override a cross-file-inherited timescale but not an own-file one.
+    pub fn begin_top_level_file(&mut self) {
+        self.current_file_ts = false;
     }
 
     /// If `line` begins a design-element declaration
@@ -746,6 +765,9 @@ impl Preprocessor {
                         // precision (down to fs) is honoured; delays scale to
                         // that tick. No truncation, no warning.
                         self.timescale = Some((u, p));
+                        // A directive in THIS file: modules that follow it here
+                        // have an own-file timescale (not merely inherited).
+                        self.current_file_ts = true;
                     }
                 }
                 output.push('\n');
@@ -841,6 +863,9 @@ impl Preprocessor {
                     // active directive is absent from the map (and defaults to
                     // 1 ns / 1 ns downstream, unchanged).
                     if let Some(ts) = self.timescale {
+                        if self.current_file_ts {
+                            self.module_ts_own_file.insert(name.clone());
+                        }
                         self.module_timescales.entry(name).or_insert(ts);
                     }
                 }

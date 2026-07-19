@@ -276,6 +276,10 @@ pub fn parse_and_elaborate_multi(
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(|p| std::path::PathBuf::from(p));
+        // Mark a new compilation file so a `timescale that stuck across from a
+        // prior file is treated as inherited (overridable by --module-timescale)
+        // rather than declared here.
+        pp.begin_top_level_file();
         let preprocessed = pp.preprocess_file(source, source_path.as_deref());
 
         let tokens = lexer::Lexer::new(&preprocessed).tokenize();
@@ -316,8 +320,9 @@ pub fn parse_and_elaborate_multi(
 
     let lib_defines = pp.snapshot_defines();
     let module_timescales = pp.module_timescales.clone();
+    let module_ts_own_file = pp.module_ts_own_file.clone();
     let (defs, mut elab) =
-        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales)?;
+        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales, &module_ts_own_file)?;
     elab.source_texts = preprocessed_texts;
     elab.source_files = source_files.to_vec();
     elab.src_file_of_module = src_file_of_module;
@@ -330,6 +335,7 @@ fn parse_and_elaborate(
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
     module_timescales: &std::collections::HashMap<String, (f64, f64)>,
+    module_ts_own_file: &std::collections::HashSet<String>,
 ) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
     // Effective per-module timescale, unifying `\`timescale` directives (from
     // the preprocessor) with in-body `timeunit`/`timeprecision` declarations
@@ -343,6 +349,11 @@ fn parse_and_elaborate(
     let cli = module_timescale_cli();
     let mut eff_ts: std::collections::HashMap<String, (f64, f64)> = std::collections::HashMap::new();
     let mut named_matched: std::collections::HashSet<String> = std::collections::HashSet::new();
+    // §3.14.2.2 — track modules that carry NO `timescale (no source-level
+    // decl, no preceding directive, no CLI override) so a mixed design (some
+    // modules timed, some not) can be warned about after the pass.
+    let mut any_explicit_ts = false;
+    let mut modules_without_ts: Vec<String> = Vec::new();
     for desc in &all_descriptions {
         if let ast::Description::Module(m) = desc {
             let name = &m.name.name;
@@ -362,15 +373,28 @@ fn parse_and_elaborate(
             let directive = module_timescales
                 .get(name)
                 .map(|&(u, p)| (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)));
-            let is_explicit = local_u.is_some() || local_p.is_some() || directive.is_some();
+            // A `\`timescale` that STUCK across from a prior file (inherited) is
+            // NOT the module's own source-level timescale. `--module-timescale`
+            // may override such an inheritance; only a local `timeunit` decl or a
+            // directive in the module's OWN file is truly "explicit source-level"
+            // and wins over the CLI.
+            let directive_own_file = directive.is_some() && module_ts_own_file.contains(name);
+            let own_explicit = local_u.is_some() || local_p.is_some() || directive_own_file;
             let named = cli.named.get(name).copied();
+            let cli_ts = named.or(cli.global);
             if named.is_some() {
                 named_matched.insert(name.clone());
             }
+            if own_explicit {
+                any_explicit_ts = true;
+            } else if directive.is_none() && cli_ts.is_none() {
+                // Genuinely no timescale anywhere (own or inherited) and no CLI.
+                modules_without_ts.push(name.clone());
+            }
 
-            let eff_exp: Option<(i32, i32)> = if is_explicit {
-                // A local decl overrides the directive field by field; a missing
-                // field falls back to the directive, then to 1 ns.
+            let eff_exp: Option<(i32, i32)> = if own_explicit {
+                // A local decl overrides the (own-file) directive field by field;
+                // a missing field falls back to the directive, then to 1 ns.
                 let (du, dp) = directive.unwrap_or((-9, -9));
                 let u = local_u.unwrap_or(du);
                 let p = local_p.unwrap_or(dp);
@@ -381,13 +405,30 @@ fn parse_and_elaborate(
                     );
                 }
                 Some((u, p))
+            } else if let Some(ts) = cli_ts {
+                // --module-timescale supplies the timescale, OVERRIDING any
+                // directive merely inherited (sticky) from a prior file.
+                Some(ts)
             } else {
-                // No explicit timescale: named CLI wins over global CLI.
-                named.or(cli.global)
+                // No CLI: keep a cross-file-inherited directive (single-compilation-
+                // unit sticky behavior) when present; else no timescale.
+                directive
             };
             if let Some((u, p)) = eff_exp {
                 eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
             }
+        }
+    }
+    // §3.14.2.2 — a design that MIXES timed and untimed modules is a common
+    // source of surprise (the untimed module falls back to the default unit).
+    // Warn once per untimed module, but only in the mixed case (a fully
+    // untimed design has a uniform default and needs no warning).
+    if any_explicit_ts {
+        for name in &modules_without_ts {
+            eprintln!(
+                "[warn] module '{}' has no timescale directive; defaulting its reported timescale to 1s/1s",
+                name
+            );
         }
     }
     // §10: warn on a named assignment that matched no module definition.
@@ -628,6 +669,34 @@ fn parse_and_elaborate(
     let lib_cli = library_cli_cell().lock().unwrap().clone();
     if !include_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(&mut definitions, include_dirs, lib_defines, &lib_cli)?;
+
+        // A `-v`/`-y` library module is adopted AFTER the primary-source delay
+        // rewrite (above), so it never received a timescale — its `#delay`s
+        // stayed raw tick-unit values while the same module compiled as a
+        // primary source would be scaled. Apply `--module-timescale` (named,
+        // else global) to each newly-adopted library module so its delays scale
+        // consistently. Library modules with no CLI timescale keep tick units
+        // (their own `` `timescale `` directive is a separate, not-yet-captured
+        // path).
+        if cli.global.is_some() || !cli.named.is_empty() {
+            let lib_names: Vec<String> = definitions
+                .keys()
+                .filter(|n| !explicit_def_names.contains(*n))
+                .cloned()
+                .collect();
+            for name in lib_names {
+                let ts = cli.named.get(&name).copied().or(cli.global);
+                let Some((u, p)) = ts else { continue };
+                let unit_s = elaborate::exp_to_secs(u);
+                let _ = p; // precision folds into the global tick, already fixed
+                if let Some(SourceDefinition::Module(rc)) = definitions.get_mut(&name) {
+                    let m = Rc::make_mut(rc);
+                    elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
+                    module_timescale_exp
+                        .insert(name.clone(), (elaborate::secs_to_exp(unit_s), elaborate::secs_to_exp(elaborate::exp_to_secs(p))));
+                }
+            }
+        }
     }
 
     let named_top_found = top_module_name.map_or(false, |n| definitions.contains_key(n));
