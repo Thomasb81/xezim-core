@@ -65,6 +65,15 @@ pub enum StatementKind {
     DoWhile { body: Box<Statement>, condition: Expression },
     Repeat { count: Expression, body: Box<Statement> },
     Forever { body: Box<Statement> },
+    /// INTERNAL (not parsed): continuation sentinel for a `forever` whose
+    /// body can block (suspend). Like `ForeachTail`, it distinguishes
+    /// FIRST entry (the `Forever` arm, which runs the body's first
+    /// iteration without gating) from RE-ENTRY after a suspension, so a
+    /// `break`/`continue`/`return` raised inside the body is honored on
+    /// resume (IEEE 1800-2023 §9.3.3) instead of being silently dropped
+    /// while the loop re-arms. Carries only the body; the statements after
+    /// the loop live in the surrounding flattened stream.
+    ForeverTail { body: Box<Statement> },
     SeqBlock { name: Option<Identifier>, stmts: Vec<Statement> },
     ParBlock { name: Option<Identifier>, join_type: JoinType, stmts: Vec<Statement> },
     TimingControl { control: TimingControl, stmt: Box<Statement> },
