@@ -276,6 +276,10 @@ pub fn parse_and_elaborate_multi(
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(|p| std::path::PathBuf::from(p));
+        // Mark a new compilation file so a `timescale that stuck across from a
+        // prior file is treated as inherited (overridable by --module-timescale)
+        // rather than declared here.
+        pp.begin_top_level_file();
         let preprocessed = pp.preprocess_file(source, source_path.as_deref());
 
         let tokens = lexer::Lexer::new(&preprocessed).tokenize();
@@ -316,8 +320,9 @@ pub fn parse_and_elaborate_multi(
 
     let lib_defines = pp.snapshot_defines();
     let module_timescales = pp.module_timescales.clone();
+    let module_ts_own_file = pp.module_ts_own_file.clone();
     let (defs, mut elab) =
-        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales)?;
+        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales, &module_ts_own_file)?;
     elab.source_texts = preprocessed_texts;
     elab.source_files = source_files.to_vec();
     elab.src_file_of_module = src_file_of_module;
@@ -330,6 +335,7 @@ fn parse_and_elaborate(
     include_dirs: &[String],
     lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
     module_timescales: &std::collections::HashMap<String, (f64, f64)>,
+    module_ts_own_file: &std::collections::HashSet<String>,
 ) -> Result<(crate::hasher::HashMap<String, SourceDefinition>, elaborate::ElaboratedModule), String> {
     // Effective per-module timescale, unifying `\`timescale` directives (from
     // the preprocessor) with in-body `timeunit`/`timeprecision` declarations
@@ -367,20 +373,28 @@ fn parse_and_elaborate(
             let directive = module_timescales
                 .get(name)
                 .map(|&(u, p)| (elaborate::secs_to_exp(u), elaborate::secs_to_exp(p)));
-            let is_explicit = local_u.is_some() || local_p.is_some() || directive.is_some();
+            // A `\`timescale` that STUCK across from a prior file (inherited) is
+            // NOT the module's own source-level timescale. `--module-timescale`
+            // may override such an inheritance; only a local `timeunit` decl or a
+            // directive in the module's OWN file is truly "explicit source-level"
+            // and wins over the CLI.
+            let directive_own_file = directive.is_some() && module_ts_own_file.contains(name);
+            let own_explicit = local_u.is_some() || local_p.is_some() || directive_own_file;
             let named = cli.named.get(name).copied();
+            let cli_ts = named.or(cli.global);
             if named.is_some() {
                 named_matched.insert(name.clone());
             }
-            if is_explicit {
+            if own_explicit {
                 any_explicit_ts = true;
-            } else if named.is_none() && cli.global.is_none() {
+            } else if directive.is_none() && cli_ts.is_none() {
+                // Genuinely no timescale anywhere (own or inherited) and no CLI.
                 modules_without_ts.push(name.clone());
             }
 
-            let eff_exp: Option<(i32, i32)> = if is_explicit {
-                // A local decl overrides the directive field by field; a missing
-                // field falls back to the directive, then to 1 ns.
+            let eff_exp: Option<(i32, i32)> = if own_explicit {
+                // A local decl overrides the (own-file) directive field by field;
+                // a missing field falls back to the directive, then to 1 ns.
                 let (du, dp) = directive.unwrap_or((-9, -9));
                 let u = local_u.unwrap_or(du);
                 let p = local_p.unwrap_or(dp);
@@ -391,9 +405,14 @@ fn parse_and_elaborate(
                     );
                 }
                 Some((u, p))
+            } else if let Some(ts) = cli_ts {
+                // --module-timescale supplies the timescale, OVERRIDING any
+                // directive merely inherited (sticky) from a prior file.
+                Some(ts)
             } else {
-                // No explicit timescale: named CLI wins over global CLI.
-                named.or(cli.global)
+                // No CLI: keep a cross-file-inherited directive (single-compilation-
+                // unit sticky behavior) when present; else no timescale.
+                directive
             };
             if let Some((u, p)) = eff_exp {
                 eff_ts.insert(name.clone(), (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
