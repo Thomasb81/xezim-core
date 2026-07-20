@@ -2142,6 +2142,8 @@ pub fn elaborate_module_with_defs(
                     .map(|dt| is_type_signed(dt))
                     .unwrap_or(false);
                 let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
+                let port_shape = fixed_unpacked_shape(&port.dimensions, &elab.parameters)
+                    .unwrap_or_default();
                 let sig = Signal { is_const: false,
                     name: port.name.name.clone(),
                     width,
@@ -2152,7 +2154,20 @@ pub fn elaborate_module_with_defs(
                     type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
-                elab.signals.insert(port.name.name.clone(), sig);
+                if port_shape.is_empty() {
+                    elab.signals.insert(port.name.name.clone(), sig);
+                } else {
+                    register_fixed_unpacked_array(
+                        &mut elab,
+                        &port.name.name,
+                        &port_shape,
+                        width,
+                        port.data_type.as_ref().map(is_type_two_state).unwrap_or(false),
+                    );
+                    if let Some(dt) = &port.data_type {
+                        elab.var_decl_types.insert(port.name.name.clone(), dt.clone());
+                    }
+                }
                 if let Some(view) = modport_view {
                     elab.modport_views.insert(port.name.name.clone(), view);
                 }
@@ -2401,8 +2416,16 @@ pub fn elaborate_module_with_defs(
                             elab.packed_full_dims.insert(decl.name.name.clone(), fdims);
                         }
                     }
-                    if let Some((lo, hi)) = net_array_range {
-                        elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                    if let Some(shape) = fixed_unpacked_shape(&decl.dimensions, &elab.parameters)
+                        .filter(|shape| !shape.is_empty())
+                    {
+                        register_fixed_unpacked_array(
+                            &mut elab,
+                            &decl.name.name,
+                            &shape,
+                            width,
+                            false,
+                        );
                         elab.var_decl_types.insert(decl.name.name.clone(), nd.data_type.clone());
                         if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
@@ -5449,6 +5472,29 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
         }
     }
 
+    fn generated_subroutine_name(
+        expr: &Expression,
+        params: &HashMap<String, Value>,
+    ) -> Option<String> {
+        let ExprKind::MemberAccess { expr: base, member } = &expr.kind else {
+            return None;
+        };
+        let ExprKind::Index { expr: scope, index } = &base.kind else {
+            return None;
+        };
+        let ExprKind::Ident(h) = &scope.kind else {
+            return None;
+        };
+        if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+            return None;
+        }
+        let idx = const_eval_i64_with_params(index, Some(params))?;
+        Some(format!(
+            "{}[{}].{}",
+            h.path[0].name.name, idx, member.name
+        ))
+    }
+
     match &expr.kind {
         ExprKind::Ident(hier) => {
             // Only check plain identifiers for now (hierarchical might be valid across modules)
@@ -5538,7 +5584,13 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
         }
         ExprKind::Paren(inner) => validate_expr_idents(inner, elab, locals)?,
         ExprKind::Call { func, args } => {
-            validate_expr_idents(func, elab, locals)?;
+            let generated = generated_subroutine_name(func, &elab.parameters)
+                .is_some_and(|name| {
+                    elab.functions.contains_key(&name) || elab.tasks.contains_key(&name)
+                });
+            if !generated {
+                validate_expr_idents(func, elab, locals)?;
+            }
             for a in args { validate_expr_idents(a, elab, locals)?; }
         }
         ExprKind::SystemCall { name, args } => {
@@ -6289,6 +6341,33 @@ fn elaborate_generate_case(gc: &GenerateCase, elab: &mut ElaboratedModule, all_d
     Ok(())
 }
 
+fn scope_generated_subroutines(items: &mut [ModuleItem], scope: &str) {
+    for item in items {
+        match item {
+            ModuleItem::FunctionDeclaration(fd) => {
+                fd.name.name.name = format!("{}.{}", scope, fd.name.name.name);
+            }
+            ModuleItem::TaskDeclaration(td) => {
+                td.name.name.name = format!("{}.{}", scope, td.name.name.name);
+            }
+            ModuleItem::GenerateRegion(gr) => {
+                scope_generated_subroutines(&mut gr.items, scope);
+            }
+            ModuleItem::GenerateIf(gi) => {
+                for (_, branch) in &mut gi.branches {
+                    scope_generated_subroutines(branch, scope);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &mut gc.arms {
+                    scope_generated_subroutines(&mut arm.items, scope);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
     let var = &gf.var;
     let mut i = gf.init_val;
@@ -6310,7 +6389,10 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
             Some(l) => format!("__gf_{}_{}_{}_", l, var, i),
             None => format!("__gf_{}_{}_", var, i),
         };
-        let renamed = rename_decls_in_iter(&subst, &suffix);
+        let mut renamed = rename_decls_in_iter(&subst, &suffix);
+        if let Some(label) = &gf.name {
+            scope_generated_subroutines(&mut renamed, &format!("{}[{}]", label, i));
+        }
         elaborate_items(&renamed, elab, all_defs)?;
         if trace && (iter_count % 8) == 0 {
             let rss = std::fs::read_to_string("/proc/self/statm")
@@ -8553,6 +8635,24 @@ fn rename_item_decls(
             stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
             span: ic.span,
         }),
+        ModuleItem::FunctionDeclaration(fd) => {
+            let mut new_fd = fd.clone();
+            new_fd.items = fd
+                .items
+                .iter()
+                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
+                .collect();
+            ModuleItem::FunctionDeclaration(new_fd)
+        }
+        ModuleItem::TaskDeclaration(td) => {
+            let mut new_td = td.clone();
+            new_td.items = td
+                .items
+                .iter()
+                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
+                .collect();
+            ModuleItem::TaskDeclaration(new_td)
+        }
         ModuleItem::ContinuousAssign(ca) => {
             let mut new_ca = ca.clone();
             new_ca.assignments = ca.assignments.iter().map(|(l, r)| (
@@ -8619,6 +8719,24 @@ fn substitute_in_module_item(
             stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
             span: ic.span,
         }),
+        ModuleItem::FunctionDeclaration(fd) => {
+            let mut new_fd = fd.clone();
+            new_fd.items = fd
+                .items
+                .iter()
+                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
+                .collect();
+            ModuleItem::FunctionDeclaration(new_fd)
+        }
+        ModuleItem::TaskDeclaration(td) => {
+            let mut new_td = td.clone();
+            new_td.items = td
+                .items
+                .iter()
+                .map(|s| rewrite_stmt(s, "", port_map, local_names, interface_map))
+                .collect();
+            ModuleItem::TaskDeclaration(new_td)
+        }
         // §9.2.3: a `final` inside a generate-for must see the genvar's
         // per-iteration constant, like initial/always do.
         ModuleItem::FinalConstruct(fc) => ModuleItem::FinalConstruct(FinalConstruct {
@@ -8814,6 +8932,380 @@ fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -
     }
 }
 
+/// §23.3.2 arrayed-instance connection width in the parent scope.
+fn ai_conn_expr_width(
+    e: &Expression,
+    widths: &HashMap<String, u32>,
+    params: &HashMap<String, Value>,
+) -> Option<u32> {
+    use crate::ast::expr::ExprKind as EK;
+    match &e.kind {
+        EK::Ident(h) => {
+            if h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let name = h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+            widths.get(&name).copied()
+        }
+        EK::RangeSelect { left, right, kind: crate::ast::expr::RangeKind::Constant, .. } => {
+            let l = const_eval_i64_with_params(left, Some(params))?;
+            let r = const_eval_i64_with_params(right, Some(params))?;
+            Some(((l - r).unsigned_abs() as u32) + 1)
+        }
+        EK::Index { .. } => Some(1),
+        EK::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(s), .. }) => Some(*s),
+        EK::Concatenation(parts) => {
+            let mut sum = 0u32;
+            for p in parts {
+                sum += ai_conn_expr_width(p, widths, params)?;
+            }
+            Some(sum)
+        }
+        EK::Paren(inner) => ai_conn_expr_width(inner, widths, params),
+        _ => None,
+    }
+}
+
+fn fixed_unpacked_shape(
+    dims: &[UnpackedDimension],
+    params: &HashMap<String, Value>,
+) -> Option<Vec<(i64, i64)>> {
+    if dims.is_empty() {
+        return Some(Vec::new());
+    }
+    dims.iter()
+        .map(|d| match d {
+            UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. } => {
+                extract_array_range(std::slice::from_ref(d), params)
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+fn register_fixed_unpacked_array(
+    elab: &mut ElaboratedModule,
+    name: &str,
+    shape: &[(i64, i64)],
+    elem_width: u32,
+    two_state: bool,
+) {
+    match shape {
+        [d0] => {
+            elab.arrays.insert(name.to_string(), (d0.0, d0.1, elem_width));
+        }
+        [d0, d1] => {
+            elab.arrays_2d
+                .insert(name.to_string(), (*d0, *d1, elem_width));
+        }
+        dims if dims.len() >= 3 => {
+            elab.arrays_nd
+                .insert(name.to_string(), (dims.to_vec(), elem_width));
+        }
+        _ => return,
+    }
+    if two_state {
+        elab.two_state_signals.insert(name.to_string());
+    }
+}
+
+fn shape_index_tuples(shape: &[(i64, i64)]) -> Vec<Vec<i64>> {
+    let mut out = vec![Vec::new()];
+    for &(lo, hi) in shape {
+        let mut next = Vec::new();
+        for prefix in &out {
+            for idx in lo..=hi {
+                let mut tuple = prefix.clone();
+                tuple.push(idx);
+                next.push(tuple);
+            }
+        }
+        out = next;
+    }
+    out
+}
+
+fn ai_append_indices(mut expr: Expression, indices: &[i64]) -> Expression {
+    for &idx in indices {
+        let span = expr.span;
+        expr = Expression::new(
+            ExprKind::Index {
+                expr: Box::new(expr),
+                index: Box::new(ai_num_expr(idx, span)),
+            },
+            span,
+        );
+    }
+    expr
+}
+
+fn ai_num_expr(n: i64, span: crate::ast::Span) -> Expression {
+    Expression::new(
+        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+            size: None,
+            signed: false,
+            base: crate::ast::expr::NumberBase::Decimal,
+            value: n.to_string(),
+            cached_val: std::cell::Cell::new(None),
+        }),
+        span,
+    )
+}
+
+fn ai_slice_conn(
+    conn: &crate::ast::decl::PortConnection,
+    p: u32,
+    k: u32,
+    n: u32,
+    widths: &HashMap<String, u32>,
+    port_shape: Option<&[(i64, i64)]>,
+    unpacked_shapes: &HashMap<String, Vec<(i64, i64)>>,
+    params: &HashMap<String, Value>,
+) -> crate::ast::decl::PortConnection {
+    use crate::ast::decl::PortConnection as PC;
+    let expr = match conn {
+        PC::Ordered(Some(e)) => e,
+        PC::Named { expr: Some(e), .. } => e,
+        _ => return conn.clone(),
+    };
+    // §23.3.3.5: when an instance array's actual has one more unpacked
+    // dimension than the formal, consume that leading dimension across the
+    // instances. Example: a formal `A[0:2]`, actual `bus[0:3][0:2]`, and four
+    // instances bind instance k to `bus[k]`.
+    if let (Some(formal), ExprKind::Ident(h)) = (port_shape, &expr.kind) {
+        if h.path.len() == 1 && h.path[0].selects.is_empty() {
+            let actual_name = &h.path[0].name.name;
+            if let Some(actual) = unpacked_shapes.get(actual_name) {
+                if actual.len() == formal.len() + 1
+                    && actual[1..] == *formal
+                    && (actual[0].1 - actual[0].0 + 1) as u32 == n
+                {
+                    let sliced = ai_append_indices(
+                        expr.clone(),
+                        &[actual[0].0 + k as i64],
+                    );
+                    return match conn {
+                        PC::Ordered(_) => PC::Ordered(Some(sliced)),
+                        PC::Named { name, implicit, .. } => PC::Named {
+                            name: name.clone(),
+                            expr: Some(sliced),
+                            implicit: *implicit,
+                        },
+                        _ => conn.clone(),
+                    };
+                }
+            }
+        }
+    }
+    let distribute = matches!(ai_conn_expr_width(expr, widths, params), Some(w) if w == p * n && w != p);
+    if !distribute {
+        return conn.clone();
+    }
+    // Slice the BASE signal at an ABSOLUTE bit offset. If the connection is
+    // already a part-select `sig[hi:lo]`, index into `sig` at `lo + p*k` — NOT
+    // `sig[hi:lo][k]`, a nested bit-of-part-select that can't be driven as a
+    // cont-assign LHS (the whole reason arrayed-instance outputs stayed X).
+    let (base, base_lo): (&Expression, i64) = match &expr.kind {
+        ExprKind::RangeSelect { expr: b, left, right, kind: crate::ast::expr::RangeKind::Constant } => {
+            let l = const_eval_i64_with_params(left, Some(params));
+            let r = const_eval_i64_with_params(right, Some(params));
+            match (l, r) {
+                (Some(l), Some(r)) => (b.as_ref(), l.min(r)),
+                _ => (expr, 0),
+            }
+        }
+        _ => (expr, 0),
+    };
+    let off = base_lo + (p * k) as i64;
+    let sliced = if p == 1 {
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(base.clone()),
+                index: Box::new(ai_num_expr(off, base.span)),
+            },
+            base.span,
+        )
+    } else {
+        Expression::new(
+            ExprKind::RangeSelect {
+                expr: Box::new(base.clone()),
+                kind: crate::ast::expr::RangeKind::Constant,
+                left: Box::new(ai_num_expr(off + p as i64 - 1, base.span)),
+                right: Box::new(ai_num_expr(off, base.span)),
+            },
+            base.span,
+        )
+    };
+    match conn {
+        PC::Ordered(_) => PC::Ordered(Some(sliced)),
+        PC::Named { name, implicit, .. } => PC::Named { name: name.clone(), expr: Some(sliced), implicit: *implicit },
+        _ => conn.clone(),
+    }
+}
+
+fn ai_expand_instances(
+    instances: &[crate::ast::decl::HierarchicalInstance],
+    port_widths: &[u32],
+    port_shapes: &[Vec<(i64, i64)>],
+    widths: &HashMap<String, u32>,
+    unpacked_shapes: &HashMap<String, Vec<(i64, i64)>>,
+    params: &HashMap<String, Value>,
+) -> Vec<crate::ast::decl::HierarchicalInstance> {
+    use crate::ast::decl::HierarchicalInstance as HInst;
+    let mut out = Vec::with_capacity(instances.len());
+    for hi in instances {
+        if hi.dimensions.is_empty() {
+            out.push(hi.clone());
+            continue;
+        }
+        let Some((lo, hi_idx)) = extract_array_range(&hi.dimensions, params) else {
+            out.push(hi.clone());
+            continue;
+        };
+        let rmin = lo.min(hi_idx);
+        let rmax = lo.max(hi_idx);
+        let n = (rmax - rmin + 1) as u32;
+        if n <= 1 {
+            out.push(hi.clone());
+            continue;
+        }
+        for j in rmin..=rmax {
+            let k = (j - rmin) as u32;
+            let new_conns = hi
+                .connections
+                .iter()
+                .enumerate()
+                .map(|(pi, conn)| {
+                    let p = port_widths.get(pi).copied().unwrap_or(1).max(1);
+                    ai_slice_conn(
+                        conn,
+                        p,
+                        k,
+                        n,
+                        widths,
+                        port_shapes.get(pi).map(Vec::as_slice),
+                        unpacked_shapes,
+                        params,
+                    )
+                })
+                .collect();
+            let mut ident = hi.name.clone();
+            ident.name = format!("{}[{}]", hi.name.name, j);
+            out.push(HInst { name: ident, dimensions: vec![], connections: new_conns, span: hi.span });
+        }
+    }
+    out
+}
+
+fn ai_module_port_widths(
+    def: &Definition,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+) -> Vec<u32> {
+    match def.ports() {
+        PortList::Ansi(ps) => ps
+            .iter()
+            .map(|p| {
+                p.data_type
+                    .as_ref()
+                    .map(|dt| resolve_type_width(dt, Some(params), Some(typedefs)))
+                    .unwrap_or(1)
+                    .max(1)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn ai_module_port_shapes(
+    def: &Definition,
+    params: &HashMap<String, Value>,
+) -> Vec<Vec<(i64, i64)>> {
+    match def.ports() {
+        PortList::Ansi(ps) => ps
+            .iter()
+            .map(|p| fixed_unpacked_shape(&p.dimensions, params).unwrap_or_default())
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn ai_scan_signal_widths(
+    items: &[ModuleItem],
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+) -> HashMap<String, u32> {
+    let mut m = HashMap::default();
+    for item in items {
+        match item {
+            ModuleItem::PortDeclaration(pd) => {
+                let w = resolve_type_width(&pd.data_type, Some(params), Some(typedefs)).max(1);
+                for d in &pd.declarators {
+                    m.insert(d.name.name.clone(), w);
+                }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                let w = resolve_type_width(&nd.data_type, Some(params), Some(typedefs)).max(1);
+                for d in &nd.declarators {
+                    if d.dimensions.is_empty() {
+                        m.insert(d.name.name.clone(), w);
+                    }
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                let w = resolve_type_width(&dd.data_type, Some(params), Some(typedefs)).max(1);
+                for d in &dd.declarators {
+                    if d.dimensions.is_empty() {
+                        m.insert(d.name.name.clone(), w);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
+fn ai_scan_unpacked_shapes(
+    items: &[ModuleItem],
+    params: &HashMap<String, Value>,
+) -> HashMap<String, Vec<(i64, i64)>> {
+    let mut shapes = HashMap::default();
+    for item in items {
+        match item {
+            ModuleItem::PortDeclaration(pd) => {
+                for d in &pd.declarators {
+                    if let Some(shape) = fixed_unpacked_shape(&d.dimensions, params) {
+                        if !shape.is_empty() {
+                            shapes.insert(d.name.name.clone(), shape);
+                        }
+                    }
+                }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators {
+                    if let Some(shape) = fixed_unpacked_shape(&d.dimensions, params) {
+                        if !shape.is_empty() {
+                            shapes.insert(d.name.name.clone(), shape);
+                        }
+                    }
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators {
+                    if let Some(shape) = fixed_unpacked_shape(&d.dimensions, params) {
+                        if !shape.is_empty() {
+                            shapes.insert(d.name.name.clone(), shape);
+                        }
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    shapes
+}
+
 /// LRM §25.4: an interface actual may be written `instance.modport`
 /// (`m u(bus.mp)`), selecting a modport VIEW of the instance. The modport
 /// segment is not part of the instance path — inlined interface tasks are
@@ -8924,7 +9416,40 @@ fn prepare_module_items(
         }
     }
 
-    let effective_items = collect_effective_items(source_def.items(), local_params);
+    let mut effective_items = collect_effective_items(source_def.items(), local_params);
+
+    // §23.3.2: expand arrays of module instances into individual instances with
+    // bit-sliced vector connections, before body_sources/driver derivation.
+    if effective_items.iter().any(|it| {
+        matches!(it, ModuleItem::ModuleInstantiation(inst)
+            if inst.instances.iter().any(|h| !h.dimensions.is_empty()))
+    }) {
+        let widths = ai_scan_signal_widths(&effective_items, local_params, typedef_widths);
+        let unpacked_shapes = ai_scan_unpacked_shapes(&effective_items, local_params);
+        for item in effective_items.iter_mut() {
+            if let ModuleItem::ModuleInstantiation(inst) = item {
+                if inst.instances.iter().any(|h| !h.dimensions.is_empty()) {
+                    let port_widths = definitions
+                        .get(&inst.module_name.name)
+                        .map(|d| ai_module_port_widths(d, local_params, typedef_widths))
+                        .unwrap_or_default();
+                    let port_shapes = definitions
+                        .get(&inst.module_name.name)
+                        .map(|d| ai_module_port_shapes(d, local_params))
+                        .unwrap_or_default();
+                    inst.instances =
+                        ai_expand_instances(
+                            &inst.instances,
+                            &port_widths,
+                            &port_shapes,
+                            &widths,
+                            &unpacked_shapes,
+                            local_params,
+                        );
+                }
+            }
+        }
+    }
 
     let mut port_directions = HashMap::default();
     match source_def.ports() {
@@ -9686,6 +10211,11 @@ fn inline_module_items(
                                 .unwrap_or(1);
                             let sig_name = format!("{}{}", inst_prefix, port.name.name);
                             let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
+                            let port_shape = fixed_unpacked_shape(
+                                &port.dimensions,
+                                &sub_merged_params,
+                            )
+                            .unwrap_or_default();
                             // Register the packed-struct field layout for a
                             // struct-typed port so a member write to the port's
                             // internal signal (`dut.out.a` for an `output
@@ -9699,14 +10229,27 @@ fn inline_module_items(
                                     }
                                 }
                             }
-                            elab.signals.insert(sig_name.clone(), Signal { is_const: false,
-                                name: sig_name, width,
-                                is_signed: port.data_type.as_ref().map(|dt| is_type_signed(dt)).unwrap_or(false),
-                                is_real,
-                                direction: port.direction,
-                                value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
-                                type_name: port.data_type.as_ref().and_then(get_type_name),
-                            });
+                            if port_shape.is_empty() {
+                                elab.signals.insert(sig_name.clone(), Signal { is_const: false,
+                                    name: sig_name, width,
+                                    is_signed: port.data_type.as_ref().map(|dt| is_type_signed(dt)).unwrap_or(false),
+                                    is_real,
+                                    direction: port.direction,
+                                    value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                    type_name: port.data_type.as_ref().and_then(get_type_name),
+                                });
+                            } else {
+                                register_fixed_unpacked_array(
+                                    elab,
+                                    &sig_name,
+                                    &port_shape,
+                                    width,
+                                    port.data_type.as_ref().map(is_type_two_state).unwrap_or(false),
+                                );
+                                if let Some(dt) = &port.data_type {
+                                    elab.var_decl_types.insert(sig_name, dt.clone());
+                                }
+                            }
                         }
                     }
                     PortList::NonAnsi(_names) => {
@@ -9937,6 +10480,41 @@ fn inline_module_items(
                 for (port_name, parent_expr) in &port_map {
                     if prepared_sub.interface_ports.contains(port_name) { continue; }
                     let sub_sig_name = format!("{}{}", inst_prefix, port_name);
+                    let port_shape = match sub_mod.ports() {
+                        PortList::Ansi(ports) => ports
+                            .iter()
+                            .find(|p| p.name.name == *port_name)
+                            .and_then(|p| fixed_unpacked_shape(&p.dimensions, &sub_merged_params)),
+                        _ => None,
+                    }
+                    .unwrap_or_default();
+                    if !port_shape.is_empty() {
+                        for indices in shape_index_tuples(&port_shape) {
+                            let sub_expr = ai_append_indices(
+                                make_ident_expr(&sub_sig_name),
+                                &indices,
+                            );
+                            let parent_elem = ai_append_indices(parent_expr.clone(), &indices);
+                            match prepared_sub.port_directions.get(port_name) {
+                                Some(PortDirection::Input) | Some(PortDirection::Inout) => {
+                                    elab.continuous_assigns.push(ContinuousAssignment {
+                                        lhs: sub_expr,
+                                        rhs: parent_elem,
+                                        delay: 0,
+                                    });
+                                }
+                                Some(PortDirection::Output) => {
+                                    elab.continuous_assigns.push(ContinuousAssignment {
+                                        lhs: parent_elem,
+                                        rhs: sub_expr,
+                                        delay: 0,
+                                    });
+                                }
+                                _ => {}
+                            }
+                        }
+                        continue;
+                    }
                     // Dump-only net collapsing: the formal and a whole-net actual
                     // are ONE physical net (see `ElaboratedModule::port_aliases`).
                     // Anything that is not a plain hierarchical identifier — a
@@ -9952,8 +10530,7 @@ fn inline_module_items(
                                 lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
                             });
                         }
-                        Some(PortDirection::Output) => {
-                            elab.continuous_assigns.push(ContinuousAssignment {
+                        Some(PortDirection::Output) => {                            elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: parent_expr.clone(), rhs: sub_expr, delay: 0,
                             });
                         }
@@ -10022,8 +10599,7 @@ fn inline_module_items(
                     }
                     if matches!(sub_item, ModuleItem::ContinuousAssign(_)) {
                         // #7: Rc-share source ASTs across sibling instances.
-                        if let BodySource::ContAssign(pairs) = body_src {
-                            for (lhs_rc, rhs_rc) in pairs {
+                        if let BodySource::ContAssign(pairs) = body_src {                            for (lhs_rc, rhs_rc) in pairs {
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
