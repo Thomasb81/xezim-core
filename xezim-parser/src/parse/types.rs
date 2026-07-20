@@ -188,6 +188,48 @@ impl Parser {
                                         crate::ast::expr::ExprKind::Ident(hier),
                                         sp,
                                     ));
+                                } else if self.at(TokenKind::KwVirtual)
+                                    && (self.peek_kind() == TokenKind::KwInterface
+                                        || self.peek_kind() == TokenKind::Identifier)
+                                {
+                                    // §25.9: `virtual <iface_type>` (or
+                                    // `virtual interface <iface>`) as a
+                                    // type-parameter argument, e.g.
+                                    // `uvc_env#(virtual uvc_intf)`. Capture
+                                    // the leaf as an Ident expression so
+                                    // per-spec keying recovers the signature,
+                                    // matching the builtin-keyword path above.
+                                    let tok_text = self.current().text.clone(); // 'virtual'
+                                    let tsp = self.current().span;
+                                    let _dt = self.parse_data_type();
+                                    let sp = self.span_from(start);
+                                    let iface_name = self
+                                        .tokens
+                                        .get(self.pos - 1)
+                                        .map(|t| t.text.clone())
+                                        .unwrap_or_else(|| tok_text);
+                                    let full_name = format!(
+                                        "virtual {}",
+                                        iface_name
+                                    );
+                                    let id = crate::ast::Identifier {
+                                        name: full_name,
+                                        span: crate::ast::Span { start: tsp.start, end: tsp.end },
+                                    };
+                                    let hier = crate::ast::expr::HierarchicalIdentifier {
+                                        root: None,
+                                        path: vec![crate::ast::expr::HierPathSegment {
+                                            name: id,
+                                            selects: Vec::new(),
+                                        }],
+                                        span: sp,
+                                        cached_signal_id: std::cell::Cell::new(None),
+                                        cached_resolved_name: std::cell::OnceCell::new(),
+                                    };
+                                    type_args.push(crate::ast::expr::Expression::new(
+                                        crate::ast::expr::ExprKind::Ident(hier),
+                                        sp,
+                                    ));
                                 } else {
                                     type_args.push(self.parse_expression());
                                 }
