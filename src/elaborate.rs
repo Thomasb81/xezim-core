@@ -8796,6 +8796,212 @@ fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -
     }
 }
 
+/// §23.3.2 arrayed-instance connection width in the parent scope.
+fn ai_conn_expr_width(
+    e: &Expression,
+    widths: &HashMap<String, u32>,
+    params: &HashMap<String, Value>,
+) -> Option<u32> {
+    use crate::ast::expr::ExprKind as EK;
+    match &e.kind {
+        EK::Ident(h) => {
+            if h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let name = h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
+            widths.get(&name).copied()
+        }
+        EK::RangeSelect { left, right, kind: crate::ast::expr::RangeKind::Constant, .. } => {
+            let l = const_eval_i64_with_params(left, Some(params))?;
+            let r = const_eval_i64_with_params(right, Some(params))?;
+            Some(((l - r).unsigned_abs() as u32) + 1)
+        }
+        EK::Index { .. } => Some(1),
+        EK::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(s), .. }) => Some(*s),
+        EK::Concatenation(parts) => {
+            let mut sum = 0u32;
+            for p in parts {
+                sum += ai_conn_expr_width(p, widths, params)?;
+            }
+            Some(sum)
+        }
+        EK::Paren(inner) => ai_conn_expr_width(inner, widths, params),
+        _ => None,
+    }
+}
+
+fn ai_num_expr(n: i64, span: crate::ast::Span) -> Expression {
+    Expression::new(
+        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+            size: None,
+            signed: false,
+            base: crate::ast::expr::NumberBase::Decimal,
+            value: n.to_string(),
+            cached_val: std::cell::Cell::new(None),
+        }),
+        span,
+    )
+}
+
+fn ai_slice_conn(
+    conn: &crate::ast::decl::PortConnection,
+    p: u32,
+    k: u32,
+    n: u32,
+    widths: &HashMap<String, u32>,
+    params: &HashMap<String, Value>,
+) -> crate::ast::decl::PortConnection {
+    use crate::ast::decl::PortConnection as PC;
+    let expr = match conn {
+        PC::Ordered(Some(e)) => e,
+        PC::Named { expr: Some(e), .. } => e,
+        _ => return conn.clone(),
+    };
+    let distribute = matches!(ai_conn_expr_width(expr, widths, params), Some(w) if w == p * n && w != p);
+    if !distribute {
+        return conn.clone();
+    }
+    // Slice the BASE signal at an ABSOLUTE bit offset. If the connection is
+    // already a part-select `sig[hi:lo]`, index into `sig` at `lo + p*k` — NOT
+    // `sig[hi:lo][k]`, a nested bit-of-part-select that can't be driven as a
+    // cont-assign LHS (the whole reason arrayed-instance outputs stayed X).
+    let (base, base_lo): (&Expression, i64) = match &expr.kind {
+        ExprKind::RangeSelect { expr: b, left, right, kind: crate::ast::expr::RangeKind::Constant } => {
+            let l = const_eval_i64_with_params(left, Some(params));
+            let r = const_eval_i64_with_params(right, Some(params));
+            match (l, r) {
+                (Some(l), Some(r)) => (b.as_ref(), l.min(r)),
+                _ => (expr, 0),
+            }
+        }
+        _ => (expr, 0),
+    };
+    let off = base_lo + (p * k) as i64;
+    let sliced = if p == 1 {
+        Expression::new(
+            ExprKind::Index {
+                expr: Box::new(base.clone()),
+                index: Box::new(ai_num_expr(off, base.span)),
+            },
+            base.span,
+        )
+    } else {
+        Expression::new(
+            ExprKind::RangeSelect {
+                expr: Box::new(base.clone()),
+                kind: crate::ast::expr::RangeKind::Constant,
+                left: Box::new(ai_num_expr(off + p as i64 - 1, base.span)),
+                right: Box::new(ai_num_expr(off, base.span)),
+            },
+            base.span,
+        )
+    };
+    match conn {
+        PC::Ordered(_) => PC::Ordered(Some(sliced)),
+        PC::Named { name, implicit, .. } => PC::Named { name: name.clone(), expr: Some(sliced), implicit: *implicit },
+        _ => conn.clone(),
+    }
+}
+
+fn ai_expand_instances(
+    instances: &[crate::ast::decl::HierarchicalInstance],
+    port_widths: &[u32],
+    widths: &HashMap<String, u32>,
+    params: &HashMap<String, Value>,
+) -> Vec<crate::ast::decl::HierarchicalInstance> {
+    use crate::ast::decl::HierarchicalInstance as HInst;
+    let mut out = Vec::with_capacity(instances.len());
+    for hi in instances {
+        if hi.dimensions.is_empty() {
+            out.push(hi.clone());
+            continue;
+        }
+        let Some((lo, hi_idx)) = extract_array_range(&hi.dimensions, params) else {
+            out.push(hi.clone());
+            continue;
+        };
+        let rmin = lo.min(hi_idx);
+        let rmax = lo.max(hi_idx);
+        let n = (rmax - rmin + 1) as u32;
+        if n <= 1 {
+            out.push(hi.clone());
+            continue;
+        }
+        for j in rmin..=rmax {
+            let k = (j - rmin) as u32;
+            let new_conns = hi
+                .connections
+                .iter()
+                .enumerate()
+                .map(|(pi, conn)| {
+                    let p = port_widths.get(pi).copied().unwrap_or(1).max(1);
+                    ai_slice_conn(conn, p, k, n, widths, params)
+                })
+                .collect();
+            let mut ident = hi.name.clone();
+            ident.name = format!("{}[{}]", hi.name.name, j);
+            out.push(HInst { name: ident, dimensions: vec![], connections: new_conns, span: hi.span });
+        }
+    }
+    out
+}
+
+fn ai_module_port_widths(
+    def: &Definition,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+) -> Vec<u32> {
+    match def.ports() {
+        PortList::Ansi(ps) => ps
+            .iter()
+            .map(|p| {
+                p.data_type
+                    .as_ref()
+                    .map(|dt| resolve_type_width(dt, Some(params), Some(typedefs)))
+                    .unwrap_or(1)
+                    .max(1)
+            })
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn ai_scan_signal_widths(
+    items: &[ModuleItem],
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+) -> HashMap<String, u32> {
+    let mut m = HashMap::default();
+    for item in items {
+        match item {
+            ModuleItem::PortDeclaration(pd) => {
+                let w = resolve_type_width(&pd.data_type, Some(params), Some(typedefs)).max(1);
+                for d in &pd.declarators {
+                    m.insert(d.name.name.clone(), w);
+                }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                let w = resolve_type_width(&nd.data_type, Some(params), Some(typedefs)).max(1);
+                for d in &nd.declarators {
+                    if d.dimensions.is_empty() {
+                        m.insert(d.name.name.clone(), w);
+                    }
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                let w = resolve_type_width(&dd.data_type, Some(params), Some(typedefs)).max(1);
+                for d in &dd.declarators {
+                    if d.dimensions.is_empty() {
+                        m.insert(d.name.name.clone(), w);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    m
+}
+
 /// LRM §25.4: an interface actual may be written `instance.modport`
 /// (`m u(bus.mp)`), selecting a modport VIEW of the instance. The modport
 /// segment is not part of the instance path — inlined interface tasks are
@@ -8906,7 +9112,28 @@ fn prepare_module_items(
         }
     }
 
-    let effective_items = collect_effective_items(source_def.items(), local_params);
+    let mut effective_items = collect_effective_items(source_def.items(), local_params);
+
+    // §23.3.2: expand arrays of module instances into individual instances with
+    // bit-sliced vector connections, before body_sources/driver derivation.
+    if effective_items.iter().any(|it| {
+        matches!(it, ModuleItem::ModuleInstantiation(inst)
+            if inst.instances.iter().any(|h| !h.dimensions.is_empty()))
+    }) {
+        let widths = ai_scan_signal_widths(&effective_items, local_params, typedef_widths);
+        for item in effective_items.iter_mut() {
+            if let ModuleItem::ModuleInstantiation(inst) = item {
+                if inst.instances.iter().any(|h| !h.dimensions.is_empty()) {
+                    let port_widths = definitions
+                        .get(&inst.module_name.name)
+                        .map(|d| ai_module_port_widths(d, local_params, typedef_widths))
+                        .unwrap_or_default();
+                    inst.instances =
+                        ai_expand_instances(&inst.instances, &port_widths, &widths, local_params);
+                }
+            }
+        }
+    }
 
     let mut port_directions = HashMap::default();
     match source_def.ports() {
@@ -9934,8 +10161,7 @@ fn inline_module_items(
                                 lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
                             });
                         }
-                        Some(PortDirection::Output) => {
-                            elab.continuous_assigns.push(ContinuousAssignment {
+                        Some(PortDirection::Output) => {                            elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: parent_expr.clone(), rhs: sub_expr, delay: 0,
                             });
                         }
@@ -10004,8 +10230,7 @@ fn inline_module_items(
                     }
                     if matches!(sub_item, ModuleItem::ContinuousAssign(_)) {
                         // #7: Rc-share source ASTs across sibling instances.
-                        if let BodySource::ContAssign(pairs) = body_src {
-                            for (lhs_rc, rhs_rc) in pairs {
+                        if let BodySource::ContAssign(pairs) = body_src {                            for (lhs_rc, rhs_rc) in pairs {
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
