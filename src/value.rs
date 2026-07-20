@@ -1308,11 +1308,44 @@ impl Value {
     // === Concatenation ===
 
     pub fn concat(values: &[Value]) -> Value {
-        // values[0] is leftmost (MSB)
-        let total_width: u32 = values.iter().map(|v| v.width).sum();
+        Self::concat_refs(values.iter())
+    }
+
+    /// Concatenate borrowed values without forcing callers to clone them into
+    /// a temporary slice. `values[0]` is the leftmost (MSB) operand.
+    pub fn concat_refs<'a, I>(values: I) -> Value
+    where
+        I: DoubleEndedIterator<Item = &'a Value> + Clone,
+    {
+        let total_width: u32 = values.clone().map(|v| v.width).sum();
+        if total_width <= 64 {
+            let mut out_v = 0u64;
+            let mut out_x = 0u64;
+            let mut offset = 0u32;
+            for val in values.rev() {
+                if val.width == 0 {
+                    continue;
+                }
+                let (v, x) = val.raw_bits();
+                let mask = Self::mask(val.width);
+                out_v |= (v & mask) << offset;
+                out_x |= (x & mask) << offset;
+                offset += val.width;
+            }
+            return Value {
+                storage: ValueStorage::Inline {
+                    val_bits: out_v,
+                    xz_bits: out_x,
+                },
+                width: total_width,
+                is_signed: false,
+                is_real: false,
+            };
+        }
+
         let mut result = Value::zero(total_width);
         let mut offset = 0u32;
-        for val in values.iter().rev() {
+        for val in values.rev() {
             for i in 0..val.width as usize {
                 result.set_bit((offset as usize) + i, val.get_bit(i));
             }
@@ -1478,6 +1511,25 @@ mod tests {
         assert_eq!(a.sub(&b).to_u64(), Some(2));
         assert_eq!(a.bitwise_and(&b).to_u64(), Some(1));
         assert_eq!(a.bitwise_or(&b).to_u64(), Some(7));
+    }
+
+    #[test]
+    fn concat_refs_preserves_order_and_unknown_bits() {
+        let a = Value::from_str_radix("10xz", 2, 4);
+        let b = Value::from_str_radix("0110", 2, 4);
+        let parts = [&a, &b];
+        let result = Value::concat_refs(parts.into_iter());
+        assert_eq!(result.width, 8);
+        assert_eq!(result.to_bin(), "10xz0110");
+
+        let wide_a = Value::from_str_radix(&"1".repeat(65), 2, 65);
+        let wide_b = Value::from_u64(2, 2);
+        let wide_parts = [&wide_a, &wide_b];
+        let wide_result = Value::concat_refs(wide_parts.into_iter());
+        assert_eq!(wide_result.width, 67);
+        assert_eq!(wide_result.get_bit(0), LogicBit::Zero);
+        assert_eq!(wide_result.get_bit(1), LogicBit::One);
+        assert!((2..67).all(|bit| wide_result.get_bit(bit) == LogicBit::One));
     }
 
     #[test]
