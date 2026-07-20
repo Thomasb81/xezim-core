@@ -317,14 +317,16 @@ impl Parser {
         };
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
-        let ports = self.parse_function_ports();
+        let mut ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
         let mut strict_body_ports = Vec::new();
         while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
             if matches!(self.current_kind(),
                 TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef) {
-                self.capture_tf_body_port(&mut strict_body_ports);
+                // §13.4.2 non-ANSI body ports fill `ports` for arg binding
+                // (ANSI functions already have a non-empty `ports` here).
+                self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
             } else {
                 items.push(self.parse_statement());
             }
@@ -362,6 +364,62 @@ impl Parser {
         self.eat(TokenKind::Semicolon);
     }
 
+    /// Parse a NON-ANSI task/function body port declaration
+    /// (`input integer x, y;` / `input [6:0] a;`) into full `FunctionPort`s so
+    /// call-argument binding works. Previously only the names were captured
+    /// (into strict_body_ports) and `ports` stayed empty, so a non-ANSI
+    /// function's arguments never bound (returned X). Also records names for
+    /// the strict-check pass. Handles one or more comma-separated declarators
+    /// sharing the leading direction+type.
+    pub(super) fn parse_tf_body_ports(
+        &mut self,
+        ports: &mut Vec<FunctionPort>,
+        _strict: &mut Vec<Identifier>,
+    ) {
+        let start = self.current().span.start;
+        let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
+        let var_kw = self.eat(TokenKind::KwVar).is_some();
+        // Optional shared data type (implicit 1-bit when omitted, e.g. `input x;`).
+        let data_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) {
+            self.parse_data_type()
+        } else if self.at(TokenKind::Identifier)
+            && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon)
+        {
+            self.parse_data_type()
+        } else if self.at(TokenKind::LBracket) {
+            let dims = self.parse_packed_dimensions();
+            DataType::Implicit { signing: None, dimensions: dims, span: self.span_from(start) }
+        } else {
+            DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+        };
+        // One or more declarators sharing that direction+type.
+        loop {
+            if !self.at(TokenKind::Identifier) && !self.at(TokenKind::EscapedIdentifier) {
+                break;
+            }
+            let name = self.parse_identifier();
+            let dimensions = self.parse_unpacked_dimensions();
+            let default = if self.eat(TokenKind::Assign).is_some() {
+                Some(self.parse_expression())
+            } else {
+                None
+            };
+            ports.push(FunctionPort {
+                direction,
+                var_kw,
+                data_type: data_type.clone(),
+                name,
+                dimensions,
+                default,
+                span: self.span_from(start),
+            });
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
+        self.eat(TokenKind::Semicolon);
+    }
+
     pub(super) fn parse_task_declaration(&mut self) -> TaskDeclaration {
         let start = self.current().span.start;
         let _virt = self.eat(TokenKind::KwVirtual).is_some();
@@ -370,14 +428,14 @@ impl Parser {
         let lifetime = self.parse_optional_lifetime();
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
-        let ports = self.parse_function_ports();
+        let mut ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
         let mut strict_body_ports = Vec::new();
         while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
             if matches!(self.current_kind(),
                 TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef) {
-                self.capture_tf_body_port(&mut strict_body_ports);
+                self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
             } else {
                 items.push(self.parse_statement());
             }
