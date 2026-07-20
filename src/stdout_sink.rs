@@ -11,7 +11,7 @@
 //!                preserved.
 
 use std::io::{self, BufWriter, Stdout, Write};
-use std::sync::mpsc::{self, Sender};
+use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread::JoinHandle;
 
 const BUF_CAPACITY: usize = 16 * 1024;
@@ -28,11 +28,31 @@ enum Mode {
 
 enum Msg {
     Chunk(Vec<u8>),
+    FlushChunk(Vec<u8>),
     Shutdown,
 }
 
 pub struct StdoutSink {
     mode: Mode,
+}
+
+fn run_threaded_writer<W: Write>(rx: Receiver<Msg>, mut writer: W) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            Msg::Chunk(bytes) => {
+                let _ = writer.write_all(&bytes);
+            }
+            Msg::FlushChunk(bytes) => {
+                let _ = writer.write_all(&bytes);
+                // writeln_str() requests this path so `$display` stays visible
+                // during a long-running or stalled simulation. Plain `$write`
+                // chunks retain the worker-side batching optimization above.
+                let _ = writer.flush();
+            }
+            Msg::Shutdown => break,
+        }
+    }
+    let _ = writer.flush();
 }
 
 impl StdoutSink {
@@ -50,14 +70,8 @@ impl StdoutSink {
                 // touches stdout (e.g. `println!` after sim.run() returns).
                 // The unlocked `Stdout` handle acquires the lock per write
                 // and releases it between calls.
-                let mut w = BufWriter::with_capacity(BUF_CAPACITY, io::stdout());
-                while let Ok(msg) = rx.recv() {
-                    match msg {
-                        Msg::Chunk(bytes) => { let _ = w.write_all(&bytes); }
-                        Msg::Shutdown => break,
-                    }
-                }
-                let _ = w.flush();
+                let w = BufWriter::with_capacity(BUF_CAPACITY, io::stdout());
+                run_threaded_writer(rx, w);
             })
             .expect("spawn xezim-stdout writer thread");
         StdoutSink {
@@ -108,11 +122,49 @@ impl StdoutSink {
             Mode::Threaded { buf, tx: Some(tx), .. } => {
                 if !buf.is_empty() {
                     let chunk = std::mem::take(buf);
-                    let _ = tx.send(Msg::Chunk(chunk));
+                    let _ = tx.send(Msg::FlushChunk(chunk));
                 }
             }
             _ => {}
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Arc, Mutex};
+
+    #[derive(Clone)]
+    struct RecordingWriter(Arc<Mutex<Vec<&'static str>>>);
+
+    impl Write for RecordingWriter {
+        fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+            self.0.lock().unwrap().push("write");
+            Ok(buf.len())
+        }
+
+        fn flush(&mut self) -> io::Result<()> {
+            self.0.lock().unwrap().push("flush");
+            Ok(())
+        }
+    }
+
+    #[test]
+    fn threaded_chunks_are_visible_before_shutdown() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let writer = RecordingWriter(Arc::clone(&events));
+        let (tx, rx) = mpsc::channel();
+        tx.send(Msg::Chunk(b"buffered ".to_vec())).unwrap();
+        tx.send(Msg::FlushChunk(b"line\n".to_vec())).unwrap();
+        tx.send(Msg::Shutdown).unwrap();
+
+        run_threaded_writer(rx, writer);
+
+        assert_eq!(
+            *events.lock().unwrap(),
+            ["write", "write", "flush", "flush"]
+        );
     }
 }
 
