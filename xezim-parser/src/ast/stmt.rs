@@ -97,6 +97,21 @@ pub enum StatementKind {
     /// Randsequence `return` — terminates the current production's action
     /// block. Caught by the enclosing `RsAction`.
     RsReturn,
+    /// §15.5.3 `wait_order (a, b, c) pass_stmt else fail_stmt`. Appended LAST
+    /// so older cached ASTs (which never contain it) keep their bincode
+    /// variant indices. `armed`/`idx` are runtime continuation state: the
+    /// executor re-pushes the statement with `armed = true` after parking on
+    /// the remaining events, and `idx` is the next event expected to fire.
+    WaitOrder {
+        events: Vec<Identifier>,
+        pass: Option<Box<Statement>>,
+        fail: Option<Box<Statement>>,
+        #[cfg_attr(feature = "serde", serde(default))]
+        armed: bool,
+        #[cfg_attr(feature = "serde", serde(default))]
+        idx: u32,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]

@@ -102,6 +102,34 @@ impl Parser {
             }
             TokenKind::KwBreak => { self.bump(); self.expect(TokenKind::Semicolon); Statement::new(StatementKind::Break, self.span_from(start)) }
             TokenKind::KwContinue => { self.bump(); self.expect(TokenKind::Semicolon); Statement::new(StatementKind::Continue, self.span_from(start)) }
+            TokenKind::KwWait_order => {
+                // §15.5.3: wait_order ( event {, event} ) action_block
+                // action_block ::= statement_or_null [ else statement ]
+                self.bump();
+                self.expect(TokenKind::LParen);
+                let mut events = Vec::new();
+                loop {
+                    events.push(self.parse_identifier());
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                }
+                self.expect(TokenKind::RParen);
+                let pass = if self.eat(TokenKind::Semicolon).is_some() {
+                    None
+                } else if self.at(TokenKind::KwElse) {
+                    None
+                } else {
+                    Some(Box::new(self.parse_statement()))
+                };
+                let fail = if self.eat(TokenKind::KwElse).is_some() {
+                    Some(Box::new(self.parse_statement()))
+                } else {
+                    None
+                };
+                Statement::new(StatementKind::WaitOrder {
+                    events, pass, fail, armed: false, idx: 0,
+                    span: self.span_from(start),
+                }, self.span_from(start))
+            }
             TokenKind::KwWait => {
                 self.bump();
                 if self.eat(TokenKind::KwFork).is_some() {
@@ -238,8 +266,44 @@ impl Parser {
                 let target = self.parse_expression();
                 self.expect(TokenKind::Semicolon);
                 let name = match target.kind {
+                    // Trailing element select parses as Index (`-> ev_arr[1]`):
+                    // bake a literal index into the element sync-object name.
+                    ExprKind::Index { ref expr, ref index } => {
+                        let base = if let ExprKind::Ident(h) = &expr.kind {
+                            h.path.last().map(|s| s.name.name.clone())
+                        } else { None };
+                        let idx = if let ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) = &index.kind {
+                            Some(value.clone())
+                        } else { None };
+                        match (base, idx) {
+                            (Some(b), Some(i)) => crate::ast::Identifier {
+                                name: format!("{}[{}]", b, i),
+                                span: self.span_from(start),
+                            },
+                            (Some(b), None) => crate::ast::Identifier {
+                                name: b,
+                                span: self.span_from(start),
+                            },
+                            _ => crate::ast::Identifier {
+                                name: "event".to_string(),
+                                span: self.span_from(start),
+                            },
+                        }
+                    }
                     ExprKind::Ident(hier) => {
-                        hier.path.last().map(|seg| seg.name.clone()).unwrap_or_else(|| crate::ast::Identifier {
+                        hier.path.last().map(|seg| {
+                            // §15.5.5 event-array element trigger
+                            // (`-> ev_arr[1]`): bake integer-literal selects
+                            // into the name so the element's sync object is
+                            // fired, not the base name.
+                            let mut nm = seg.name.name.clone();
+                            for sel in &seg.selects {
+                                if let ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) = &sel.kind {
+                                    nm = format!("{}[{}]", nm, value);
+                                }
+                            }
+                            crate::ast::Identifier { name: nm, span: seg.name.span }
+                        }).unwrap_or_else(|| crate::ast::Identifier {
                             name: "event".to_string(),
                             span: self.span_from(start),
                         })
@@ -429,10 +493,17 @@ impl Parser {
                 loop {
                     let name = self.parse_identifier();
                     let ds = name.span.start;
+                    // §6.17 events are first-class objects: arrays
+                    // (`event ev[3]`), queues (`event q[$:5]`) and handle
+                    // initializers all parse like any variable declarator.
+                    let dimensions = self.parse_unpacked_dimensions();
+                    let init = if self.eat(TokenKind::Assign).is_some() {
+                        Some(self.parse_expression())
+                    } else { None };
                     declarators.push(VarDeclarator {
                         name,
-                        dimensions: Vec::new(),
-                        init: None,
+                        dimensions,
+                        init,
                         span: self.span_from(ds),
                     });
                     if self.eat(TokenKind::Comma).is_none() { break; }
