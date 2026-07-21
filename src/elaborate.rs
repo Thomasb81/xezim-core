@@ -9743,6 +9743,101 @@ fn prepare_module_items(
     prepared
 }
 
+/// Best-effort self-determined width of a port-connection actual, reading
+/// widths from already-registered parent signals/parameters. Returns None
+/// when the width cannot be judged (unknown net, expression form we do not
+/// size, or a §5.7.1 fill literal, which legally adapts to any width).
+fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
+    use crate::ast::expr::ExprKind as EK;
+    match &e.kind {
+        EK::Paren(inner) => port_conn_width(inner, elab),
+        EK::Ident(h) => {
+            if h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let name = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if let Some(sig) = elab.signals.get(&name) {
+                return Some(sig.width);
+            }
+            elab.parameters.get(&name).map(|v| v.width)
+        }
+        EK::Index { expr: base, .. } => {
+            // A bit-select of a packed vector is 1 bit; an element-select of
+            // an unpacked array or multi-dim packed vector is the ELEMENT
+            // width. Skip (None) when the base isn't resolvable.
+            if let EK::Ident(h) = &base.kind {
+                let name = h
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if let Some(&(_, _, elem_w)) = elab.arrays.get(&name) {
+                    return Some(elem_w);
+                }
+                if let Some(&ew) = elab.packed_signal_elem_widths.get(&name) {
+                    return Some(ew);
+                }
+                if elab.signals.contains_key(&name) {
+                    return Some(1);
+                }
+            }
+            None
+        }
+        EK::RangeSelect { left, right, kind: crate::ast::expr::RangeKind::Constant, .. } => {
+            let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
+            let r = const_eval_i64_with_params(right, Some(&elab.parameters))?;
+            Some(((l - r).unsigned_abs() + 1) as u32)
+        }
+        EK::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
+        EK::Concatenation(parts) => {
+            let mut total = 0u32;
+            for p in parts {
+                total = total.checked_add(port_conn_width(p, elab)?)?;
+            }
+            Some(total)
+        }
+        _ => None,
+    }
+}
+
+/// Warn once per (module, port) about a width-mismatched connection. §23.3.3
+/// makes the mismatch legal (implicit truncation/extension applies), but it
+/// is the classic wiring bug, and commercial tools flag it.
+fn warn_port_width_mismatch(
+    sub_mod_name: &str,
+    port: &str,
+    formal_w: u32,
+    actual_w: u32,
+    inst_prefix: &str,
+    span_off: usize,
+) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let key = (sub_mod_name.to_string(), port.to_string());
+    let first = seen.lock().map(|mut g| g.insert(key)).unwrap_or(false);
+    if first {
+        eprintln!(
+            "[xezim][warning] port width mismatch: module '{}' port '{}' is {} bit(s) but the \
+             connection is {} bit(s) — instance '{}' (connection at source offset {}); the value \
+             is truncated/extended per IEEE 1800-2017 §23.3.3. Further instances of this \
+             (module, port) pair are not reported.",
+            sub_mod_name,
+            port,
+            formal_w,
+            actual_w,
+            inst_prefix.trim_end_matches('.'),
+            span_off
+        );
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -10637,6 +10732,34 @@ fn inline_module_items(
                                 lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
                             });
                         }
+                    }
+                }
+
+                // Pre-simulation connectivity lint: every bound port's own
+                // signal (registered above for both ANSI and non-ANSI styles)
+                // carries the FORMAL width under this instance's parameters;
+                // compare with each actual's self-determined width and warn on
+                // mismatch, naming the instance and port.
+                for (pname, actual) in port_map.iter() {
+                    let Some(formal) = elab
+                        .signals
+                        .get(&format!("{}{}", inst_prefix, pname))
+                        .map(|s| s.width)
+                    else {
+                        continue;
+                    };
+                    let Some(actual_w) = port_conn_width(actual, elab) else {
+                        continue;
+                    };
+                    if actual_w != formal && actual_w != 0 && formal != 0 {
+                        warn_port_width_mismatch(
+                            sub_mod_name,
+                            pname,
+                            formal,
+                            actual_w,
+                            &inst_prefix,
+                            actual.span.start,
+                        );
                     }
                 }
 
