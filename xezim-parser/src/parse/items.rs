@@ -1159,22 +1159,23 @@ impl Parser {
 
     fn parse_generate_if(&mut self, start: usize) -> ModuleItem {
         let mut branches = Vec::new();
+        let mut branch_labels = Vec::new();
         self.bump(); self.expect(TokenKind::LParen);
         let cond = self.parse_expression(); self.expect(TokenKind::RParen);
-        let items = self.parse_generate_branch_items();
-        branches.push((Some(cond), items));
+        let (items, label) = self.parse_generate_branch_items_named();
+        branches.push((Some(cond), items)); branch_labels.push(label);
         while self.eat(TokenKind::KwElse).is_some() {
             if self.at(TokenKind::KwIf) {
                 self.bump(); self.expect(TokenKind::LParen);
                 let c = self.parse_expression(); self.expect(TokenKind::RParen);
-                let items = self.parse_generate_branch_items();
-                branches.push((Some(c), items));
+                let (items, label) = self.parse_generate_branch_items_named();
+                branches.push((Some(c), items)); branch_labels.push(label);
             } else {
-                let items = self.parse_generate_branch_items();
-                branches.push((None, items)); break;
+                let (items, label) = self.parse_generate_branch_items_named();
+                branches.push((None, items)); branch_labels.push(label); break;
             }
         }
-        ModuleItem::GenerateIf(GenerateIf { branches, span: self.span_from(start) })
+        ModuleItem::GenerateIf(GenerateIf { branches, branch_labels, span: self.span_from(start) })
     }
 
     fn parse_generate_case(&mut self, start: usize) -> ModuleItem {
@@ -1196,8 +1197,8 @@ impl Parser {
                 }
                 self.expect(TokenKind::Colon);
             }
-            let items = self.parse_generate_branch_items();
-            arms.push(GenerateCaseArm { values, items });
+            let (items, label) = self.parse_generate_branch_items_named();
+            arms.push(GenerateCaseArm { values, items, label });
         }
         self.expect(TokenKind::KwEndcase);
         ModuleItem::GenerateCase(GenerateCase { selector, arms, span: self.span_from(start) })

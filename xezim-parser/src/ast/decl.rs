@@ -623,6 +623,10 @@ pub struct GenerateRegion {
 pub struct GenerateIf {
     /// Chain of (condition, items). Last entry may have None condition for `else`.
     pub branches: Vec<(Option<super::expr::Expression>, Vec<ModuleItem>)>,
+    /// §27.6 `begin : label` block name per branch (parallel to `branches`).
+    /// Empty (older cached ASTs) means all branches are unnamed.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub branch_labels: Vec<Option<String>>,
     pub span: Span,
 }
 
@@ -635,6 +639,9 @@ pub struct GenerateCaseArm {
     pub values: Vec<super::expr::Expression>,
     /// Generate items elaborated when this arm is selected.
     pub items: Vec<ModuleItem>,
+    /// §27.6 `begin : label` block name for this arm.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub label: Option<String>,
 }
 
 /// A generate-case construct: case (selector) <arm>* endcase
