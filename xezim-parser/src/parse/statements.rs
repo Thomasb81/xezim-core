@@ -1042,27 +1042,14 @@ impl Parser {
         }
         let is_property = self.eat(TokenKind::KwProperty).is_some();
         self.expect(TokenKind::LParen);
-        // LRM §16.6 — optional `disable iff (<expr>)` clause at the START of
-        // a property expression (applies whether or not a clocking event
-        // `@(...)` follows). Captured as a Binary{LogAnd, !guard, body} so
-        // the SVA executor can short-circuit when the guard is true.
-        let disable_guard = if self.at(TokenKind::KwDisable)
-            && self.peek_kind() == TokenKind::KwIff
-        {
-            self.bump(); // disable
-            self.bump(); // iff
-            let _ = self.eat(TokenKind::LParen);
-            let g = self.parse_expression();
-            let _ = self.eat(TokenKind::RParen);
-            Some(g)
-        } else {
-            None
-        };
-        // For property expressions starting with a clocking event `@(...`,
-        // capture the clock event and the body separately so the executor
-        // can drive SVA-style cycle delay (LRM §16.5). The clock event is
-        // wrapped on `SvaClocked { clock, body }` (the executor checks for
-        // it before falling back to plain-logical evaluation).
+        // LRM §16.6 property_spec grammar:
+        //   [ clocking_event ] [ disable iff ( expr_or_dist ) ] property_expr
+        // Parse the optional clocking event FIRST, then the optional
+        // `disable iff` clause, so BOTH orderings work:
+        //   @(posedge clk) disable iff (!rst_n) body   (explicit clock)
+        //   disable iff (!rst_n) body                  (default clocking)
+        // Captured as Binary{LogAnd, !guard, body} so the SVA executor can
+        // short-circuit when the guard is true.
         let clk_event = if self.at(TokenKind::At) {
             self.bump(); // @
             let e = if self.at(TokenKind::LParen) {
@@ -1081,6 +1068,18 @@ impl Parser {
             };
             Some(e)
         } else { None };
+        let disable_guard = if self.at(TokenKind::KwDisable)
+            && self.peek_kind() == TokenKind::KwIff
+        {
+            self.bump(); // disable
+            self.bump(); // iff
+            let _ = self.eat(TokenKind::LParen);
+            let g = self.parse_expression();
+            let _ = self.eat(TokenKind::RParen);
+            Some(g)
+        } else {
+            None
+        };
         let body_inner = self.parse_expression();
         let body = if let Some(g) = disable_guard {
             let span = body_inner.span;
