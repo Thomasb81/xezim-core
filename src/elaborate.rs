@@ -11539,6 +11539,47 @@ fn lower_udp_instances(
             }
         }
         let inst_path = format!("{}{}", prefix, hi.name.name);
+        // §6.10: an undeclared identifier used in a PRIMITIVE TERMINAL gets an
+        // implicit 1-bit net, exactly like one in a continuous assign. The
+        // cont-assign pass never sees a net that only wires two UDPs together
+        // (e.g. a vendor cell's `udp_mux2 I1 (n1, ...)` feeding
+        // `udp_dff I0 (n0, n1, ...)`) — without this, both instances were
+        // DROPPED as unresolved and the cell went dead.
+        if hi.dimensions.is_empty() && !sv_parser::default_nettype_none_seen() {
+            // (instance arrays excluded: their terminals are vectors that get
+            // bit-selected per element — a 1-bit implicit net would be wrong)
+            for t in &terms {
+                if let ExprKind::Ident(h) = &t.kind {
+                    if h.path.iter().all(|seg| seg.selects.is_empty()) {
+                        let name = h
+                            .path
+                            .iter()
+                            .map(|seg| seg.name.name.as_str())
+                            .collect::<Vec<_>>()
+                            .join(".");
+                        if !name.is_empty()
+                            && !elab.signals.contains_key(&name)
+                            && !elab.parameters.contains_key(&name)
+                        {
+                            if crate::implicit_net_warn() {
+                                eprintln!(
+                                    "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                                     (IEEE 1800-2017 §6.10, primitive terminal of '{}'). Add an explicit declaration to silence.",
+                                    name, inst_path
+                                );
+                            }
+                            elab.signals.insert(name.clone(), Signal { is_const: false,
+                                name: name.clone(), width: 1, is_signed: false,
+                                direction: None, value: Value::new(1),
+                                is_real: false, type_name: None,
+                            });
+                            elab.implicit_nets.insert(name.clone());
+                            elab.nets.insert(name);
+                        }
+                    }
+                }
+            }
+        }
         if bad || terms.len() != n_ports {
             eprintln!(
                 "\n========================================================================\n\
