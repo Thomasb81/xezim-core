@@ -1158,8 +1158,21 @@ fn resolve_library_modules(
     // reachable from the explicitly-compiled design, transitively (a pulled-in
     // library module may itself instantiate further library modules).
     let mut seed = std::collections::HashSet::new();
-    for def in definitions.values() {
-        instantiations(def, &mut seed);
+    // Instantiated-name -> referring definition names. This is what turns an
+    // opaque "module 'X' not found" into an actionable note: it names WHICH
+    // module's body references X, so a user can check whether that reference
+    // even elaborates (a reference inside a dead `generate`/parameter branch
+    // is collected by this TEXTUAL scan but never needed at runtime — a
+    // commercial elaborator would report nothing for it).
+    let mut referrers: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    for (def_name, def) in definitions.iter() {
+        let mut names = std::collections::HashSet::new();
+        instantiations(def, &mut names);
+        for n in &names {
+            referrers.entry(n.clone()).or_default().insert(def_name.clone());
+        }
+        seed.extend(names);
     }
     let mut work: Vec<String> = seed.into_iter().collect();
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
@@ -1184,6 +1197,7 @@ fn resolve_library_modules(
             instantiations(def, &mut more);
             definitions.insert(name.clone(), def.clone());
             for n in more {
+                referrers.entry(n.clone()).or_default().insert(name.clone());
                 if !definitions.contains_key(&n) {
                     work.push(n);
                 }
@@ -1221,6 +1235,27 @@ fn resolve_library_modules(
                 lib.len(),
                 scanned_paths.len()
             );
+            // WHO references it — so the user can judge whether the reference
+            // is live (a real missing cell) or sits in a branch elaboration
+            // never enters (in which case this note is advisory only; the
+            // textual scan cannot evaluate generate/parameter conditions).
+            if let Some(refs) = referrers.get(name) {
+                let shown: Vec<String> = refs
+                    .iter()
+                    .take(4)
+                    .map(|r| match lib_origins.get(r) {
+                        Some((path, _, _)) => format!("'{}' ({})", r, path.display()),
+                        None => format!("'{}'", r),
+                    })
+                    .collect();
+                line.push_str(&format!(" — instantiated in: {}", shown.join(", ")));
+                if refs.len() > 4 {
+                    line.push_str(&format!(" and {} more", refs.len() - 4));
+                }
+                line.push_str(
+                    "; if that reference sits in a generate/`ifdef branch that never elaborates, this note is advisory and no model is needed",
+                );
+            }
             // Case mismatch is a classic netlist/lib mismatch.
             if let Some(close) = lib
                 .keys()

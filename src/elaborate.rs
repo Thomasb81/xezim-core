@@ -6436,20 +6436,65 @@ pub const SANE_MAX_PACKED_WIDTH: u32 = 1 << 20;
 const UNDERFLOW_WIDTH_PLACEHOLDER: u32 = 1;
 
 /// Combine packed-dimension widths with saturating math and clamp the result to
-/// `SANE_MAX_PACKED_WIDTH`, warning once when an absurd width is suppressed.
-fn clamp_packed_width(w: u64, ctx: &str) -> u32 {
+/// `SANE_MAX_PACKED_WIDTH`, warning once PER DISTINCT DETAIL when an absurd
+/// width is suppressed. `detail` carries whatever identity the call site can
+/// cheaply assemble (offending range bounds, parameter names + resolved
+/// values, source byte offset) so the user can find the declaration — a bare
+/// "somewhere a width underflowed" was unactionable on customer designs.
+fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
     if w > SANE_MAX_PACKED_WIDTH as u64 {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            eprintln!("[xezim][warning] packed width {} exceeds sane cap {} ({}); collapsing to \
+        use std::sync::{Mutex, OnceLock};
+        static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+        let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let key = format!("{}|{}", ctx, detail);
+        if seen.lock().map(|mut g| g.insert(key)).unwrap_or(false) {
+            let detail_part = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", detail)
+            };
+            eprintln!("[xezim][warning] packed width {} exceeds sane cap {} ({}{}); collapsing to \
                        {} bit — a parameter likely resolved to 0 causing an `[N-1:0]` underflow",
-                w, SANE_MAX_PACKED_WIDTH, ctx, UNDERFLOW_WIDTH_PLACEHOLDER);
+                w, SANE_MAX_PACKED_WIDTH, ctx, detail_part, UNDERFLOW_WIDTH_PLACEHOLDER);
         }
         UNDERFLOW_WIDTH_PLACEHOLDER
     } else {
         w as u32
     }
+}
+
+/// Describe an underflowed packed range for `clamp_packed_width` detail:
+/// resolved bounds, the parameter identifiers appearing in the bound
+/// expressions with their resolved values, and the source byte offset (a
+/// span into the preprocessed file — searchable even without file:line).
+fn describe_packed_range(
+    left: &Expression,
+    right: &Expression,
+    l: i64,
+    r: i64,
+    params: Option<&HashMap<String, Value>>,
+) -> String {
+    let mut idents: Vec<String> = Vec::new();
+    collect_ident_names(left, &mut idents);
+    collect_ident_names(right, &mut idents);
+    idents.sort();
+    idents.dedup();
+    let mut d = format!("range resolved to [{}:{}]", l, r);
+    if !idents.is_empty() {
+        let vals: Vec<String> = idents
+            .iter()
+            .take(4)
+            .map(|n| {
+                match params.and_then(|p| p.get(n)) {
+                    Some(v) => format!("{}={}", n, v.to_u64().unwrap_or(0)),
+                    None => format!("{}=<unresolved>", n),
+                }
+            })
+            .collect();
+        d.push_str(&format!(" with {}", vals.join(", ")));
+    }
+    d.push_str(&format!(" (source offset {})", left.span.start));
+    d
 }
 
 pub fn default_tick_s() -> f64 { 1e-9 }
@@ -6575,17 +6620,21 @@ pub fn resolve_type_width(
         DataType::IntegerVector { dimensions, .. } => {
             if dimensions.is_empty() { return 1; }
             let mut total = 1u64;
+            let mut culprit: Option<String> = None;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
                     let lv = const_eval_i64_with_params(left, params);
                     let rv = const_eval_i64_with_params(right, params);
                     if let (Some(l), Some(r)) = (lv, rv) {
                         let w = ((l - r).abs() + 1) as u64;
+                        if w > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
+                            culprit = Some(describe_packed_range(left, right, l, r, params));
+                        }
                         total = total.saturating_mul(w);
                     }
                 }
             }
-            clamp_packed_width(total, "IntegerVector")
+            clamp_packed_width(total, "IntegerVector", culprit.as_deref().unwrap_or(""))
         }
         DataType::IntegerAtom { kind, .. } => match kind {
             IntegerAtomType::Byte => 8,
@@ -6609,7 +6658,7 @@ pub fn resolve_type_width(
                     }
                 }
             }
-            clamp_packed_width(total, "Implicit")
+            clamp_packed_width(total, "Implicit", "")
         }
         DataType::TypeReference { name, dimensions, .. } => {
             let mut base_width = if let Some(td) = typedefs {
@@ -6627,7 +6676,7 @@ pub fn resolve_type_width(
                         }
                     }
                 }
-                base_width = clamp_packed_width(total, "TypeReference");
+                base_width = clamp_packed_width(total, "TypeReference", "");
             }
             base_width
         }
@@ -6672,7 +6721,7 @@ pub fn resolve_type_width(
                     }
                 }
             }
-            clamp_packed_width(w, "Struct")
+            clamp_packed_width(w, "Struct", "")
         }
         DataType::Void(_) => 0,
         _ => 32,
