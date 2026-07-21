@@ -2139,6 +2139,22 @@ pub fn elaborate_module_with_defs(
                     val = Value::from_f64(val.to_f64());
                 }
 
+                // §6.20.2 + §5.7.1: an IMPLICIT-type parameter initialized with
+                // an unbased-unsized literal keeps its fill-ness, so
+                // `parameter P = '1; wire [3:0] w = P;` yields 4'b1111 and
+                // `w !== P` compares equal at the consumer's width.
+                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                    && param_overrides.get(&assign.name.name).is_none()
+                {
+                    if let Some(init) = &assign.init {
+                        if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &init.kind {
+                            // §6.20.2 self-determined: 1-bit, unsigned, plain.
+                            val = Value::fill_of(*c);
+                            val.is_fill = false;
+                        }
+                    }
+                }
+
                 if let Some(fields) = struct_fields {
                     tls_register_struct_layout(&assign.name.name, &fields);
                     elab.packed_struct_fields
@@ -3452,6 +3468,27 @@ pub fn elaborate_module_with_defs(
                             val.is_signed = current_signed;
                             if is_type_two_state(data_type) {
                                 val = val.to_two_state();
+                            }
+                        }
+
+                        // §6.20.2: an implicit-type parameter takes the SELF-
+                        // DETERMINED size of its init; an unbased-unsized
+                        // literal is 1 bit, so `parameter P = '1` is 1'b1 (a
+                        // reference-simulator-verified reading: `wire [3:0] w
+                        // = P;` yields 4'b0001, NOT a fill).
+                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                            && !elab.parameters.contains_key(&assign.name.name)
+                        {
+                            if let Some(init) = &assign.init {
+                                if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &init.kind {
+                                    val = Value::fill_of(*c);
+                                    val.is_fill = false; // materialize at 1 bit
+                                    // The registered signal must match, or a
+                                    // signed-32 declared shell sign-extends the
+                                    // 1-bit payload at consumers.
+                                    current_width = 1;
+                                    current_signed = false;
+                                }
                             }
                         }
 
@@ -6046,6 +6083,22 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         }
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
+                                // §6.20.2 + §5.7.1: an implicit-type parameter
+                                // keeps an unbased-unsized init as a FILL value
+                                // so consumers replicate it at their own width.
+                                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                                    if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &init.kind {
+                                        // §6.20.2 self-determined: 1-bit, unsigned, plain.
+                                        let mut pv = Value::fill_of(*c);
+                                        pv.is_fill = false;
+                                        elab.parameters.insert(assign.name.name.clone(), pv.clone());
+                                        elab.signals.insert(assign.name.name.clone(), Signal { is_const: false,
+                                            name: assign.name.name.clone(), width: 1, is_signed: false,
+                                            direction: None, value: pv, is_real: false, type_name: get_type_name(data_type),
+                                        });
+                                        continue;
+                                    }
+                                }
                                 let mut v = eval_init_for_width(init, &elab.parameters, width);
                                 if signed { v.is_signed = true; }
                                 v
@@ -7927,9 +7980,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 // the simulation tick unit (1 ns), preserving the prior behaviour
                 // where `10ns` const-folded to 10.
                 NumberLiteral::Time(s) => Value::from_f64(*s * 1e9),
-                NumberLiteral::UnbasedUnsized(c) => match c {
-                    '0' => Value::zero(1), '1' => Value::from_u64(1, 1), _ => Value::new(1),
-                },
+                // §5.7.1 fill literal — flagged so downstream resize/ops
+                // replicate to the consuming width.
+                NumberLiteral::UnbasedUnsized(c) => Value::fill_of(*c),
             }
         }
         ExprKind::StringLiteral(s) => Value::from_string(s),
