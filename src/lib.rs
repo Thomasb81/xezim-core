@@ -177,6 +177,12 @@ pub struct LibraryCli {
 
 static LIBRARY_CLI: std::sync::OnceLock<std::sync::Mutex<LibraryCli>> = std::sync::OnceLock::new();
 
+/// Whether `--primitive-verbose` is active — read by the simulator's UDP
+/// lowering to print per-terminal resolution detail.
+pub fn primitive_verbose() -> bool {
+    library_cli_cell().lock().map(|g| g.primitive_verbose).unwrap_or(false)
+}
+
 fn library_cli_cell() -> &'static std::sync::Mutex<LibraryCli> {
     LIBRARY_CLI.get_or_init(|| std::sync::Mutex::new(LibraryCli::default()))
 }
