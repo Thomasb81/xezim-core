@@ -37,6 +37,30 @@ pub enum StatementKind {
     Case { unique_priority: Option<UniquePriority>, kind: CaseKind, expr: Expression, items: Vec<CaseItem> },
     For { init: Vec<ForInit>, condition: Option<Expression>, step: Vec<Expression>, body: Box<Statement> },
     Foreach { array: Expression, vars: Vec<Option<Identifier>>, body: Box<Statement> },
+    /// INTERNAL (not parsed): continuation sentinel for a `foreach` whose
+    /// body can block (suspend). Mirrors how `while`/`for` re-append
+    /// themselves so a process blocked at a timing control inside the loop
+    /// body resumes at the NEXT iteration (IEEE 1800-2023 §9.4.3: a blocked
+    /// process shall continue at the point of suspension) instead of
+    /// restarting the whole `foreach` from index 0. Carries the materialized
+    /// key list (frozen at loop entry) and the next index to execute.
+    /// `var_scope` is the array's instance prefix, for aliased loop vars in
+    /// submodule foreach bodies. `fe_auto_len` truncates `auto_loop_vars`.
+    ForeachTail {
+        loop_var: Option<String>,
+        var_scope: Option<String>,
+        body: Box<Statement>,
+        keys: Vec<String>,
+        is_str: bool,
+        idx: usize,
+        fe_auto_len: usize,
+        /// When set, `idx` is bounds-checked against the LIVE queue/dynamic-
+        /// array size on every iteration resume (not the frozen `keys.len()`).
+        /// IEEE 1800-2023 §12.7.3 leaves queue-during-foreach modification
+        /// unspecified, but UVM routinely shrinks `arb_sequence_q` mid-loop;
+        /// a frozen key list would then access deleted indices (QUEUEDEL).
+        live_size_name: Option<String>,
+    },
     While { condition: Expression, body: Box<Statement> },
     DoWhile { body: Box<Statement>, condition: Expression },
     Repeat { count: Expression, body: Box<Statement> },

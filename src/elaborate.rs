@@ -400,38 +400,6 @@ fn install_ooc_constraint_body(
     }
 }
 
-/// Convert a DataType (from a `extends Base#(type T, ...)` clause) into a
-/// textual fragment suitable for specialization signatures. E.g.
-/// `this_type` -> `"this_type"`, a scoped type ref -> leaf name.
-fn datatype_to_spec_fragment(dt: &crate::ast::types::DataType) -> String {
-    use crate::ast::types::DataType;
-    match dt {
-        DataType::TypeReference { name, .. } => name.name.name.clone(),
-        DataType::Simple { kind, .. } => format!("{:?}", kind).to_lowercase(),
-        _ => "<unknown>".to_string(),
-    }
-}
-
-/// Convert an Expression (from an extends clause arg) into a textual
-/// fragment. Bare identifiers like `this_type` or `T` → their name.
-/// String literals → quoted text. Other exprs → best-effort string.
-fn expr_to_spec_fragment(ex: &crate::ast::expr::Expression) -> String {
-    use crate::ast::expr::{ExprKind, Expression};
-    match &ex.kind {
-        ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone()).unwrap_or_default(),
-        ExprKind::StringLiteral(s) => format!("\"{}\"", s),
-        ExprKind::Specialization { base, type_args_text, .. } => {
-            if let ExprKind::Ident(h) = &base.kind {
-                if let Some(last) = h.path.last() {
-                    return format!("{}#({})", last.name.name, type_args_text);
-                }
-            }
-            "<unknown>".to_string()
-        }
-        _ => "<unknown>".to_string(),
-    }
-}
-
 pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut properties = HashMap::default();
     let mut property_order: Vec<String> = Vec::new();
@@ -765,10 +733,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
             }).collect()
         }).unwrap_or_default(),
         extends_type_args: c.extends.as_ref().map(|e| {
-            e.args.iter().map(|a| match a {
-                ParamValue::Type(dt) => datatype_to_spec_fragment(dt),
-                ParamValue::Expr(ex) => expr_to_spec_fragment(ex),
-            }).collect()
+            e.args.iter().map(param_value_to_arg_string).collect()
         }).unwrap_or_default(),
         properties,
         property_order,
@@ -5004,6 +4969,59 @@ fn walk_stmt_for_class_new(stmt: &Statement, elab: &ElaboratedModule) -> Result<
         _ => {}
     }
     Ok(())
+}
+
+/// Stringify one `extends Base #(arg)` positional argument for
+/// `ElaboratedClass.extends_type_args`. Type args become their bare type or
+/// type-parameter name (e.g. `this_type`, `T`, a concrete class name); value
+/// args become their expression text (a bare identifier or an integer
+/// literal). Anything we cannot render simply becomes "<unknown>", which the
+/// specialization-chain resolver treats as "give up on this arg".
+fn param_value_to_arg_string(pv: &ParamValue) -> String {
+    match pv {
+        ParamValue::Type(dt) => match dt {
+            DataType::TypeReference { name, .. } => name.name.name.clone(),
+            DataType::Simple { kind, .. } => format!("{:?}", kind).to_lowercase(),
+            _ => "<unknown>".to_string(),
+        },
+        ParamValue::Expr(ex) => expr_to_arg_string(ex),
+    }
+}
+
+/// Render the small set of expression shapes that appear as class parameter
+/// arguments: a (possibly hierarchical) identifier and an integer literal.
+fn expr_to_arg_string(ex: &Expression) -> String {
+    use crate::ast::expr::{ExprKind, NumberLiteral};
+    match &ex.kind {
+        ExprKind::Ident(h) => {
+            if h.path.len() == 1 && h.root.is_none() {
+                h.path[0].name.name.clone()
+            } else {
+                let mut parts: Vec<String> =
+                    h.root.iter().cloned().collect();
+                parts.extend(h.path.iter().map(|seg| seg.name.name.clone()));
+                parts.join("::")
+            }
+        }
+        ExprKind::TypeLiteral(dt) => match dt.as_ref() {
+            DataType::TypeReference { name, .. } => name.name.name.clone(),
+            _ => "<unknown>".to_string(),
+        },
+        ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
+        // Nested parameterized type arg in an `extends` clause, e.g.
+        // `class X extends Y#(Z#(T))`. Per-specialization keying relies on
+        // the rendered arg matching the specialization text used elsewhere.
+        ExprKind::Specialization { base, type_args_text, .. } => {
+            if let ExprKind::Ident(h) = &base.kind {
+                if let Some(last) = h.path.last() {
+                    return format!("{}#({})", last.name.name, type_args_text);
+                }
+            }
+            "<unknown>".to_string()
+        }
+        ExprKind::StringLiteral(s) => format!("\"{}\"", s),
+        _ => "<unknown>".to_string(),
+    }
 }
 
 fn data_type_kind_name(dt: &DataType) -> String {
