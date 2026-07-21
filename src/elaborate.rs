@@ -5658,8 +5658,14 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
             }
         }
         EventControl::Identifier(id) => {
+            // §14.3/§14.11: `@(cb)` may name a clocking block, and the parser
+            // desugars procedural `##N` to a wait on the reserved
+            // `__xz_default_clocking` marker — both resolve at simulation
+            // time to the block's clock event, not to a declared signal.
             if !elab.signals.contains_key(&id.name) && !elab.parameters.contains_key(&id.name)
                 && !elab.sequences.contains(&id.name) && !locals.contains(&id.name)
+                && !elab.clocking_blocks.contains_key(&id.name)
+                && id.name != "__xz_default_clocking"
             {
                 return Err(format!("Undeclared identifier '{}'", id.name));
             }

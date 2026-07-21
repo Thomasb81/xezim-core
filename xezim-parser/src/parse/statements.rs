@@ -283,6 +283,44 @@ impl Parser {
                     stmt: Box::new(stmt),
                 }, self.span_from(start))
             }
+            // §14.11: procedural cycle delay `##N [stmt]` — wait N cycles of
+            // the DEFAULT clocking block's clock event. Desugared here to
+            // `begin repeat (N) @(__xz_default_clocking); stmt end`; the
+            // simulator's event resolution maps the reserved marker identifier
+            // to the default clocking block's clock (posedge). Previously the
+            // token sequence didn't parse as a statement at all, so `##N` in a
+            // testbench was a hard parse error (or, via sequence-expression
+            // fallback paths, a silent no-op).
+            TokenKind::HashHash => {
+                self.bump();
+                let count = if self.at(TokenKind::LParen) {
+                    self.bump();
+                    let e = self.parse_expression();
+                    self.expect(TokenKind::RParen);
+                    e
+                } else {
+                    // Same restricted binding power as `#delay` above: a bare
+                    // cycle count is a primary, not a full expression.
+                    self.parse_expr_bp(3)
+                };
+                let sp = self.span_from(start);
+                let stmt = self.parse_statement();
+                let wait_one = Statement::new(StatementKind::TimingControl {
+                    control: TimingControl::Event(EventControl::Identifier(crate::ast::Identifier {
+                        name: "__xz_default_clocking".to_string(),
+                        span: sp,
+                    })),
+                    stmt: Box::new(Statement::new(StatementKind::Null, sp)),
+                }, sp);
+                let rep = Statement::new(StatementKind::Repeat {
+                    count,
+                    body: Box::new(wait_one),
+                }, sp);
+                Statement::new(StatementKind::SeqBlock {
+                    name: None,
+                    stmts: vec![rep, stmt],
+                }, self.span_from(start))
+            }
             // §26.3: a local `import pkg::item;` / `import pkg::*;` inside a
             // statement block (UVM's `initial begin import uvm_pkg::…; … end`).
             // It affects name visibility only; consume it and emit a no-op.

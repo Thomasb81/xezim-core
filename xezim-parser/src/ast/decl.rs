@@ -224,6 +224,10 @@ pub struct ClockingDeclaration {
     /// was declared without an event — implementation-defined behavior.
     #[cfg_attr(feature = "serde", serde(default))]
     pub clock_signal: Option<Identifier>,
+    /// LRM §14.11: true when declared `default clocking ...` — the block
+    /// that procedural cycle delays (`##N`) synchronize to.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_default: bool,
     pub signals: Vec<ClockingSignal>,
     pub items: Vec<super::stmt::Statement>, // Approximate clocking body as statements
     pub endlabel: Option<Identifier>,
