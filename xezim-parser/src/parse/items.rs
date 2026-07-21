@@ -166,6 +166,21 @@ impl Parser {
             let mut names = Vec::new();
             loop {
                 if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
+                // §23.2.2.1 null port — `(a, , b)` / `(a,, b)` is legal: the
+                // position exists but is unnamed. Synthesize a placeholder
+                // name so ordered instantiation keeps positional alignment;
+                // nothing in the body can bind it, so a connection landing on
+                // this slot is dropped, matching the LRM's "connection to a
+                // null port is ignored".
+                if self.at(TokenKind::Comma) {
+                    let sp = self.current().span;
+                    names.push(crate::ast::Identifier {
+                        name: format!("__xz_null_port_{}", names.len()),
+                        span: sp,
+                    });
+                    self.bump(); // consume the comma standing in for the port
+                    continue;
+                }
                 names.push(self.parse_identifier());
                 if self.eat(TokenKind::Comma).is_none() { break; }
             }

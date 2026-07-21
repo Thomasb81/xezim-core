@@ -5719,11 +5719,13 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
     names_to_add.sort();
     names_to_add.dedup();
     for name in names_to_add {
-        eprintln!(
-            "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
-             (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.",
-            name
-        );
+        if crate::implicit_net_warn() {
+            eprintln!(
+                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                 (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.",
+                name
+            );
+        }
         elab.signals.insert(name.clone(), Signal { is_const: false,
             name: name.clone(), width: 1, is_signed: false,
             direction: None, value: Value::new(1),
@@ -5752,11 +5754,13 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
                     name
                 ));
             }
-            eprintln!(
-                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
-                 (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
-                name
-            );
+            if crate::implicit_net_warn() {
+                eprintln!(
+                    "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                     (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
+                    name
+                );
+            }
             elab.signals.insert(name.clone(), Signal { is_const: false,
                 name: name.clone(), width: 1, is_signed: false,
                 direction: None, value: Value::new(1),

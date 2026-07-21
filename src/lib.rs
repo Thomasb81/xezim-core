@@ -180,6 +180,21 @@ fn library_cli_cell() -> &'static std::sync::Mutex<LibraryCli> {
     LIBRARY_CLI.get_or_init(|| std::sync::Mutex::new(LibraryCli::default()))
 }
 
+/// `-xenowarn`: suppress the §6.10 "implicit 1-bit net created" warnings.
+/// Gate-level customer designs with thousands of vendor-cell pins can emit
+/// thousands of these; the flag silences the WARNING while keeping the
+/// implicit-net behavior itself (and the `default_nettype none error).
+static IMPLICIT_NET_WARN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_implicit_net_warn(on: bool) {
+    IMPLICIT_NET_WARN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn implicit_net_warn() -> bool {
+    IMPLICIT_NET_WARN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_library_cli(cfg: LibraryCli) {
     *library_cli_cell().lock().unwrap() = cfg;
 }
@@ -1197,7 +1212,9 @@ fn resolve_library_modules(
     // where the library scan is in scope, so the eventual "instantiated but not
     // found" elaboration error arrives with its cause already on the terminal.
     if !unresolved.is_empty() && (!lib.is_empty() || !lib_cli.lib_files.is_empty()) {
-        for name in unresolved.iter().take(8) {
+        // Print EVERY unresolved name — a truncated list once hid 2 of a
+        // customer design's 10 missing vendor cells.
+        for name in unresolved.iter() {
             let mut line = format!(
                 "note: module '{}' not defined in the design and not found among {} definition(s) indexed from {} library file(s)",
                 name,
