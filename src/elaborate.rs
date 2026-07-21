@@ -1103,7 +1103,11 @@ pub struct ElaboratedModule {
     /// to span-less diagnostics.
     #[serde(skip)]
     pub source_texts: Vec<String>,
-    #[serde(skip)]
+    /// Serialized (small): the compile-time source paths. Together with
+    /// `src_file_of_module` this lets a cache-hit run repopulate
+    /// `source_texts` (re-preprocessed by the cache-key pass) so runtime
+    /// diagnostics keep their `file:line` resolution instead of degrading.
+    #[serde(default)]
     pub source_files: Vec<String>,
     /// Source-file index (into `source_texts`/`source_files`) of each
     /// module/interface/program DEFINITION, by name. Filled by
@@ -1111,9 +1115,9 @@ pub struct ElaboratedModule {
     /// knows which file produced which definition. Runtime diagnostics map an
     /// offending process's instance scope → defining module (`instances`) →
     /// THIS file, so a span (a per-file byte offset) resolves against the
-    /// right file in multi-file designs. Not serialized, like
-    /// `source_texts`: a .xzb run carries no sources to resolve against.
-    #[serde(skip)]
+    /// right file in multi-file designs. Serialized (small name->index map)
+    /// so cache-hit runs keep multi-file `file:line` diagnostics.
+    #[serde(default)]
     pub src_file_of_module: HashMap<String, u32>,
 }
 
