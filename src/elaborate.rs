@@ -981,6 +981,11 @@ pub struct ElaboratedModule {
     /// Used to enforce §6.5 driver-conflict rules only against variables.
     #[serde(default)]
     pub nets: HashSet<String>,
+    /// Subset of `nets` that §6.10 created IMPLICITLY (referenced but never
+    /// declared). `--primitive-verbose` flags UDP terminals landing on one of
+    /// these — the classic signature of a dropped/unresolved vendor cell.
+    #[serde(default)]
+    pub implicit_nets: HashSet<String>,
     /// The design's instance tree, in elaboration order. Inlining flattens
     /// every module into this one, so without this the hierarchy is only
     /// implicit in dotted signal names — enough to resolve a name, not
@@ -1188,6 +1193,7 @@ impl ElaboratedModule {
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
+            implicit_nets: HashSet::default(),
             instances: Vec::new(),
             out_of_class_constraints: HashSet::default(),
             timeunit_exp: default_timeunit_exp(),
@@ -5786,6 +5792,7 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             direction: None, value: Value::new(1),
             is_real: false, type_name: None,
         });
+        elab.implicit_nets.insert(name.clone());
         elab.nets.insert(name);
     }
 }
@@ -5821,6 +5828,7 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
                 direction: None, value: Value::new(1),
                 is_real: false, type_name: None,
             });
+            elab.implicit_nets.insert(name.clone());
             elab.nets.insert(name);
         }
     }
@@ -8727,9 +8735,10 @@ fn rename_item_decls(
         ModuleItem::ModuleInstantiation(mi) => {
             let mut new_mi = mi.clone();
             for hi in &mut new_mi.instances {
-                if rename_set.contains(&hi.name.name) {
-                    hi.name.name = format!("{}{}", hi.name.name, suffix);
-                }
+                // Instance names are NOT suffixed: each generate-for iteration
+                // gets a distinct `scope[i].` prefix (§27.6), which both keeps
+                // iterations unique and reports the LRM hierarchical path
+                // (`genblk4[0].u_ff`, not `u_ff__gf_i_0_`).
                 for conn in &mut hi.connections {
                     match conn {
                         PortConnection::Named { expr: Some(e), .. }
@@ -8798,6 +8807,7 @@ fn rename_item_decls(
                 GenerateCaseArm {
                     values: arm.values.iter().map(|v| rewrite_expr(v, "", port_map, local_names, interface_map)).collect(),
                     items: arm.items.iter().map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map)).collect(),
+                    label: arm.label.clone(),
                 }
             }).collect();
             ModuleItem::GenerateCase(GenerateCase {
@@ -8914,6 +8924,7 @@ fn substitute_in_module_item(
                 GenerateCaseArm {
                     values: arm.values.iter().map(|v| rewrite_expr(v, "", port_map, local_names, interface_map)).collect(),
                     items: arm.items.iter().map(|i| substitute_in_module_item(i, port_map, local_names, interface_map)).collect(),
+                    label: arm.label.clone(),
                 }
             }).collect();
             ModuleItem::GenerateCase(GenerateCase {
@@ -8938,26 +8949,73 @@ fn substitute_in_module_item(
 /// Recursively inline all instantiations found in `source_mod`, using `prefix` for signal naming.
 /// Flatten module items by resolving generate-if/else and generate regions.
 /// Returns all effective items after evaluating generate conditions.
+/// §27.6: the implicit name of an unnamed generate block is `genblk<N>` where
+/// N is the construct's ordinal position among ALL generate constructs in its
+/// enclosing scope (named ones consume a number too). Prefix every instance
+/// name in a flattened generate block with its scope name so hierarchical
+/// paths match the LRM (`u_mod.genblk1.u_ff` — what other simulators report),
+/// composing naturally for nested blocks (inner blocks flatten first, so the
+/// outer prefix lands leftmost).
+fn gen_scope_name(label: Option<&String>, ordinal: u32) -> String {
+    match label {
+        Some(l) => l.clone(),
+        None => format!("genblk{}", ordinal),
+    }
+}
+
+/// Prepend `scope.` to the instance names of every module/gate instantiation
+/// in an already-flattened item list. Declarations, assigns and processes are
+/// left alone: xezim's flattening keeps those in the parent namespace.
+fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
+    for item in items.iter_mut() {
+        match item {
+            ModuleItem::ModuleInstantiation(inst) => {
+                for hi in &mut inst.instances {
+                    hi.name.name = format!("{}.{}", scope, hi.name.name);
+                }
+            }
+            ModuleItem::GateInstantiation(g) => {
+                for gi in &mut g.instances {
+                    if let Some(n) = &mut gi.name {
+                        n.name = format!("{}.{}", scope, n.name);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn collect_effective_items(items: &[ModuleItem], params: &HashMap<String, Value>) -> Vec<ModuleItem> {
+    let mut gen_ordinal = 0u32;
+    collect_effective_items_scoped(items, params, &mut gen_ordinal)
+}
+
+fn collect_effective_items_scoped(items: &[ModuleItem], params: &HashMap<String, Value>, gen_ordinal: &mut u32) -> Vec<ModuleItem> {
     let mut result = Vec::new();
     for item in items {
         match item {
             ModuleItem::GenerateRegion(gr) => {
-                result.extend(collect_effective_items(&gr.items, params));
+                // A generate region is NOT a scope (§27.3) — its constructs
+                // number in the enclosing scope, so the counter is shared.
+                result.extend(collect_effective_items_scoped(&gr.items, params, gen_ordinal));
             }
             ModuleItem::GenerateIf(gi) => {
+                *gen_ordinal += 1;
                 let mut matched = false;
-                for (cond, branch_items) in &gi.branches {
-                    if let Some(cond_expr) = cond {
-                        let val = eval_const_expr(cond_expr, params);
-                        if val != 0 {
-                            result.extend(collect_effective_items(branch_items, params));
-                            matched = true;
-                            break;
-                        }
-                    } else {
-                        // Unconditional else branch
-                        result.extend(collect_effective_items(branch_items, params));
+                for (bi, (cond, branch_items)) in gi.branches.iter().enumerate() {
+                    let take = match cond {
+                        Some(cond_expr) => eval_const_expr(cond_expr, params) != 0,
+                        None => true, // unconditional else branch
+                    };
+                    if take {
+                        // All branches of one if-chain share the construct's
+                        // scope name unless the taken branch is labeled.
+                        let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
+                        let scope = gen_scope_name(label, *gen_ordinal);
+                        let mut inner = collect_effective_items(branch_items, params);
+                        prefix_gen_scope(&mut inner, &scope);
+                        result.extend(inner);
                         matched = true;
                         break;
                     }
@@ -8965,28 +9023,30 @@ fn collect_effective_items(items: &[ModuleItem], params: &HashMap<String, Value>
                 let _ = matched;
             }
             ModuleItem::GenerateCase(gc) => {
+                *gen_ordinal += 1;
                 let sel = eval_const_expr(&gc.selector, params);
-                let mut matched = false;
+                let mut chosen: Option<&GenerateCaseArm> = None;
                 // First pass: try non-default arms.
                 for arm in &gc.arms {
                     if arm.values.is_empty() { continue; }
                     if arm.values.iter().any(|v| eval_const_expr(v, params) == sel) {
-                        result.extend(collect_effective_items(&arm.items, params));
-                        matched = true;
+                        chosen = Some(arm);
                         break;
                     }
                 }
                 // Default arm fallback.
-                if !matched {
-                    for arm in &gc.arms {
-                        if arm.values.is_empty() {
-                            result.extend(collect_effective_items(&arm.items, params));
-                            break;
-                        }
-                    }
+                if chosen.is_none() {
+                    chosen = gc.arms.iter().find(|arm| arm.values.is_empty());
+                }
+                if let Some(arm) = chosen {
+                    let scope = gen_scope_name(arm.label.as_ref(), *gen_ordinal);
+                    let mut inner = collect_effective_items(&arm.items, params);
+                    prefix_gen_scope(&mut inner, &scope);
+                    result.extend(inner);
                 }
             }
             ModuleItem::GenerateFor(gf) => {
+                *gen_ordinal += 1;
                 // Without this expansion, items inside `for genvar` (always
                 // blocks, instances, cont assigns) are dropped when the
                 // host module is inlined into its parent. ct_fifo's
@@ -9011,7 +9071,10 @@ fn collect_effective_items(items: &[ModuleItem], params: &HashMap<String, Value>
                         None => format!("__gf_{}_{}_", gf.var, i),
                     };
                     let subst = rename_decls_in_iter(&subst, &suffix);
-                    result.extend(collect_effective_items(&subst, &local_params));
+                    let scope = format!("{}[{}]", gen_scope_name(gf.name.as_ref(), *gen_ordinal), i);
+                    let mut inner = collect_effective_items(&subst, &local_params);
+                    prefix_gen_scope(&mut inner, &scope);
+                    result.extend(inner);
                     match &gf.incr.kind {
                         ExprKind::Unary { op: UnaryOp::PostIncr, .. }
                         | ExprKind::Unary { op: UnaryOp::PreIncr, .. } => i += 1,
