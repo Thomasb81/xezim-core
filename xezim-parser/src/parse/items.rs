@@ -166,6 +166,21 @@ impl Parser {
             let mut names = Vec::new();
             loop {
                 if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
+                // §23.2.2.1 null port — `(a, , b)` / `(a,, b)` is legal: the
+                // position exists but is unnamed. Synthesize a placeholder
+                // name so ordered instantiation keeps positional alignment;
+                // nothing in the body can bind it, so a connection landing on
+                // this slot is dropped, matching the LRM's "connection to a
+                // null port is ignored".
+                if self.at(TokenKind::Comma) {
+                    let sp = self.current().span;
+                    names.push(crate::ast::Identifier {
+                        name: format!("__xz_null_port_{}", names.len()),
+                        span: sp,
+                    });
+                    self.bump(); // consume the comma standing in for the port
+                    continue;
+                }
                 names.push(self.parse_identifier());
                 if self.eat(TokenKind::Comma).is_none() { break; }
             }
@@ -675,7 +690,7 @@ impl Parser {
                     Some(self.parse_identifier())
                 } else { None };
                 let id = cb_name.unwrap_or_else(|| Identifier { name: "default".to_string(), span: self.span_from(start) });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: clock_signal_id, signals, items, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: clock_signal_id, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover =>
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement())),
@@ -824,12 +839,18 @@ impl Parser {
                 // ClockingDeclaration struct needs an Option<Identifier> for name if we want to store it accurately,
                 // but for now let's just use a dummy identifier if it's missing.
                 let id = name.unwrap_or_else(|| Identifier { name: "default".to_string(), span: self.span_from(start) });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: None, signals, items, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: None, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwDefault => {
                 self.bump();
                 if self.at(TokenKind::KwClocking) {
-                    self.parse_module_item() // recurse to handle clocking
+                    // §14.11: mark the block so procedural `##N` knows which
+                    // clocking block to synchronize to.
+                    let mut item = self.parse_module_item(); // recurse to handle clocking
+                    if let Some(ModuleItem::ClockingDeclaration(cd)) = item.as_mut() {
+                        cd.is_default = true;
+                    }
+                    item
                 } else if self.at(TokenKind::KwDisable) {
                     // IEEE 1800-2023 §16.4.2: `default disable iff <expr>;`
                     // is a default for all concurrent assertions in scope.

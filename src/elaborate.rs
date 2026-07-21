@@ -1068,7 +1068,11 @@ pub struct ElaboratedModule {
     /// to span-less diagnostics.
     #[serde(skip)]
     pub source_texts: Vec<String>,
-    #[serde(skip)]
+    /// Serialized (small): the compile-time source paths. Together with
+    /// `src_file_of_module` this lets a cache-hit run repopulate
+    /// `source_texts` (re-preprocessed by the cache-key pass) so runtime
+    /// diagnostics keep their `file:line` resolution instead of degrading.
+    #[serde(default)]
     pub source_files: Vec<String>,
     /// Source-file index (into `source_texts`/`source_files`) of each
     /// module/interface/program DEFINITION, by name. Filled by
@@ -1076,9 +1080,9 @@ pub struct ElaboratedModule {
     /// knows which file produced which definition. Runtime diagnostics map an
     /// offending process's instance scope → defining module (`instances`) →
     /// THIS file, so a span (a per-file byte offset) resolves against the
-    /// right file in multi-file designs. Not serialized, like
-    /// `source_texts`: a .xzb run carries no sources to resolve against.
-    #[serde(skip)]
+    /// right file in multi-file designs. Serialized (small name->index map)
+    /// so cache-hit runs keep multi-file `file:line` diagnostics.
+    #[serde(default)]
     pub src_file_of_module: HashMap<String, u32>,
 }
 
@@ -2098,6 +2102,22 @@ pub fn elaborate_module_with_defs(
 
                 if is_real {
                     val = Value::from_f64(val.to_f64());
+                }
+
+                // §6.20.2 + §5.7.1: an IMPLICIT-type parameter initialized with
+                // an unbased-unsized literal keeps its fill-ness, so
+                // `parameter P = '1; wire [3:0] w = P;` yields 4'b1111 and
+                // `w !== P` compares equal at the consumer's width.
+                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                    && param_overrides.get(&assign.name.name).is_none()
+                {
+                    if let Some(init) = &assign.init {
+                        if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &init.kind {
+                            // §6.20.2 self-determined: 1-bit, unsigned, plain.
+                            val = Value::fill_of(*c);
+                            val.is_fill = false;
+                        }
+                    }
                 }
 
                 if let Some(fields) = struct_fields {
@@ -3413,6 +3433,27 @@ pub fn elaborate_module_with_defs(
                             val.is_signed = current_signed;
                             if is_type_two_state(data_type) {
                                 val = val.to_two_state();
+                            }
+                        }
+
+                        // §6.20.2: an implicit-type parameter takes the SELF-
+                        // DETERMINED size of its init; an unbased-unsized
+                        // literal is 1 bit, so `parameter P = '1` is 1'b1 (a
+                        // reference-simulator-verified reading: `wire [3:0] w
+                        // = P;` yields 4'b0001, NOT a fill).
+                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                            && !elab.parameters.contains_key(&assign.name.name)
+                        {
+                            if let Some(init) = &assign.init {
+                                if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &init.kind {
+                                    val = Value::fill_of(*c);
+                                    val.is_fill = false; // materialize at 1 bit
+                                    // The registered signal must match, or a
+                                    // signed-32 declared shell sign-extends the
+                                    // 1-bit payload at consumers.
+                                    current_width = 1;
+                                    current_signed = false;
+                                }
                             }
                         }
 
@@ -5676,8 +5717,14 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
             }
         }
         EventControl::Identifier(id) => {
+            // §14.3/§14.11: `@(cb)` may name a clocking block, and the parser
+            // desugars procedural `##N` to a wait on the reserved
+            // `__xz_default_clocking` marker — both resolve at simulation
+            // time to the block's clock event, not to a declared signal.
             if !elab.signals.contains_key(&id.name) && !elab.parameters.contains_key(&id.name)
                 && !elab.sequences.contains(&id.name) && !locals.contains(&id.name)
+                && !elab.clocking_blocks.contains_key(&id.name)
+                && id.name != "__xz_default_clocking"
             {
                 return Err(format!("Undeclared identifier '{}'", id.name));
             }
@@ -5727,11 +5774,13 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
     names_to_add.sort();
     names_to_add.dedup();
     for name in names_to_add {
-        eprintln!(
-            "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
-             (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.",
-            name
-        );
+        if crate::implicit_net_warn() {
+            eprintln!(
+                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                 (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.",
+                name
+            );
+        }
         elab.signals.insert(name.clone(), Signal { is_const: false,
             name: name.clone(), width: 1, is_signed: false,
             direction: None, value: Value::new(1),
@@ -5760,11 +5809,13 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
                     name
                 ));
             }
-            eprintln!(
-                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
-                 (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
-                name
-            );
+            if crate::implicit_net_warn() {
+                eprintln!(
+                    "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                     (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
+                    name
+                );
+            }
             elab.signals.insert(name.clone(), Signal { is_const: false,
                 name: name.clone(), width: 1, is_signed: false,
                 direction: None, value: Value::new(1),
@@ -6050,6 +6101,22 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         }
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
+                                // §6.20.2 + §5.7.1: an implicit-type parameter
+                                // keeps an unbased-unsized init as a FILL value
+                                // so consumers replicate it at their own width.
+                                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                                    if let ExprKind::Number(NumberLiteral::UnbasedUnsized(c)) = &init.kind {
+                                        // §6.20.2 self-determined: 1-bit, unsigned, plain.
+                                        let mut pv = Value::fill_of(*c);
+                                        pv.is_fill = false;
+                                        elab.parameters.insert(assign.name.name.clone(), pv.clone());
+                                        elab.signals.insert(assign.name.name.clone(), Signal { is_const: false,
+                                            name: assign.name.name.clone(), width: 1, is_signed: false,
+                                            direction: None, value: pv, is_real: false, type_name: get_type_name(data_type),
+                                        });
+                                        continue;
+                                    }
+                                }
                                 let mut v = eval_init_for_width(init, &elab.parameters, width);
                                 if signed { v.is_signed = true; }
                                 v
@@ -6440,20 +6507,65 @@ pub const SANE_MAX_PACKED_WIDTH: u32 = 1 << 20;
 const UNDERFLOW_WIDTH_PLACEHOLDER: u32 = 1;
 
 /// Combine packed-dimension widths with saturating math and clamp the result to
-/// `SANE_MAX_PACKED_WIDTH`, warning once when an absurd width is suppressed.
-fn clamp_packed_width(w: u64, ctx: &str) -> u32 {
+/// `SANE_MAX_PACKED_WIDTH`, warning once PER DISTINCT DETAIL when an absurd
+/// width is suppressed. `detail` carries whatever identity the call site can
+/// cheaply assemble (offending range bounds, parameter names + resolved
+/// values, source byte offset) so the user can find the declaration — a bare
+/// "somewhere a width underflowed" was unactionable on customer designs.
+fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
     if w > SANE_MAX_PACKED_WIDTH as u64 {
-        use std::sync::atomic::{AtomicBool, Ordering};
-        static WARNED: AtomicBool = AtomicBool::new(false);
-        if !WARNED.swap(true, Ordering::Relaxed) {
-            eprintln!("[xezim][warning] packed width {} exceeds sane cap {} ({}); collapsing to \
+        use std::sync::{Mutex, OnceLock};
+        static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
+        let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        let key = format!("{}|{}", ctx, detail);
+        if seen.lock().map(|mut g| g.insert(key)).unwrap_or(false) {
+            let detail_part = if detail.is_empty() {
+                String::new()
+            } else {
+                format!(", {}", detail)
+            };
+            eprintln!("[xezim][warning] packed width {} exceeds sane cap {} ({}{}); collapsing to \
                        {} bit — a parameter likely resolved to 0 causing an `[N-1:0]` underflow",
-                w, SANE_MAX_PACKED_WIDTH, ctx, UNDERFLOW_WIDTH_PLACEHOLDER);
+                w, SANE_MAX_PACKED_WIDTH, ctx, detail_part, UNDERFLOW_WIDTH_PLACEHOLDER);
         }
         UNDERFLOW_WIDTH_PLACEHOLDER
     } else {
         w as u32
     }
+}
+
+/// Describe an underflowed packed range for `clamp_packed_width` detail:
+/// resolved bounds, the parameter identifiers appearing in the bound
+/// expressions with their resolved values, and the source byte offset (a
+/// span into the preprocessed file — searchable even without file:line).
+fn describe_packed_range(
+    left: &Expression,
+    right: &Expression,
+    l: i64,
+    r: i64,
+    params: Option<&HashMap<String, Value>>,
+) -> String {
+    let mut idents: Vec<String> = Vec::new();
+    collect_ident_names(left, &mut idents);
+    collect_ident_names(right, &mut idents);
+    idents.sort();
+    idents.dedup();
+    let mut d = format!("range resolved to [{}:{}]", l, r);
+    if !idents.is_empty() {
+        let vals: Vec<String> = idents
+            .iter()
+            .take(4)
+            .map(|n| {
+                match params.and_then(|p| p.get(n)) {
+                    Some(v) => format!("{}={}", n, v.to_u64().unwrap_or(0)),
+                    None => format!("{}=<unresolved>", n),
+                }
+            })
+            .collect();
+        d.push_str(&format!(" with {}", vals.join(", ")));
+    }
+    d.push_str(&format!(" (source offset {})", left.span.start));
+    d
 }
 
 pub fn default_tick_s() -> f64 { 1e-9 }
@@ -6579,17 +6691,21 @@ pub fn resolve_type_width(
         DataType::IntegerVector { dimensions, .. } => {
             if dimensions.is_empty() { return 1; }
             let mut total = 1u64;
+            let mut culprit: Option<String> = None;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
                     let lv = const_eval_i64_with_params(left, params);
                     let rv = const_eval_i64_with_params(right, params);
                     if let (Some(l), Some(r)) = (lv, rv) {
                         let w = ((l - r).abs() + 1) as u64;
+                        if w > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
+                            culprit = Some(describe_packed_range(left, right, l, r, params));
+                        }
                         total = total.saturating_mul(w);
                     }
                 }
             }
-            clamp_packed_width(total, "IntegerVector")
+            clamp_packed_width(total, "IntegerVector", culprit.as_deref().unwrap_or(""))
         }
         DataType::IntegerAtom { kind, .. } => match kind {
             IntegerAtomType::Byte => 8,
@@ -6613,7 +6729,7 @@ pub fn resolve_type_width(
                     }
                 }
             }
-            clamp_packed_width(total, "Implicit")
+            clamp_packed_width(total, "Implicit", "")
         }
         DataType::TypeReference { name, dimensions, .. } => {
             let mut base_width = if let Some(td) = typedefs {
@@ -6631,7 +6747,7 @@ pub fn resolve_type_width(
                         }
                     }
                 }
-                base_width = clamp_packed_width(total, "TypeReference");
+                base_width = clamp_packed_width(total, "TypeReference", "");
             }
             base_width
         }
@@ -6676,7 +6792,7 @@ pub fn resolve_type_width(
                     }
                 }
             }
-            clamp_packed_width(w, "Struct")
+            clamp_packed_width(w, "Struct", "")
         }
         DataType::Void(_) => 0,
         _ => 32,
@@ -7882,9 +7998,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 // the simulation tick unit (1 ns), preserving the prior behaviour
                 // where `10ns` const-folded to 10.
                 NumberLiteral::Time(s) => Value::from_f64(*s * 1e9),
-                NumberLiteral::UnbasedUnsized(c) => match c {
-                    '0' => Value::zero(1), '1' => Value::from_u64(1, 1), _ => Value::new(1),
-                },
+                // §5.7.1 fill literal — flagged so downstream resize/ops
+                // replicate to the consuming width.
+                NumberLiteral::UnbasedUnsized(c) => Value::fill_of(*c),
             }
         }
         ExprKind::StringLiteral(s) => Value::from_string(s),
@@ -9645,6 +9761,101 @@ fn prepare_module_items(
     prepared
 }
 
+/// Best-effort self-determined width of a port-connection actual, reading
+/// widths from already-registered parent signals/parameters. Returns None
+/// when the width cannot be judged (unknown net, expression form we do not
+/// size, or a §5.7.1 fill literal, which legally adapts to any width).
+fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
+    use crate::ast::expr::ExprKind as EK;
+    match &e.kind {
+        EK::Paren(inner) => port_conn_width(inner, elab),
+        EK::Ident(h) => {
+            if h.path.iter().any(|s| !s.selects.is_empty()) {
+                return None;
+            }
+            let name = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if let Some(sig) = elab.signals.get(&name) {
+                return Some(sig.width);
+            }
+            elab.parameters.get(&name).map(|v| v.width)
+        }
+        EK::Index { expr: base, .. } => {
+            // A bit-select of a packed vector is 1 bit; an element-select of
+            // an unpacked array or multi-dim packed vector is the ELEMENT
+            // width. Skip (None) when the base isn't resolvable.
+            if let EK::Ident(h) = &base.kind {
+                let name = h
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if let Some(&(_, _, elem_w)) = elab.arrays.get(&name) {
+                    return Some(elem_w);
+                }
+                if let Some(&ew) = elab.packed_signal_elem_widths.get(&name) {
+                    return Some(ew);
+                }
+                if elab.signals.contains_key(&name) {
+                    return Some(1);
+                }
+            }
+            None
+        }
+        EK::RangeSelect { left, right, kind: crate::ast::expr::RangeKind::Constant, .. } => {
+            let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
+            let r = const_eval_i64_with_params(right, Some(&elab.parameters))?;
+            Some(((l - r).unsigned_abs() + 1) as u32)
+        }
+        EK::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
+        EK::Concatenation(parts) => {
+            let mut total = 0u32;
+            for p in parts {
+                total = total.checked_add(port_conn_width(p, elab)?)?;
+            }
+            Some(total)
+        }
+        _ => None,
+    }
+}
+
+/// Warn once per (module, port) about a width-mismatched connection. §23.3.3
+/// makes the mismatch legal (implicit truncation/extension applies), but it
+/// is the classic wiring bug, and commercial tools flag it.
+fn warn_port_width_mismatch(
+    sub_mod_name: &str,
+    port: &str,
+    formal_w: u32,
+    actual_w: u32,
+    inst_prefix: &str,
+    span_off: usize,
+) {
+    use std::sync::{Mutex, OnceLock};
+    static SEEN: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
+    let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+    let key = (sub_mod_name.to_string(), port.to_string());
+    let first = seen.lock().map(|mut g| g.insert(key)).unwrap_or(false);
+    if first {
+        eprintln!(
+            "[xezim][warning] port width mismatch: module '{}' port '{}' is {} bit(s) but the \
+             connection is {} bit(s) — instance '{}' (connection at source offset {}); the value \
+             is truncated/extended per IEEE 1800-2017 §23.3.3. Further instances of this \
+             (module, port) pair are not reported.",
+            sub_mod_name,
+            port,
+            formal_w,
+            actual_w,
+            inst_prefix.trim_end_matches('.'),
+            span_off
+        );
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -10539,6 +10750,34 @@ fn inline_module_items(
                                 lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
                             });
                         }
+                    }
+                }
+
+                // Pre-simulation connectivity lint: every bound port's own
+                // signal (registered above for both ANSI and non-ANSI styles)
+                // carries the FORMAL width under this instance's parameters;
+                // compare with each actual's self-determined width and warn on
+                // mismatch, naming the instance and port.
+                for (pname, actual) in port_map.iter() {
+                    let Some(formal) = elab
+                        .signals
+                        .get(&format!("{}{}", inst_prefix, pname))
+                        .map(|s| s.width)
+                    else {
+                        continue;
+                    };
+                    let Some(actual_w) = port_conn_width(actual, elab) else {
+                        continue;
+                    };
+                    if actual_w != formal && actual_w != 0 && formal != 0 {
+                        warn_port_width_mismatch(
+                            sub_mod_name,
+                            pname,
+                            formal,
+                            actual_w,
+                            &inst_prefix,
+                            actual.span.start,
+                        );
                     }
                 }
 

@@ -46,9 +46,13 @@ pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x03 = zstd-compressed varint bincode body
-/// (\x02 = uncompressed varint, \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x03";
+/// Version byte: \x07 = \x06 + Value is_fill field (§5.7.1 unbased-unsized);
+/// \x06 = \x05 + serialized source_files/src_file_of_module
+/// (cache-hit file:line diagnostics); \x05 = \x04 + const-NBA and branch fusion opcodes; \x04 = \x03 encoding + fused load-select opcodes
+/// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
+/// zstd-compressed varint bincode body (\x02 = uncompressed varint,
+/// \x01 = uncompressed fixint).
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x07";
 
 /// zstd compression level used for `.xez` artifacts. Level 3 is zstd's own
 /// default — strong compression at high throughput. Empirically shrinks
@@ -156,21 +160,46 @@ pub struct ModuleTimescaleCli {
     pub named: std::collections::HashMap<String, (i32, i32)>,
 }
 
-/// Library-search configuration from the CLI (`-v <file>`, `+libext+<ext>`),
+/// Library-search configuration from the CLI (`-v <file>`, `-y <dir>`,
+/// `+libext+<ext>`),
 /// consumed by `resolve_library_modules`. Commercial semantics: a `-v` file's
 /// definitions are adopted only to satisfy unresolved instantiations (never
 /// top candidates); `+libext+` REPLACES the default `-y` extension list.
 #[derive(Default, Clone)]
 pub struct LibraryCli {
     pub lib_files: Vec<String>,
+    pub lib_dirs: Vec<String>,
     /// `None` = default extensions (v, sv, V); `Some(list)` = exactly `list`.
     pub lib_exts: Option<Vec<String>>,
+    /// Emit detailed parse and adoption diagnostics for explicit `-v` files.
+    pub primitive_verbose: bool,
 }
 
 static LIBRARY_CLI: std::sync::OnceLock<std::sync::Mutex<LibraryCli>> = std::sync::OnceLock::new();
 
+/// Whether `--primitive-verbose` is active — read by the simulator's UDP
+/// lowering to print per-terminal resolution detail.
+pub fn primitive_verbose() -> bool {
+    library_cli_cell().lock().map(|g| g.primitive_verbose).unwrap_or(false)
+}
+
 fn library_cli_cell() -> &'static std::sync::Mutex<LibraryCli> {
     LIBRARY_CLI.get_or_init(|| std::sync::Mutex::new(LibraryCli::default()))
+}
+
+/// `-xenowarn`: suppress the §6.10 "implicit 1-bit net created" warnings.
+/// Gate-level customer designs with thousands of vendor-cell pins can emit
+/// thousands of these; the flag silences the WARNING while keeping the
+/// implicit-net behavior itself (and the `default_nettype none error).
+static IMPLICIT_NET_WARN: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(true);
+
+pub fn set_implicit_net_warn(on: bool) {
+    IMPLICIT_NET_WARN.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub(crate) fn implicit_net_warn() -> bool {
+    IMPLICIT_NET_WARN.load(std::sync::atomic::Ordering::Relaxed)
 }
 
 pub fn set_library_cli(cfg: LibraryCli) {
@@ -658,7 +687,7 @@ fn parse_and_elaborate(
         }
     }
     // Capture the definitions that came from the explicitly-provided source
-    // files BEFORE pulling in library (`-y` / `+incdir`) modules. Library
+    // files BEFORE pulling in `-y` / `-v` library modules. Library
     // modules satisfy instantiations but must NEVER be candidates for the
     // implicit top: otherwise compiling a self-contained file (e.g. a lone
     // `class`) that shares an include dir with sibling testbenches would let
@@ -667,7 +696,7 @@ fn parse_and_elaborate(
     let explicit_def_names: std::collections::HashSet<String> =
         definitions.keys().cloned().collect();
     let lib_cli = library_cli_cell().lock().unwrap().clone();
-    if !include_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
+    if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(&mut definitions, include_dirs, lib_defines, &lib_cli)?;
 
         // A `-v`/`-y` library module is adopted AFTER the primary-source delay
@@ -916,11 +945,13 @@ fn resolve_library_modules(
         None => vec!["v".into(), "sv".into(), "V".into()],
     };
 
-    let mut files = Vec::new();
-    for dir in include_dirs {
+    let mut files: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    for dir in &lib_cli.lib_dirs {
         let path = std::path::Path::new(dir);
         if path.is_dir() {
-            collect_sv_files(path, &exts, &mut files)?;
+            let mut found = Vec::new();
+            collect_sv_files(path, &exts, &mut found)?;
+            files.extend(found.into_iter().map(|path| (path, false)));
         }
     }
     // `-v <file>`: an explicit library FILE (any extension). Indexed like a
@@ -930,7 +961,7 @@ fn resolve_library_modules(
         if !path.is_file() {
             return Err(format!("-v library file not found: {}", f));
         }
-        files.push(path);
+        files.push((path, true));
     }
 
     // Index every library file's module/interface/program definitions (and
@@ -945,7 +976,9 @@ fn resolve_library_modules(
     let mut lib_typedefs: Vec<Rc<ast::decl::TypedefDeclaration>> = Vec::new();
     let mut scanned_paths: Vec<std::path::PathBuf> = Vec::new();
     let mut parse_issue_files: Vec<std::path::PathBuf> = Vec::new();
-    for path in files {
+    let mut lib_origins: crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)> =
+        Default::default();
+    for (path, explicit_v) in files {
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
@@ -963,27 +996,102 @@ fn resolve_library_modules(
         }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
         let result = sv_parser::parse(&preprocessed);
+        let line_col = |off: usize| -> (usize, usize) {
+            let (mut line, mut col) = (1usize, 1usize);
+            for (i, ch) in preprocessed.char_indices() {
+                if i >= off {
+                    break;
+                }
+                if ch == '\n' {
+                    line += 1;
+                    col = 1;
+                } else {
+                    col += 1;
+                }
+            }
+            (line, col)
+        };
+        if explicit_v && lib_cli.primitive_verbose {
+            let mut modules = 0usize;
+            let mut primitives = 0usize;
+            for desc in &result.source.descriptions {
+                match desc {
+                    ast::Description::Module(m) => {
+                        modules += 1;
+                        eprintln!(
+                            "[primitive-verbose] parsed module '{}' from -v '{}'",
+                            m.name.name,
+                            path.display()
+                        );
+                    }
+                    ast::Description::Udp(u) => {
+                        primitives += 1;
+                        eprintln!(
+                            "[primitive-verbose] parsed UDP '{}' from -v '{}': ports={} rows={} sequential={} init={:?}",
+                            u.name.name,
+                            path.display(),
+                            u.ports.len(),
+                            u.rows.len(),
+                            u.is_sequential,
+                            u.init
+                        );
+                    }
+                    ast::Description::Interface(i) => eprintln!(
+                        "[primitive-verbose] parsed interface '{}' from -v '{}'",
+                        i.name.name,
+                        path.display()
+                    ),
+                    ast::Description::Program(p) => eprintln!(
+                        "[primitive-verbose] parsed program '{}' from -v '{}'",
+                        p.name.name,
+                        path.display()
+                    ),
+                    _ => {}
+                }
+            }
+            eprintln!(
+                "[primitive-verbose] -v parse summary '{}': bytes={} descriptions={} modules={} primitives={} errors={} warnings={}",
+                path.display(),
+                source.len(),
+                result.source.descriptions.len(),
+                modules,
+                primitives,
+                result.errors.len(),
+                result.warnings.len()
+            );
+            if !result.errors.is_empty() || !result.warnings.is_empty() {
+                eprintln!(
+                    "[primitive-verbose] detailed parser diagnostics for -v '{}':",
+                    path.display()
+                );
+                for (severity, diagnostic) in result
+                    .errors
+                    .iter()
+                    .map(|d| ("error", d))
+                    .chain(result.warnings.iter().map(|d| ("warning", d)))
+                    .take(16)
+                {
+                    let (line, col) = line_col(diagnostic.span.start);
+                    let source_line = preprocessed.lines().nth(line.saturating_sub(1)).unwrap_or("");
+                    eprintln!(
+                        "  {}:{}:{}: {}: {}",
+                        path.display(),
+                        line,
+                        col,
+                        severity,
+                        diagnostic.message
+                    );
+                    eprintln!("    {}", source_line);
+                    eprintln!("    {}^", " ".repeat(col.saturating_sub(1)));
+                }
+            }
+        }
         // A half-parsed library file silently loses every definition after the
         // point of failure — the classic "-v vendor.v then Module 'X' not
         // found". Surface it VCS-style: file:line:col per error (first three),
         // resolved against the preprocessed text the spans index (line numbers
         // can shift from the raw file where `include/macros expand).
         if !result.errors.is_empty() {
-            let line_col = |off: usize| -> (usize, usize) {
-                let (mut line, mut col) = (1usize, 1usize);
-                for (i, ch) in preprocessed.char_indices() {
-                    if i >= off {
-                        break;
-                    }
-                    if ch == '\n' {
-                        line += 1;
-                        col = 1;
-                    } else {
-                        col += 1;
-                    }
-                }
-                (line, col)
-            };
             eprintln!(
                 "Warning: library file '{}': {} parse error(s) — definitions after the first error may be lost:",
                 path.display(),
@@ -1001,16 +1109,25 @@ fn resolve_library_modules(
         for desc in result.source.descriptions {
             match desc {
                 ast::Description::Module(m) => {
-                    lib.entry(m.name.name.clone())
-                        .or_insert_with(|| SourceDefinition::Module(Rc::new(m)));
+                    let name = m.name.name.clone();
+                    if !lib.contains_key(&name) {
+                        lib.insert(name.clone(), SourceDefinition::Module(Rc::new(m)));
+                        lib_origins.insert(name, (path.clone(), explicit_v, "module"));
+                    }
                 }
                 ast::Description::Interface(i) => {
-                    lib.entry(i.name.name.clone())
-                        .or_insert_with(|| SourceDefinition::Interface(Rc::new(i)));
+                    let name = i.name.name.clone();
+                    if !lib.contains_key(&name) {
+                        lib.insert(name.clone(), SourceDefinition::Interface(Rc::new(i)));
+                        lib_origins.insert(name, (path.clone(), explicit_v, "interface"));
+                    }
                 }
                 ast::Description::Program(p) => {
-                    lib.entry(p.name.name.clone())
-                        .or_insert_with(|| SourceDefinition::Program(Rc::new(p)));
+                    let name = p.name.name.clone();
+                    if !lib.contains_key(&name) {
+                        lib.insert(name.clone(), SourceDefinition::Program(Rc::new(p)));
+                        lib_origins.insert(name, (path.clone(), explicit_v, "program"));
+                    }
                 }
                 // A non-forward typedef may fill a forward typedef the primary
                 // design actually declared; adopted below, never blanket. A
@@ -1022,8 +1139,11 @@ fn resolve_library_modules(
                 // §29: a UDP defined in a `-v`/`-y` library file (vendor
                 // stdcell). Adopted on demand like a library module.
                 ast::Description::Udp(u) => {
-                    lib.entry(u.name.name.clone())
-                        .or_insert_with(|| SourceDefinition::Udp(Rc::new(u)));
+                    let name = u.name.name.clone();
+                    if !lib.contains_key(&name) {
+                        lib.insert(name.clone(), SourceDefinition::Udp(Rc::new(u)));
+                        lib_origins.insert(name, (path.clone(), explicit_v, "UDP"));
+                    }
                 }
                 _ => {}
             }
@@ -1045,20 +1165,46 @@ fn resolve_library_modules(
     // reachable from the explicitly-compiled design, transitively (a pulled-in
     // library module may itself instantiate further library modules).
     let mut seed = std::collections::HashSet::new();
-    for def in definitions.values() {
-        instantiations(def, &mut seed);
+    // Instantiated-name -> referring definition names. This is what turns an
+    // opaque "module 'X' not found" into an actionable note: it names WHICH
+    // module's body references X, so a user can check whether that reference
+    // even elaborates (a reference inside a dead `generate`/parameter branch
+    // is collected by this TEXTUAL scan but never needed at runtime — a
+    // commercial elaborator would report nothing for it).
+    let mut referrers: std::collections::HashMap<String, std::collections::BTreeSet<String>> =
+        std::collections::HashMap::new();
+    for (def_name, def) in definitions.iter() {
+        let mut names = std::collections::HashSet::new();
+        instantiations(def, &mut names);
+        for n in &names {
+            referrers.entry(n.clone()).or_default().insert(def_name.clone());
+        }
+        seed.extend(names);
     }
     let mut work: Vec<String> = seed.into_iter().collect();
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
+    let mut adopted_from_v = 0usize;
     while let Some(name) = work.pop() {
         if definitions.contains_key(&name) {
             continue;
         }
         if let Some(def) = lib.get(&name) {
+            if let Some((path, true, kind)) = lib_origins.get(&name) {
+                adopted_from_v += 1;
+                if lib_cli.primitive_verbose {
+                    eprintln!(
+                        "[primitive-verbose] adopting {} '{}' from -v '{}' to resolve an instantiation",
+                        kind,
+                        name,
+                        path.display()
+                    );
+                }
+            }
             let mut more = std::collections::HashSet::new();
             instantiations(def, &mut more);
             definitions.insert(name.clone(), def.clone());
             for n in more {
+                referrers.entry(n.clone()).or_default().insert(name.clone());
                 if !definitions.contains_key(&n) {
                     work.push(n);
                 }
@@ -1067,17 +1213,56 @@ fn resolve_library_modules(
             unresolved.insert(name);
         }
     }
+    if lib_cli.primitive_verbose && !lib_cli.lib_files.is_empty() {
+        let indexed_from_v = lib_origins.values().filter(|(_, from_v, _)| *from_v).count();
+        eprintln!(
+            "[primitive-verbose] -v resolution summary: files={} indexed_definitions={} adopted={} unresolved={}",
+            lib_cli.lib_files.len(),
+            indexed_from_v,
+            adopted_from_v,
+            unresolved.len()
+        );
+        for name in &unresolved {
+            eprintln!(
+                "[primitive-verbose] unresolved definition '{}' after scanning explicit -v files",
+                name
+            );
+        }
+    }
     // Detailed context for names the libraries could not supply — printed here,
     // where the library scan is in scope, so the eventual "instantiated but not
     // found" elaboration error arrives with its cause already on the terminal.
     if !unresolved.is_empty() && (!lib.is_empty() || !lib_cli.lib_files.is_empty()) {
-        for name in unresolved.iter().take(8) {
+        // Print EVERY unresolved name — a truncated list once hid 2 of a
+        // customer design's 10 missing vendor cells.
+        for name in unresolved.iter() {
             let mut line = format!(
                 "note: module '{}' not defined in the design and not found among {} definition(s) indexed from {} library file(s)",
                 name,
                 lib.len(),
                 scanned_paths.len()
             );
+            // WHO references it — so the user can judge whether the reference
+            // is live (a real missing cell) or sits in a branch elaboration
+            // never enters (in which case this note is advisory only; the
+            // textual scan cannot evaluate generate/parameter conditions).
+            if let Some(refs) = referrers.get(name) {
+                let shown: Vec<String> = refs
+                    .iter()
+                    .take(4)
+                    .map(|r| match lib_origins.get(r) {
+                        Some((path, _, _)) => format!("'{}' ({})", r, path.display()),
+                        None => format!("'{}'", r),
+                    })
+                    .collect();
+                line.push_str(&format!(" — instantiated in: {}", shown.join(", ")));
+                if refs.len() > 4 {
+                    line.push_str(&format!(" and {} more", refs.len() - 4));
+                }
+                line.push_str(
+                    "; if that reference sits in a generate/`ifdef branch that never elaborates, this note is advisory and no model is needed",
+                );
+            }
             // Case mismatch is a classic netlist/lib mismatch.
             if let Some(close) = lib
                 .keys()
@@ -1088,8 +1273,8 @@ fn resolve_library_modules(
                     close
                 ));
             }
-            // A UDP with this name explains everything: xezim indexes modules,
-            // not primitives. Error path only — re-reads the files.
+            // Primitive-looking text without an indexed UDP usually means the
+            // parser lost the declaration after an earlier syntax error.
             let prim_pat = format!("primitive {}", name);
             let prim_pat2 = format!("primitive  {}", name);
             if let Some(f) = scanned_paths.iter().find(|p| {
@@ -1098,7 +1283,7 @@ fn resolve_library_modules(
                     .unwrap_or(false)
             }) {
                 line.push_str(&format!(
-                    " — '{}' defines it as a UDP `primitive`, which xezim does not yet support",
+                    " — '{}' contains a UDP `primitive` with this name, but parsing did not recover its definition; rerun with --primitive-verbose",
                     f.display()
                 ));
             }
