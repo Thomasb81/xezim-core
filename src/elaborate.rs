@@ -2624,6 +2624,45 @@ pub fn elaborate_module_with_defs(
                 let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                 for decl in &dd.declarators {
                     elab.note_explicit_type(&decl.name.name, &dd.data_type)?;
+                    // §23.2.2.1 non-ANSI port completion: a variable declaration
+                    // may supply the data type of an already-declared port —
+                    //   output [W-1:0] Q_out;   // direction (implicit net type)
+                    //   reg    [W-1:0] Q_out;   // completes it as a variable
+                    // The port line registered Q_out (direction = Some), so this
+                    // `reg`/`logic` line is the legal type-completing half, NOT
+                    // an illegal redeclaration (mirrors the `wire`-completes-port
+                    // handling in NetDeclaration and the direction-completes-var
+                    // handling in PortDeclaration). Merge the data type onto the
+                    // existing port entry and mark it a variable.
+                    if elab
+                        .signals
+                        .get(&decl.name.name)
+                        .is_some_and(|s| s.direction.is_some())
+                        && !elab.parameters.contains_key(&decl.name.name)
+                    {
+                        let explicit_type = !matches!(dd.data_type, DataType::Implicit { .. });
+                        let decl_is_real = is_type_real(&dd.data_type);
+                        let existing = elab.signals.get_mut(&decl.name.name).unwrap();
+                        if explicit_type {
+                            existing.width = width;
+                            existing.is_signed = is_signed;
+                            existing.is_real = decl_is_real;
+                            existing.type_name = get_type_name(&dd.data_type);
+                            existing.value = if decl_is_real {
+                                Value::from_f64(0.0)
+                            } else {
+                                Value::new(width)
+                            };
+                        }
+                        if is_type_two_state(&dd.data_type) {
+                            elab.two_state_signals.insert(decl.name.name.clone());
+                        }
+                        // A reg/logic completion makes the port a variable, not a net.
+                        elab.nets.remove(&decl.name.name);
+                        elab.var_decl_types
+                            .insert(decl.name.name.clone(), dd.data_type.clone());
+                        continue;
+                    }
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
                         // LRM §6.x: re-declaring a name already declared in the
                         // same scope is illegal. In strict mode (the default)
