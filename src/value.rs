@@ -1389,15 +1389,22 @@ impl Value {
     // === Reduction ===
 
     pub fn reduce_and(&self) -> Value {
+        // §11.4.8 (Table 11-13): a known 0 bit forces the result to 0 even in
+        // the presence of X/Z. Only when NO bit is 0 does an X/Z make the
+        // result X; all-ones gives 1. (Previously an X/Z short-circuited to X
+        // before the 0-check, so `&4'b1x0z` wrongly gave x instead of 0.)
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 let mask = Self::mask(self.width);
-                if *xz_bits & mask != 0 { Value::new(1) }
-                else { Value::from_u64(if *val_bits & mask == mask { 1 } else { 0 }, 1) }
+                // A bit is a known 0 when both its value and xz bits are clear.
+                if (!*val_bits & !*xz_bits & mask) != 0 { Value::from_u64(0, 1) }
+                else if *xz_bits & mask != 0 { Value::new(1) }
+                else { Value::from_u64(1, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.iter().any(|b| !b.is_known()) { Value::new(1) }
-                else { Value::from_u64(if bits.iter().all(|b| *b == LogicBit::One) { 1 } else { 0 }, 1) }
+                if bits.iter().any(|b| *b == LogicBit::Zero) { Value::from_u64(0, 1) }
+                else if bits.iter().any(|b| !b.is_known()) { Value::new(1) }
+                else { Value::from_u64(1, 1) }
             }
         }
     }
@@ -2124,15 +2131,74 @@ impl Value {
 
     /// Select a single bit
     pub fn bit_select(&self, index: usize) -> Value {
+        // §11.5.1: a bit-select address outside the vector bounds reads as x
+        // (for a 4-state type). A fill value replicates instead (§5.7.1).
+        if (index as u32) >= self.width && !self.is_fill {
+            return Value::new(1);
+        }
         let bit = self.get_bit(index);
         let mut v = Value::zero(1);
         v.set_bit(0, bit);
         v
     }
 
-    /// Select a range of bits [left:right]
+    /// Select a range of bits [left:right] (§11.5.1). Source indices outside
+    /// the vector bounds read as x; a fill value (§5.7.1) replicates instead.
     #[inline]
     pub fn range_select(&self, left: usize, right: usize) -> Value {
+        let result = self.range_select_zext(left, right);
+        if self.is_fill {
+            return result;
+        }
+        let lo = left.min(right);
+        let w = self.width as usize;
+        let width = result.width as usize;
+        if lo >= w {
+            // The entire select is beyond the vector — all bits read x.
+            return Value::new(width as u32);
+        }
+        if lo + width <= w {
+            // Fully in range — the fast paths already produced the value.
+            return result;
+        }
+        // Partial overhang: the low bits are real, the high bits read x.
+        let mut result = result;
+        for i in 0..width {
+            if lo + i >= w {
+                result.set_bit(i, LogicBit::X);
+            }
+        }
+        result
+    }
+
+    /// §11.5.1 part-select with SIGNED source bounds — used for `[l -: w]`
+    /// when `l < w-1`, where the low index falls below 0. `hi >= lo`; every
+    /// output bit whose source index is <0 or >=width reads x. `is_fill`
+    /// values replicate their bit 0 into any position instead.
+    pub fn range_select_signed(&self, hi: i64, lo: i64) -> Value {
+        let width = (hi - lo + 1).max(0);
+        if width == 0 {
+            return Value::zero(0);
+        }
+        let width = width as usize;
+        let mut result = Value::new(width as u32); // starts all-x
+        let w = self.width as i64;
+        for j in 0..width {
+            let src = lo + j as i64;
+            if self.is_fill {
+                result.set_bit(j, self.get_bit(0));
+            } else if src >= 0 && src < w {
+                result.set_bit(j, self.get_bit(src as usize));
+            }
+            // otherwise leave x
+        }
+        result
+    }
+
+    /// Zero-extending range select (internal). Bits beyond the source width
+    /// come back as 0; `range_select` overlays the §11.5.1 x-on-overrun rule.
+    #[inline]
+    fn range_select_zext(&self, left: usize, right: usize) -> Value {
         let width = if left >= right { left - right + 1 } else { right - left + 1 };
         // LRM §11.5.1: out-of-range part-select bits read as X. A runtime index
         // that underflowed (`sig[v-1:0]` with `v` = 0 at time 0 → left ≈ u32::MAX)
