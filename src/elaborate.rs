@@ -8833,6 +8833,15 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
                     collect_decl_names_in_items(&arm.items, names);
                 }
             }
+            // A NESTED generate-for's body decls must also be uniquified by the
+            // OUTER iteration's suffix — otherwise an inner `localparam X` (or
+            // signal) collides across outer iterations (its inner-loop rename
+            // only varies by the inner genvar), so every outer iteration reuses
+            // the FIRST-registered value. That silently collapsed
+            // `for(a) for(b) localparam Idx = f(a,b)` to `f(0,b)` — the
+            // rr_arb_tree binary-tree index bug. The inner loop's own rename
+            // then composes a second suffix, giving a distinct name per (a,b).
+            ModuleItem::GenerateFor(gf) => collect_decl_names_in_items(&gf.items, names),
             _ => {}
         }
     }
