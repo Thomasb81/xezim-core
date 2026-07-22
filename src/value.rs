@@ -378,7 +378,7 @@ impl Value {
                 is_signed: self.is_signed,
                 is_real: false, is_fill: false,
             },
-            ValueStorage::Wide(bits) => {
+            ValueStorage::Wide(_bits) => {
                 let mut out = self.clone();
                 if let ValueStorage::Wide(ob) = &mut out.storage {
                     for b in ob.iter_mut() {
@@ -1379,7 +1379,7 @@ impl Value {
                 else { Some(false) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.iter().any(|b| *b == LogicBit::One) { Some(true) }
+                if bits.contains(&LogicBit::One) { Some(true) }
                 else if bits.iter().any(|b| matches!(b, LogicBit::X | LogicBit::Z)) { None }
                 else { Some(false) }
             }
@@ -1402,7 +1402,7 @@ impl Value {
                 else { Value::from_u64(1, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.iter().any(|b| *b == LogicBit::Zero) { Value::from_u64(0, 1) }
+                if bits.contains(&LogicBit::Zero) { Value::from_u64(0, 1) }
                 else if bits.iter().any(|b| !b.is_known()) { Value::new(1) }
                 else { Value::from_u64(1, 1) }
             }
@@ -1418,7 +1418,7 @@ impl Value {
                 else { Value::from_u64(0, 1) }
             }
             ValueStorage::Wide(bits) => {
-                if bits.iter().any(|b| *b == LogicBit::One) { Value::from_u64(1, 1) }
+                if bits.contains(&LogicBit::One) { Value::from_u64(1, 1) }
                 else if bits.iter().any(|b| !b.is_known()) { Value::new(1) }
                 else { Value::from_u64(0, 1) }
             }
@@ -1483,7 +1483,7 @@ impl Value {
     /// Format as hex string.
     pub fn to_hex(&self) -> String {
         if self.width == 0 { return "0".into(); }
-        let ndigits = ((self.width + 3) / 4) as usize;
+        let ndigits = self.width.div_ceil(4) as usize;
         let mut s = String::with_capacity(ndigits);
         for d in (0..ndigits).rev() {
             // §21.2.1.2 unknown casing, per hex digit (matches reference/commercial
@@ -1875,7 +1875,7 @@ impl Value {
                     _ => {}
                 }
             }
-            let w = self.width as u32;
+            let w = self.width;
             let ch = if n_x == w {
                 'x'
             } else if n_z == w {
@@ -1956,7 +1956,7 @@ impl Value {
     /// §21.2.1.4 unformatted `%u`/`%z` dumps end in alignment NULs that
     /// `len()`/`getc()` must observe.
     pub fn sv_string_bytes(&self) -> Vec<u8> {
-        let num_bytes = ((self.width + 7) / 8) as usize;
+        let num_bytes = self.width.div_ceil(8) as usize;
         let mut out: Vec<u8> = Vec::new();
         let mut started = false;
         for bi in (0..num_bytes).rev() {

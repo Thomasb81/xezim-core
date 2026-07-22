@@ -27,7 +27,7 @@ pub struct Bits2 {
 impl Bits2 {
     #[inline]
     fn nwords_for(width: u32) -> usize {
-        ((width.max(1) as usize) + 63) / 64
+        (width.max(1) as usize).div_ceil(64)
     }
 
     /// Mask for the top word given `width` (all-ones when width is a multiple of 64).

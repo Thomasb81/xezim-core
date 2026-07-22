@@ -119,12 +119,11 @@ impl StdoutSink {
     pub fn flush(&mut self) {
         match &mut self.mode {
             Mode::Inline(w) => { let _ = w.flush(); }
-            Mode::Threaded { buf, tx: Some(tx), .. } => {
-                if !buf.is_empty() {
+            Mode::Threaded { buf, tx: Some(tx), .. }
+                if !buf.is_empty() => {
                     let chunk = std::mem::take(buf);
                     let _ = tx.send(Msg::FlushChunk(chunk));
                 }
-            }
             _ => {}
         }
     }
