@@ -8864,6 +8864,15 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
                     collect_decl_names_in_items(&arm.items, names);
                 }
             }
+            // A NESTED generate-for's body decls must also be uniquified by the
+            // OUTER iteration's suffix — otherwise an inner `localparam X` (or
+            // signal) collides across outer iterations (its inner-loop rename
+            // only varies by the inner genvar), so every outer iteration reuses
+            // the FIRST-registered value. That silently collapsed
+            // `for(a) for(b) localparam Idx = f(a,b)` to `f(0,b)` — the
+            // rr_arb_tree binary-tree index bug. The inner loop's own rename
+            // then composes a second suffix, giving a distinct name per (a,b).
+            ModuleItem::GenerateFor(gf) => collect_decl_names_in_items(&gf.items, names),
             _ => {}
         }
     }
@@ -9053,6 +9062,96 @@ fn rename_item_decls(
     }
 }
 
+/// Genvar-substitute the expressions inside packed dimensions (`[left:right]`).
+/// A declaration inside a generate-for can size itself from the genvar
+/// (`logic [i*8+7:0] byte_i;`); without this the range keeps the bare genvar
+/// ident and resolves to a wrong/underflowed width once the loop var is gone.
+fn rewrite_packed_dims_genvar(
+    dims: &[PackedDimension],
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Vec<PackedDimension> {
+    dims.iter().map(|d| match d {
+        PackedDimension::Range { left, right, span } => PackedDimension::Range {
+            left: Box::new(rewrite_expr(left, "", port_map, local_names, interface_map)),
+            right: Box::new(rewrite_expr(right, "", port_map, local_names, interface_map)),
+            span: *span,
+        },
+        other => other.clone(),
+    }).collect()
+}
+
+/// Genvar-substitute the expressions inside unpacked dimensions.
+fn rewrite_unpacked_dims_genvar(
+    dims: &[UnpackedDimension],
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Vec<UnpackedDimension> {
+    dims.iter().map(|d| match d {
+        UnpackedDimension::Range { left, right, span } => UnpackedDimension::Range {
+            left: Box::new(rewrite_expr(left, "", port_map, local_names, interface_map)),
+            right: Box::new(rewrite_expr(right, "", port_map, local_names, interface_map)),
+            span: *span,
+        },
+        UnpackedDimension::Expression { expr, span } => UnpackedDimension::Expression {
+            expr: Box::new(rewrite_expr(expr, "", port_map, local_names, interface_map)),
+            span: *span,
+        },
+        UnpackedDimension::Queue { max_size, span } => UnpackedDimension::Queue {
+            max_size: max_size.as_ref().map(|e| Box::new(rewrite_expr(e, "", port_map, local_names, interface_map))),
+            span: *span,
+        },
+        other => other.clone(),
+    }).collect()
+}
+
+/// Genvar-substitute the dimension expressions carried by a data type (packed
+/// ranges on vectors/typerefs, and recursively into packed-struct members).
+fn rewrite_data_type_genvar(
+    dt: &DataType,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> DataType {
+    match dt {
+        DataType::IntegerVector { kind, signing, dimensions, span } => DataType::IntegerVector {
+            kind: *kind, signing: *signing,
+            dimensions: rewrite_packed_dims_genvar(dimensions, port_map, local_names, interface_map),
+            span: *span,
+        },
+        DataType::TypeReference { name, dimensions, type_args, span } => DataType::TypeReference {
+            name: name.clone(),
+            dimensions: rewrite_packed_dims_genvar(dimensions, port_map, local_names, interface_map),
+            type_args: type_args.iter().map(|e| rewrite_expr(e, "", port_map, local_names, interface_map)).collect(),
+            span: *span,
+        },
+        DataType::Implicit { signing, dimensions, span } => DataType::Implicit {
+            signing: *signing,
+            dimensions: rewrite_packed_dims_genvar(dimensions, port_map, local_names, interface_map),
+            span: *span,
+        },
+        DataType::Struct(su) => {
+            let mut new_su = su.clone();
+            new_su.dimensions = rewrite_packed_dims_genvar(&su.dimensions, port_map, local_names, interface_map);
+            new_su.members = su.members.iter().map(|m| StructMember {
+                rand_qualifier: m.rand_qualifier,
+                data_type: rewrite_data_type_genvar(&m.data_type, port_map, local_names, interface_map),
+                declarators: m.declarators.iter().map(|sd| StructDeclarator {
+                    name: sd.name.clone(),
+                    dimensions: rewrite_unpacked_dims_genvar(&sd.dimensions, port_map, local_names, interface_map),
+                    init: sd.init.as_ref().map(|e| rewrite_expr(e, "", port_map, local_names, interface_map)),
+                    span: sd.span,
+                }).collect(),
+                span: m.span,
+            }).collect();
+            DataType::Struct(new_su)
+        }
+        other => other.clone(),
+    }
+}
+
 fn substitute_in_module_item(
     item: &ModuleItem,
     port_map: &HashMap<String, Expression>,
@@ -9164,8 +9263,56 @@ fn substitute_in_module_item(
             new_gf.items = gf.items.iter().map(|i| substitute_in_module_item(i, port_map, local_names, interface_map)).collect();
             ModuleItem::GenerateFor(new_gf)
         }
-        // Most other module-level declarations don't carry expressions that
-        // reference a genvar in practice; pass through unchanged.
+        // A localparam/parameter declared inside a generate-for can size or
+        // value itself from the genvar — e.g. rr_arb_tree's
+        // `localparam int Idx0 = 2**level-1+l;` per tree node. Without genvar
+        // substitution here the init keeps the bare `level`/`l` idents and
+        // every iteration's Idx0 collapses to X/0, so `assign vec[Idx0]` all
+        // target bit 0 and the arbiter never routes (floo_router forwarding
+        // loss). Substitute the init and dimension expressions.
+        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+            let mut new_pd = pd.clone();
+            if let ParameterKind::Data { data_type, assignments } = &mut new_pd.kind {
+                *data_type = rewrite_data_type_genvar(data_type, port_map, local_names, interface_map);
+                for a in assignments.iter_mut() {
+                    a.dimensions = rewrite_unpacked_dims_genvar(&a.dimensions, port_map, local_names, interface_map);
+                    if let Some(init) = &a.init {
+                        a.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
+                    }
+                }
+            }
+            match item {
+                ModuleItem::ParameterDeclaration(_) => ModuleItem::ParameterDeclaration(new_pd),
+                _ => ModuleItem::LocalparamDeclaration(new_pd),
+            }
+        }
+        // A variable/net declared inside a generate-for can size itself from
+        // the genvar (`logic [i*W-1:0] slice_i;`) or initialise from it. Same
+        // fall-through hazard as the parameter case above.
+        ModuleItem::DataDeclaration(dd) => {
+            let mut new_dd = dd.clone();
+            new_dd.data_type = rewrite_data_type_genvar(&dd.data_type, port_map, local_names, interface_map);
+            for d in new_dd.declarators.iter_mut() {
+                d.dimensions = rewrite_unpacked_dims_genvar(&d.dimensions, port_map, local_names, interface_map);
+                if let Some(init) = &d.init {
+                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
+                }
+            }
+            ModuleItem::DataDeclaration(new_dd)
+        }
+        ModuleItem::NetDeclaration(nd) => {
+            let mut new_nd = nd.clone();
+            new_nd.data_type = rewrite_data_type_genvar(&nd.data_type, port_map, local_names, interface_map);
+            for d in new_nd.declarators.iter_mut() {
+                d.dimensions = rewrite_unpacked_dims_genvar(&d.dimensions, port_map, local_names, interface_map);
+                if let Some(init) = &d.init {
+                    d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
+                }
+            }
+            ModuleItem::NetDeclaration(new_nd)
+        }
+        // Remaining module-level items don't carry genvar-dependent
+        // expressions; pass through unchanged.
         other => other.clone(),
     }
 }
@@ -10463,10 +10610,47 @@ fn inline_module_items(
                         sub_mod_name, inst_prefix,
                         inst.params.as_ref().map(|p| p.len()), hi.name.name, sub_param_decls.len());
                 }
+                let expr_as_type_ref = |v: &Expression| -> Option<DataType> {
+                    if let ExprKind::Ident(hier) = &v.kind {
+                        if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
+                            let (scope, tname) = match &hier.root {
+                                Some(r) => (
+                                    Some(Identifier { name: r.clone(), span: v.span }),
+                                    hier.path[0].name.clone(),
+                                ),
+                                None => (None, hier.path[0].name.clone()),
+                            };
+                            return Some(DataType::TypeReference {
+                                name: TypeName { scope, name: tname, span: v.span },
+                                dimensions: Vec::new(),
+                                type_args: Vec::new(),
+                                span: v.span,
+                            });
+                        }
+                    }
+                    None
+                };
+                let formal_is_type_param = |formal: &str| -> bool {
+                    sub_param_decls.iter().any(|p| matches!(&p.kind,
+                        ParameterKind::Type { assignments }
+                            if assignments.iter().any(|a| a.name.name == formal)))
+                };
+                let mut type_overrides: Vec<(String, DataType)> = Vec::new();
                 if let Some(param_conns) = &inst.params {
                     for (i, conn) in param_conns.iter().enumerate() {
                         match conn {
                             ParamConnection::Named { name, value } => {
+                                if let Some(ParamValue::Type(dt)) = value {
+                                    type_overrides.push((name.name.clone(), dt.clone()));
+                                }
+                                if let Some(ParamValue::Expr(v)) = value {
+                                    if formal_is_type_param(&name.name) {
+                                        if let Some(dt) = expr_as_type_ref(v) {
+                                            type_overrides.push((name.name.clone(), dt));
+                                            continue;
+                                        }
+                                    }
+                                }
                                 if let Some(ParamValue::Expr(v)) = value {
                                     let mut val = eval_const_expr_val(v, scoped_eval_params);
                                     // Check if target parameter is real or implicit real
@@ -10495,6 +10679,27 @@ fn inline_module_items(
                                             _ => None,
                                         }));
                                 }
+                                if let Some(ParamValue::Type(dt)) = value {
+                                    if let Some(p_decl) = sub_param_decls.get(i) {
+                                        if let ParameterKind::Type { assignments } = &p_decl.kind {
+                                            if let Some(a) = assignments.first() {
+                                                type_overrides.push((a.name.name.clone(), dt.clone()));
+                                            }
+                                        }
+                                    }
+                                }
+                                if let Some(ParamValue::Expr(v)) = value {
+                                    if let Some(p_decl) = sub_param_decls.get(i) {
+                                        if let ParameterKind::Type { assignments } = &p_decl.kind {
+                                            if let Some(a) = assignments.first() {
+                                                if let Some(dt) = expr_as_type_ref(v) {
+                                                    type_overrides.push((a.name.name.clone(), dt));
+                                                    continue;
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(ParamValue::Expr(v)) = value {
                                     if let Some(p_decl) = sub_param_decls.get(i) {
                                         if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
@@ -10522,40 +10727,78 @@ fn inline_module_items(
                 // Moved (was clone): sub_params is not used after this line.
                 let mut sub_local_params = sub_params;
 
-                // Helper to add parameters from a list of items
+                // Bind collected TYPE parameter overrides as scoped typedefs
+                // for the duration of this instance's inlining (including the
+                // recursion into ITS sub-instances, so `.T(type_t)` chains
+                // resolve). Prior same-named entries saved for restore.
+                let mut saved_type_binds: Vec<(String, Option<u32>, Option<DataType>)> = Vec::new();
+                for (tp_name, tp_dt) in &type_overrides {
+                    let resolved_dt =
+                        resolve_typedef_chain(tp_dt, &elab.typedef_types).clone();
+                    let w = resolve_type_width(
+                        &resolved_dt,
+                        Some(scoped_eval_params),
+                        Some(&elab.typedefs),
+                    );
+                    saved_type_binds.push((
+                        tp_name.clone(),
+                        elab.typedefs.get(tp_name).copied(),
+                        elab.typedef_types.get(tp_name).cloned(),
+                    ));
+                    elab.typedefs.insert(tp_name.clone(), w);
+                    elab.typedef_types.insert(tp_name.clone(), resolved_dt);
+                }
+
+                // Helper to add parameters from a list of items.
+                //
+                // Iterated to a FIXPOINT: `collect_effective_items` expands a
+                // generate-for using the params it is handed, so a loop whose
+                // bound is a same-scope localparam (e.g. rr_arb_tree's
+                // `localparam NumLevels = $clog2(NumIn);` then
+                // `for (level < NumLevels) ... localparam Idx0 = 2**level-1+l;`)
+                // does NOT expand on the first pass — NumLevels isn't in the map
+                // yet — so the per-iteration Idx0 localparams never get
+                // registered and read X, collapsing every `assign vec[Idx0]` to
+                // bit 0 (floo_router forwarding loss). Re-running after NumLevels
+                // is bound lets the loop expand and its body localparams resolve.
                 let add_params_from_items = |items: &[ModuleItem], local_map: &mut HashMap<String, Value>, elab_ro: &ElaboratedModule| {
-                    let effective_items = collect_effective_items(items, local_map);
-                    for item in &effective_items {
-                        if let ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) = item {
-                            if let ParameterKind::Data { data_type, assignments } = &pd.kind {
-                                for assign in assignments {
-                                    if !local_map.contains_key(&assign.name.name) {
-                                        if let Some(init) = &assign.init {
-                                            // §13.4.3 const-function calls.
-                                            let subbed_init;
-                                            let init: &Expression = if expr_has_call(init) {
-                                                match substitute_const_fn_calls(init, local_map, elab_ro, 0)
-                                                    .filter(|e| !expr_has_call(e))
-                                                {
-                                                    Some(e) => { subbed_init = e; &subbed_init }
-                                                    None => init,
-                                                }
-                                            } else {
-                                                init
-                                            };
-                                            let mut val = eval_const_expr_val(init, local_map);
-                                            if is_type_real(data_type) {
-                                                val = Value::from_f64(val.to_f64());
-                                            } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                                                && val.is_real {
+                    for _ in 0..64 {
+                        let before = local_map.len();
+                        let effective_items = collect_effective_items(items, local_map);
+                        for item in &effective_items {
+                            if let ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) = item {
+                                if let ParameterKind::Data { data_type, assignments } = &pd.kind {
+                                    for assign in assignments {
+                                        if !local_map.contains_key(&assign.name.name) {
+                                            if let Some(init) = &assign.init {
+                                                // §13.4.3 const-function calls.
+                                                let subbed_init;
+                                                let init: &Expression = if expr_has_call(init) {
+                                                    match substitute_const_fn_calls(init, local_map, elab_ro, 0)
+                                                        .filter(|e| !expr_has_call(e))
+                                                    {
+                                                        Some(e) => { subbed_init = e; &subbed_init }
+                                                        None => init,
+                                                    }
+                                                } else {
+                                                    init
+                                                };
+                                                let mut val = eval_const_expr_val(init, local_map);
+                                                if is_type_real(data_type) {
                                                     val = Value::from_f64(val.to_f64());
+                                                } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                                                    if val.is_real {
+                                                        val = Value::from_f64(val.to_f64());
+                                                    }
                                                 }
-                                            local_map.insert(assign.name.name.clone(), val);
+                                                local_map.insert(assign.name.name.clone(), val);
+                                            }
                                         }
                                     }
                                 }
                             }
                         }
+                        if local_map.len() == before { break; }
                     }
                 };
 
@@ -10734,6 +10977,41 @@ fn inline_module_items(
                     }
                     m
                 };
+
+                // Bind NON-overridden `parameter type` DEFAULTS as scoped
+                // typedefs, resolving their width against the sub-instance's
+                // params. rr_arb_tree declares
+                //   parameter type idx_t = logic [IdxWidth-1:0]
+                // and never overrides it, so without this idx_t (used for
+                // rr_q/idx_o/index_nodes) falls back to the 32-bit default —
+                // the index-node concatenations then truncate and idx_o reads 0,
+                // so the wormhole arbiter selects the wrong input and the router
+                // drops the flit. Uses sub_merged_params (has IdxWidth), unlike
+                // the override pass above which only sees parent params. Prior
+                // typedef entries are saved to the same list for restore.
+                let overridden_type_names: std::collections::HashSet<&str> =
+                    type_overrides.iter().map(|(n, _)| n.as_str()).collect();
+                for p_decl in sub_mod.params() {
+                    if let ParameterKind::Type { assignments } = &p_decl.kind {
+                        for a in assignments {
+                            if overridden_type_names.contains(a.name.name.as_str()) { continue; }
+                            let Some(def_dt) = &a.init else { continue; };
+                            let resolved_dt = resolve_typedef_chain(def_dt, &elab.typedef_types).clone();
+                            let w = resolve_type_width(
+                                &resolved_dt,
+                                Some(&sub_merged_params),
+                                Some(&elab.typedefs),
+                            );
+                            saved_type_binds.push((
+                                a.name.name.clone(),
+                                elab.typedefs.get(&a.name.name).copied(),
+                                elab.typedef_types.get(&a.name.name).cloned(),
+                            ));
+                            elab.typedefs.insert(a.name.name.clone(), w);
+                            elab.typedef_types.insert(a.name.name.clone(), resolved_dt);
+                        }
+                    }
+                }
                 match sub_mod.ports() {
                     PortList::Ansi(ports) => {
                         for port in ports {
@@ -11296,6 +11574,19 @@ fn inline_module_items(
 
                 // Recurse into sub-module instantiations
                 inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache)?;
+
+                // Restore typedef entries shadowed by this instance's TYPE
+                // parameter overrides.
+                for (tp_name, prev_w, prev_dt) in saved_type_binds {
+                    match prev_w {
+                        Some(w) => { elab.typedefs.insert(tp_name.clone(), w); }
+                        None => { elab.typedefs.remove(&tp_name); }
+                    }
+                    match prev_dt {
+                        Some(dt) => { elab.typedef_types.insert(tp_name, dt); }
+                        None => { elab.typedef_types.remove(&tp_name); }
+                    }
+                }
             }
         }
     }
