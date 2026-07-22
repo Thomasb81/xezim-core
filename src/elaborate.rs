@@ -2089,14 +2089,25 @@ pub fn elaborate_module_with_defs(
                 let mut val = if let Some(override_val) = param_overrides.get(&assign.name.name) {
                     override_val.clone()
                 } else if let Some(init) = &assign.init {
+                    let subbed_init3;
+                    let init_eval: &Expression = if expr_has_call(init) {
+                        match substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
+                            .filter(|e| !expr_has_call(e))
+                        {
+                            Some(e) => { subbed_init3 = e; &subbed_init3 }
+                            None => init,
+                        }
+                    } else {
+                        init
+                    };
                     let mut v = if is_struct_param {
                         pack_struct_const_value(
-                            data_type, init, &elab.parameters,
+                            data_type, init_eval, &elab.parameters,
                             &elab.typedefs, &elab.typedef_types)
                         .map(|sv| sv.resize(width))
-                        .unwrap_or_else(|| eval_init_for_width(init, &elab.parameters, width))
+                        .unwrap_or_else(|| eval_init_for_width(init_eval, &elab.parameters, width))
                     } else {
-                        eval_init_for_width(init, &elab.parameters, width)
+                        eval_init_for_width(init_eval, &elab.parameters, width)
                     };
                     if signed { v.is_signed = true; }
                     v
@@ -2225,6 +2236,15 @@ pub fn elaborate_module_with_defs(
 
     // Process items
     if let Definition::Package(p) = module {
+        // §13.4.3: package functions first, so a package parameter whose
+        // initializer calls a sizing helper const-evaluates.
+        for item in &p.items {
+            if let crate::ast::decl::PackageItem::Function(fd) = item {
+                elab.functions
+                    .entry(fd.name.name.name.clone())
+                    .or_insert_with(|| fd.clone());
+            }
+        }
         for item in &p.items {
             match item {
                 crate::ast::decl::PackageItem::Typedef(td) => {
@@ -2257,7 +2277,20 @@ pub fn elaborate_module_with_defs(
                                     width
                                 };
                                 width = eff_width;
-                                let mut v = eval_init_for_width(init, &elab.parameters, eff_width);
+                                // §13.4.3 const-function calls in package
+                                // parameter initializers.
+                                let subbed_init5;
+                                let init_eval: &Expression = if expr_has_call(init) {
+                                    match substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
+                                        .filter(|e| !expr_has_call(e))
+                                    {
+                                        Some(e) => { subbed_init5 = e; &subbed_init5 }
+                                        None => init,
+                                    }
+                                } else {
+                                    init
+                                };
+                                let mut v = eval_init_for_width(init_eval, &elab.parameters, eff_width);
                                 if is_signed { v.is_signed = true; }
                                 elab.parameters.insert(assign.name.name.clone(), v);
                             }
@@ -3420,10 +3453,25 @@ pub fn elaborate_module_with_defs(
                             elab.parameters.get(&assign.name.name).cloned().unwrap_or(Value::zero(current_width))
                         } else if let Some(init) = &assign.init {
                             if expr_has_call(init) {
+                                // §13.4.3: try to CONST-EVALUATE the calls
+                                // (LOG2-style sizing helpers) right now —
+                                // deferring leaves the parameter 0 during
+                                // elaboration, so every dependent width
+                                // wraps ([LOG_X-6-1:0] → 4-billion-bit bus
+                                // collapsed to 1 bit).
+                                if let Some(subbed) =
+                                    substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
+                                        .filter(|e| !expr_has_call(e))
+                                {
+                                    let mut v = eval_init_for_width(&subbed, &elab.parameters, current_width);
+                                    if current_signed { v.is_signed = true; }
+                                    v
+                                } else {
                                 elab.deferred_param_exprs.push((assign.name.name.clone(), init.clone()));
                                 let mut v = Value::zero(current_width);
                                 if current_signed { v.is_signed = true; }
                                 v
+                                }
                             } else {
                                 let mut v = if is_struct_param {
                                     pack_struct_const_value(
@@ -6140,7 +6188,21 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                         continue;
                                     }
                                 }
-                                let mut v = eval_init_for_width(init, &elab.parameters, width);
+                                // §13.4.3 const-function calls (log2-style
+                                // sizing helpers): substitute before eval so
+                                // dependent declaration widths don't wrap.
+                                let subbed_init4;
+                                let init_eval: &Expression = if expr_has_call(init) {
+                                    match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                                        .filter(|e| !expr_has_call(e))
+                                    {
+                                        Some(e) => { subbed_init4 = e; &subbed_init4 }
+                                        None => init,
+                                    }
+                                } else {
+                                    init
+                                };
+                                let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
                                 if signed { v.is_signed = true; }
                                 v
                             } else { Value::zero(width) };
@@ -8353,6 +8415,15 @@ pub fn inline_instantiations(
                 // so repeating is safe and the side-effecting Data initializers in
                 // the main pass below run exactly once. Three passes cover the
                 // chains here (max_cfgs → lg_max_cfgs → enum width → member values).
+                // §13.4.3: package sizing functions must be visible to the
+                // parameter passes below.
+                for item in &p.items {
+                    if let crate::ast::decl::PackageItem::Function(fd) = item {
+                        elab.functions
+                            .entry(fd.name.name.name.clone())
+                            .or_insert_with(|| fd.clone());
+                    }
+                }
                 for _ in 0..3 {
                     for item in &p.items {
                         match item {
@@ -8368,6 +8439,18 @@ pub fn inline_instantiations(
                                         } else { base_width };
                                         register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
                                         if let Some(init) = &assign.init {
+                                            // §13.4.3 const-function calls.
+                                            let subbed_init6;
+                                            let init: &Expression = if expr_has_call(init) {
+                                                match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                                                    .filter(|e| !expr_has_call(e))
+                                                {
+                                                    Some(e) => { subbed_init6 = e; &subbed_init6 }
+                                                    None => init,
+                                                }
+                                            } else {
+                                                init
+                                            };
                                             let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                             if is_signed { v.is_signed = true; }
                                             elab.parameters.insert(assign.name.name.clone(), v);
@@ -10316,7 +10399,7 @@ fn inline_module_items(
                 let mut sub_local_params = sub_params;
                 
                 // Helper to add parameters from a list of items
-                let add_params_from_items = |items: &[ModuleItem], local_map: &mut HashMap<String, Value>| {
+                let add_params_from_items = |items: &[ModuleItem], local_map: &mut HashMap<String, Value>, elab_ro: &ElaboratedModule| {
                     let effective_items = collect_effective_items(items, local_map);
                     for item in &effective_items {
                         if let ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) = item {
@@ -10324,6 +10407,18 @@ fn inline_module_items(
                                 for assign in assignments {
                                     if !local_map.contains_key(&assign.name.name) {
                                         if let Some(init) = &assign.init {
+                                            // §13.4.3 const-function calls.
+                                            let subbed_init;
+                                            let init: &Expression = if expr_has_call(init) {
+                                                match substitute_const_fn_calls(init, local_map, elab_ro, 0)
+                                                    .filter(|e| !expr_has_call(e))
+                                                {
+                                                    Some(e) => { subbed_init = e; &subbed_init }
+                                                    None => init,
+                                                }
+                                            } else {
+                                                init
+                                            };
                                             let mut val = eval_const_expr_val(init, local_map);
                                             if is_type_real(data_type) {
                                                 val = Value::from_f64(val.to_f64());
@@ -10341,6 +10436,16 @@ fn inline_module_items(
                     }
                 };
 
+                // §13.4.3: register the sub-module's function declarations
+                // BEFORE the parameter passes so `parameter LOG_X = log2(X)`
+                // const-evaluates instead of collapsing to 0.
+                for it in sub_mod.items() {
+                    if let ModuleItem::FunctionDeclaration(fd) = it {
+                        elab.functions
+                            .entry(fd.name.name.name.clone())
+                            .or_insert_with(|| fd.clone());
+                    }
+                }
                 // 1. Parameters from port list
                 for p_decl in sub_mod.params() {
                     if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
@@ -10417,7 +10522,22 @@ fn inline_module_items(
                                     if let Some(fields) = flatten_struct_fields(data_type, &sub_local_params, &elab.typedefs, &elab.typedef_types) {
                                         if !fields.is_empty() { tls_register_struct_layout(&assign.name.name, &fields); }
                                     }
-                                    let mut val = eval_const_expr_val(init, &sub_local_params);
+                                    // §13.4.3 const-function calls in the
+                                    // initializer: substitute before eval —
+                                    // otherwise the call yields 0 and every
+                                    // dependent width wraps.
+                                    let subbed_init2;
+                                    let init_eval: &Expression = if expr_has_call(init) {
+                                        match substitute_const_fn_calls(init, &sub_local_params, elab, 0)
+                                            .filter(|e| !expr_has_call(e))
+                                        {
+                                            Some(e) => { subbed_init2 = e; &subbed_init2 }
+                                            None => init,
+                                        }
+                                    } else {
+                                        init
+                                    };
+                                    let mut val = eval_const_expr_val(init_eval, &sub_local_params);
                                     if is_type_real(data_type) {
                                         val = Value::from_f64(val.to_f64());
                                     } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
@@ -10457,7 +10577,7 @@ fn inline_module_items(
                 }
 
                 // 2. Parameters from module items
-                add_params_from_items(sub_mod.items(), &mut sub_local_params);
+                add_params_from_items(sub_mod.items(), &mut sub_local_params, elab);
 
                 let prepared_sub = prepare_module_items(sub_mod, definitions, &sub_local_params, &elab.typedefs, cache);
 
@@ -11312,6 +11432,380 @@ fn make_syscall(name: &str, args: Vec<Expression>, span: Span) -> Expression {
 /// Only whole-net drivers (`assign w = ...`) participate; a driver of a slice
 /// (`assign w[3:0] = ...`) is left alone, and variables are untouched — they
 /// legitimately have one driver.
+/// Elaboration-time evaluation of a call to a SIMPLE user function over
+/// constant arguments (IEEE 1800-2017 §13.4.3 constant functions): the usual
+/// `LOG2`/ceil-log style helpers that size ports and parameters. Interprets
+/// blocking assigns, if/else, for/while (bounded), and return over a locals
+/// map; anything else (waits, tasks, hierarchical refs) bails to None. A
+/// parameter initializer that calls one of these used to be DEFERRED with
+/// value 0 — every dependent parameter and port width then wrapped
+/// (`LOG_X - 6` → 4294967290) and whole buses collapsed to 1 bit.
+fn eval_const_user_function(
+    fd: &FunctionDeclaration,
+    arg_vals: &[Value],
+    elab: &ElaboratedModule,
+    depth: u32,
+) -> Option<Value> {
+    if depth > 64 {
+        return None;
+    }
+    let fname = fd.name.name.name.clone();
+    let mut locals: HashMap<String, Value> = elab.parameters.clone();
+    for (i, port) in fd.ports.iter().enumerate() {
+        locals.insert(
+            port.name.name.clone(),
+            arg_vals.get(i).cloned().unwrap_or_else(|| Value::zero(32)),
+        );
+    }
+    // The implicit return variable.
+    locals.insert(fname.clone(), Value::zero(32));
+
+    enum Flow {
+        Normal,
+        Returned,
+    }
+    fn exec_stmt(
+        stmt: &Statement,
+        locals: &mut HashMap<String, Value>,
+        fname: &str,
+        elab: &ElaboratedModule,
+        depth: u32,
+        fuel: &mut u32,
+    ) -> Option<Flow> {
+        if *fuel == 0 {
+            return None;
+        }
+        *fuel -= 1;
+        use crate::ast::stmt::StatementKind as SK;
+        match &stmt.kind {
+            SK::Null => Some(Flow::Normal),
+            SK::SeqBlock { stmts, .. } => {
+                for st in stmts {
+                    match exec_stmt(st, locals, fname, elab, depth, fuel)? {
+                        Flow::Returned => return Some(Flow::Returned),
+                        Flow::Normal => {}
+                    }
+                }
+                Some(Flow::Normal)
+            }
+            SK::VarDecl { declarators, .. } => {
+                for d in declarators {
+                    let v = match &d.init {
+                        Some(e) => eval_fn_expr(e, locals, elab, depth)?,
+                        None => Value::zero(32),
+                    };
+                    locals.insert(d.name.name.clone(), v);
+                }
+                Some(Flow::Normal)
+            }
+            SK::BlockingAssign { lvalue, rvalue } => {
+                let name = match &lvalue.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        h.path[0].name.name.clone()
+                    }
+                    _ => return None,
+                };
+                let v = eval_fn_expr(rvalue, locals, elab, depth)?;
+                locals.insert(name, v);
+                Some(Flow::Normal)
+            }
+            SK::If { condition, then_stmt, else_stmt, .. } => {
+                let c = eval_fn_expr(condition, locals, elab, depth)?;
+                if c.is_true() {
+                    exec_stmt(then_stmt, locals, fname, elab, depth, fuel)
+                } else if let Some(e) = else_stmt {
+                    exec_stmt(e, locals, fname, elab, depth, fuel)
+                } else {
+                    Some(Flow::Normal)
+                }
+            }
+            SK::For { init, condition, step, body } => {
+                for fi in init {
+                    match fi {
+                        crate::ast::stmt::ForInit::VarDecl { name, init: e, .. } => {
+                            let v = eval_fn_expr(e, locals, elab, depth)?;
+                            locals.insert(name.name.clone(), v);
+                        }
+                        crate::ast::stmt::ForInit::Assign { lvalue, rvalue } => {
+                            let name = match &lvalue.kind {
+                                ExprKind::Ident(h)
+                                    if h.path.len() == 1
+                                        && h.path[0].selects.is_empty() =>
+                                {
+                                    h.path[0].name.name.clone()
+                                }
+                                _ => return None,
+                            };
+                            let v = eval_fn_expr(rvalue, locals, elab, depth)?;
+                            locals.insert(name, v);
+                        }
+                    }
+                }
+                loop {
+                    if let Some(c) = condition {
+                        if !eval_fn_expr(c, locals, elab, depth)?.is_true() {
+                            break;
+                        }
+                    } else {
+                        return None; // unbounded
+                    }
+                    match exec_stmt(body, locals, fname, elab, depth, fuel)? {
+                        Flow::Returned => return Some(Flow::Returned),
+                        Flow::Normal => {}
+                    }
+                    // step entries are EXPRESSIONS: `i++`, `i = i + 1`.
+                    for st in step {
+                        step_expr(st, locals, elab, depth)?;
+                    }
+                    if *fuel == 0 {
+                        return None;
+                    }
+                }
+                Some(Flow::Normal)
+            }
+            SK::While { condition, body } => {
+                loop {
+                    if !eval_fn_expr(condition, locals, elab, depth)?.is_true() {
+                        break;
+                    }
+                    match exec_stmt(body, locals, fname, elab, depth, fuel)? {
+                        Flow::Returned => return Some(Flow::Returned),
+                        Flow::Normal => {}
+                    }
+                    if *fuel == 0 {
+                        return None;
+                    }
+                }
+                Some(Flow::Normal)
+            }
+            SK::Return(e) => {
+                if let Some(e) = e {
+                    let v = eval_fn_expr(e, locals, elab, depth)?;
+                    locals.insert(fname.to_string(), v);
+                }
+                Some(Flow::Returned)
+            }
+            // Expression statements with side-effect ops (i++ in step position
+            // arrives here as Expr) — support inc/dec on locals.
+            SK::Expr(e) => {
+                if let ExprKind::Unary { op, operand } = &e.kind {
+                    use crate::ast::expr::UnaryOp;
+                    if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr | UnaryOp::PostDecr | UnaryOp::PreDecr) {
+                        if let ExprKind::Ident(h) = &operand.kind {
+                            if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                                let n = h.path[0].name.name.clone();
+                                let cur = locals.get(&n)?.to_i64().unwrap_or(0);
+                                let nv = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { cur + 1 } else { cur - 1 };
+                                locals.insert(n, Value::from_u64(nv as u64, 32));
+                                return Some(Flow::Normal);
+                            }
+                        }
+                    }
+                }
+                // Any OTHER expression statement is presumed side-effecting
+                // (part-select inc/dec, assignment-expression on a select…):
+                // bail so the parameter defers instead of silently dropping
+                // the effect.
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn step_expr(
+        e: &Expression,
+        locals: &mut HashMap<String, Value>,
+        elab: &ElaboratedModule,
+        depth: u32,
+    ) -> Option<()> {
+        use crate::ast::expr::UnaryOp;
+        match &e.kind {
+            ExprKind::Unary { op, operand }
+                if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr | UnaryOp::PostDecr | UnaryOp::PreDecr) =>
+            {
+                if let ExprKind::Ident(h) = &operand.kind {
+                    if h.path.len() == 1 && h.path[0].selects.is_empty() {
+                        let n = h.path[0].name.name.clone();
+                        let cur = locals.get(&n)?.to_i64().unwrap_or(0);
+                        let nv = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { cur + 1 } else { cur - 1 };
+                        locals.insert(n, Value::from_u64(nv as u64, 32));
+                        return Some(());
+                    }
+                }
+                None
+            }
+            ExprKind::Binary { op: crate::ast::expr::BinaryOp::Assign, left, right }
+            | ExprKind::AssignExpr { lvalue: left, rvalue: right } => {
+                if let ExprKind::Ident(h) = &left.kind {
+                    if h.path.len() == 1 {
+                        let n = h.path[0].name.name.clone();
+                        let v = eval_fn_expr(right, locals, elab, depth)?;
+                        locals.insert(n, v);
+                        return Some(());
+                    }
+                }
+                None
+            }
+            _ => None,
+        }
+    }
+
+    fn eval_fn_expr(
+        e: &Expression,
+        locals: &HashMap<String, Value>,
+        elab: &ElaboratedModule,
+        depth: u32,
+    ) -> Option<Value> {
+        if !const_fn_expr_supported(e) {
+            return None;
+        }
+        // Nested calls: substitute first, then const-eval.
+        let subbed = substitute_const_fn_calls(e, locals, elab, depth + 1)?;
+        if expr_has_call(&subbed) {
+            return None;
+        }
+        Some(eval_const_expr_val(&subbed, locals))
+    }
+
+    let mut fuel: u32 = 100_000;
+    for st in &fd.items {
+        match exec_stmt(st, &mut locals, &fname, elab, depth, &mut fuel)? {
+            Flow::Returned => break,
+            Flow::Normal => {}
+        }
+    }
+    locals.remove(&fname)
+}
+
+    /// STRICT support check: only expression shapes we KNOW
+/// eval_const_expr_val computes faithfully. Anything else (size casts,
+/// part-selects, side-effect operators, unknown system calls) bails the
+/// whole const-fn evaluation so the parameter falls back to sim-time
+/// deferral rather than silently computing a wrong value.
+fn const_fn_expr_supported(e: &Expression) -> bool {
+    use crate::ast::expr::{BinaryOp, UnaryOp};
+    match &e.kind {
+        ExprKind::Number(_) => true,
+        ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].selects.is_empty(),
+        ExprKind::Paren(i) => const_fn_expr_supported(i),
+        ExprKind::Unary { op, operand } => !matches!(
+            op,
+            UnaryOp::PreIncr | UnaryOp::PostIncr | UnaryOp::PreDecr | UnaryOp::PostDecr
+        ) && const_fn_expr_supported(operand),
+        ExprKind::Binary { op, left, right } => {
+            !matches!(op, BinaryOp::Assign)
+                && const_fn_expr_supported(left)
+                && const_fn_expr_supported(right)
+        }
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            const_fn_expr_supported(condition)
+                && const_fn_expr_supported(then_expr)
+                && const_fn_expr_supported(else_expr)
+        }
+        ExprKind::Call { args, .. } => args.iter().all(|a| const_fn_expr_supported(a)),
+        ExprKind::SystemCall { name, args } => {
+            matches!(name.as_str(), "$clog2" | "$bits")
+                && args.iter().all(|a| const_fn_expr_supported(a))
+        }
+        _ => false,
+    }
+}
+
+
+/// Rewrite `expr`, replacing each call to a KNOWN simple user function with the
+/// literal it evaluates to (arguments const-evaluated against `params`).
+/// Returns None when a call can't be resolved — callers then fall back to
+/// the old deferral behavior.
+fn substitute_const_fn_calls(
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    elab: &ElaboratedModule,
+    depth: u32,
+) -> Option<Expression> {
+    if depth > 64 {
+        return None;
+    }
+    let rebuild = |k: ExprKind| Expression::new(k, expr.span);
+    let sub = |e: &Expression| substitute_const_fn_calls(e, params, elab, depth);
+    Some(match &expr.kind {
+        ExprKind::Call { func, args } => {
+            let fname = match &func.kind {
+                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone())?,
+                _ => return None,
+            };
+            let fd = elab.functions.get(&fname)?.clone();
+            let mut argv = Vec::with_capacity(args.len());
+            for a in args {
+                if !const_fn_expr_supported(a) {
+                    return None;
+                }
+                let sa = sub(a)?;
+                if expr_has_call(&sa) {
+                    return None;
+                }
+                argv.push(eval_const_expr_val(&sa, params));
+            }
+            let v = eval_const_user_function(&fd, &argv, elab, depth)?;
+            let iv = v.to_i64()?;
+            make_i64_literal(iv, expr.span)
+        }
+        ExprKind::Binary { op, left, right } => rebuild(ExprKind::Binary {
+            op: *op,
+            left: Box::new(sub(left)?),
+            right: Box::new(sub(right)?),
+        }),
+        ExprKind::Unary { op, operand } => rebuild(ExprKind::Unary {
+            op: *op,
+            operand: Box::new(sub(operand)?),
+        }),
+        ExprKind::Paren(inner) => rebuild(ExprKind::Paren(Box::new(sub(inner)?))),
+        ExprKind::Conditional { condition, then_expr, else_expr } => rebuild(ExprKind::Conditional {
+            condition: Box::new(sub(condition)?),
+            then_expr: Box::new(sub(then_expr)?),
+            else_expr: Box::new(sub(else_expr)?),
+        }),
+        ExprKind::Concatenation(items) => rebuild(ExprKind::Concatenation(
+            items.iter().map(|i| sub(i)).collect::<Option<Vec<_>>>()?,
+        )),
+        ExprKind::Replication { count, exprs } => rebuild(ExprKind::Replication {
+            count: Box::new(sub(count)?),
+            exprs: exprs.iter().map(|i| sub(i)).collect::<Option<Vec<_>>>()?,
+        }),
+        ExprKind::SystemCall { name, args } => rebuild(ExprKind::SystemCall {
+            name: name.clone(),
+            args: args.iter().map(|i| sub(i)).collect::<Option<Vec<_>>>()?,
+        }),
+        // Leaves (idents, numbers, strings, …): unchanged.
+        _ => expr.clone(),
+    })
+}
+
+/// A signed decimal literal expression for elaboration-substituted values.
+fn make_i64_literal(v: i64, span: crate::ast::Span) -> Expression {
+    let (txt, neg) = if v < 0 { ((-v).to_string(), true) } else { (v.to_string(), false) };
+    let num = Expression::new(
+        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+            size: None,
+            signed: true,
+            base: crate::ast::expr::NumberBase::Decimal,
+            value: txt,
+            cached_val: std::cell::Cell::new(None),
+        }),
+        span,
+    );
+    if neg {
+        Expression::new(
+            ExprKind::Unary {
+                op: crate::ast::expr::UnaryOp::Minus,
+                operand: Box::new(num),
+            },
+            span,
+        )
+    } else {
+        num
+    }
+}
+
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     let mut counts: HashMap<String, usize> = HashMap::default();
     for ca in &elab.continuous_assigns {
@@ -12061,6 +12555,18 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             signed = true;
                                         }
                                         let v = if let Some(init) = &assign.init {
+                                            // §13.4.3 const-function calls.
+                                            let subbed_init7;
+                                            let init: &Expression = if expr_has_call(init) {
+                                                match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                                                    .filter(|e| !expr_has_call(e))
+                                                {
+                                                    Some(e) => { subbed_init7 = e; &subbed_init7 }
+                                                    None => init,
+                                                }
+                                            } else {
+                                                init
+                                            };
                                             let mut v = eval_init_for_width(init, &elab.parameters, width);
                                             if signed { v.is_signed = true; }
                                             if is_real { v = Value::from_f64(v.to_f64()); }
@@ -12181,6 +12687,15 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                 }
             } else {
                 // Wildcard import
+                // §13.4.3: package sizing functions must be registered before
+                // the parameters that call them are evaluated.
+                for pi in &pkg.items {
+                    if let PackageItem::Function(fd) = pi {
+                        elab.functions
+                            .entry(fd.name.name.name.clone())
+                            .or_insert_with(|| fd.clone());
+                    }
+                }
                 for pi in &pkg.items {
                     match pi {
                         PackageItem::Parameter(pd) => {
@@ -12202,6 +12717,18 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                     } else { base_width };
                                     register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
                                     if let Some(init) = &assign.init {
+                                        // §13.4.3 const-function calls.
+                                        let subbed_init8;
+                                        let init: &Expression = if expr_has_call(init) {
+                                            match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                                                .filter(|e| !expr_has_call(e))
+                                            {
+                                                Some(e) => { subbed_init8 = e; &subbed_init8 }
+                                                None => init,
+                                            }
+                                        } else {
+                                            init
+                                        };
                                         let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                         if signed { v.is_signed = true; }
                                         if is_real { v = Value::from_f64(v.to_f64()); }
