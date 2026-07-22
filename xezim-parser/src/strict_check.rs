@@ -33,7 +33,7 @@ pub fn strict_violations(descriptions: &[Description]) -> Vec<String> {
             Description::Package(p) => walk_package_items(&p.items, &mut out),
             Description::Class(c) => walk_class_items(&c.items, &mut out),
             Description::PackageItem(pi) => walk_package_item(pi, &mut out),
-            _ => {}
+            _ => { }
         }
     }
     // §6.20.2 / §23.10: a named parameter override must name an *overridable*
@@ -144,7 +144,6 @@ fn walk_class_items(items: &[ClassItem], out: &mut Vec<String>) {
                 | ClassMethodKind::PureVirtual(fd)
                 | ClassMethodKind::Extern(fd) => check_function(fd, out),
                 ClassMethodKind::Task(td) => check_task(td, out),
-                _ => {}
             }
         }
     }

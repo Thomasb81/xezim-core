@@ -96,6 +96,12 @@ pub struct PinDelay {
     pub fall: u64,
 }
 
+impl Default for SdfAnnotation {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl SdfAnnotation {
     pub fn new() -> Self {
         Self { signal_delays: HashMap::new(), pin_delays: HashMap::new() }
@@ -431,7 +437,7 @@ pub fn annotate_sdf(
                     *existing = (*existing).max(max_delay);
 
                     // Store per-pin delay
-                    annotation.pin_delays.entry(out_signal).or_insert_with(Vec::new)
+                    annotation.pin_delays.entry(out_signal).or_default()
                         .push(PinDelay { input_pin: in_pin, rise: rise_ticks, fall: fall_ticks });
                 }
                 SdfDelay::Interconnect { source: _, dest, rise, fall } => {
@@ -505,6 +511,7 @@ mod tests {
         let sdf = parse_sdf(sdf_content).unwrap();
         let ann = annotate_sdf(&sdf, 1e-9, DelaySelect::Typ);
         // 0.25ns max(rise=0.2, fall=0.25) in 1ns timescale → rounds to 0 ticks
+        assert_eq!(ann.get_delay("top.buf1.X"), 0);
         // With ps timescale (1e-12), 0.25ns = 250ps = 250 ticks
         let ann_ps = annotate_sdf(&sdf, 1e-12, DelaySelect::Typ);
         assert_eq!(ann_ps.get_delay("top.buf1.X"), 250);

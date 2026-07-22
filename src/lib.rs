@@ -76,7 +76,7 @@ pub fn xez_bincode_options() -> impl bincode::Options + Copy {
 }
 
 fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
-    if &file_magic[..7] == &XEZIM_BYTECODE_MAGIC[..7] && file_magic[7] != XEZIM_BYTECODE_MAGIC[7] {
+    if file_magic[..7] == XEZIM_BYTECODE_MAGIC[..7] && file_magic[7] != XEZIM_BYTECODE_MAGIC[7] {
         Some(format!(
             "incompatible xezim artifact version (file v{}, expected v{}); recompile with current xezim",
             file_magic[7], XEZIM_BYTECODE_MAGIC[7]
@@ -340,7 +340,7 @@ pub fn parse_and_elaborate_multi(
     }
 
     for (i, source) in sources.iter().enumerate() {
-        let source_path = source_files.get(i).map(|p| std::path::PathBuf::from(p));
+        let source_path = source_files.get(i).map(std::path::PathBuf::from);
         // Mark a new compilation file so a `timescale that stuck across from a
         // prior file is treated as inherited (overridable by --module-timescale)
         // rather than declared here.
@@ -764,7 +764,7 @@ fn parse_and_elaborate(
         }
     }
 
-    let named_top_found = top_module_name.map_or(false, |n| definitions.contains_key(n));
+    let named_top_found = top_module_name.is_some_and(|n| definitions.contains_key(n));
     if let (Some(name), true) = (top_module_name, named_top_found) {
         top_module = Some(name.to_string());
     } else {
@@ -804,7 +804,7 @@ fn parse_and_elaborate(
         // candidate-based heuristic. Otherwise fall through to the heuristic
         // and rely on `candidates.sort()` for determinism.
         let parse_pick_valid = top_module.as_ref()
-            .map_or(false, |n| candidates.iter().any(|c| c == n));
+            .is_some_and(|n| candidates.iter().any(|c| c == n));
         if parse_pick_valid {
             // Keep top_module as-is — deterministic via source order.
         } else if candidates.len() == 1 {
@@ -833,23 +833,23 @@ fn parse_and_elaborate(
     let def_refs: crate::hasher::HashMap<String, elaborate::Definition> =
         definitions.iter().filter_map(|(k, v)| {
             let def = match v {
-                SourceDefinition::Module(m) => elaborate::Definition::Module(&**m),
-                SourceDefinition::Interface(i) => elaborate::Definition::Interface(&**i),
-                SourceDefinition::Program(p) => elaborate::Definition::Program(&**p),
-                SourceDefinition::Class(c) => elaborate::Definition::Class(&**c),
-                SourceDefinition::Package(p) => elaborate::Definition::Package(&**p),
-                SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(&**t),
-                SourceDefinition::Udp(u) => elaborate::Definition::Udp(&**u),
+                SourceDefinition::Module(m) => elaborate::Definition::Module(m),
+                SourceDefinition::Interface(i) => elaborate::Definition::Interface(i),
+                SourceDefinition::Program(p) => elaborate::Definition::Program(p),
+                SourceDefinition::Class(c) => elaborate::Definition::Class(c),
+                SourceDefinition::Package(p) => elaborate::Definition::Package(p),
+                SourceDefinition::Typedef(t) => elaborate::Definition::Typedef(t),
+                SourceDefinition::Udp(u) => elaborate::Definition::Udp(u),
             };
             Some((k.clone(), def))
         }).collect();
 
     let elab_def = match top_def {
-        SourceDefinition::Module(m) => elaborate::Definition::Module(&**m),
-        SourceDefinition::Interface(i) => elaborate::Definition::Interface(&**i),
-        SourceDefinition::Program(p) => elaborate::Definition::Program(&**p),
-        SourceDefinition::Class(c) => elaborate::Definition::Class(&**c),
-        SourceDefinition::Package(p) => elaborate::Definition::Package(&**p),
+        SourceDefinition::Module(m) => elaborate::Definition::Module(m),
+        SourceDefinition::Interface(i) => elaborate::Definition::Interface(i),
+        SourceDefinition::Program(p) => elaborate::Definition::Program(p),
+        SourceDefinition::Class(c) => elaborate::Definition::Class(c),
+        SourceDefinition::Package(p) => elaborate::Definition::Package(p),
         _ => return Err(format!("Top-level element '{}' is not a module or program", top_name)),
     };
     let mut elab = elaborate::elaborate_module_with_defs(
