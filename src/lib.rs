@@ -46,13 +46,16 @@ pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x07 = \x06 + Value is_fill field (§5.7.1 unbased-unsized);
+/// Version byte: \x0a = \x09 + ElaboratedModule.elab_diagnostics (warm-cache
+/// diagnostic replay); \x09 = \x08 + ForeverTail StatementKind variant;
+/// \x08 = \x07 + genblk branch labels + elab implicit_nets set;
+/// \x07 = \x06 + Value is_fill field (§5.7.1 unbased-unsized);
 /// \x06 = \x05 + serialized source_files/src_file_of_module
 /// (cache-hit file:line diagnostics); \x05 = \x04 + const-NBA and branch fusion opcodes; \x04 = \x03 encoding + fused load-select opcodes
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x09";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x0a";
 
 /// zstd compression level used for `.xez` artifacts. Level 3 is zstd's own
 /// default — strong compression at high throughput. Empirically shrinks
@@ -200,6 +203,39 @@ pub fn set_implicit_net_warn(on: bool) {
 
 pub(crate) fn implicit_net_warn() -> bool {
     IMPLICIT_NET_WARN.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+// --- Elaboration diagnostic capture (for warm-cache replay) ---------------
+//
+// Elaboration emits diagnostics (implicit-net warnings, port-width lint,
+// unresolved-module notes, width-underflow) as a side effect. A warm design-
+// cache HIT skips elaboration, so those messages would silently vanish. When
+// capture is active, `elab_diag` records each message so the caller can store
+// it in the artifact and replay it on a hit. Messages are ALWAYS printed live.
+thread_local! {
+    static ELAB_DIAG_SINK: std::cell::RefCell<Option<Vec<String>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// Start capturing elaboration diagnostics (single-threaded elaboration).
+pub fn elab_diag_capture_begin() {
+    ELAB_DIAG_SINK.with(|c| *c.borrow_mut() = Some(Vec::new()));
+}
+
+/// Stop capturing and return the captured messages (empty if not capturing).
+pub fn elab_diag_capture_take() -> Vec<String> {
+    ELAB_DIAG_SINK.with(|c| c.borrow_mut().take().unwrap_or_default())
+}
+
+/// Emit an elaboration diagnostic: printed live, and recorded when capture is
+/// active so a warm cache hit can replay it.
+pub(crate) fn elab_diag(msg: String) {
+    eprintln!("{}", msg);
+    ELAB_DIAG_SINK.with(|c| {
+        if let Some(v) = c.borrow_mut().as_mut() {
+            v.push(msg);
+        }
+    });
 }
 
 pub fn set_library_cli(cfg: LibraryCli) {
@@ -1287,7 +1323,7 @@ fn resolve_library_modules(
                     f.display()
                 ));
             }
-            eprintln!("{}", line);
+            elab_diag(line);
         }
         for f in parse_issue_files.iter().take(3) {
             eprintln!(

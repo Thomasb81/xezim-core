@@ -986,6 +986,12 @@ pub struct ElaboratedModule {
     /// these — the classic signature of a dropped/unresolved vendor cell.
     #[serde(default)]
     pub implicit_nets: HashSet<String>,
+    /// Elaboration-time diagnostics (implicit-net warnings, port-width lint,
+    /// unresolved-module notes, width-underflow) captured during a cold run so
+    /// a warm design-cache HIT — which skips elaboration — can replay them
+    /// instead of silently dropping them.
+    #[serde(default)]
+    pub elab_diagnostics: Vec<String>,
     /// The design's instance tree, in elaboration order. Inlining flattens
     /// every module into this one, so without this the hierarchy is only
     /// implicit in dotted signal names — enough to resolve a name, not
@@ -1194,6 +1200,7 @@ impl ElaboratedModule {
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
             implicit_nets: HashSet::default(),
+            elab_diagnostics: Vec::new(),
             instances: Vec::new(),
             out_of_class_constraints: HashSet::default(),
             timeunit_exp: default_timeunit_exp(),
@@ -5855,11 +5862,11 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
     names_to_add.dedup();
     for name in names_to_add {
         if crate::implicit_net_warn() {
-            eprintln!(
+            crate::elab_diag(format!(
                 "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
                  (IEEE 1800-2017 §6.10, pending sub-module cont-assign). Add an explicit declaration to silence.",
                 name
-            );
+            ));
         }
         elab.signals.insert(name.clone(), Signal { is_const: false,
             name: name.clone(), width: 1, is_signed: false,
@@ -5891,11 +5898,11 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
                 ));
             }
             if crate::implicit_net_warn() {
-                eprintln!(
+                crate::elab_diag(format!(
                     "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
                      (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
                     name
-                );
+                ));
             }
             elab.signals.insert(name.clone(), Signal { is_const: false,
                 name: name.clone(), width: 1, is_signed: false,
@@ -6620,9 +6627,9 @@ fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
             } else {
                 format!(", {}", detail)
             };
-            eprintln!("[xezim][warning] packed width {} exceeds sane cap {} ({}{}); collapsing to \
+            crate::elab_diag(format!("[xezim][warning] packed width {} exceeds sane cap {} ({}{}); collapsing to \
                        {} bit — a parameter likely resolved to 0 causing an `[N-1:0]` underflow",
-                w, SANE_MAX_PACKED_WIDTH, ctx, detail_part, UNDERFLOW_WIDTH_PLACEHOLDER);
+                w, SANE_MAX_PACKED_WIDTH, ctx, detail_part, UNDERFLOW_WIDTH_PLACEHOLDER));
         }
         UNDERFLOW_WIDTH_PLACEHOLDER
     } else {
@@ -10062,7 +10069,7 @@ fn warn_port_width_mismatch(
     let key = (sub_mod_name.to_string(), port.to_string());
     let first = seen.lock().map(|mut g| g.insert(key)).unwrap_or(false);
     if first {
-        eprintln!(
+        crate::elab_diag(format!(
             "[xezim][warning] port width mismatch: module '{}' port '{}' is {} bit(s) but the \
              connection is {} bit(s) — instance '{}' (connection at source offset {}); the value \
              is truncated/extended per IEEE 1800-2017 §23.3.3. Further instances of this \
@@ -10073,7 +10080,7 @@ fn warn_port_width_mismatch(
             actual_w,
             inst_prefix.trim_end_matches('.'),
             span_off
-        );
+        ));
     }
 }
 
@@ -12209,11 +12216,11 @@ fn lower_udp_instances(
                             && !elab.parameters.contains_key(&name)
                         {
                             if crate::implicit_net_warn() {
-                                eprintln!(
+                                crate::elab_diag(format!(
                                     "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
                                      (IEEE 1800-2017 §6.10, primitive terminal of '{}'). Add an explicit declaration to silence.",
                                     name, inst_path
-                                );
+                                ));
                             }
                             elab.signals.insert(name.clone(), Signal { is_const: false,
                                 name: name.clone(), width: 1, is_signed: false,
