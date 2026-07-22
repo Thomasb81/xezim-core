@@ -71,6 +71,44 @@ impl Parser {
                 let decl = self.parse_parameter_decl_stmt();
                 let span = self.span_from(start);
                 if let crate::ast::decl::ParameterKind::Data { data_type, assignments } = decl.kind {
+                    // §6.20.2: an UNTYPED local `localparam`/`parameter` is
+                    // SELF-DETERMINED from its initializer — NOT the 1-bit that
+                    // an implicit `logic` resolves to (which truncates
+                    // `localparam Q = 24;` to 0). Infer a concrete type from
+                    // the first init: a real literal → real, a string → string,
+                    // otherwise a 32-bit signed integer. (A genuine `var v =
+                    // 24;` keeps its 1-bit `logic` type — this only rewrites the
+                    // localparam/parameter path, where the identity is known.)
+                    let is_implicit_untyped = matches!(
+                        &data_type,
+                        crate::ast::types::DataType::Implicit { dimensions, .. }
+                            if dimensions.is_empty()
+                    );
+                    let data_type = if is_implicit_untyped {
+                        use crate::ast::expr::{ExprKind, NumberLiteral};
+                        let init0 = assignments.first().and_then(|a| a.init.as_ref());
+                        match init0.map(|e| &e.kind) {
+                            Some(ExprKind::Number(NumberLiteral::Real(_))) => {
+                                crate::ast::types::DataType::Real {
+                                    kind: crate::ast::types::RealType::Real,
+                                    span,
+                                }
+                            }
+                            Some(ExprKind::StringLiteral(_)) => {
+                                crate::ast::types::DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    span,
+                                }
+                            }
+                            _ => crate::ast::types::DataType::IntegerAtom {
+                                kind: crate::ast::types::IntegerAtomType::Int,
+                                signing: Some(crate::ast::types::Signing::Signed),
+                                span,
+                            },
+                        }
+                    } else {
+                        data_type
+                    };
                     let declarators: Vec<VarDeclarator> = assignments.into_iter().map(|a| {
                         VarDeclarator { name: a.name, dimensions: a.dimensions, init: a.init, span: a.span }
                     }).collect();
