@@ -1997,6 +1997,16 @@ pub fn elaborate_module_with_defs(
         elab.lets.insert(l.name.name.clone(), l.clone());
     }
 
+    // §13.4.3: register module-body function declarations before the
+    // parameter pass so a header `parameter LOG_X = log2(X)` const-evaluates.
+    for it in module.items() {
+        if let ModuleItem::FunctionDeclaration(fd) = it {
+            elab.functions
+                .entry(fd.name.name.name.clone())
+                .or_insert_with(|| fd.clone());
+        }
+    }
+    set_funcs_tls(&elab.functions);
     // Process parameters
     for param in module.params() {
         if let ParameterKind::Data { data_type, assignments } = &param.kind {
@@ -2245,6 +2255,7 @@ pub fn elaborate_module_with_defs(
                     .or_insert_with(|| fd.clone());
             }
         }
+        set_funcs_tls(&elab.functions);
         for item in &p.items {
             match item {
                 crate::ast::decl::PackageItem::Typedef(td) => {
@@ -7207,16 +7218,64 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
             let p = params?;
             eval_const_expr_val(expr, p).to_u64().map(|u| u as i64)
         }
-        // User ceil-log2 const function (HardFloat `clog2`), == $clog2.
-        ExprKind::Call { func, args }
-            if matches!(&func.kind, ExprKind::Ident(h)
-                if h.path.last().map(|s| s.name.name.as_str()) == Some("clog2")) =>
-        {
-            let n = const_eval_i64_with_params(args.first()?, params)? as u64;
-            Some(ceil_log2(n) as i64)
+        // §13.4.3: a user sizing function called directly in a dimension.
+        // Interpret its REAL body (FUNCS_TLS) — the name-based ceil-log2
+        // fallback below only fires when the declaration isn't visible, and
+        // silently assumes $clog2 semantics (wrong for floor-log2 variants).
+        ExprKind::Call { func, args } => {
+            let fname = if let ExprKind::Ident(h) = &func.kind {
+                h.path.last().map(|s| s.name.name.clone())?
+            } else {
+                return None;
+            };
+            let fd_rc = FUNCS_TLS.with(|cell| {
+                cell.borrow()
+                    .as_ref()
+                    .filter(|m| m.contains_key(&fname))
+                    .cloned()
+            });
+            if let Some(funcs) = fd_rc {
+                let fd = funcs.get(&fname).cloned()?;
+                let mut argv = Vec::with_capacity(args.len());
+                for a in args {
+                    let av = const_eval_i64_with_params(a, params)?;
+                    argv.push(Value::from_u64(av as u64, 32));
+                }
+                let mut shell = ElaboratedModule::new(String::new());
+                if let Some(p) = params {
+                    shell.parameters = p.clone();
+                }
+                shell.functions = (*funcs).clone();
+                if let Some(v) = eval_const_user_function(&fd, &argv, &shell, 0) {
+                    return v.to_i64();
+                }
+            }
+            // Name-based ceil-log2 fallback (HardFloat `clog2` == $clog2).
+            if fname == "clog2" {
+                let n = const_eval_i64_with_params(args.first()?, params)? as u64;
+                return Some(ceil_log2(n) as i64);
+            }
+            None
         }
         _ => None,
     }
+}
+
+/// §13.4.3 — thread-local FUNCTION table consulted by
+/// `const_eval_i64_with_params` when a RANGE DIMENSION calls a user sizing
+/// function directly (`reg [log2(DEPTH)-1:0] a;` with no parameter in
+/// between). Same shape as TYPEDEFS_TLS: refreshed by `set_funcs_tls`
+/// wherever function declarations are (pre-)registered, so dimension
+/// resolution sees them without threading `&elab` through 47 call sites.
+thread_local! {
+    static FUNCS_TLS: std::cell::RefCell<Option<std::rc::Rc<HashMap<String, FunctionDeclaration>>>>
+        = std::cell::RefCell::new(None);
+}
+
+fn set_funcs_tls(funcs: &HashMap<String, FunctionDeclaration>) {
+    FUNCS_TLS.with(|cell| {
+        *cell.borrow_mut() = Some(std::rc::Rc::new(funcs.clone()));
+    });
 }
 
 // LRM §20.7 — thread-local typedef table consulted by const-eval `$bits`
@@ -8424,6 +8483,7 @@ pub fn inline_instantiations(
                             .or_insert_with(|| fd.clone());
                     }
                 }
+                set_funcs_tls(&elab.functions);
                 for _ in 0..3 {
                     for item in &p.items {
                         match item {
@@ -10446,6 +10506,7 @@ fn inline_module_items(
                             .or_insert_with(|| fd.clone());
                     }
                 }
+                set_funcs_tls(&elab.functions);
                 // 1. Parameters from port list
                 for p_decl in sub_mod.params() {
                     if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
@@ -11578,6 +11639,36 @@ fn eval_const_user_function(
                 }
                 Some(Flow::Normal)
             }
+            SK::Case { expr, items, .. } => {
+                let sel = eval_fn_expr(expr, locals, elab, depth)?.to_i64()?;
+                let mut chosen: Option<&Statement> = None;
+                for item in items {
+                    if item.is_default {
+                        continue;
+                    }
+                    if item.pattern.is_some() {
+                        return None; // pattern-matching case: bail
+                    }
+                    let mut hit = false;
+                    for pat in &item.patterns {
+                        if eval_fn_expr(pat, locals, elab, depth)?.to_i64()? == sel {
+                            hit = true;
+                            break;
+                        }
+                    }
+                    if hit {
+                        chosen = Some(&item.stmt);
+                        break;
+                    }
+                }
+                if chosen.is_none() {
+                    chosen = items.iter().find(|i| i.is_default).map(|i| &i.stmt);
+                }
+                match chosen {
+                    Some(st) => exec_stmt(st, locals, fname, elab, depth, fuel),
+                    None => Some(Flow::Normal),
+                }
+            }
             SK::Return(e) => {
                 if let Some(e) = e {
                     let v = eval_fn_expr(e, locals, elab, depth)?;
@@ -11674,7 +11765,17 @@ fn eval_const_user_function(
             Flow::Normal => {}
         }
     }
-    locals.remove(&fname)
+    let v = locals.remove(&fname)?;
+    // §13.4.1: the result takes the DECLARED return type — a
+    // `function [3:0]` returning 20 yields 4, not 20. Unresolvable return
+    // widths bail (deferral) rather than guessing.
+    let rw = resolve_type_width(&fd.return_type, Some(&elab.parameters), Some(&elab.typedefs));
+    if rw == 0 {
+        return None;
+    }
+    let mut v = v.resize(rw);
+    v.is_signed = is_type_signed(&fd.return_type);
+    Some(v)
 }
 
     /// STRICT support check: only expression shapes we KNOW
@@ -12696,6 +12797,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             .or_insert_with(|| fd.clone());
                     }
                 }
+                set_funcs_tls(&elab.functions);
                 for pi in &pkg.items {
                     match pi {
                         PackageItem::Parameter(pd) => {
