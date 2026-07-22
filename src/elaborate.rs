@@ -282,6 +282,20 @@ pub struct ElaboratedClass {
     /// Names of type parameters declared on the class.
     #[serde(default)]
     pub type_param_names: Vec<String>,
+    /// IEEE 1800-2020 §6.20.2: default type/class for each type parameter that
+    /// declares one (`type T = some_class`). Stored as `(name, fragment)`
+    /// where `fragment` is the default rendered to its class/identifier text
+    /// (e.g. `uvm_callback`). Used to CANONICALIZE specialization signatures
+    /// so a specialization that omits a defaulted trailing param
+    /// (`C#(arg)` vs `C#(arg, default)`) keys its statics consistently
+    /// regardless of whether it was named directly or reached via `extends`.
+    /// Without this, `uvm_callbacks#(T,CB=uvm_callback)::m_typeid` was keyed
+    /// `uvm_callbacks#a_comp::m_typeid` when named directly but
+    /// `uvm_callbacks#a_comp, uvm_callback::m_typeid` via `extends`, so
+    /// `register_super_type` read a different (empty) cell and
+    /// `m_derived_types` stayed empty.
+    #[serde(default)]
+    pub type_param_defaults: Vec<(String, String)>,
     /// IEEE 1800-2017 §8.7: value arguments in the `extends Base(args)` clause,
     /// passed to the implicit `super.new(args)` when the derived constructor
     /// does not call `super.new` explicitly.
@@ -706,6 +720,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let has_pure_virtual = c.items.iter().any(|it|
         matches!(it, ClassItem::Method(m) if matches!(m.kind, ClassMethodKind::PureVirtual(_))));
     let mut type_param_names = Vec::new();
+    let mut type_param_defaults: Vec<(String, String)> = Vec::new();
     let mut param_order: Vec<String> = Vec::new();
     for p in &c.params {
         match &p.kind {
@@ -713,6 +728,12 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 for a in assignments {
                     type_param_names.push(a.name.name.clone());
                     param_order.push(a.name.name.clone());
+                    // Capture the default type as a textual fragment.
+                    if let Some(dt) = &a.init {
+                        if let Some(frag) = data_type_to_spec_fragment(dt) {
+                            type_param_defaults.push((a.name.name.clone(), frag));
+                        }
+                    }
                 }
             }
             crate::ast::decl::ParameterKind::Data { assignments, .. } => {
@@ -750,6 +771,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         has_pure_virtual,
         implements: c.implements.iter().map(|i| i.name.clone()).collect(),
         type_param_names,
+        type_param_defaults,
         param_order,
         typedef_names: c.items.iter().filter_map(|it| match it {
             ClassItem::Typedef(td) => Some(td.name.name.clone()),
@@ -5066,12 +5088,21 @@ fn walk_stmt_for_class_new(stmt: &Statement, elab: &ElaboratedModule) -> Result<
 /// specialization-chain resolver treats as "give up on this arg".
 fn param_value_to_arg_string(pv: &ParamValue) -> String {
     match pv {
-        ParamValue::Type(dt) => match dt {
-            DataType::TypeReference { name, .. } => name.name.name.clone(),
-            DataType::Simple { kind, .. } => format!("{:?}", kind).to_lowercase(),
-            _ => "<unknown>".to_string(),
-        },
+        ParamValue::Type(dt) => data_type_to_spec_fragment(dt).unwrap_or_else(|| "<unknown>".to_string()),
         ParamValue::Expr(ex) => expr_to_arg_string(ex),
+    }
+}
+
+/// Render a `DataType` (the default of a `type T = <dt>` parameter) to the
+/// textual fragment used in specialization-signature canonicalization. Only
+/// the shapes that can legally be a type-parameter default are handled
+/// (class/type-reference and simple built-ins); anything else yields None so
+/// the caller leaves that param position un-padded.
+fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
+    match dt {
+        DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+        DataType::Simple { kind, .. } => Some(format!("{:?}", kind).to_lowercase()),
+        _ => None,
     }
 }
 
