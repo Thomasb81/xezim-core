@@ -513,6 +513,15 @@ impl Parser {
             && self.tokens.get(self.pos + 1).map(|t| t.text.as_str()).unwrap_or("") == "'";
         if (self.is_data_type_keyword() || self.at(TokenKind::KwVoid)) && !is_type_cast {
             ParamValue::Type(self.parse_data_type())
+        } else if self.at(TokenKind::KwVirtual)
+            && (self.peek_kind() == TokenKind::KwInterface
+                || self.peek_kind() == TokenKind::Identifier)
+        {
+            // §25.9 / §8.25.1: `virtual <iface_type>` or
+            // `virtual interface <iface_type>` as a type-parameter argument
+            // (e.g. `C#(virtual my_if)`). Parse as a Type so it binds to a
+            // `type` parameter. May carry `#(...)` parameter args.
+            ParamValue::Type(self.parse_data_type())
         } else {
             ParamValue::Expr(self.parse_expression())
         }
@@ -593,6 +602,30 @@ impl Parser {
 
             let data_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) {
                 self.parse_data_type()
+            } else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket
+                && self.peek_kind_n(2) == TokenKind::Dollar
+                && self.peek_kind_n(3) == TokenKind::RBracket
+            {
+                // §6.3/§13.3: inherited-type port — `name [$]` where the type
+                // is inherited from the previous port (e.g. the second arg in
+                // `function f(string src, dest[$])`). The identifier is the
+                // PORT NAME, `[$]` is the unpacked queue dimension, and the
+                // data type is Implicit (elaboration copies the previous
+                // port's resolved type). Handle the whole port inline to
+                // avoid the later `parse_identifier` consuming the `[`.
+                let name = self.parse_identifier();
+                let dimensions = self.parse_unpacked_dimensions();
+                let data_type = DataType::Implicit {
+                    signing: None,
+                    dimensions: Vec::new(),
+                    span: self.span_from(start),
+                };
+                let default = if self.eat(TokenKind::Assign).is_some() {
+                    Some(self.parse_expression())
+                } else { None };
+                ports.push(FunctionPort { direction, var_kw, data_type, name, dimensions, default, span: self.span_from(start) });
+                if self.eat(TokenKind::Comma).is_none() { break; }
+                continue;
             } else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon) {
                 self.parse_data_type()
             } else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket {

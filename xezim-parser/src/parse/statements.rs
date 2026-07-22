@@ -1113,24 +1113,18 @@ impl Parser {
         }
         let is_property = self.eat(TokenKind::KwProperty).is_some();
         self.expect(TokenKind::LParen);
-        // For property expressions starting with a clocking event `@(...)`,
-        // capture the clock event and the body separately so the executor
-        // can drive SVA-style cycle delay (LRM §16.5). The clock event is
-        // wrapped on `SvaClocked { clock, body }` (the executor checks for
-        // it before falling back to plain-logical evaluation).
-        if self.at(TokenKind::At) {
+        // LRM §16.6 property_spec grammar:
+        //   [ clocking_event ] [ disable iff ( expr_or_dist ) ] property_expr
+        // Parse the optional clocking event FIRST, then the optional
+        // `disable iff` clause, so BOTH orderings work:
+        //   @(posedge clk) disable iff (!rst_n) body   (explicit clock)
+        //   disable iff (!rst_n) body                  (default clocking)
+        // Captured as Binary{LogAnd, !guard, body} so the SVA executor can
+        // short-circuit when the guard is true.
+        let clk_event = if self.at(TokenKind::At) {
             self.bump(); // @
-            // Parse the @(...) clocking event: optional posedge/negedge,
-            // then a signal expression. Wrap in a Unary node so the
-            // executor can see the edge polarity. We use UnaryOp::HashHash
-            // as a placeholder marker for the polarity since the expr AST
-            // has no dedicated edge op — we stash the polarity in the
-            // SvaClocked wrapper via a parallel side channel (see executor).
-            let clk_event = if self.at(TokenKind::LParen) {
+            let e = if self.at(TokenKind::LParen) {
                 self.bump();
-                // Skip optional edge keyword; we encode it lossily as
-                // the bare signal — the executor treats any change as an
-                // edge for now (works for posedge-only clocks).
                 let _ = self.eat(TokenKind::KwPosedge);
                 let _ = self.eat(TokenKind::KwNegedge);
                 let _ = self.eat(TokenKind::KwEdge);
@@ -1143,69 +1137,41 @@ impl Parser {
                 let _ = self.eat(TokenKind::KwEdge);
                 self.parse_expression()
             };
-            // LRM §16.6 — optional `disable iff (<expr>)` clause.
-            // Captured as a Binary{LogOr, guard_expr, body} so the SVA
-            // executor can short-circuit when the guard is true (the
-            // guard inversion is folded into the executor's check).
-            // Encoded into the SvaClocked.body via a wrapper expression
-            // — a follow-up could add a dedicated field if needed.
-            let disable_guard = if self.at(TokenKind::KwDisable)
-                && self.peek_kind() == TokenKind::KwIff
-            {
-                self.bump(); // disable
-                self.bump(); // iff
-                let _ = self.eat(TokenKind::LParen);
-                let g = self.parse_expression();
-                let _ = self.eat(TokenKind::RParen);
-                Some(g)
-            } else {
-                None
-            };
-            let body_inner = self.parse_expression();
-            // When `disable iff (g)` is present, wrap the body in a
-            // Binary{LogAnd, !g, body} — this is the structural
-            // encoding the SVA executor recognises: it evaluates the
-            // left side and short-circuits when the guard is true.
-            // Specifically, the executor checks `Binary{LogAnd, l, r}`
-            // as: "if l is false, the property is vacuously suppressed".
-            let body = if let Some(g) = disable_guard {
-                let span = body_inner.span;
-                let not_g = Expression::new(
-                    ExprKind::Unary {
-                        op: crate::ast::expr::UnaryOp::LogNot,
-                        operand: Box::new(g),
-                    },
-                    span,
-                );
-                Expression::new(
-                    ExprKind::Binary {
-                        op: crate::ast::expr::BinaryOp::LogAnd,
-                        left: Box::new(not_g),
-                        right: Box::new(body_inner),
-                    },
-                    span,
-                )
-            } else {
-                body_inner
-            };
-            self.expect(TokenKind::RParen);
-            let action = if !self.at(TokenKind::Semicolon) && !self.at(TokenKind::KwElse) {
-                Some(Box::new(self.parse_statement()))
-            } else { None };
-            let else_action = if self.eat(TokenKind::KwElse).is_some() {
-                Some(Box::new(self.parse_statement()))
-            } else { None };
-            self.eat(TokenKind::Semicolon);
-            let combined = Expression::new(
-                ExprKind::SvaClocked {
-                    clock: Box::new(clk_event),
-                    body: Box::new(body),
+            Some(e)
+        } else { None };
+        let disable_guard = if self.at(TokenKind::KwDisable)
+            && self.peek_kind() == TokenKind::KwIff
+        {
+            self.bump(); // disable
+            self.bump(); // iff
+            let _ = self.eat(TokenKind::LParen);
+            let g = self.parse_expression();
+            let _ = self.eat(TokenKind::RParen);
+            Some(g)
+        } else {
+            None
+        };
+        let body_inner = self.parse_expression();
+        let body = if let Some(g) = disable_guard {
+            let span = body_inner.span;
+            let not_g = Expression::new(
+                ExprKind::Unary {
+                    op: crate::ast::expr::UnaryOp::LogNot,
+                    operand: Box::new(g),
                 },
-                self.span_from(start),
+                span,
             );
-            return AssertionStatement { kind, expr: combined, action, else_action, is_property, span: self.span_from(start) };
-        }
-        let expr = self.parse_expression();
+            Expression::new(
+                ExprKind::Binary {
+                    op: crate::ast::expr::BinaryOp::LogAnd,
+                    left: Box::new(not_g),
+                    right: Box::new(body_inner),
+                },
+                span,
+            )
+        } else {
+            body_inner
+        };
         self.expect(TokenKind::RParen);
         let action = if !self.at(TokenKind::Semicolon) && !self.at(TokenKind::KwElse) {
             Some(Box::new(self.parse_statement()))
@@ -1216,6 +1182,18 @@ impl Parser {
         let else_action = if self.eat(TokenKind::KwElse).is_some() {
             Some(Box::new(self.parse_statement()))
         } else { None };
+        self.eat(TokenKind::Semicolon);
+        let expr = if let Some(clk) = clk_event {
+            Expression::new(
+                ExprKind::SvaClocked {
+                    clock: Box::new(clk),
+                    body: Box::new(body),
+                },
+                self.span_from(start),
+            )
+        } else {
+            body
+        };
         AssertionStatement { kind, expr, action, else_action, is_property, span: self.span_from(start) }
     }
 
