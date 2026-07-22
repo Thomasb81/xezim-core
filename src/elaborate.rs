@@ -2170,13 +2170,28 @@ pub fn elaborate_module_with_defs(
                 let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
                 let port_shape = fixed_unpacked_shape(&port.dimensions, &elab.parameters)
                     .unwrap_or_default();
+                // §23.2.2.4: `output logic clk = 0` — the default on an
+                // OUTPUT (variable) port is the variable's initializer.
+                // (Input-port defaults are unconnected-port fallbacks,
+                // handled at instantiation time.)
+                let init_val = match (&port.direction, &port.default) {
+                    (Some(PortDirection::Output), Some(def)) => {
+                        let v = eval_const_expr(def, &elab.parameters);
+                        Some(if is_real {
+                            Value::from_f64(v as f64)
+                        } else {
+                            Value::from_u64(v as u64, width).resize(width)
+                        })
+                    }
+                    _ => None,
+                };
                 let sig = Signal { is_const: false,
                     name: port.name.name.clone(),
                     width,
                     is_signed,
                     is_real,
                     direction: port.direction,
-                    value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                    value: init_val.unwrap_or_else(|| if is_real { Value::from_f64(0.0) } else { Value::new(width) }),
                     type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
@@ -11304,6 +11319,29 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             *counts.entry(n).or_insert(0) += 1;
         }
     }
+    // Sub-module bodies may still sit in the LAZY pending list; two
+    // instances driving one parent net (`m u1(.b(b)); m u2(.b(b));`) are
+    // invisible to the count above — the net silently lost ALL drivers
+    // (read z). Resolve each pending assign's LHS name (cheap: one ident
+    // rewrite), and MATERIALIZE only the entries that hit a multi-driven
+    // net so they join the fold; everything else stays lazy.
+    let pending_lhs: Vec<Option<String>> = elab
+        .pending_cont_assign
+        .iter()
+        .map(|p| {
+            let lhs = rewrite_expr(
+                &p.lhs_source,
+                &p.ctx.prefix,
+                &p.ctx.port_map,
+                &p.ctx.local_names,
+                &p.ctx.interface_map,
+            );
+            ident_flat_name(&lhs)
+        })
+        .collect();
+    for n in pending_lhs.iter().flatten() {
+        *counts.entry(n.clone()).or_insert(0) += 1;
+    }
     let multi: HashSet<String> = counts
         .into_iter()
         .filter(|(n, c)| *c > 1 && elab.nets.contains(n))
@@ -11311,6 +11349,20 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         .collect();
     if multi.is_empty() {
         return;
+    }
+    if pending_lhs
+        .iter()
+        .any(|n| n.as_ref().map_or(false, |n| multi.contains(n)))
+    {
+        let pending = std::mem::take(&mut elab.pending_cont_assign);
+        for (p, name) in pending.into_iter().zip(pending_lhs) {
+            if name.map_or(false, |n| multi.contains(&n)) {
+                let ca = p.materialize();
+                elab.continuous_assigns.push(ca);
+            } else {
+                elab.pending_cont_assign.push(p);
+            }
+        }
     }
     let all = std::mem::take(&mut elab.continuous_assigns);
     // Per multi-driven net: keep the lhs/delay, and accumulate STRONG drivers
@@ -11345,7 +11397,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         };
         let slot = folded.entry(name.clone()).or_insert_with(|| {
             order.push(name.clone());
-            Acc { lhs: ca.lhs.clone(), delay: ca.delay, strong: None, weak: None }
+            Acc { lhs: make_ident_expr(&name), delay: ca.delay, strong: None, weak: None }
         });
         let chain = if weak { &mut slot.weak } else { &mut slot.strong };
         *chain = Some(match chain.take() {
