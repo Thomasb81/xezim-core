@@ -1325,16 +1325,25 @@ impl Parser {
             }
         }
 
-        if !is_recrem_or_setuphold || args.len() < 9 {
-            return; // $setup/$hold and short forms have no delayed nets
+        // Two-limit checks ($setuphold/$recrem) carry delayed_ref/delayed_data
+        // at args[7]/[8] (§15.6 13-arg form); single-limit checks ($setup/
+        // $hold/$recovery/$removal) at args[6]/[7] in the vendor-extension
+        // 8-arg form `(ref, data, limit, notifier, tstamp_cond, tcheck_cond,
+        // delayed_ref, delayed_data)` that gate libraries wire UDP terminals
+        // from. Short (LRM-minimal) forms have no delayed nets.
+        let (dref_idx, ddata_idx) = if is_recrem_or_setuphold { (7, 8) } else { (6, 7) };
+        if args.len() <= dref_idx {
+            return;
         }
         let ref_sig = signal_of(&args[0]);
         let data_sig = signal_of(&args[1]);
-        if let (Some(dref), Some(src)) = (plain_net(&args[7]), ref_sig) {
+        if let (Some(dref), Some(src)) = (plain_net(&args[dref_idx]), ref_sig) {
             out.push((dref, src));
         }
-        if let (Some(ddata), Some(src)) = (plain_net(&args[8]), data_sig) {
-            out.push((ddata, src));
+        if let Some(a) = args.get(ddata_idx) {
+            if let (Some(ddata), Some(src)) = (plain_net(a), data_sig) {
+                out.push((ddata, src));
+            }
         }
     }
 
