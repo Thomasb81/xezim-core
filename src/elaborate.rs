@@ -11496,12 +11496,32 @@ fn inline_module_items(
                     interface_map: sub_interface_map.clone(),
                 });
 
+                // A task/function formal whose width uses a MODULE PARAMETER
+                // (`input [word_width-1:0] d`) must have that parameter baked in
+                // NOW — the sub-module is being inlined, so its params won't be
+                // in the flat param map when the formal's width is resolved at
+                // call time, and the formal would collapse to 1 bit. Substitute
+                // the sub-instance's resolved params into the formals' data
+                // types + unpacked dims.
+                let param_expr_map: HashMap<String, Expression> = sub_merged_params
+                    .iter()
+                    .filter_map(|(k, v)| v.to_i64().map(|iv| (k.clone(), genvar_const_expr(iv))))
+                    .collect();
+                let no_local: std::collections::HashSet<String> = std::collections::HashSet::default();
+                let no_iface: HashMap<String, String> = HashMap::default();
+                let bake_formal_type = |p: &mut FunctionPort| {
+                    p.data_type = rewrite_data_type_genvar(&p.data_type, &param_expr_map, &no_local, &no_iface);
+                    p.dimensions = rewrite_unpacked_dims_genvar(&p.dimensions, &param_expr_map, &no_local, &no_iface);
+                };
                 // Inline the sub-module's continuous assigns
                 for (sub_item, body_src) in prepared_sub.effective_items.iter().zip(prepared_sub.body_sources.iter()) {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
                         let mut new_fd = fd.clone();
                         new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
+                        // Return-type width can also use a module parameter.
+                        new_fd.return_type = rewrite_data_type_genvar(&new_fd.return_type, &param_expr_map, &no_local, &no_iface);
                         for p in &mut new_fd.ports {
+                            bake_formal_type(p);
                             if let Some(def) = &p.default {
                                 p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
                             }
@@ -11515,6 +11535,7 @@ fn inline_module_items(
                         let mut new_td = td.clone();
                         new_td.name.name.name = format!("{}{}", inst_prefix, td.name.name.name);
                         for p in &mut new_td.ports {
+                            bake_formal_type(p);
                             if let Some(def) = &p.default {
                                 p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
                             }
