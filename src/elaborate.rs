@@ -6729,6 +6729,14 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
                     rewrite_stmt_delays(s, unit_s, tick_s);
                 }
             }
+            // `assign #5 y = a;` — the cont-assign delay counts module
+            // timeunits like any other delay; unscaled it ran as raw ticks
+            // (5 ps in a 1ns/1ps module instead of 5 ns).
+            ModuleItem::ContinuousAssign(ca) => {
+                if let Some(d) = ca.delay.as_mut() {
+                    rewrite_delay_expr(d, unit_s, tick_s);
+                }
+            }
             ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, tick_s),
             ModuleItem::GenerateIf(gi) => {
                 for (_c, items) in gi.branches.iter_mut() {
@@ -6769,6 +6777,18 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, tick_s: f64) {
     }
 }
 
+/// §9.4.5 intra-assignment delays are canonicalized pre-parse into
+/// `$__xz_intra_delay(d, rhs)` marker calls (see xezim's intra_delay pass);
+/// their first arg is a delay in module timeunits and must be scaled like
+/// any other delay.
+fn rewrite_intra_marker_delay(e: &mut Expression, unit_s: f64, tick_s: f64) {
+    if let ExprKind::SystemCall { name, args } = &mut e.kind {
+        if name == "$__xz_intra_delay" && args.len() == 2 {
+            rewrite_delay_expr(&mut args[0], unit_s, tick_s);
+        }
+    }
+}
+
 fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, tick_s: f64) {
     match &mut stmt.kind {
         StatementKind::TimingControl { control, stmt } => {
@@ -6777,8 +6797,15 @@ fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, tick_s: f64) {
             }
             rewrite_stmt_delays(stmt, unit_s, tick_s);
         }
-        StatementKind::NonblockingAssign { delay: Some(d), .. } => {
+        StatementKind::BlockingAssign { rvalue, .. } => {
+            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
+        }
+        StatementKind::NonblockingAssign { delay: Some(d), rvalue, .. } => {
             rewrite_delay_expr(d, unit_s, tick_s);
+            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
+        }
+        StatementKind::NonblockingAssign { rvalue, .. } => {
+            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
         }
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
             for s in stmts.iter_mut() { rewrite_stmt_delays(s, unit_s, tick_s); }
@@ -7494,7 +7521,16 @@ fn width_with_unpacked_dims(dims: &[crate::ast::types::UnpackedDimension], base_
 
 /// Evaluate a constant expression (for enum values, parameter defaults, etc.)
 fn eval_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> u64 {
-    eval_const_expr_val(expr, params).to_u64().unwrap_or(0)
+    let v = eval_const_expr_val(expr, params);
+    if v.is_real {
+        // A real result (e.g. a timeunit-scaled delay `5 * 1000.0`) must be
+        // converted NUMERICALLY — to_u64 on a real Value returns the raw
+        // IEEE-754 bit pattern (5000.0 -> ~4.6e18, a delay parked forever).
+        let f = v.to_f64();
+        if f.is_finite() && f > 0.0 { f.round() as u64 } else { 0 }
+    } else {
+        v.to_u64().unwrap_or(0)
+    }
 }
 
 /// Evaluate an initializer for a typed declaration of known target width.
