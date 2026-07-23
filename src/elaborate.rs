@@ -6771,6 +6771,15 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
             ModuleItem::AlwaysConstruct(ac) => rewrite_stmt_delays(&mut ac.stmt, unit_s, tick_s),
             ModuleItem::InitialConstruct(ic) => rewrite_stmt_delays(&mut ic.stmt, unit_s, tick_s),
             ModuleItem::FinalConstruct(fc) => rewrite_stmt_delays(&mut fc.stmt, unit_s, tick_s),
+            // Task bodies carry delays too (`task pulse; #1 clk = 1; ...`).
+            // Without this a task-body `#1` stayed a raw 1-tick delay while
+            // the caller's `#1` was unit-scaled — a 1ns/1ps module's task
+            // delays silently ran 1000x too fast (§3.14.3).
+            ModuleItem::TaskDeclaration(td) => {
+                for s in td.items.iter_mut() {
+                    rewrite_stmt_delays(s, unit_s, tick_s);
+                }
+            }
             ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, tick_s),
             ModuleItem::GenerateIf(gi) => {
                 for (_c, items) in gi.branches.iter_mut() {
@@ -8745,7 +8754,7 @@ pub fn inline_instantiations(
     // resolve imported package parameters like black-parrot's `all_cfgs_gp`.
     set_param_fallback(&top_params);
     let mut cache = HashMap::default();
-    inline_module_items(elab, top_def, "", definitions, &mut HashMap::default(), &top_params, &mut cache)?;
+    inline_module_items(elab, top_def, "", definitions, &mut HashMap::default(), &top_params, &mut cache, &[])?;
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }
@@ -10310,6 +10319,57 @@ fn warn_port_width_mismatch(
     }
 }
 
+/// Extract the dotted instance/parameter path of a `defparam` LHS
+/// (`u.sub.PARAM` → `["u","sub","PARAM"]`). Returns None for anything that
+/// isn't a plain hierarchical identifier (bit-selects etc. are not valid
+/// defparam targets). The last segment is the parameter name.
+fn defparam_path_segments(e: &Expression) -> Option<Vec<String>> {
+    // `u.sub.PARAM` parses as a MemberAccess chain (`.` is member access),
+    // and a bare `u` (or a whole path) as an Ident — handle both.
+    fn walk(e: &Expression, out: &mut Vec<String>) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                for seg in &h.path {
+                    if !seg.selects.is_empty() {
+                        return false;
+                    }
+                    out.push(seg.name.name.clone());
+                }
+                true
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                walk(expr, out) && {
+                    out.push(member.name.clone());
+                    true
+                }
+            }
+            // `u[2].V` — an array-of-instances element. Array expansion names
+            // elements `u[<j>]` (ai_expand_instances), so fold the constant
+            // index into the preceding segment to match that instance name.
+            ExprKind::Index { expr, index } => {
+                if !walk(expr, out) {
+                    return false;
+                }
+                let idx = eval_const_expr(index, &HashMap::default());
+                match out.last_mut() {
+                    Some(last) => {
+                        *last = format!("{}[{}]", last, idx);
+                        true
+                    }
+                    None => false,
+                }
+            }
+            _ => false,
+        }
+    }
+    let mut segs = Vec::new();
+    if walk(e, &mut segs) && segs.len() >= 2 {
+        Some(segs)
+    } else {
+        None
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -10318,8 +10378,25 @@ fn inline_module_items(
     interface_map: &mut HashMap<String, String>,
     local_params: &HashMap<String, Value>,
     cache: &mut InlinePrepCache,
+    // §23.10.1 pending `defparam` overrides targeting instances in THIS scope:
+    // `(path_segments, value)` where the value was already evaluated in the
+    // scope that declared the defparam. Path[0] is a child instance name.
+    pending_defparams: &[(Vec<String>, Value)],
 ) -> Result<(), String> {
     let prepared_source = prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
+    // Collect defparams: those propagated in from a parent scope, plus this
+    // module's own `defparam` items (RHS evaluated in THIS scope, §23.10.1).
+    let mut defparams: Vec<(Vec<String>, Value)> = pending_defparams.to_vec();
+    for it in &prepared_source.effective_items {
+        if let ModuleItem::Defparam(assigns) = it {
+            for (lhs, rhs) in assigns {
+                if let Some(path) = defparam_path_segments(lhs) {
+                    let val = eval_const_expr_val(rhs, local_params);
+                    defparams.push((path, val));
+                }
+            }
+        }
+    }
     for item in &prepared_source.effective_items {
         if let ModuleItem::ModuleInstantiation(inst) = item {
             let sub_mod_name = &inst.module_name.name;
@@ -10740,6 +10817,58 @@ fn inline_module_items(
                                 }
                             }
                         }
+                    }
+                }
+
+                // §23.10.1 `defparam` overrides for THIS instance. A path
+                // `hi.name.PARAM` (2 segs after the instance) sets a parameter
+                // of this instance directly; a longer path targets a deeper
+                // instance and is propagated into the recursion below. defparam
+                // wins over `#(…)` (applied after), matching common tool
+                // behavior. Localparams are not overridable, but the sub-module
+                // param resolution already excludes those.
+                // The instance name may be dotted after generate-scope
+                // flattening (`gblk.u`), so match it against the LEADING path
+                // segments rather than just path[0].
+                // §6.20.4: a `localparam` is NOT overridable. `sub_param_decls`
+                // lists exactly the overridable parameters (header non-local +
+                // body `parameter`), so a direct target absent from it is a
+                // localparam (or unknown) and must be ignored, not applied.
+                let overridable: std::collections::HashSet<&str> = sub_param_decls
+                    .iter()
+                    .flat_map(|p| match &p.kind {
+                        ParameterKind::Data { assignments, .. } => assignments
+                            .iter()
+                            .map(|a| a.name.name.as_str())
+                            .collect::<Vec<_>>(),
+                        ParameterKind::Type { assignments } => assignments
+                            .iter()
+                            .map(|a| a.name.name.as_str())
+                            .collect::<Vec<_>>(),
+                    })
+                    .collect();
+                let inst_segs: Vec<&str> = hi.name.name.split('.').collect();
+                let n_inst = inst_segs.len();
+                let mut sub_defparams: Vec<(Vec<String>, Value)> = Vec::new();
+                for (path, val) in &defparams {
+                    if path.len() <= n_inst
+                        || !path[..n_inst]
+                            .iter()
+                            .zip(&inst_segs)
+                            .all(|(a, b)| a == b)
+                    {
+                        continue;
+                    }
+                    let rest = &path[n_inst..];
+                    if rest.len() == 1 {
+                        // Targets a parameter of this instance directly — apply
+                        // only if it is overridable (skip localparams, §6.20.4).
+                        if overridable.contains(rest[0].as_str()) {
+                            sub_params.insert(rest[0].clone(), val.clone());
+                        }
+                    } else {
+                        // Targets a deeper instance — propagate into recursion.
+                        sub_defparams.push((rest.to_vec(), val.clone()));
                     }
                 }
 
@@ -11427,12 +11556,32 @@ fn inline_module_items(
                     interface_map: sub_interface_map.clone(),
                 });
 
+                // A task/function formal whose width uses a MODULE PARAMETER
+                // (`input [word_width-1:0] d`) must have that parameter baked in
+                // NOW — the sub-module is being inlined, so its params won't be
+                // in the flat param map when the formal's width is resolved at
+                // call time, and the formal would collapse to 1 bit. Substitute
+                // the sub-instance's resolved params into the formals' data
+                // types + unpacked dims.
+                let param_expr_map: HashMap<String, Expression> = sub_merged_params
+                    .iter()
+                    .filter_map(|(k, v)| v.to_i64().map(|iv| (k.clone(), genvar_const_expr(iv))))
+                    .collect();
+                let no_local: std::collections::HashSet<String> = std::collections::HashSet::default();
+                let no_iface: HashMap<String, String> = HashMap::default();
+                let bake_formal_type = |p: &mut FunctionPort| {
+                    p.data_type = rewrite_data_type_genvar(&p.data_type, &param_expr_map, &no_local, &no_iface);
+                    p.dimensions = rewrite_unpacked_dims_genvar(&p.dimensions, &param_expr_map, &no_local, &no_iface);
+                };
                 // Inline the sub-module's continuous assigns
                 for (sub_item, body_src) in prepared_sub.effective_items.iter().zip(prepared_sub.body_sources.iter()) {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
                         let mut new_fd = fd.clone();
                         new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
+                        // Return-type width can also use a module parameter.
+                        new_fd.return_type = rewrite_data_type_genvar(&new_fd.return_type, &param_expr_map, &no_local, &no_iface);
                         for p in &mut new_fd.ports {
+                            bake_formal_type(p);
                             if let Some(def) = &p.default {
                                 p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
                             }
@@ -11446,6 +11595,7 @@ fn inline_module_items(
                         let mut new_td = td.clone();
                         new_td.name.name.name = format!("{}{}", inst_prefix, td.name.name.name);
                         for p in &mut new_td.ports {
+                            bake_formal_type(p);
                             if let Some(def) = &p.default {
                                 p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
                             }
@@ -11593,7 +11743,7 @@ fn inline_module_items(
                 });
 
                 // Recurse into sub-module instantiations
-                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache)?;
+                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache, &sub_defparams)?;
 
                 // Restore typedef entries shadowed by this instance's TYPE
                 // parameter overrides.

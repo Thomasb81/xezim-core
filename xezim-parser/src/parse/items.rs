@@ -292,14 +292,34 @@ impl Parser {
             TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
                 Some(ModuleItem::TimeunitsDecl(self.parse_timeunits_declaration()))
             }
-            // Deprecated hierarchical parameter override `defparam path.p = e;`
-            // (LRM §23.10.1). Parse and discard — consume to the terminating
-            // semicolon so it doesn't break the module-item stream (veer-el2 tb).
+            // Deprecated hierarchical parameter override `defparam path.p = e, …;`
+            // (LRM §23.10.1). Parse each `<hier_path> = <expr>` pair so
+            // elaboration can apply the override; on any malformed pair, fall
+            // back to consuming to the semicolon so the item stream survives.
             TokenKind::KwDefparam => {
                 self.bump();
-                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
-                let _ = self.eat(TokenKind::Semicolon);
-                None
+                let mut assigns: Vec<(Expression, Expression)> = Vec::new();
+                loop {
+                    let lhs = self.parse_expression();
+                    if self.eat(TokenKind::Assign).is_none() {
+                        break;
+                    }
+                    let rhs = self.parse_expression();
+                    assigns.push((lhs, rhs));
+                    if self.eat(TokenKind::Comma).is_some() {
+                        continue;
+                    }
+                    break;
+                }
+                // Recover to the terminating semicolon regardless.
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
+                let _ = self.eat(TokenKind::Semicolon);                if assigns.is_empty() {
+                    None
+                } else {
+                    Some(ModuleItem::Defparam(assigns))
+                }
             }
             // Elaboration-time system tasks at module-item level: $error, $warning,
             // $info, $fatal — typically inside a `STATIC_ASSERT` macro expansion
@@ -1305,16 +1325,25 @@ impl Parser {
             }
         }
 
-        if !is_recrem_or_setuphold || args.len() < 9 {
-            return; // $setup/$hold and short forms have no delayed nets
+        // Two-limit checks ($setuphold/$recrem) carry delayed_ref/delayed_data
+        // at args[7]/[8] (§15.6 13-arg form); single-limit checks ($setup/
+        // $hold/$recovery/$removal) at args[6]/[7] in the vendor-extension
+        // 8-arg form `(ref, data, limit, notifier, tstamp_cond, tcheck_cond,
+        // delayed_ref, delayed_data)` that gate libraries wire UDP terminals
+        // from. Short (LRM-minimal) forms have no delayed nets.
+        let (dref_idx, ddata_idx) = if is_recrem_or_setuphold { (7, 8) } else { (6, 7) };
+        if args.len() <= dref_idx {
+            return;
         }
         let ref_sig = signal_of(&args[0]);
         let data_sig = signal_of(&args[1]);
-        if let (Some(dref), Some(src)) = (plain_net(&args[7]), ref_sig) {
+        if let (Some(dref), Some(src)) = (plain_net(&args[dref_idx]), ref_sig) {
             out.push((dref, src));
         }
-        if let (Some(ddata), Some(src)) = (plain_net(&args[8]), data_sig) {
-            out.push((ddata, src));
+        if let Some(a) = args.get(ddata_idx) {
+            if let (Some(ddata), Some(src)) = (plain_net(a), data_sig) {
+                out.push((ddata, src));
+            }
         }
     }
 
