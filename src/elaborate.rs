@@ -9774,6 +9774,7 @@ fn ai_expand_instances(
     instances: &[crate::ast::decl::HierarchicalInstance],
     port_widths: &[u32],
     port_shapes: &[Vec<(i64, i64)>],
+    port_names: &[String],
     widths: &HashMap<String, u32>,
     unpacked_shapes: &HashMap<String, Vec<(i64, i64)>>,
     params: &HashMap<String, Value>,
@@ -9803,14 +9804,27 @@ fn ai_expand_instances(
                 .iter()
                 .enumerate()
                 .map(|(pi, conn)| {
-                    let p = port_widths.get(pi).copied().unwrap_or(1).max(1);
+                    // §23.3.2: bit-distribution needs the FORMAL port's width,
+                    // keyed by port index. A positional connection's port index
+                    // is its list position; a by-name connection binds by NAME,
+                    // so it may be reordered or sparse — look its index up in
+                    // the declared port list (falling back to list position for
+                    // NonAnsi / unknown ports).
+                    let port_idx = match conn {
+                        crate::ast::decl::PortConnection::Named { name, .. } => port_names
+                            .iter()
+                            .position(|pn| pn == &name.name)
+                            .unwrap_or(pi),
+                        _ => pi,
+                    };
+                    let p = port_widths.get(port_idx).copied().unwrap_or(1).max(1);
                     ai_slice_conn(
                         conn,
                         p,
                         k,
                         n,
                         widths,
-                        port_shapes.get(pi).map(Vec::as_slice),
+                        port_shapes.get(port_idx).map(Vec::as_slice),
                         unpacked_shapes,
                         params,
                     )
@@ -9840,6 +9854,16 @@ fn ai_module_port_widths(
                     .max(1)
             })
             .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The declared port names of a module, in port-list order (parallel to
+/// `ai_module_port_widths`). Used to map by-name instance-array connections
+/// to the correct FORMAL port index for bit-distribution (§23.3.2).
+fn ai_module_port_names(def: &Definition) -> Vec<String> {
+    match def.ports() {
+        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
         _ => Vec::new(),
     }
 }
@@ -10064,11 +10088,16 @@ fn prepare_module_items(
                         .get(&inst.module_name.name)
                         .map(|d| ai_module_port_shapes(d, local_params))
                         .unwrap_or_default();
+                    let port_names = definitions
+                        .get(&inst.module_name.name)
+                        .map(ai_module_port_names)
+                        .unwrap_or_default();
                     inst.instances =
                         ai_expand_instances(
                             &inst.instances,
                             &port_widths,
                             &port_shapes,
+                            &port_names,
                             &widths,
                             &unpacked_shapes,
                             local_params,
