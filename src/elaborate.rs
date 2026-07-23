@@ -10283,6 +10283,22 @@ fn defparam_path_segments(e: &Expression) -> Option<Vec<String>> {
                     true
                 }
             }
+            // `u[2].V` — an array-of-instances element. Array expansion names
+            // elements `u[<j>]` (ai_expand_instances), so fold the constant
+            // index into the preceding segment to match that instance name.
+            ExprKind::Index { expr, index } => {
+                if !walk(expr, out) {
+                    return false;
+                }
+                let idx = eval_const_expr(index, &HashMap::default());
+                match out.last_mut() {
+                    Some(last) => {
+                        *last = format!("{}[{}]", last, idx);
+                        true
+                    }
+                    None => false,
+                }
+            }
             _ => false,
         }
     }
@@ -10754,6 +10770,23 @@ fn inline_module_items(
                 // The instance name may be dotted after generate-scope
                 // flattening (`gblk.u`), so match it against the LEADING path
                 // segments rather than just path[0].
+                // §6.20.4: a `localparam` is NOT overridable. `sub_param_decls`
+                // lists exactly the overridable parameters (header non-local +
+                // body `parameter`), so a direct target absent from it is a
+                // localparam (or unknown) and must be ignored, not applied.
+                let overridable: std::collections::HashSet<&str> = sub_param_decls
+                    .iter()
+                    .flat_map(|p| match &p.kind {
+                        ParameterKind::Data { assignments, .. } => assignments
+                            .iter()
+                            .map(|a| a.name.name.as_str())
+                            .collect::<Vec<_>>(),
+                        ParameterKind::Type { assignments } => assignments
+                            .iter()
+                            .map(|a| a.name.name.as_str())
+                            .collect::<Vec<_>>(),
+                    })
+                    .collect();
                 let inst_segs: Vec<&str> = hi.name.name.split('.').collect();
                 let n_inst = inst_segs.len();
                 let mut sub_defparams: Vec<(Vec<String>, Value)> = Vec::new();
@@ -10768,8 +10801,11 @@ fn inline_module_items(
                     }
                     let rest = &path[n_inst..];
                     if rest.len() == 1 {
-                        // Targets a parameter of this instance directly.
-                        sub_params.insert(rest[0].clone(), val.clone());
+                        // Targets a parameter of this instance directly — apply
+                        // only if it is overridable (skip localparams, §6.20.4).
+                        if overridable.contains(rest[0].as_str()) {
+                            sub_params.insert(rest[0].clone(), val.clone());
+                        }
                     } else {
                         // Targets a deeper instance — propagate into recursion.
                         sub_defparams.push((rest.to_vec(), val.clone()));
