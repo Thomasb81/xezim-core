@@ -316,6 +316,16 @@ pub struct ElaboratedClass {
     /// `param_defaults` alone lose the combined order.
     #[serde(default)]
     pub param_order: Vec<String>,
+    /// Declared `#(...)` specialization args for each CLASS PROPERTY typed
+    /// with a parameterized type (e.g. `special_comp#(1) a1;` records
+    /// `a1 -> [<1>]`). Locals get `var_type_args`; module-level decls get
+    /// `ElaboratedModule::class_type_args`; but class properties had neither,
+    /// so a later `this.a1 = new(...)` constructed with NO type-args and the
+    /// value parameter `N` defaulted — collapsing `#(1)`/`#(2)` properties
+    /// to `#(0)` (UVM 09callbacks/25params). Looked up by the runtime at
+    /// construction time via the `this` instance's class definition.
+    #[serde(default)]
+    pub property_type_args: HashMap<String, Vec<Expression>>,
     /// Typedef names declared in the class body.
     #[serde(default)]
     pub typedef_names: Vec<String>,
@@ -428,6 +438,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
+    let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
@@ -630,6 +641,14 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     if matches!(&p.data_type, DataType::Simple { kind: SimpleType::String, .. }) {
                         string_properties.insert(decl.name.name.clone());
                     }
+                    // Record a property's declared `#(...)` specialization
+                    // args so a later `this.prop = new(...)` constructs the
+                    // right specialization (binding value parameters).
+                    if let DataType::TypeReference { type_args, .. } = &p.data_type {
+                        if !type_args.is_empty() {
+                            property_type_args.insert(decl.name.name.clone(), type_args.clone());
+                        }
+                    }
                     properties.insert(decl.name.name.clone(), Signal { is_const: false,
                         name: decl.name.name.clone(),
                         width,
@@ -772,6 +791,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         type_param_names,
         type_param_defaults,
         param_order,
+        property_type_args,
         typedef_names: c.items.iter().filter_map(|it| match it {
             ClassItem::Typedef(td) => Some(td.name.name.clone()),
             _ => None,
