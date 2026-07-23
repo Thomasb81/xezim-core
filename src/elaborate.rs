@@ -6720,6 +6720,15 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
             ModuleItem::AlwaysConstruct(ac) => rewrite_stmt_delays(&mut ac.stmt, unit_s, tick_s),
             ModuleItem::InitialConstruct(ic) => rewrite_stmt_delays(&mut ic.stmt, unit_s, tick_s),
             ModuleItem::FinalConstruct(fc) => rewrite_stmt_delays(&mut fc.stmt, unit_s, tick_s),
+            // Task bodies carry delays too (`task pulse; #1 clk = 1; ...`).
+            // Without this a task-body `#1` stayed a raw 1-tick delay while
+            // the caller's `#1` was unit-scaled — a 1ns/1ps module's task
+            // delays silently ran 1000x too fast (§3.14.3).
+            ModuleItem::TaskDeclaration(td) => {
+                for s in td.items.iter_mut() {
+                    rewrite_stmt_delays(s, unit_s, tick_s);
+                }
+            }
             ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, tick_s),
             ModuleItem::GenerateIf(gi) => {
                 for (_c, items) in gi.branches.iter_mut() {
