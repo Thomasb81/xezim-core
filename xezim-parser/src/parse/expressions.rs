@@ -694,6 +694,44 @@ impl Parser {
             // a (sub-)sequence operand — `… ##1 @(posedge clk1) out1`. Only in
             // an SVA sequence/property body; consume the event and continue with
             // the operand (the clock retiming is parse-accepted, not modelled).
+            // §16.9.3 sampled-value function clocking argument:
+            // `$rose(x, @(posedge clk))` — parse `@(edge sig)` into the
+            // internal marker call `$__xz_clocking_arg(edge_code, sig)`
+            // (0 = any change, 1 = posedge, 2 = negedge) so the simulator
+            // can key its sampled history on the explicit clock.
+            TokenKind::At if !self.in_sva_seq => {
+                self.bump(); // @
+                let mut edge_code: u64 = 0;
+                let mut clk = Expression::new(ExprKind::Null, self.span_from(start));
+                if self.eat(TokenKind::LParen).is_some() {
+                    match self.current_kind() {
+                        TokenKind::KwPosedge => { edge_code = 1; self.bump(); }
+                        TokenKind::KwNegedge => { edge_code = 2; self.bump(); }
+                        TokenKind::KwEdge => { self.bump(); }
+                        _ => {}
+                    }
+                    clk = self.parse_expression();
+                    self.expect(TokenKind::RParen);
+                }
+                let span = self.span_from(start);
+                let edge_lit = Expression::new(
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: crate::ast::expr::NumberBase::Decimal,
+                        value: edge_code.to_string(),
+                        cached_val: std::cell::Cell::new(None),
+                    }),
+                    span,
+                );
+                return Expression::new(
+                    ExprKind::SystemCall {
+                        name: "$__xz_clocking_arg".to_string(),
+                        args: vec![edge_lit, clk],
+                    },
+                    span,
+                );
+            }
             TokenKind::At if self.in_sva_seq => {
                 self.bump(); // @
                 if self.at(TokenKind::LParen) {

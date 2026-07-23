@@ -879,6 +879,12 @@ pub struct ElaboratedModule {
     pub net_strengths: HashMap<String, (String, String)>,
     /// Arrays declared with descending range (e.g. [7:0])
     pub descending_arrays: HashSet<String>,
+    /// DECLARED (left, right) bounds per unpacked dimension, outermost first
+    /// (§20.7 array queries must report declared order — `[3:1]` has
+    /// $left=3/$right=1 and $increment=1; the arrays* tables normalize to
+    /// (lo, hi) and lose it).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unpacked_decl_dims: HashMap<String, Vec<(i64, i64)>>,
     /// Packed vectors declared with an ASCENDING range (`logic [0:7]`), mapped
     /// to their width. Bit/part selects index these from the MSB end (label 0 =
     /// MSB), so the interpreter remaps `sig[i]` → internal bit `(W-1)-i`
@@ -1177,6 +1183,7 @@ impl ElaboratedModule {
             dynamic_arrays: HashSet::default(),
             net_strengths: HashMap::default(),
             descending_arrays: HashSet::default(),
+            unpacked_decl_dims: HashMap::default(),
             ascending_packed: HashMap::default(),
             typedef_unpacked_dims: HashMap::default(),
             queue_max_sizes: HashMap::default(),
@@ -2920,6 +2927,9 @@ pub fn elaborate_module_with_defs(
                         };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                            if let Some(dd) = declared_unpacked_dims(&effective_dims, &elab.parameters) {
+                                elab.unpacked_decl_dims.insert(decl.name.name.clone(), dd);
+                            }
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
@@ -2968,6 +2978,9 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        if let Some(dd2) = declared_unpacked_dims(&effective_dims, &elab.parameters) {
+                            elab.unpacked_decl_dims.insert(decl.name.name.clone(), dd2);
+                        }
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
@@ -2991,6 +3004,9 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        if let Some(dd) = declared_unpacked_dims(&effective_dims, &elab.parameters) {
+                            elab.unpacked_decl_dims.insert(decl.name.name.clone(), dd);
+                        }
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
@@ -6737,6 +6753,12 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
                     rewrite_delay_expr(d, unit_s, tick_s);
                 }
             }
+            // `buf #(4) g(y, a);` — gate delays likewise count timeunits.
+            ModuleItem::GateInstantiation(gi) => {
+                if let Some(d) = gi.delay.as_mut() {
+                    rewrite_delay_expr(d, unit_s, tick_s);
+                }
+            }
             ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, tick_s),
             ModuleItem::GenerateIf(gi) => {
                 for (_c, items) in gi.branches.iter_mut() {
@@ -7469,6 +7491,37 @@ fn index_tuples(shape: &[(i64, i64)]) -> Vec<String> {
     out
 }
 
+/// DECLARED (left, right) for each unpacked dimension, outermost first —
+/// raw order preserved (no lo/hi normalization). `[N]` size form is (0, N-1).
+/// Returns None if any dimension is dynamic/associative/unresolvable.
+pub fn declared_unpacked_dims(
+    dims: &[crate::ast::types::UnpackedDimension],
+    params: &HashMap<String, Value>,
+) -> Option<Vec<(i64, i64)>> {
+    if dims.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dims.len());
+    for d in dims {
+        match d {
+            crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
+                let l = const_eval_i64_with_params(left, Some(params))?;
+                let r = const_eval_i64_with_params(right, Some(params))?;
+                out.push((l, r));
+            }
+            crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
+                let size = const_eval_i64_with_params(expr, Some(params))?;
+                if size <= 0 {
+                    return None;
+                }
+                out.push((0, size - 1));
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 pub fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
     if dims.is_empty() { return None; }
     match &dims[0] {
@@ -7575,7 +7628,7 @@ pub fn packed_full_dims_of(
         DataType::IntegerVector { dimensions, .. } => dimensions,
         _ => return None,
     };
-    if dims.len() < 2 {
+    if dims.is_empty() {
         return None;
     }
     let mut out = Vec::with_capacity(dims.len());
@@ -7585,6 +7638,16 @@ pub fn packed_full_dims_of(
             let r = const_eval_i64_with_params(right, Some(params))?;
             out.push((l, r));
         } else {
+            return None;
+        }
+    }
+    // A single [w-1:0] dimension is the normalized default the query
+    // functions already assume — recording it would be pure overhead. A
+    // single NON-normalized dimension ([15:8], ascending [0:7]) must be
+    // recorded so §20.7 array queries report the DECLARED bounds.
+    if out.len() == 1 {
+        let (l, r) = out[0];
+        if r == 0 && l >= 0 {
             return None;
         }
     }
@@ -12647,9 +12710,18 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
     if record_tran_switches(gi, elab, |e| e.clone()) {
         return;
     }
+    // Gate delay (`buf #(4)`) — pre-scaled to ticks by the module-delay
+    // rewrite; carried onto the lowered cont-assign, whose delayed-update
+    // path models the §28.9 single-delay INERTIAL behavior (a pulse
+    // narrower than the delay is filtered).
+    let delay = gi
+        .delay
+        .as_ref()
+        .map(|d| eval_const_expr(d, &elab.parameters))
+        .unwrap_or(0);
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
-        elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay: 0 });
+        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay });
     }
 }
 
