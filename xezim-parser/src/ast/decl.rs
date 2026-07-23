@@ -115,6 +115,11 @@ pub enum ModuleItem {
     /// same way as a top-level bind: the wrapped instantiation is appended
     /// to every instance of `target`.
     Bind(BindDirective),
+    /// Deprecated hierarchical parameter override `defparam path.p = e, ...;`
+    /// (LRM §23.10.1). Each entry is `(target_path, value)`; the target path's
+    /// LAST segment is the parameter name and the leading segments are the
+    /// instance path relative to the enclosing scope.
+    Defparam(Vec<(Expression, Expression)>),
     Null,
 }
 

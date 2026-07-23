@@ -292,14 +292,34 @@ impl Parser {
             TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
                 Some(ModuleItem::TimeunitsDecl(self.parse_timeunits_declaration()))
             }
-            // Deprecated hierarchical parameter override `defparam path.p = e;`
-            // (LRM §23.10.1). Parse and discard — consume to the terminating
-            // semicolon so it doesn't break the module-item stream (veer-el2 tb).
+            // Deprecated hierarchical parameter override `defparam path.p = e, …;`
+            // (LRM §23.10.1). Parse each `<hier_path> = <expr>` pair so
+            // elaboration can apply the override; on any malformed pair, fall
+            // back to consuming to the semicolon so the item stream survives.
             TokenKind::KwDefparam => {
                 self.bump();
-                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
-                let _ = self.eat(TokenKind::Semicolon);
-                None
+                let mut assigns: Vec<(Expression, Expression)> = Vec::new();
+                loop {
+                    let lhs = self.parse_expression();
+                    if self.eat(TokenKind::Assign).is_none() {
+                        break;
+                    }
+                    let rhs = self.parse_expression();
+                    assigns.push((lhs, rhs));
+                    if self.eat(TokenKind::Comma).is_some() {
+                        continue;
+                    }
+                    break;
+                }
+                // Recover to the terminating semicolon regardless.
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
+                let _ = self.eat(TokenKind::Semicolon);                if assigns.is_empty() {
+                    None
+                } else {
+                    Some(ModuleItem::Defparam(assigns))
+                }
             }
             // Elaboration-time system tasks at module-item level: $error, $warning,
             // $info, $fatal — typically inside a `STATIC_ASSERT` macro expansion

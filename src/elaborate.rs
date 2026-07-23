@@ -8694,7 +8694,7 @@ pub fn inline_instantiations(
     // resolve imported package parameters like black-parrot's `all_cfgs_gp`.
     set_param_fallback(&top_params);
     let mut cache = HashMap::default();
-    inline_module_items(elab, top_def, "", definitions, &mut HashMap::default(), &top_params, &mut cache)?;
+    inline_module_items(elab, top_def, "", definitions, &mut HashMap::default(), &top_params, &mut cache, &[])?;
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
     }
@@ -10259,6 +10259,41 @@ fn warn_port_width_mismatch(
     }
 }
 
+/// Extract the dotted instance/parameter path of a `defparam` LHS
+/// (`u.sub.PARAM` → `["u","sub","PARAM"]`). Returns None for anything that
+/// isn't a plain hierarchical identifier (bit-selects etc. are not valid
+/// defparam targets). The last segment is the parameter name.
+fn defparam_path_segments(e: &Expression) -> Option<Vec<String>> {
+    // `u.sub.PARAM` parses as a MemberAccess chain (`.` is member access),
+    // and a bare `u` (or a whole path) as an Ident — handle both.
+    fn walk(e: &Expression, out: &mut Vec<String>) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                for seg in &h.path {
+                    if !seg.selects.is_empty() {
+                        return false;
+                    }
+                    out.push(seg.name.name.clone());
+                }
+                true
+            }
+            ExprKind::MemberAccess { expr, member } => {
+                walk(expr, out) && {
+                    out.push(member.name.clone());
+                    true
+                }
+            }
+            _ => false,
+        }
+    }
+    let mut segs = Vec::new();
+    if walk(e, &mut segs) && segs.len() >= 2 {
+        Some(segs)
+    } else {
+        None
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -10267,8 +10302,25 @@ fn inline_module_items(
     interface_map: &mut HashMap<String, String>,
     local_params: &HashMap<String, Value>,
     cache: &mut InlinePrepCache,
+    // §23.10.1 pending `defparam` overrides targeting instances in THIS scope:
+    // `(path_segments, value)` where the value was already evaluated in the
+    // scope that declared the defparam. Path[0] is a child instance name.
+    pending_defparams: &[(Vec<String>, Value)],
 ) -> Result<(), String> {
     let prepared_source = prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
+    // Collect defparams: those propagated in from a parent scope, plus this
+    // module's own `defparam` items (RHS evaluated in THIS scope, §23.10.1).
+    let mut defparams: Vec<(Vec<String>, Value)> = pending_defparams.to_vec();
+    for it in &prepared_source.effective_items {
+        if let ModuleItem::Defparam(assigns) = it {
+            for (lhs, rhs) in assigns {
+                if let Some(path) = defparam_path_segments(lhs) {
+                    let val = eval_const_expr_val(rhs, local_params);
+                    defparams.push((path, val));
+                }
+            }
+        }
+    }
     for item in &prepared_source.effective_items {
         if let ModuleItem::ModuleInstantiation(inst) = item {
             let sub_mod_name = &inst.module_name.name;
@@ -10689,6 +10741,38 @@ fn inline_module_items(
                                 }
                             }
                         }
+                    }
+                }
+
+                // §23.10.1 `defparam` overrides for THIS instance. A path
+                // `hi.name.PARAM` (2 segs after the instance) sets a parameter
+                // of this instance directly; a longer path targets a deeper
+                // instance and is propagated into the recursion below. defparam
+                // wins over `#(…)` (applied after), matching common tool
+                // behavior. Localparams are not overridable, but the sub-module
+                // param resolution already excludes those.
+                // The instance name may be dotted after generate-scope
+                // flattening (`gblk.u`), so match it against the LEADING path
+                // segments rather than just path[0].
+                let inst_segs: Vec<&str> = hi.name.name.split('.').collect();
+                let n_inst = inst_segs.len();
+                let mut sub_defparams: Vec<(Vec<String>, Value)> = Vec::new();
+                for (path, val) in &defparams {
+                    if path.len() <= n_inst
+                        || !path[..n_inst]
+                            .iter()
+                            .zip(&inst_segs)
+                            .all(|(a, b)| a == b)
+                    {
+                        continue;
+                    }
+                    let rest = &path[n_inst..];
+                    if rest.len() == 1 {
+                        // Targets a parameter of this instance directly.
+                        sub_params.insert(rest[0].clone(), val.clone());
+                    } else {
+                        // Targets a deeper instance — propagate into recursion.
+                        sub_defparams.push((rest.to_vec(), val.clone()));
                     }
                 }
 
@@ -11542,7 +11626,7 @@ fn inline_module_items(
                 });
 
                 // Recurse into sub-module instantiations
-                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache)?;
+                inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache, &sub_defparams)?;
 
                 // Restore typedef entries shadowed by this instance's TYPE
                 // parameter overrides.
