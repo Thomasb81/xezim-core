@@ -808,6 +808,12 @@ pub struct ElaboratedModule {
     /// non-ANSI redeclarations while still permitting the legal split forms.
     #[serde(skip)]
     pub typed_decls: HashMap<String, bool>,
+    /// §26.3: names that are BOTH brought in by a wildcard package import
+    /// (`import pkg::*`) AND re-declared locally in this scope. A local
+    /// declaration shadows the imported name — so at such a name the
+    /// duplicate-declaration check overrides (drops the imported entry) instead
+    /// of erroring. Explicit imports (`import pkg::x`) are never listed here.
+    pub wildcard_shadowed: std::collections::HashSet<String>,
     pub port_order: Vec<String>,
     pub continuous_assigns: Vec<ContinuousAssignment>,
     /// §28.8 bidirectional switches (`tran`/`tranif0`/`tranif1`), pending
@@ -1159,6 +1165,7 @@ impl ElaboratedModule {
             tick_s: default_tick_s(),
             signals: HashMap::default(),
             typed_decls: HashMap::default(),
+            wildcard_shadowed: std::collections::HashSet::default(),
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
             tran_switches: Vec::new(),
@@ -2354,6 +2361,11 @@ pub fn elaborate_module_with_defs(
     }
 
 
+    // §26.3: names a wildcard import brings in that are ALSO declared locally
+    // — the local declaration shadows the imported one (no duplicate error).
+    if let Some(defs) = all_defs {
+        elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), defs);
+    }
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -2368,7 +2380,12 @@ pub fn elaborate_module_with_defs(
                 let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
-                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        if elab.wildcard_shadowed.contains(&decl.name.name) {
+                            elab.parameters.remove(&decl.name.name);
+                            elab.signals.remove(&decl.name.name);
+                        } else {
+                            return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        }
                     }
                     elab.note_explicit_type(&decl.name.name, &pd.data_type)?;
                     // §23.2.2.1 non-ANSI ports: the data type and the direction
@@ -2425,7 +2442,12 @@ pub fn elaborate_module_with_defs(
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
-                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        if elab.wildcard_shadowed.contains(&decl.name.name) {
+                            elab.parameters.remove(&decl.name.name);
+                            elab.signals.remove(&decl.name.name);
+                        } else {
+                            return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        }
                     }
                     elab.note_explicit_type(&decl.name.name, &nd.data_type)?;
                     // A `wire X;` (or other NetDeclaration) following an
@@ -2680,7 +2702,12 @@ pub fn elaborate_module_with_defs(
                             .insert(decl.name.name.clone(), dd.data_type.clone());
                         continue;
                     }
-                    if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
+                    if (elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name))
+                        && elab.wildcard_shadowed.contains(&decl.name.name) {
+                        // §26.3: local decl shadows the wildcard-imported name.
+                        elab.signals.remove(&decl.name.name);
+                        elab.parameters.remove(&decl.name.name);
+                    } else if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
                         // LRM §6.x: re-declaring a name already declared in the
                         // same scope is illegal. In strict mode (the default)
                         // this is a hard error. It stays a warning under
@@ -3464,7 +3491,12 @@ pub fn elaborate_module_with_defs(
                     }
                     for assign in assignments {
                         if elab.signals.contains_key(&assign.name.name) || elab.parameters.contains_key(&assign.name.name) {
-                            return Err(format!("Duplicate declaration of '{}'", assign.name.name));
+                            if elab.wildcard_shadowed.contains(&assign.name.name) {
+                                elab.parameters.remove(&assign.name.name);
+                                elab.signals.remove(&assign.name.name);
+                            } else {
+                                return Err(format!("Duplicate declaration of '{}'", assign.name.name));
+                            }
                         }
                         // IEEE 1800-2023: keyed assignment-pattern init for
                         // associative-array typed parameters. Materialize
@@ -3787,6 +3819,14 @@ pub fn elaborate_module_with_defs(
                 // LRM §9.2.3 — `final` executes once after the event loop
                 // exits (e.g. on $finish). Collected here; the simulator drains
                 // `final_blocks` before VCD/coverage flush.
+                // §24.9 — a final block runs like a function: nonblocking
+                // assignments are illegal inside it. Reject at elaboration.
+                if stmt_contains_nonblocking(&fc.stmt) {
+                    return Err(
+                        "final procedures cannot contain nonblocking assignments (LRM §24.9)"
+                            .to_string(),
+                    );
+                }
                 elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone(), scope: String::new(), });
             }
             ModuleItem::GenerateRegion(gr) => {
@@ -6059,7 +6099,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
-                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        if elab.wildcard_shadowed.contains(&decl.name.name) {
+                            elab.parameters.remove(&decl.name.name);
+                            elab.signals.remove(&decl.name.name);
+                        } else {
+                            return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        }
                     }
                     // §23.2.2.1 non-ANSI split type/direction — merge (see the
                     // matching comment in the top-module elaboration path).
@@ -6250,7 +6295,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) { width = 32; }
                     for assign in assignments {
                         if elab.signals.contains_key(&assign.name.name) || elab.parameters.contains_key(&assign.name.name) {
-                            return Err(format!("Duplicate declaration of '{}'", assign.name.name));
+                            if elab.wildcard_shadowed.contains(&assign.name.name) {
+                                elab.parameters.remove(&assign.name.name);
+                                elab.signals.remove(&assign.name.name);
+                            } else {
+                                return Err(format!("Duplicate declaration of '{}'", assign.name.name));
+                            }
                         }
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
@@ -6352,6 +6402,13 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     ), scope: String::new(), });
             }
             ModuleItem::FinalConstruct(fc) => {
+                // §24.9 — nonblocking assignments are illegal in a final block.
+                if stmt_contains_nonblocking(&fc.stmt) {
+                    return Err(
+                        "final procedures cannot contain nonblocking assignments (LRM §24.9)"
+                            .to_string(),
+                    );
+                }
                 elab.final_blocks.push(InitialBlock { stmt: fc.stmt.clone(), scope: String::new(), });
             }
             ModuleItem::ModuleInstantiation(inst) => {
@@ -13260,6 +13317,153 @@ thread_local! {
     /// Recursion-depth guard for re-export resolution in `process_import`
     /// (prevents stack overflow on cyclic `import`/`export` package graphs).
     static IMPORT_DEPTH: std::cell::Cell<u32> = const { std::cell::Cell::new(0) };
+}
+
+/// The declared name(s) a package item introduces (§26.3 shadow tracking).
+/// §24.9 — a `final` block executes like a function once the event loop exits;
+/// it may not contain nonblocking assignments. Detect one anywhere in the
+/// (possibly nested) statement so elaboration can reject the block.
+fn stmt_contains_nonblocking(s: &Statement) -> bool {
+    match &s.kind {
+        StatementKind::NonblockingAssign { .. } => true,
+        StatementKind::If { then_stmt, else_stmt, .. } => {
+            stmt_contains_nonblocking(then_stmt)
+                || else_stmt.as_ref().is_some_and(|e| stmt_contains_nonblocking(e))
+        }
+        StatementKind::Case { items, .. } => {
+            items.iter().any(|it| stmt_contains_nonblocking(&it.stmt))
+        }
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            stmts.iter().any(stmt_contains_nonblocking)
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Forever { body }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Foreach { body, .. } => stmt_contains_nonblocking(body),
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            stmt_contains_nonblocking(stmt)
+        }
+        _ => false,
+    }
+}
+
+fn package_item_names(pi: &PackageItem) -> Vec<String> {
+    match pi {
+        PackageItem::Parameter(pd) => match &pd.kind {
+            ParameterKind::Data { assignments, .. } => {
+                assignments.iter().map(|a| a.name.name.clone()).collect()
+            }
+            _ => Vec::new(),
+        },
+        PackageItem::Typedef(td) => {
+            let mut v = vec![td.name.name.clone()];
+            // §6.19: an enum typedef also introduces each MEMBER name into the
+            // enclosing scope, so those are shadowable too (`localparam C = 4`
+            // shadowing an imported enum member `C`).
+            if let DataType::Enum(en) = &td.data_type {
+                for m in &en.members {
+                    v.push(m.name.name.clone());
+                }
+            }
+            v
+        }
+        PackageItem::Function(fd) => vec![fd.name.name.name.clone()],
+        PackageItem::Task(td) => vec![td.name.name.name.clone()],
+        PackageItem::Data(dd) => dd.declarators.iter().map(|d| d.name.name.clone()).collect(),
+        PackageItem::Class(cd) => vec![cd.name.name.clone()],
+        _ => Vec::new(),
+    }
+}
+
+/// Names declared LOCALLY in a module scope (§26.3 shadow tracking): params,
+/// vars, nets, ports, typedefs, functions, tasks, classes, instances.
+fn collect_local_scope_names(items: &[ModuleItem]) -> std::collections::HashSet<String> {
+    let mut out = std::collections::HashSet::default();
+    for item in items {
+        match item {
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators { out.insert(d.name.name.clone()); }
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators { out.insert(d.name.name.clone()); }
+            }
+            ModuleItem::PortDeclaration(pd) => {
+                for d in &pd.declarators { out.insert(d.name.name.clone()); }
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for a in assignments { out.insert(a.name.name.clone()); }
+                }
+            }
+            ModuleItem::TypedefDeclaration(td) => {
+                out.insert(td.name.name.clone());
+                if let DataType::Enum(en) = &td.data_type {
+                    for m in &en.members { out.insert(m.name.name.clone()); }
+                }
+            }
+            ModuleItem::FunctionDeclaration(fd) => { out.insert(fd.name.name.name.clone()); }
+            ModuleItem::TaskDeclaration(td) => { out.insert(td.name.name.name.clone()); }
+            ModuleItem::ClassDeclaration(cd) => { out.insert(cd.name.name.clone()); }
+            ModuleItem::ModuleInstantiation(mi) => {
+                for hi in &mi.instances { out.insert(hi.name.name.clone()); }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+/// §26.3: names shadowed by a local declaration over a WILDCARD import. For
+/// each `import pkg::*` in `items`, every package name that is ALSO declared
+/// locally is a shadow (the local wins). Explicit imports are excluded.
+fn compute_wildcard_shadowed(
+    items: &[ModuleItem],
+    defs: &HashMap<String, Definition>,
+) -> std::collections::HashSet<String> {
+    // §26.3 ordering rule: a local declaration only legally SHADOWS a
+    // wildcard-imported name if it precedes any use of that name. A name that a
+    // procedural/continuous-assign block references BEFORE its local
+    // re-declaration is a genuine conflict (error), not a shadow. We approximate
+    // "before any use" conservatively as "declared before the first behavioral
+    // item": declarations that come after an initial/always/final/assign are NOT
+    // treated as shadows, so the duplicate-declaration error still fires for
+    // them (matching the CE case where names are used before re-declaration).
+    let first_behavior = items.iter().position(|it| {
+        matches!(
+            it,
+            ModuleItem::InitialConstruct(_)
+                | ModuleItem::AlwaysConstruct(_)
+                | ModuleItem::FinalConstruct(_)
+                | ModuleItem::ContinuousAssign(_)
+        )
+    });
+    let decl_items: &[ModuleItem] = match first_behavior {
+        Some(idx) => &items[..idx],
+        None => items,
+    };
+    let local = collect_local_scope_names(decl_items);
+    let mut out = std::collections::HashSet::default();
+    for item in items {
+        if let ModuleItem::ImportDeclaration(imp) = item {
+            for ii in &imp.items {
+                if ii.item.is_some() {
+                    continue; // explicit import: not shadowable
+                }
+                if let Some(Definition::Package(pkg)) = defs.get(&ii.package.name) {
+                    for pi in &pkg.items {
+                        for n in package_item_names(pi) {
+                            if local.contains(&n) {
+                                out.insert(n);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    out
 }
 
 fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &HashMap<String, Definition>) -> Result<(), String> {

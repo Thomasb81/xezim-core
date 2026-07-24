@@ -292,6 +292,19 @@ impl Parser {
             TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
                 Some(ModuleItem::TimeunitsDecl(self.parse_timeunits_declaration()))
             }
+            // A `program … endprogram` block nested inside a module (LRM §24.3).
+            // A program shares the enclosing scope for cross-references (its
+            // `initial`/`final` blocks drive the module's nets), so inline its
+            // items as an (unnamed) generate region — they elaborate directly in
+            // the module scope, which is exactly the sharing the LRM prescribes
+            // for the common testbench-in-module form.
+            TokenKind::KwProgram => {
+                let prog = self.parse_program_declaration();
+                Some(ModuleItem::GenerateRegion(GenerateRegion {
+                    items: prog.items,
+                    span: prog.span,
+                }))
+            }
             // Deprecated hierarchical parameter override `defparam path.p = e, …;`
             // (LRM §23.10.1). Parse each `<hier_path> = <expr>` pair so
             // elaboration can apply the override; on any malformed pair, fall
