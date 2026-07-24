@@ -626,13 +626,18 @@ impl Parser {
                 // its inputs before each clock edge. Falls back to the
                 // legacy skip path for forms we don't recognise.
                 let mut clock_signal_id: Option<crate::ast::Identifier> = None;
+                let mut clock_edge: Option<crate::ast::stmt::Edge> = None;
                 if self.at(TokenKind::At) {
                     self.bump();
                     if self.at(TokenKind::LParen) {
                         self.bump();
-                        let _ = self.eat(TokenKind::KwPosedge);
-                        let _ = self.eat(TokenKind::KwNegedge);
-                        let _ = self.eat(TokenKind::KwEdge);
+                        if self.eat(TokenKind::KwPosedge).is_some() {
+                            clock_edge = Some(crate::ast::stmt::Edge::Posedge);
+                        } else if self.eat(TokenKind::KwNegedge).is_some() {
+                            clock_edge = Some(crate::ast::stmt::Edge::Negedge);
+                        } else if self.eat(TokenKind::KwEdge).is_some() {
+                            clock_edge = Some(crate::ast::stmt::Edge::Edge);
+                        }
                         if self.at(TokenKind::Identifier) {
                             clock_signal_id = Some(self.parse_identifier());
                         }
@@ -723,7 +728,7 @@ impl Parser {
                     Some(self.parse_identifier())
                 } else { None };
                 let id = cb_name.unwrap_or_else(|| Identifier { name: "default".to_string(), span: self.span_from(start) });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: clock_signal_id, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: clock_signal_id, clock_edge, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover =>
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement())),
@@ -872,7 +877,7 @@ impl Parser {
                 // ClockingDeclaration struct needs an Option<Identifier> for name if we want to store it accurately,
                 // but for now let's just use a dummy identifier if it's missing.
                 let id = name.unwrap_or_else(|| Identifier { name: "default".to_string(), span: self.span_from(start) });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: None, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: None, clock_edge: None, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwDefault => {
                 self.bump();

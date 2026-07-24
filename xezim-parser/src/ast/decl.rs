@@ -229,6 +229,11 @@ pub struct ClockingDeclaration {
     /// was declared without an event — implementation-defined behavior.
     #[cfg_attr(feature = "serde", serde(default))]
     pub clock_signal: Option<Identifier>,
+    /// LRM §14.3: the clock event's EDGE (`posedge`/`negedge`/`edge`). `None`
+    /// when unspecified — the simulator defaults to posedge. Without this the
+    /// block would always sync on posedge even for `@(negedge clk)`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub clock_edge: Option<super::stmt::Edge>,
     /// LRM §14.11: true when declared `default clocking ...` — the block
     /// that procedural cycle delays (`##N`) synchronize to.
     #[cfg_attr(feature = "serde", serde(default))]
