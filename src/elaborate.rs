@@ -282,6 +282,20 @@ pub struct ElaboratedClass {
     /// Names of type parameters declared on the class.
     #[serde(default)]
     pub type_param_names: Vec<String>,
+    /// IEEE 1800-2020 §6.20.2: default type/class for each type parameter that
+    /// declares one (`type T = some_class`). Stored as `(name, fragment)`
+    /// where `fragment` is the default rendered to its class/identifier text
+    /// (e.g. `uvm_callback`). Used to CANONICALIZE specialization signatures
+    /// so a specialization that omits a defaulted trailing param
+    /// (`C#(arg)` vs `C#(arg, default)`) keys its statics consistently
+    /// regardless of whether it was named directly or reached via `extends`.
+    /// Without this, `uvm_callbacks#(T,CB=uvm_callback)::m_typeid` was keyed
+    /// `uvm_callbacks#a_comp::m_typeid` when named directly but
+    /// `uvm_callbacks#a_comp, uvm_callback::m_typeid` via `extends`, so
+    /// `register_super_type` read a different (empty) cell and
+    /// `m_derived_types` stayed empty.
+    #[serde(default)]
+    pub type_param_defaults: Vec<(String, String)>,
     /// IEEE 1800-2017 §8.7: value arguments in the `extends Base(args)` clause,
     /// passed to the implicit `super.new(args)` when the derived constructor
     /// does not call `super.new` explicitly.
@@ -302,6 +316,16 @@ pub struct ElaboratedClass {
     /// `param_defaults` alone lose the combined order.
     #[serde(default)]
     pub param_order: Vec<String>,
+    /// Declared `#(...)` specialization args for each CLASS PROPERTY typed
+    /// with a parameterized type (e.g. `special_comp#(1) a1;` records
+    /// `a1 -> [<1>]`). Locals get `var_type_args`; module-level decls get
+    /// `ElaboratedModule::class_type_args`; but class properties had neither,
+    /// so a later `this.a1 = new(...)` constructed with NO type-args and the
+    /// value parameter `N` defaulted — collapsing `#(1)`/`#(2)` properties
+    /// to `#(0)` (UVM 09callbacks/25params). Looked up by the runtime at
+    /// construction time via the `this` instance's class definition.
+    #[serde(default)]
+    pub property_type_args: HashMap<String, Vec<Expression>>,
     /// Typedef names declared in the class body.
     #[serde(default)]
     pub typedef_names: Vec<String>,
@@ -414,6 +438,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
+    let mut property_type_args: HashMap<String, Vec<Expression>> = HashMap::default();
     let mut static_collections: Vec<(String, bool, u32)> = Vec::new();
     let mut property_inits: HashMap<String, crate::ast::expr::Expression> = HashMap::default();
     let mut constraints = HashMap::default();
@@ -616,6 +641,14 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     if matches!(&p.data_type, DataType::Simple { kind: SimpleType::String, .. }) {
                         string_properties.insert(decl.name.name.clone());
                     }
+                    // Record a property's declared `#(...)` specialization
+                    // args so a later `this.prop = new(...)` constructs the
+                    // right specialization (binding value parameters).
+                    if let DataType::TypeReference { type_args, .. } = &p.data_type {
+                        if !type_args.is_empty() {
+                            property_type_args.insert(decl.name.name.clone(), type_args.clone());
+                        }
+                    }
                     properties.insert(decl.name.name.clone(), Signal { is_const: false,
                         name: decl.name.name.clone(),
                         width,
@@ -706,6 +739,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     let has_pure_virtual = c.items.iter().any(|it|
         matches!(it, ClassItem::Method(m) if matches!(m.kind, ClassMethodKind::PureVirtual(_))));
     let mut type_param_names = Vec::new();
+    let mut type_param_defaults: Vec<(String, String)> = Vec::new();
     let mut param_order: Vec<String> = Vec::new();
     for p in &c.params {
         match &p.kind {
@@ -713,6 +747,12 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 for a in assignments {
                     type_param_names.push(a.name.name.clone());
                     param_order.push(a.name.name.clone());
+                    // Capture the default type as a textual fragment.
+                    if let Some(dt) = &a.init {
+                        if let Some(frag) = data_type_to_spec_fragment(dt) {
+                            type_param_defaults.push((a.name.name.clone(), frag));
+                        }
+                    }
                 }
             }
             crate::ast::decl::ParameterKind::Data { assignments, .. } => {
@@ -749,7 +789,9 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
         has_pure_virtual,
         implements: c.implements.iter().map(|i| i.name.clone()).collect(),
         type_param_names,
+        type_param_defaults,
         param_order,
+        property_type_args,
         typedef_names: c.items.iter().filter_map(|it| match it {
             ClassItem::Typedef(td) => Some(td.name.name.clone()),
             _ => None,
@@ -5176,12 +5218,21 @@ fn walk_stmt_for_class_new(stmt: &Statement, elab: &ElaboratedModule) -> Result<
 /// specialization-chain resolver treats as "give up on this arg".
 fn param_value_to_arg_string(pv: &ParamValue) -> String {
     match pv {
-        ParamValue::Type(dt) => match dt {
-            DataType::TypeReference { name, .. } => name.name.name.clone(),
-            DataType::Simple { kind, .. } => format!("{:?}", kind).to_lowercase(),
-            _ => "<unknown>".to_string(),
-        },
+        ParamValue::Type(dt) => data_type_to_spec_fragment(dt).unwrap_or_else(|| "<unknown>".to_string()),
         ParamValue::Expr(ex) => expr_to_arg_string(ex),
+    }
+}
+
+/// Render a `DataType` (the default of a `type T = <dt>` parameter) to the
+/// textual fragment used in specialization-signature canonicalization. Only
+/// the shapes that can legally be a type-parameter default are handled
+/// (class/type-reference and simple built-ins); anything else yields None so
+/// the caller leaves that param position un-padded.
+fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
+    match dt {
+        DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+        DataType::Simple { kind, .. } => Some(format!("{:?}", kind).to_lowercase()),
+        _ => None,
     }
 }
 
