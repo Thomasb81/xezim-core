@@ -858,6 +858,11 @@ pub struct ElaboratedModule {
     pub func_decl_scope: HashMap<String, String>,
     /// DPI imports by SV-visible symbol name.
     pub dpi_imports: HashMap<String, DpiImportSpec>,
+    /// §35.5.4 exported SV functions/tasks (`export "DPI-C" function f;`), in
+    /// declaration order. The index is a stable id the C-callable trampoline
+    /// passes back to identify which subroutine to run.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dpi_exports: Vec<String>,
     /// Clocking block definitions: name -> AST declaration.
     pub clocking_blocks: HashMap<String, ClockingDeclaration>,
     /// Let declarations visible in the elaborated scope.
@@ -1174,6 +1179,7 @@ impl ElaboratedModule {
             tasks: HashMap::default(),
             func_decl_scope: HashMap::default(),
             dpi_imports: HashMap::default(),
+            dpi_exports: Vec::new(),
             clocking_blocks: HashMap::default(),
             lets: HashMap::default(),
             modport_views: HashMap::default(),
@@ -3884,6 +3890,15 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::DPIImport(di) => {
                 register_dpi_import(di, &mut elab)?;
+            }
+            ModuleItem::DPIExport(e) => {
+                let name = match &e.proto {
+                    crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
+                    crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
+                };
+                if !elab.dpi_exports.contains(&name) {
+                    elab.dpi_exports.push(name);
+                }
             }
             ModuleItem::OutOfClassConstraint { class_name, constraint_name, items } => {
                 elab.out_of_class_constraints.insert((class_name.clone(), constraint_name.clone()));
