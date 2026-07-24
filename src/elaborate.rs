@@ -11818,6 +11818,54 @@ fn inline_module_items(
                             .collect();
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
+                    if let ModuleItem::ClockingDeclaration(cd) = sub_item {
+                        // §14.3 interface-scoped clocking block: register it under
+                        // the instance-prefixed name (`iface_inst.cb`) so
+                        // `@(iface_inst.cb)` and `iface_inst.cb.sig` resolve, with
+                        // the clock signal resolved through the port binding
+                        // (interface `clk` port → the connected net) and the
+                        // sampled/driven signals prefixed to the inlined interface
+                        // nets. Without this the block was dropped and `@(bus.cb)`
+                        // degraded to a never-firing wait (returned at t=0).
+                        let resolve = |name: &str| -> String {
+                            let e = make_ident_expr(name);
+                            let re = rewrite_expr(
+                                &e,
+                                &inst_prefix,
+                                &rewrite_port_map,
+                                &prepared_sub.local_names,
+                                &sub_interface_map,
+                            );
+                            match &re.kind {
+                                ExprKind::Ident(h) => h
+                                    .path
+                                    .iter()
+                                    .map(|s| s.name.name.as_str())
+                                    .collect::<Vec<_>>()
+                                    .join("."),
+                                _ => format!("{}{}", inst_prefix, name),
+                            }
+                        };
+                        let mut new_cd = cd.clone();
+                        new_cd.name.name = format!("{}{}", inst_prefix, cd.name.name);
+                        if let Some(clk) = &cd.clock_signal {
+                            new_cd.clock_signal = Some(crate::ast::Identifier {
+                                name: resolve(&clk.name),
+                                span: clk.span,
+                            });
+                        }
+                        for s in &mut new_cd.signals {
+                            s.name.name = resolve(&s.name.name);
+                        }
+                        let mut dirs = HashMap::default();
+                        for s in &new_cd.signals {
+                            dirs.insert(s.name.name.clone(), s.direction);
+                        }
+                        elab.clocking_signal_dirs
+                            .insert(new_cd.name.name.clone(), dirs);
+                        elab.clocking_blocks
+                            .insert(new_cd.name.name.clone(), new_cd);
+                    }
                     if matches!(sub_item, ModuleItem::ContinuousAssign(_)) {
                         // #7: Rc-share source ASTs across sibling instances.
                         if let BodySource::ContAssign(pairs) = body_src {                            for (lhs_rc, rhs_rc) in pairs {
