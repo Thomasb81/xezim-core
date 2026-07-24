@@ -258,6 +258,10 @@ pub struct ClockingSignal {
     /// §14.4 per-signal skew (`output #0 sig;`). None = use the block default.
     #[cfg_attr(feature = "serde", serde(default))]
     pub skew: Option<super::expr::Expression>,
+    /// §14.3 signal RENAMING: `input alias = actual_expr;` binds the clocking
+    /// name to a different signal. None = the clocking name IS the signal.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub bound_to: Option<super::expr::Expression>,
     pub span: Span,
 }
 

@@ -3888,12 +3888,35 @@ pub fn elaborate_module_with_defs(
                 elab.covergroups.insert(cg.name.name.clone(), cg.clone());
             }
             ModuleItem::ClockingDeclaration(cd) => {
+                // §14.12 standalone designation `default clocking <name>;`
+                // arrives as an empty, clock-less marker — fold it into the
+                // real same-named block instead of overwriting it (either
+                // declaration order). A real block keeps a designation that
+                // arrived first.
+                let is_designation =
+                    cd.clock_signal.is_none() && cd.signals.is_empty() && cd.is_default;
+                if is_designation {
+                    if let Some(existing) = elab.clocking_blocks.get_mut(&cd.name.name) {
+                        existing.is_default = true;
+                    } else {
+                        elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+                    }
+                    continue;
+                }
                 let mut dirs = HashMap::default();
                 for s in &cd.signals {
                     dirs.insert(s.name.name.clone(), s.direction);
                 }
+                let was_default = elab
+                    .clocking_blocks
+                    .get(&cd.name.name)
+                    .is_some_and(|p| p.is_default && p.clock_signal.is_none());
+                let mut cd_owned = cd.clone();
+                if was_default {
+                    cd_owned.is_default = true;
+                }
                 elab.clocking_signal_dirs.insert(cd.name.name.clone(), dirs);
-                elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+                elab.clocking_blocks.insert(cd.name.name.clone(), cd_owned);
             }
             ModuleItem::ClassDeclaration(cd) => {
                 validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
@@ -6495,12 +6518,35 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
             }
             ModuleItem::ClockingDeclaration(cd) => {
+                // §14.12 standalone designation `default clocking <name>;`
+                // arrives as an empty, clock-less marker — fold it into the
+                // real same-named block instead of overwriting it (either
+                // declaration order). A real block keeps a designation that
+                // arrived first.
+                let is_designation =
+                    cd.clock_signal.is_none() && cd.signals.is_empty() && cd.is_default;
+                if is_designation {
+                    if let Some(existing) = elab.clocking_blocks.get_mut(&cd.name.name) {
+                        existing.is_default = true;
+                    } else {
+                        elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+                    }
+                    continue;
+                }
                 let mut dirs = HashMap::default();
                 for s in &cd.signals {
                     dirs.insert(s.name.name.clone(), s.direction);
                 }
+                let was_default = elab
+                    .clocking_blocks
+                    .get(&cd.name.name)
+                    .is_some_and(|p| p.is_default && p.clock_signal.is_none());
+                let mut cd_owned = cd.clone();
+                if was_default {
+                    cd_owned.is_default = true;
+                }
                 elab.clocking_signal_dirs.insert(cd.name.name.clone(), dirs);
-                elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+                elab.clocking_blocks.insert(cd.name.name.clone(), cd_owned);
             }
             ModuleItem::LetDeclaration(ld) => {
                 elab.lets.insert(ld.name.name.clone(), ld.clone());

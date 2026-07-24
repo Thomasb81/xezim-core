@@ -749,7 +749,13 @@ impl Parser {
                             loop {
                                 if self.at(TokenKind::Identifier) {
                                     let id = self.parse_identifier();
-                                    signals.push(ClockingSignal { direction, name: id, skew: sig_skew.clone(), span: self.span_from(sstart) });
+                                    // §14.3 signal renaming: `input alias = expr;`
+                                    let bound_to = if self.eat(TokenKind::Assign).is_some() {
+                                        Some(self.parse_expression())
+                                    } else {
+                                        None
+                                    };
+                                    signals.push(ClockingSignal { direction, name: id, skew: sig_skew.clone(), bound_to, span: self.span_from(sstart) });
                                 }
                                 if self.eat(TokenKind::Comma).is_none() { break; }
                             }
@@ -902,7 +908,7 @@ impl Parser {
                             loop {
                                 if self.at(TokenKind::Identifier) {
                                     let id = self.parse_identifier();
-                                    signals.push(ClockingSignal { direction, name: id, skew: None, span: self.span_from(sstart) });
+                                    signals.push(ClockingSignal { direction, name: id, skew: None, bound_to: None, span: self.span_from(sstart) });
                                 }
                                 if self.eat(TokenKind::Comma).is_none() { break; }
                             }
@@ -921,6 +927,34 @@ impl Parser {
             TokenKind::KwDefault => {
                 self.bump();
                 if self.at(TokenKind::KwClocking) {
+                    // §14.12 STANDALONE designation `default clocking <name>;`
+                    // — names an ALREADY-declared block rather than declaring
+                    // one. Detect by the `;` right after the identifier (a
+                    // declaration always has `@(...)` or at least a body) and
+                    // emit a marker: an empty, clock-less ClockingDeclaration
+                    // with is_default set, which the elaborator folds into the
+                    // existing same-named block. Without this the parser
+                    // recursed into the block form and ran to EOF looking for
+                    // `endclocking`.
+                    if matches!(self.peek_kind(), TokenKind::Identifier)
+                        && self.peek_kind_n(2) == TokenKind::Semicolon
+                    {
+                        self.bump(); // clocking
+                        let name = self.parse_identifier();
+                        self.expect(TokenKind::Semicolon);
+                        return Some(ModuleItem::ClockingDeclaration(ClockingDeclaration {
+                            name,
+                            clock_signal: None,
+                            clock_edge: None,
+                            default_input_skew: None,
+                            default_output_skew: None,
+                            is_default: true,
+                            signals: Vec::new(),
+                            items: Vec::new(),
+                            endlabel: None,
+                            span: self.span_from(start),
+                        }));
+                    }
                     // §14.11: mark the block so procedural `##N` knows which
                     // clocking block to synchronize to.
                     let mut item = self.parse_module_item(); // recurse to handle clocking
