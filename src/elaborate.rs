@@ -2504,18 +2504,22 @@ pub fn elaborate_module_with_defs(
                                 }
                             }
                         }
-                        // Packed multi-D NET: `wire logic [3:0][7:0] foo;` —
-                        // record the per-element width so `foo[i]` resolves to
-                        // an 8-bit slice instead of a 1-bit select (LRM §7.4.1).
-                        // The variable (DataDeclaration) arm already does this;
-                        // the net arm omitted it, so packed-element port
-                        // connections in genloops read/drove single bits.
-                        if let Some(elem_w) = packed_inner_elem_width(&nd.data_type, &elab.parameters, &elab.typedefs) {
-                            elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
-                        }
-                        if let Some(fdims) = packed_full_dims_of(&nd.data_type, &elab.parameters) {
-                            elab.packed_full_dims.insert(decl.name.name.clone(), fdims);
-                        }
+                    }
+                    // Packed multi-D NET: `wire logic [3:0][7:0] foo;` —
+                    // record the per-element width so `foo[i]` resolves to
+                    // an 8-bit slice instead of a 1-bit select (LRM §7.4.1).
+                    // Registered even when the declarator ALSO has unpacked
+                    // dimensions (`wire [1:0][7:0] w [0:1];`): the packed dims
+                    // of the ELEMENT type still govern `w[i][j]`. The variable
+                    // (DataDeclaration) arm has always registered
+                    // unconditionally; the net arm gated it behind
+                    // "no unpacked dims", so element selects into an unpacked
+                    // array of packed vectors lost their width.
+                    if let Some(elem_w) = packed_inner_elem_width(&nd.data_type, &elab.parameters, &elab.typedefs) {
+                        elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
+                    }
+                    if let Some(fdims) = packed_full_dims_of(&nd.data_type, &elab.parameters) {
+                        elab.packed_full_dims.insert(decl.name.name.clone(), fdims);
                     }
                     if let Some(shape) = fixed_unpacked_shape(&decl.dimensions, &elab.parameters)
                         .filter(|shape| !shape.is_empty())
