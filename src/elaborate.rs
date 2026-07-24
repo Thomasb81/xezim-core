@@ -322,7 +322,7 @@ pub struct ElaboratedClass {
     /// `ElaboratedModule::class_type_args`; but class properties had neither,
     /// so a later `this.a1 = new(...)` constructed with NO type-args and the
     /// value parameter `N` defaulted — collapsing `#(1)`/`#(2)` properties
-    /// to `#(0)` (UVM 09callbacks/25params). Looked up by the runtime at
+    /// to `#(0)` (a UVM callbacks specialization case). Looked up by the runtime at
     /// construction time via the `this` instance's class definition.
     #[serde(default)]
     pub property_type_args: HashMap<String, Vec<Expression>>,
@@ -1583,7 +1583,7 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
 ///    class uvm_phase and was invisible to `port_is_assoc_array`; and (b)
 ///    config_db / type-handle equality resolves the class-local type.
 ///    Without it the phase-DAG successor writeback was silently lost and every
-///    UVM test stalled at t=0.
+///    such test stalled at t=0.
 pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedModule) {
     for item in &c.items {
         if let ClassItem::Typedef(td) = item {
