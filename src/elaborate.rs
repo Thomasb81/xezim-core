@@ -11539,9 +11539,23 @@ fn inline_module_items(
                                 }
                             }
                             elab.typedefs.insert(td.name.name.clone(), base_width);
+                            elab.typedef_types
+                                .entry(td.name.name.clone())
+                                .or_insert_with(|| td.data_type.clone());
                         } else {
                             let w = resolve_type_width(&td.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
                             elab.typedefs.insert(td.name.name.clone(), w);
+                            // Register the TYPE too (not just its width) so a
+                            // struct/union member access (`s.m0`) on a submodule
+                            // variable of this typedef can resolve to its bit
+                            // layout. Only the width was recorded before, so
+                            // `flatten_struct_fields` below found nothing and the
+                            // member cont-assign was silently dropped (struct
+                            // stayed X). `entry().or_insert` = first-declared
+                            // wins, matching the enum-member shadowing rule.
+                            elab.typedef_types
+                                .entry(td.name.name.clone())
+                                .or_insert_with(|| td.data_type.clone());
                         }
                     }
                 }
@@ -11629,6 +11643,44 @@ fn inline_module_items(
                                     let scoped = format!("{}{}", inst_prefix, bare);
                                     elab.packed_full_dims.insert(bare, fdims.clone());
                                     elab.packed_full_dims.insert(scoped, fdims.clone());
+                                }
+                            }
+                            // PACKED-STRUCT member layout for a submodule variable
+                            // (`typedef struct packed {...} t; t s;`). The top-
+                            // level DataDeclaration arm registers this; the
+                            // submodule arm did NOT, so `s.m0 = v` had no bit
+                            // offset to resolve and was DROPPED (struct read back
+                            // X). Register under BOTH the bare name and the
+                            // instance-scoped name, mirroring the packed-dim
+                            // blocks above. Only PACKED structs (contiguous bit
+                            // layout); unpacked structs keep per-member signals.
+                            if let DataType::Struct(su) = &resolve_typedef_chain(
+                                &dd.data_type,
+                                &elab.typedef_types,
+                            ) {
+                                if su.packed {
+                                    if let Some(fields) = flatten_struct_fields(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            for decl in &dd.declarators {
+                                                if !decl.dimensions.is_empty() {
+                                                    continue;
+                                                }
+                                                let bare = decl.name.name.clone();
+                                                let scoped = format!("{}{}", inst_prefix, bare);
+                                                tls_register_struct_layout(&bare, &fields);
+                                                tls_register_struct_layout(&scoped, &fields);
+                                                elab.packed_struct_fields
+                                                    .insert(bare, fields.clone());
+                                                elab.packed_struct_fields
+                                                    .insert(scoped, fields.clone());
+                                            }
+                                        }
+                                    }
                                 }
                             }
                             let width = match &dd.data_type {
