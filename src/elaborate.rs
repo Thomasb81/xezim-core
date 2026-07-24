@@ -7641,6 +7641,13 @@ pub fn packed_full_dims_of(
 ) -> Option<Vec<(i64, i64)>> {
     let dims = match dt {
         DataType::IntegerVector { dimensions, .. } => dimensions,
+        // A declaration with packed ranges but NO type keyword — the common
+        // `wire [1:0][7:0] w;` net form — parses as an IMPLICIT data type
+        // (implicitly 4-state logic, §6.10). Its packed dimensions must be
+        // recorded exactly like an explicit `logic [1:0][7:0]`, otherwise
+        // element selects degrade to bit-selects and element continuous
+        // assigns cannot resolve to a slice.
+        DataType::Implicit { dimensions, .. } => dimensions,
         _ => return None,
     };
     if dims.is_empty() {
@@ -7754,7 +7761,9 @@ pub fn packed_inner_elem_width(
         // typedef refs so callers can resolve via their own context.
         return None;
     } else { dt };
-    if let DataType::IntegerVector { dimensions, .. } = resolved {
+    if let DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } =
+        resolved
+    {
         if dimensions.len() < 2 { return None; }
         // Total width = product of all dims
         let mut total = 1u32;
