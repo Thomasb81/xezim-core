@@ -663,12 +663,50 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 let items: Vec<crate::ast::stmt::Statement> = Vec::new();
                 let mut signals: Vec<ClockingSignal> = Vec::new();
+                let mut default_input_skew: Option<crate::ast::expr::Expression> = None;
+                let mut default_output_skew: Option<crate::ast::expr::Expression> = None;
                 while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
-                    // `default input #1step output ...;` and other body
-                    // statements (LRM §14.3) are not captured — skip to the
-                    // matching `;` so the signal-list pass below stays in
-                    // sync.
+                    // `default input #d output #d;` (§14.4) — capture the skew
+                    // expressions; anything unrecognized is skipped to the `;`
+                    // so the signal-list pass below stays in sync. `#1step`
+                    // (the LRM default) is left as None — the simulator's
+                    // preponed sampling IS the 1step behavior.
                     if self.at(TokenKind::KwDefault) {
+                        self.bump();
+                        loop {
+                            let dir_in = self.at(TokenKind::KwInput);
+                            let dir_out = self.at(TokenKind::KwOutput);
+                            if !dir_in && !dir_out {
+                                break;
+                            }
+                            self.bump();
+                            if self.at(TokenKind::Hash) {
+                                self.bump();
+                                let skew = if self.at(TokenKind::LParen) {
+                                    self.bump();
+                                    let e = self.parse_expression();
+                                    self.expect(TokenKind::RParen);
+                                    Some(e)
+                                } else if matches!(
+                                    self.current_kind(),
+                                    TokenKind::IntegerLiteral
+                                        | TokenKind::TimeLiteral
+                                        | TokenKind::RealLiteral
+                                ) {
+                                    Some(self.parse_expr_bp(3))
+                                } else {
+                                    // `#1step` or other non-literal — treat as
+                                    // the default (None) and skip the token.
+                                    self.bump();
+                                    None
+                                };
+                                if dir_in {
+                                    default_input_skew = skew;
+                                } else {
+                                    default_output_skew = skew;
+                                }
+                            }
+                        }
                         while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
                         if self.at(TokenKind::Semicolon) { self.bump(); }
                         continue;
@@ -677,23 +715,24 @@ impl Parser {
                         TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef => {
                             let sstart = self.current().span.start;
                             let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
-                            // Optional `#delay` skew specifier — skip past
-                            // (parse_optional_direction already left us
-                            // looking at the next token after the dir kw).
+                            // Optional `#delay` skew specifier (§14.4) —
+                            // captured per-signal; `#1step`/opaque forms → None.
+                            let mut sig_skew: Option<crate::ast::expr::Expression> = None;
                             if self.at(TokenKind::Hash) {
                                 self.bump();
                                 if self.at(TokenKind::LParen) {
-                                    let mut d = 1i32; self.bump();
-                                    while !self.at(TokenKind::Eof) && d > 0 {
-                                        match self.current_kind() {
-                                            TokenKind::LParen => d += 1,
-                                            TokenKind::RParen => d -= 1,
-                                            _ => {}
-                                        }
-                                        self.bump();
-                                    }
+                                    self.bump();
+                                    sig_skew = Some(self.parse_expression());
+                                    self.expect(TokenKind::RParen);
+                                } else if matches!(
+                                    self.current_kind(),
+                                    TokenKind::IntegerLiteral
+                                        | TokenKind::TimeLiteral
+                                        | TokenKind::RealLiteral
+                                ) {
+                                    sig_skew = Some(self.parse_expr_bp(3));
                                 } else {
-                                    self.bump(); // single token (`1step`, identifier, etc.)
+                                    self.bump(); // `1step`, identifier, etc.
                                 }
                             }
                             // Optional `negedge`/`posedge`/`edge` skew kw.
@@ -710,7 +749,7 @@ impl Parser {
                             loop {
                                 if self.at(TokenKind::Identifier) {
                                     let id = self.parse_identifier();
-                                    signals.push(ClockingSignal { direction, name: id, span: self.span_from(sstart) });
+                                    signals.push(ClockingSignal { direction, name: id, skew: sig_skew.clone(), span: self.span_from(sstart) });
                                 }
                                 if self.eat(TokenKind::Comma).is_none() { break; }
                             }
@@ -728,7 +767,7 @@ impl Parser {
                     Some(self.parse_identifier())
                 } else { None };
                 let id = cb_name.unwrap_or_else(|| Identifier { name: "default".to_string(), span: self.span_from(start) });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: clock_signal_id, clock_edge, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: clock_signal_id, clock_edge, default_input_skew, default_output_skew, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover =>
                 Some(ModuleItem::AssertionItem(self.parse_assertion_statement())),
@@ -863,7 +902,7 @@ impl Parser {
                             loop {
                                 if self.at(TokenKind::Identifier) {
                                     let id = self.parse_identifier();
-                                    signals.push(ClockingSignal { direction, name: id, span: self.span_from(sstart) });
+                                    signals.push(ClockingSignal { direction, name: id, skew: None, span: self.span_from(sstart) });
                                 }
                                 if self.eat(TokenKind::Comma).is_none() { break; }
                             }
@@ -877,7 +916,7 @@ impl Parser {
                 // ClockingDeclaration struct needs an Option<Identifier> for name if we want to store it accurately,
                 // but for now let's just use a dummy identifier if it's missing.
                 let id = name.unwrap_or_else(|| Identifier { name: "default".to_string(), span: self.span_from(start) });
-                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: None, clock_edge: None, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::ClockingDeclaration(ClockingDeclaration { name: id, clock_signal: None, clock_edge: None, default_input_skew: None, default_output_skew: None, is_default: false, signals, items, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwDefault => {
                 self.bump();

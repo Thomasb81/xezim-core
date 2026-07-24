@@ -234,6 +234,12 @@ pub struct ClockingDeclaration {
     /// block would always sync on posedge even for `@(negedge clk)`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub clock_edge: Option<super::stmt::Edge>,
+    /// §14.4 `default input #d` skew expression, if declared.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_input_skew: Option<super::expr::Expression>,
+    /// §14.4 `default output #d` skew expression, if declared.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub default_output_skew: Option<super::expr::Expression>,
     /// LRM §14.11: true when declared `default clocking ...` — the block
     /// that procedural cycle delays (`##N`) synchronize to.
     #[cfg_attr(feature = "serde", serde(default))]
@@ -249,6 +255,9 @@ pub struct ClockingDeclaration {
 pub struct ClockingSignal {
     pub direction: PortDirection,
     pub name: Identifier,
+    /// §14.4 per-signal skew (`output #0 sig;`). None = use the block default.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub skew: Option<super::expr::Expression>,
     pub span: Span,
 }
 
