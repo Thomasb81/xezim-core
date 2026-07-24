@@ -420,6 +420,11 @@ pub struct ModportPort {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct GateInstantiation {
     pub gate_type: GateType,
+    /// `buf #(d) g(y, a);` — the gate delay (first expression of the delay
+    /// spec; rise/fall pairs collapse to the first). Counts the enclosing
+    /// module's timeunit until the elaborator pre-scales it to ticks.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay: Option<Expression>,
     pub instances: Vec<GateInstance>,
     pub span: Span,
 }

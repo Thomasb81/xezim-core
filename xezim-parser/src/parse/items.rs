@@ -1143,9 +1143,12 @@ impl Parser {
             self.expect(TokenKind::RParen);
         }
         // Optional `#(delay)` or `#delay` spec between the gate keyword and
-        // the first instance: `buf #(D) name (...)`.
+        // the first instance: `buf #(D) name (...)`. Capture the FIRST delay
+        // expression (rise/fall/turn-off lists collapse to it); skip the rest.
+        let mut delay: Option<Expression> = None;
         if self.eat(TokenKind::Hash).is_some() {
             if self.eat(TokenKind::LParen).is_some() {
+                delay = Some(self.parse_expression());
                 let mut depth = 1;
                 while depth > 0 && !self.at(TokenKind::Eof) {
                     match self.current_kind() {
@@ -1155,7 +1158,7 @@ impl Parser {
                     }
                 }
             } else {
-                let _ = self.parse_expression();
+                delay = Some(self.parse_expression());
             }
         }
         let mut instances = Vec::new();
@@ -1174,7 +1177,7 @@ impl Parser {
             if self.eat(TokenKind::Comma).is_none() { break; }
         }
         self.expect(TokenKind::Semicolon);
-        GateInstantiation { gate_type, instances, span: self.span_from(start) }
+        GateInstantiation { gate_type, delay, instances, span: self.span_from(start) }
     }
 
     fn parse_generate_if(&mut self, start: usize) -> ModuleItem {

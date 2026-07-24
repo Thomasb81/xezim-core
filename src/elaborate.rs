@@ -900,6 +900,11 @@ pub struct ElaboratedModule {
     pub func_decl_scope: HashMap<String, String>,
     /// DPI imports by SV-visible symbol name.
     pub dpi_imports: HashMap<String, DpiImportSpec>,
+    /// §35.5.4 exported SV functions/tasks (`export "DPI-C" function f;`), in
+    /// declaration order. The index is a stable id the C-callable trampoline
+    /// passes back to identify which subroutine to run.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dpi_exports: Vec<String>,
     /// Clocking block definitions: name -> AST declaration.
     pub clocking_blocks: HashMap<String, ClockingDeclaration>,
     /// Let declarations visible in the elaborated scope.
@@ -921,6 +926,12 @@ pub struct ElaboratedModule {
     pub net_strengths: HashMap<String, (String, String)>,
     /// Arrays declared with descending range (e.g. [7:0])
     pub descending_arrays: HashSet<String>,
+    /// DECLARED (left, right) bounds per unpacked dimension, outermost first
+    /// (§20.7 array queries must report declared order — `[3:1]` has
+    /// $left=3/$right=1 and $increment=1; the arrays* tables normalize to
+    /// (lo, hi) and lose it).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub unpacked_decl_dims: HashMap<String, Vec<(i64, i64)>>,
     /// Packed vectors declared with an ASCENDING range (`logic [0:7]`), mapped
     /// to their width. Bit/part selects index these from the MSB end (label 0 =
     /// MSB), so the interpreter remaps `sig[i]` → internal bit `(W-1)-i`
@@ -1210,6 +1221,7 @@ impl ElaboratedModule {
             tasks: HashMap::default(),
             func_decl_scope: HashMap::default(),
             dpi_imports: HashMap::default(),
+            dpi_exports: Vec::new(),
             clocking_blocks: HashMap::default(),
             lets: HashMap::default(),
             modport_views: HashMap::default(),
@@ -1219,6 +1231,7 @@ impl ElaboratedModule {
             dynamic_arrays: HashSet::default(),
             net_strengths: HashMap::default(),
             descending_arrays: HashSet::default(),
+            unpacked_decl_dims: HashMap::default(),
             ascending_packed: HashMap::default(),
             typedef_unpacked_dims: HashMap::default(),
             queue_max_sizes: HashMap::default(),
@@ -2962,6 +2975,9 @@ pub fn elaborate_module_with_defs(
                         };
                         if let (Some((lo1, hi1)), Some((lo2, hi2))) = (r1, r2) {
                             elab.arrays_2d.insert(decl.name.name.clone(), ((lo1, hi1), (lo2, hi2), width));
+                            if let Some(dd) = declared_unpacked_dims(&effective_dims, &elab.parameters) {
+                                elab.unpacked_decl_dims.insert(decl.name.name.clone(), dd);
+                            }
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
@@ -3010,6 +3026,9 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                         elab.arrays_nd.insert(decl.name.name.clone(), (shape.clone(), width));
+                        if let Some(dd2) = declared_unpacked_dims(&effective_dims, &elab.parameters) {
+                            elab.unpacked_decl_dims.insert(decl.name.name.clone(), dd2);
+                        }
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
@@ -3033,6 +3052,9 @@ pub fn elaborate_module_with_defs(
                     if let Some((lo, hi)) = array_range {
                         // Register this as an array for the simulator
                         elab.arrays.insert(decl.name.name.clone(), (lo, hi, width));
+                        if let Some(dd) = declared_unpacked_dims(&effective_dims, &elab.parameters) {
+                            elab.unpacked_decl_dims.insert(decl.name.name.clone(), dd);
+                        }
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
@@ -3910,6 +3932,15 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::DPIImport(di) => {
                 register_dpi_import(di, &mut elab)?;
+            }
+            ModuleItem::DPIExport(e) => {
+                let name = match &e.proto {
+                    crate::ast::decl::DPIProto::Function(fd) => fd.name.name.name.clone(),
+                    crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
+                };
+                if !elab.dpi_exports.contains(&name) {
+                    elab.dpi_exports.push(name);
+                }
             }
             ModuleItem::OutOfClassConstraint { class_name, constraint_name, items } => {
                 elab.out_of_class_constraints.insert((class_name.clone(), constraint_name.clone()));
@@ -6780,6 +6811,20 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
                     rewrite_stmt_delays(s, unit_s, tick_s);
                 }
             }
+            // `assign #5 y = a;` — the cont-assign delay counts module
+            // timeunits like any other delay; unscaled it ran as raw ticks
+            // (5 ps in a 1ns/1ps module instead of 5 ns).
+            ModuleItem::ContinuousAssign(ca) => {
+                if let Some(d) = ca.delay.as_mut() {
+                    rewrite_delay_expr(d, unit_s, tick_s);
+                }
+            }
+            // `buf #(4) g(y, a);` — gate delays likewise count timeunits.
+            ModuleItem::GateInstantiation(gi) => {
+                if let Some(d) = gi.delay.as_mut() {
+                    rewrite_delay_expr(d, unit_s, tick_s);
+                }
+            }
             ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, tick_s),
             ModuleItem::GenerateIf(gi) => {
                 for (_c, items) in gi.branches.iter_mut() {
@@ -6820,6 +6865,18 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, tick_s: f64) {
     }
 }
 
+/// §9.4.5 intra-assignment delays are canonicalized pre-parse into
+/// `$__xz_intra_delay(d, rhs)` marker calls (see xezim's intra_delay pass);
+/// their first arg is a delay in module timeunits and must be scaled like
+/// any other delay.
+fn rewrite_intra_marker_delay(e: &mut Expression, unit_s: f64, tick_s: f64) {
+    if let ExprKind::SystemCall { name, args } = &mut e.kind {
+        if name == "$__xz_intra_delay" && args.len() == 2 {
+            rewrite_delay_expr(&mut args[0], unit_s, tick_s);
+        }
+    }
+}
+
 fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, tick_s: f64) {
     match &mut stmt.kind {
         StatementKind::TimingControl { control, stmt } => {
@@ -6828,8 +6885,15 @@ fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, tick_s: f64) {
             }
             rewrite_stmt_delays(stmt, unit_s, tick_s);
         }
-        StatementKind::NonblockingAssign { delay: Some(d), .. } => {
+        StatementKind::BlockingAssign { rvalue, .. } => {
+            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
+        }
+        StatementKind::NonblockingAssign { delay: Some(d), rvalue, .. } => {
             rewrite_delay_expr(d, unit_s, tick_s);
+            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
+        }
+        StatementKind::NonblockingAssign { rvalue, .. } => {
+            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
         }
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
             for s in stmts.iter_mut() { rewrite_stmt_delays(s, unit_s, tick_s); }
@@ -7493,6 +7557,37 @@ fn index_tuples(shape: &[(i64, i64)]) -> Vec<String> {
     out
 }
 
+/// DECLARED (left, right) for each unpacked dimension, outermost first —
+/// raw order preserved (no lo/hi normalization). `[N]` size form is (0, N-1).
+/// Returns None if any dimension is dynamic/associative/unresolvable.
+pub fn declared_unpacked_dims(
+    dims: &[crate::ast::types::UnpackedDimension],
+    params: &HashMap<String, Value>,
+) -> Option<Vec<(i64, i64)>> {
+    if dims.is_empty() {
+        return None;
+    }
+    let mut out = Vec::with_capacity(dims.len());
+    for d in dims {
+        match d {
+            crate::ast::types::UnpackedDimension::Range { left, right, .. } => {
+                let l = const_eval_i64_with_params(left, Some(params))?;
+                let r = const_eval_i64_with_params(right, Some(params))?;
+                out.push((l, r));
+            }
+            crate::ast::types::UnpackedDimension::Expression { expr, .. } => {
+                let size = const_eval_i64_with_params(expr, Some(params))?;
+                if size <= 0 {
+                    return None;
+                }
+                out.push((0, size - 1));
+            }
+            _ => return None,
+        }
+    }
+    Some(out)
+}
+
 pub fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params: &HashMap<String, Value>) -> Option<(i64, i64)> {
     if dims.is_empty() { return None; }
     match &dims[0] {
@@ -7545,7 +7640,16 @@ fn width_with_unpacked_dims(dims: &[crate::ast::types::UnpackedDimension], base_
 
 /// Evaluate a constant expression (for enum values, parameter defaults, etc.)
 fn eval_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> u64 {
-    eval_const_expr_val(expr, params).to_u64().unwrap_or(0)
+    let v = eval_const_expr_val(expr, params);
+    if v.is_real {
+        // A real result (e.g. a timeunit-scaled delay `5 * 1000.0`) must be
+        // converted NUMERICALLY — to_u64 on a real Value returns the raw
+        // IEEE-754 bit pattern (5000.0 -> ~4.6e18, a delay parked forever).
+        let f = v.to_f64();
+        if f.is_finite() && f > 0.0 { f.round() as u64 } else { 0 }
+    } else {
+        v.to_u64().unwrap_or(0)
+    }
 }
 
 /// Evaluate an initializer for a typed declaration of known target width.
@@ -7588,9 +7692,16 @@ pub fn packed_full_dims_of(
 ) -> Option<Vec<(i64, i64)>> {
     let dims = match dt {
         DataType::IntegerVector { dimensions, .. } => dimensions,
+        // A declaration with packed ranges but NO type keyword — the common
+        // `wire [1:0][7:0] w;` net form — parses as an IMPLICIT data type
+        // (implicitly 4-state logic, §6.10). Its packed dimensions must be
+        // recorded exactly like an explicit `logic [1:0][7:0]`, otherwise
+        // element selects degrade to bit-selects and element continuous
+        // assigns cannot resolve to a slice.
+        DataType::Implicit { dimensions, .. } => dimensions,
         _ => return None,
     };
-    if dims.len() < 2 {
+    if dims.is_empty() {
         return None;
     }
     let mut out = Vec::with_capacity(dims.len());
@@ -7600,6 +7711,16 @@ pub fn packed_full_dims_of(
             let r = const_eval_i64_with_params(right, Some(params))?;
             out.push((l, r));
         } else {
+            return None;
+        }
+    }
+    // A single [w-1:0] dimension is the normalized default the query
+    // functions already assume — recording it would be pure overhead. A
+    // single NON-normalized dimension ([15:8], ascending [0:7]) must be
+    // recorded so §20.7 array queries report the DECLARED bounds.
+    if out.len() == 1 {
+        let (l, r) = out[0];
+        if r == 0 && l >= 0 {
             return None;
         }
     }
@@ -7691,7 +7812,9 @@ pub fn packed_inner_elem_width(
         // typedef refs so callers can resolve via their own context.
         return None;
     } else { dt };
-    if let DataType::IntegerVector { dimensions, .. } = resolved {
+    if let DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } =
+        resolved
+    {
         if dimensions.len() < 2 { return None; }
         // Total width = product of all dims
         let mut total = 1u32;
@@ -9726,6 +9849,7 @@ fn ai_expand_instances(
     instances: &[crate::ast::decl::HierarchicalInstance],
     port_widths: &[u32],
     port_shapes: &[Vec<(i64, i64)>],
+    port_names: &[String],
     widths: &HashMap<String, u32>,
     unpacked_shapes: &HashMap<String, Vec<(i64, i64)>>,
     params: &HashMap<String, Value>,
@@ -9755,14 +9879,27 @@ fn ai_expand_instances(
                 .iter()
                 .enumerate()
                 .map(|(pi, conn)| {
-                    let p = port_widths.get(pi).copied().unwrap_or(1).max(1);
+                    // §23.3.2: bit-distribution needs the FORMAL port's width,
+                    // keyed by port index. A positional connection's port index
+                    // is its list position; a by-name connection binds by NAME,
+                    // so it may be reordered or sparse — look its index up in
+                    // the declared port list (falling back to list position for
+                    // NonAnsi / unknown ports).
+                    let port_idx = match conn {
+                        crate::ast::decl::PortConnection::Named { name, .. } => port_names
+                            .iter()
+                            .position(|pn| pn == &name.name)
+                            .unwrap_or(pi),
+                        _ => pi,
+                    };
+                    let p = port_widths.get(port_idx).copied().unwrap_or(1).max(1);
                     ai_slice_conn(
                         conn,
                         p,
                         k,
                         n,
                         widths,
-                        port_shapes.get(pi).map(Vec::as_slice),
+                        port_shapes.get(port_idx).map(Vec::as_slice),
                         unpacked_shapes,
                         params,
                     )
@@ -9792,6 +9929,16 @@ fn ai_module_port_widths(
                     .max(1)
             })
             .collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// The declared port names of a module, in port-list order (parallel to
+/// `ai_module_port_widths`). Used to map by-name instance-array connections
+/// to the correct FORMAL port index for bit-distribution (§23.3.2).
+fn ai_module_port_names(def: &Definition) -> Vec<String> {
+    match def.ports() {
+        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
         _ => Vec::new(),
     }
 }
@@ -10016,11 +10163,16 @@ fn prepare_module_items(
                         .get(&inst.module_name.name)
                         .map(|d| ai_module_port_shapes(d, local_params))
                         .unwrap_or_default();
+                    let port_names = definitions
+                        .get(&inst.module_name.name)
+                        .map(ai_module_port_names)
+                        .unwrap_or_default();
                     inst.instances =
                         ai_expand_instances(
                             &inst.instances,
                             &port_widths,
                             &port_shapes,
+                            &port_names,
                             &widths,
                             &unpacked_shapes,
                             local_params,
@@ -12662,9 +12814,18 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
     if record_tran_switches(gi, elab, |e| e.clone()) {
         return;
     }
+    // Gate delay (`buf #(4)`) — pre-scaled to ticks by the module-delay
+    // rewrite; carried onto the lowered cont-assign, whose delayed-update
+    // path models the §28.9 single-delay INERTIAL behavior (a pulse
+    // narrower than the delay is filtered).
+    let delay = gi
+        .delay
+        .as_ref()
+        .map(|d| eval_const_expr(d, &elab.parameters))
+        .unwrap_or(0);
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
-        elab.continuous_assigns.push(ContinuousAssignment { lhs, rhs, delay: 0 });
+        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay });
     }
 }
 
