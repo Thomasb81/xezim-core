@@ -11680,6 +11680,18 @@ fn inline_module_items(
                                         elab.packed_struct_fields.insert(sig_name.clone(), fields);
                                     }
                                 }
+                                // Packed multi-D PORT (`output [3:0][7:0] opv`):
+                                // record the element width and dimensions like a
+                                // net/variable declaration would, so element and
+                                // element-RANGE selects on the inlined signal
+                                // (`u_s.opv[2:1] = …` from the submodule's own
+                                // assigns) slice elements instead of bits.
+                                if let Some(ew) = packed_inner_elem_width(dt, &sub_merged_params, &elab.typedefs) {
+                                    elab.packed_signal_elem_widths.insert(sig_name.clone(), ew);
+                                }
+                                if let Some(fdims) = packed_full_dims_of(dt, &sub_merged_params) {
+                                    elab.packed_full_dims.insert(sig_name.clone(), fdims);
+                                }
                             }
                             if port_shape.is_empty() {
                                 elab.signals.insert(sig_name.clone(), Signal { is_const: false,
