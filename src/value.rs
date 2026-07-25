@@ -82,6 +82,34 @@ fn wide_filled_bits(width: u32, bit: LogicBit) -> ValueStorage {
 }
 
 impl Value {
+    /// §5.7.1 — natural width of an UNSIZED based literal (`'h1234…`).
+    ///
+    /// An unsized number is at least 32 bits, but its size must never DROP digits
+    /// the source actually wrote: `'h123456789ABCDEF0` carries 64 bits of value and
+    /// parsing it at a flat 32 silently kept only the low half. Returns
+    /// `max(32, bits implied by the digit string)`; the usual context resize then
+    /// widens or truncates from there. Small literals are unaffected (their natural
+    /// width is under 32), so this only ever widens a constant that would have lost
+    /// data.
+    pub fn unsized_literal_width(value: &str, radix: u32) -> u32 {
+        let digits = value.chars().filter(|c| *c != '_').count() as u32;
+        let natural = match radix {
+            2 => digits,
+            8 => digits.saturating_mul(3),
+            16 => digits.saturating_mul(4),
+            // Decimal: use the magnitude when it fits, else a safe upper bound
+            // (log2(10) < 3.33, so 4 bits per digit never under-counts).
+            _ => {
+                let cleaned: String = value.chars().filter(|c| *c != '_').collect();
+                match cleaned.parse::<u128>() {
+                    Ok(v) => (128 - v.leading_zeros()).max(1),
+                    Err(_) => digits.saturating_mul(4),
+                }
+            }
+        };
+        natural.max(32)
+    }
+
     /// Bit mask for the valid bits of an inline value.
     #[inline(always)]
     fn mask(width: u32) -> u64 {
