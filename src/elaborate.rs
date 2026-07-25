@@ -11674,8 +11674,11 @@ fn inline_module_items(
                             // sample_t out`) resolves the field — otherwise the
                             // write was dropped and the output stayed X.
                             if let Some(dt) = &port.data_type {
+                                let mut struct_w: u32 = 0;
                                 if let Some(fields) = flatten_struct_fields(dt, &sub_merged_params, &elab.typedefs, &elab.typedef_types) {
                                     if !fields.is_empty() {
+                                        struct_w =
+                                            fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
                                         tls_register_struct_layout(&sig_name, &fields);
                                         elab.packed_struct_fields.insert(sig_name.clone(), fields);
                                     }
@@ -11690,6 +11693,28 @@ fn inline_module_items(
                                     elab.packed_signal_elem_widths.insert(sig_name.clone(), ew);
                                 }
                                 if let Some(fdims) = packed_full_dims_of(dt, &sub_merged_params) {
+                                    elab.packed_full_dims.insert(sig_name.clone(), fdims);
+                                }
+                                // Packed array of a STRUCT TYPEDEF as a PORT
+                                // (`output some_t [1:0] o`). Both helpers above
+                                // return None for a TypeReference base, so such a
+                                // port registered no element metadata: the
+                                // submodule's own `o[0].member = …` writes had no
+                                // element width to slice by and every member of
+                                // every element stayed X.
+                                if let Some(fdims) =
+                                    packed_typedef_array_dims(dt, struct_w, &sub_merged_params)
+                                {
+                                    let total: i64 =
+                                        fdims.iter().map(|(l, r)| (l - r).abs() + 1).product();
+                                    let (ol, orr) = fdims[0];
+                                    let outer = (ol - orr).abs() + 1;
+                                    if outer > 0 && total > 0 {
+                                        elab.packed_signal_elem_widths.insert(
+                                            sig_name.clone(),
+                                            (total / outer) as u32,
+                                        );
+                                    }
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
                             }
