@@ -227,9 +227,56 @@ pub fn elab_diag_capture_take() -> Vec<String> {
     ELAB_DIAG_SINK.with(|c| c.borrow_mut().take().unwrap_or_default())
 }
 
+/// How many times one KIND of elaboration diagnostic is reported before the
+/// rest are summarized away. A design with hundreds of implicit nets (or
+/// width-mismatched ports) otherwise buries every other message.
+const DIAG_KIND_LIMIT: u32 = 5;
+
+/// Group key for the duplicate cap: the message up to the first quoted name.
+/// "…undeclared identifier 'a'" and "…undeclared identifier 'b'" share a key,
+/// so the cap counts one KIND rather than one exact string.
+fn diag_kind_key(msg: &str) -> &str {
+    match msg.find('\'') {
+        Some(i) => &msg[..i],
+        None => msg,
+    }
+}
+
+thread_local! {
+    static ELAB_DIAG_COUNTS: std::cell::RefCell<crate::hasher::HashMap<String, u32>> =
+        std::cell::RefCell::new(crate::hasher::HashMap::default());
+}
+
+/// Reset the per-kind diagnostic counters (start of an elaboration run).
+pub fn elab_diag_reset_counts() {
+    ELAB_DIAG_COUNTS.with(|c| c.borrow_mut().clear());
+}
+
 /// Emit an elaboration diagnostic: printed live, and recorded when capture is
 /// active so a warm cache hit can replay it.
+///
+/// At most `DIAG_KIND_LIMIT` messages of a given kind are emitted; the last one
+/// carries a note that the rest are suppressed. Suppressed messages are dropped
+/// from the capture sink too, so a warm-cache replay reproduces the same output.
 pub(crate) fn elab_diag(msg: String) {
+    let n = ELAB_DIAG_COUNTS.with(|c| {
+        let mut m = c.borrow_mut();
+        let e = m.entry(diag_kind_key(&msg).to_string()).or_insert(0);
+        *e += 1;
+        *e
+    });
+    if n > DIAG_KIND_LIMIT {
+        return;
+    }
+    let msg = if n == DIAG_KIND_LIMIT {
+        format!(
+            "{}\n[xezim][warning] further messages of this kind are suppressed \
+             (limit {}).",
+            msg, DIAG_KIND_LIMIT
+        )
+    } else {
+        msg
+    };
     eprintln!("{}", msg);
     ELAB_DIAG_SINK.with(|c| {
         if let Some(v) = c.borrow_mut().as_mut() {
