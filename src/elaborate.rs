@@ -11990,6 +11990,37 @@ fn inline_module_items(
                                     }
                                     _ => {}
                                 }
+                                // A MULTI-dimensional unpacked variable in a
+                                // submodule (`logic [15:0] grid [0:1][0:1];`).
+                                // `extract_array_range` only understands ONE
+                                // dimension, so a 2-D/N-D declarator fell through
+                                // to the scalar branch below and no element
+                                // storage existed at all — writes to `grid[i][j]`
+                                // went nowhere and reads came back X. The same
+                                // declaration at top level registers via
+                                // `fixed_unpacked_shape`; mirror that here.
+                                {
+                                    // Checked BEFORE `array_range`, which reports
+                                    // only the FIRST dimension and so claims a 2-D
+                                    // declarator as 1-D (storage came out as
+                                    // `grid[0]`/`grid[1]` instead of
+                                    // `grid[i][j]`).
+                                    if let Some(shape) =
+                                        fixed_unpacked_shape(&decl.dimensions, &sub_merged_params)
+                                            .filter(|sh| sh.len() > 1)
+                                    {
+                                        register_fixed_unpacked_array(
+                                            elab,
+                                            &sig_name,
+                                            &shape,
+                                            width,
+                                            is_type_two_state(&dd.data_type),
+                                        );
+                                        elab.var_decl_types
+                                            .insert(sig_name.clone(), dd.data_type.clone());
+                                        continue;
+                                    }
+                                }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
                                     if is_type_two_state(&dd.data_type) {
