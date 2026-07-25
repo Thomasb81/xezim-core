@@ -11781,6 +11781,61 @@ fn inline_module_items(
                             let width = resolve_type_width(&nd.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
                             for decl in &nd.declarators {
                                 let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                // An UNPACKED array net inside a submodule
+                                // (`wire [15:0] pipe [0:2];`) must register its
+                                // range like the variable arm below, otherwise it
+                                // collapses to a single scalar signal and every
+                                // element select degrades to a 1-BIT select —
+                                // `$bits(pipe[0])` came back 1 instead of 16 and a
+                                // port fed from `pipe[i]` carried one bit. The same
+                                // declaration at TOP level always worked, which is
+                                // what made this look like a generate/genvar bug.
+                                // Packed multi-D net (`wire [1:0][15:0] a;`):
+                                // record the element width / full dimensions so
+                                // `a[i]` slices instead of bit-selecting.
+                                if let Some(elem_w) = packed_inner_elem_width(
+                                    &nd.data_type,
+                                    &sub_merged_params,
+                                    &elab.typedefs,
+                                ) {
+                                    elab.packed_signal_elem_widths
+                                        .insert(sig_name.clone(), elem_w);
+                                }
+                                if let Some(fdims) =
+                                    packed_full_dims_of(&nd.data_type, &sub_merged_params)
+                                {
+                                    elab.packed_full_dims.insert(sig_name.clone(), fdims);
+                                }
+                                // UNPACKED array net of any rank
+                                // (`wire [15:0] pipe [0:2];`, `… [0:1][0:1];`).
+                                if let Some(shape) =
+                                    fixed_unpacked_shape(&decl.dimensions, &sub_merged_params)
+                                        .filter(|shape| !shape.is_empty())
+                                {
+                                    register_fixed_unpacked_array(
+                                        elab,
+                                        &sig_name,
+                                        &shape,
+                                        width,
+                                        is_type_two_state(&nd.data_type),
+                                    );
+                                    elab.var_decl_types
+                                        .insert(sig_name.clone(), nd.data_type.clone());
+                                    if let Some(UnpackedDimension::Range { left, right, .. }) =
+                                        decl.dimensions.first()
+                                    {
+                                        let l = const_eval_i64_with_params(left, Some(&sub_merged_params))
+                                            .unwrap_or(0);
+                                        let r = const_eval_i64_with_params(right, Some(&sub_merged_params))
+                                            .unwrap_or(0);
+                                        if l > r {
+                                            elab.descending_arrays.insert(sig_name.clone());
+                                        }
+                                    }
+                                    // Per-element Signals are synthesized by
+                                    // Simulator::new from the array metadata.
+                                    continue;
+                                }
                                 let init_value = match nd.net_type {
                                     NetType::Supply0 => Value::zero(width),
                                     NetType::Supply1 => Value::ones(width),
