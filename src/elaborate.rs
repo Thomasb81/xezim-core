@@ -10745,10 +10745,28 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
             }
             None
         }
-        EK::RangeSelect { left, right, kind: crate::ast::expr::RangeKind::Constant, .. } => {
+        EK::RangeSelect { expr: base, left, right, kind: crate::ast::expr::RangeKind::Constant, .. } => {
             let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
             let r = const_eval_i64_with_params(right, Some(&elab.parameters))?;
-            Some(((l - r).unsigned_abs() + 1) as u32)
+            let count = ((l - r).unsigned_abs() + 1) as u32;
+            // §7.4.1: a constant range on a packed MULTI-D base selects
+            // ELEMENTS, so the connection carries count × elem_w bits.
+            // `.p(arr[1:0])` on a packed array of 128-bit structs is 256
+            // bits, and reporting 2 here mis-sized the port cont-assign.
+            if let EK::Ident(h) = &base.kind {
+                let name = h
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if let Some(&ew) = elab.packed_signal_elem_widths.get(&name) {
+                    if ew > 1 {
+                        return Some(count * ew);
+                    }
+                }
+            }
+            Some(count)
         }
         EK::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
         EK::Concatenation(parts) => {
