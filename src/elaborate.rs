@@ -7442,6 +7442,23 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                                     .map(|w| w as i64)
                             }))
                     }
+                    // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
+                    // `::` lowers to the SAME `MemberAccess` node as a struct
+                    // member select, so accept the leaf name and let the typedef
+                    // table arbitrate — a real type name hits it, a member select
+                    // misses and yields None exactly as before. Without this the
+                    // whole arm fell through to `_ => None`, so a port declared
+                    // `[$bits(some_pkg::some_t)-1:0]` elaborated to ONE BIT and
+                    // silently truncated the bus.
+                    ExprKind::MemberAccess { expr: base, member }
+                        if matches!(base.kind, ExprKind::Ident(_)) =>
+                    {
+                        TYPEDEFS_TLS.with(|td| {
+                            td.borrow().as_ref()
+                                .and_then(|m| m.get(member.name.as_str()).copied())
+                                .map(|w| w as i64)
+                        })
+                    }
                     ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => Some(*s as i64),
                     ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
                     ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
@@ -8584,6 +8601,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     params.get(n).map(|v| v.width)
                         .or_else(|| TYPEDEFS_TLS.with(|td|
                             td.borrow().as_ref().and_then(|m| m.get(n).copied())))
+                        .unwrap_or(0)
+                }
+                // §26.3 package-/class-scoped type — see the matching arm in
+                // `const_eval_i64_with_params`.
+                ExprKind::MemberAccess { expr: base, member }
+                    if matches!(base.kind, ExprKind::Ident(_)) =>
+                {
+                    TYPEDEFS_TLS.with(|td|
+                        td.borrow().as_ref().and_then(|m| m.get(member.name.as_str()).copied()))
                         .unwrap_or(0)
                 }
                 ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => *s,
