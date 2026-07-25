@@ -7800,6 +7800,66 @@ fn register_packed_array_elem_w(name: &str, dt: &DataType, typedefs: &HashMap<St
     }
 }
 
+/// Rewrite `$bits(<ident>)` to a literal when `<ident>` names a SIGNAL in the
+/// enclosing scope. Instance parameter overrides are const-evaluated against
+/// the parameter map only, so `#(.W($bits(some_signal)))` found nothing and
+/// evaluated to 0 — a port declared `[W-1:0]` then elaborated as `[-1:0]`,
+/// i.e. 2 bits, which surfaced as a bogus "port is 2 bit(s)" width-mismatch
+/// warning. Parameters and typedefs already resolve inside `$bits` itself and
+/// are left untouched here.
+fn prebind_bits_of_signals(
+    e: &Expression,
+    signals: &HashMap<String, Signal>,
+    params: &HashMap<String, Value>,
+    prefix: &str,
+) -> Expression {
+    let mut out = e.clone();
+    if let ExprKind::SystemCall { name, args } = &e.kind {
+        if name == "$bits" && args.len() == 1 {
+            if let ExprKind::Ident(h) = &args[0].kind {
+                let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                if !leaf.is_empty() && !params.contains_key(leaf) {
+                    let w = signals
+                        .get(&format!("{}{}", prefix, leaf))
+                        .or_else(|| signals.get(leaf))
+                        .map(|sig| sig.width);
+                    if let Some(w) = w.filter(|w| *w > 0) {
+                        out.kind = ExprKind::Number(NumberLiteral::Integer {
+                            size: None,
+                            signed: false,
+                            base: crate::ast::expr::NumberBase::Decimal,
+                            value: w.to_string(),
+                            cached_val: std::cell::Cell::new(None),
+                        });
+                        return out;
+                    }
+                }
+            }
+            return out;
+        }
+    }
+    // Recurse into the common composite forms so `$bits(sig)-1` works.
+    match &mut out.kind {
+        ExprKind::Binary { left, right, .. } => {
+            **left = prebind_bits_of_signals(left, signals, params, prefix);
+            **right = prebind_bits_of_signals(right, signals, params, prefix);
+        }
+        ExprKind::Unary { operand, .. } => {
+            **operand = prebind_bits_of_signals(operand, signals, params, prefix);
+        }
+        ExprKind::Paren(inner) => {
+            **inner = prebind_bits_of_signals(inner, signals, params, prefix);
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args.iter_mut() {
+                *a = prebind_bits_of_signals(a, signals, params, prefix);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Run `f` with `typedefs` installed as the thread-local typedef table
 /// consulted by const-eval `$bits(typedef_name)`. The previous binding
 /// is restored on exit so nested calls compose correctly.
@@ -11003,6 +11063,75 @@ fn inline_module_items(
                 // Was: `let scoped_eval_params = local_params.clone();` — wasted clone, only read.
                 let scoped_eval_params: &HashMap<String, Value> = local_params;
 
+                // §6.10 implicit nets bound by port connections INSIDE the
+                // module being inlined. The top-level pass only sees the top
+                // module's instantiations, and the pending pass only sees
+                // cont-assign bodies, so a net that exists solely as a port
+                // actual one level down (a clock net bound only as an actual
+                // inside an instantiated wrapper) was never registered as a
+                // signal. Its
+                // driver then had NO write id and its reader NO read id: the
+                // hop stayed out of the settle dependency graph and updated
+                // only when some unrelated change forced a settle, silently
+                // dropping most transitions on a fast clock. Register it here,
+                // under this instance's prefix, exactly as a declared net.
+                {
+                    let sub_mod_port_names: std::collections::HashSet<String> = match sub_mod.ports() {
+                        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
+                        PortList::NonAnsi(ps) => ps.iter().map(|p| p.name.clone()).collect(),
+                        _ => std::collections::HashSet::default(),
+                    };
+                    let sub_mod_declares: std::collections::HashSet<String> = {
+                        let mut v = Vec::new();
+                        collect_decl_names_in_items(sub_mod.items(), &mut v);
+                        v.into_iter().collect()
+                    };
+                    let mut cands: Vec<String> = Vec::new();
+                    collect_port_connection_net_candidates(sub_mod.items(), &mut cands);
+                    cands.sort();
+                    cands.dedup();
+                    for name in cands {
+                        // A formal port of the sub-module is bound to the
+                        // parent's expression, not declared here.
+                        if sub_mod_port_names.contains(&name) {
+                            continue;
+                        }
+                        let scoped = format!("{}{}", inst_prefix, name);
+                        if elab.signals.contains_key(&scoped)
+                            || elab.signals.contains_key(&name)
+                            || elab.parameters.contains_key(&name)
+                            || elab.parameters.contains_key(&scoped)
+                            || elab.nets.contains(&scoped)
+                            || elab.arrays.contains_key(&scoped)
+                            || elab.arrays_2d.contains_key(&scoped)
+                            || elab.arrays_nd.contains_key(&scoped)
+                            || elab.interfaces.contains(&scoped)
+                        {
+                            continue;
+                        }
+                        // Declared inside the sub-module itself (a net/var
+                        // declaration or one of its own ports) — the regular
+                        // inline paths create those.
+                        if sub_mod_declares.contains(&name) {
+                            continue;
+                        }
+                        if crate::implicit_net_warn() {
+                            crate::elab_diag(format!(
+                                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                                 (IEEE 1800-2017 §6.10, instance port connection). Add an explicit declaration to silence.",
+                                scoped
+                            ));
+                        }
+                        elab.signals.insert(scoped.clone(), Signal { is_const: false,
+                            name: scoped.clone(), width: 1, is_signed: false,
+                            direction: None, value: Value::new(1),
+                            is_real: false, type_name: None,
+                        });
+                        elab.implicit_nets.insert(scoped.clone());
+                        elab.nets.insert(scoped);
+                    }
+                }
+
                 // Build port map and interface map
                 let mut port_map = HashMap::default();
                 let mut sub_interface_map = HashMap::default();
@@ -11242,6 +11371,9 @@ fn inline_module_items(
                                     }
                                 }
                                 if let Some(ParamValue::Expr(v)) = value {
+                                    let v = &prebind_bits_of_signals(
+                                        v, &elab.signals, scoped_eval_params, prefix,
+                                    );
                                     let mut val = eval_const_expr_val(v, scoped_eval_params);
                                     // Check if target parameter is real or implicit real
                                     for p_decl in sub_mod.params() {
