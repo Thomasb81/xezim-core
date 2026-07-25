@@ -11992,6 +11992,11 @@ fn inline_module_items(
                                         &elab.typedef_types,
                                     ) {
                                         if !fields.is_empty() {
+                                            let struct_w = fields
+                                                .iter()
+                                                .map(|(_, o, w)| o + w)
+                                                .max()
+                                                .unwrap_or(0);
                                             for decl in &dd.declarators {
                                                 if !decl.dimensions.is_empty() {
                                                     continue;
@@ -12003,14 +12008,52 @@ fn inline_module_items(
                                                 elab.packed_struct_fields
                                                     .insert(bare, fields.clone());
                                                 elab.packed_struct_fields
-                                                    .insert(scoped, fields.clone());
+                                                    .insert(scoped.clone(), fields.clone());
+                                                // Packed dims written on the
+                                                // typedef itself (`some_t [1:0] g;`)
+                                                // — register the element metadata
+                                                // under the SCOPED name, like the
+                                                // top-level and port paths already
+                                                // do. Without it `g[0]` inside the
+                                                // submodule was a 1-BIT select:
+                                                // `$bits(g[0])` read 1 and an
+                                                // element assign wrote one bit.
+                                                if let Some(fdims) = packed_typedef_array_dims(
+                                                    &dd.data_type,
+                                                    struct_w,
+                                                    &sub_merged_params,
+                                                ) {
+                                                    let total: i64 = fdims
+                                                        .iter()
+                                                        .map(|(l, r)| (l - r).abs() + 1)
+                                                        .product();
+                                                    let (ol, orr) = fdims[0];
+                                                    let outer = (ol - orr).abs() + 1;
+                                                    if outer > 0 && total > 0 {
+                                                        elab.packed_signal_elem_widths.insert(
+                                                            scoped.clone(),
+                                                            (total / outer) as u32,
+                                                        );
+                                                    }
+                                                    elab.packed_full_dims
+                                                        .insert(scoped, fdims);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                             let width = match &dd.data_type {
-                                DataType::TypeReference { name, .. } => {
+                                // Packed dims on the reference (`some_t [1:0] g`)
+                                // multiply the typedef's width — the bare-typedef
+                                // shortcut is only valid without them. Taking it
+                                // anyway sized a two-element struct array at ONE
+                                // element, so the second element's writes were
+                                // clamped away and it read X (the top-level arms
+                                // already carry this exact guard).
+                                DataType::TypeReference { name, dimensions, .. }
+                                    if dimensions.is_empty() =>
+                                {
                                     elab.typedefs.get(&name.name.name).copied()
                                         .unwrap_or(resolve_type_width(&dd.data_type, Some(&sub_merged_params), Some(&elab.typedefs)))
                                 }
