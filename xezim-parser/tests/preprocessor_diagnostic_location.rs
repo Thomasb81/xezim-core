@@ -56,3 +56,21 @@ fn reserved_macro_redefinition_in_include_reports_include_location() {
 
     std::fs::remove_dir_all(dir).expect("remove temp include directory");
 }
+
+#[test]
+fn guarded_reserved_macro_fallbacks_are_skipped_in_strict_mode() {
+    let mut pp = Preprocessor::new();
+    let out = pp.preprocess_file(
+        "`ifndef __FILE__\n\
+         `define __FILE__ 0\n\
+         `endif\n\
+         `ifndef __LINE__\n\
+         `define __LINE__ 0\n\
+         `endif\n\
+         marker `__FILE__ `__LINE__\n",
+        Some(Path::new("/work/dram_ut/amb_types.h")),
+    );
+
+    assert!(pp.errors().is_empty(), "guarded fallback should be skipped: {:?}", pp.errors());
+    assert!(out.contains("marker \"/work/dram_ut/amb_types.h\" 7"), "unexpected output:\n{out}");
+}

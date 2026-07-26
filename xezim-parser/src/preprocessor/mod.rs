@@ -292,7 +292,7 @@ impl Preprocessor {
     }
 
     pub fn is_defined(&self, name: &str) -> bool {
-        self.defines.contains_key(name)
+        matches!(name, "__FILE__" | "__LINE__") || self.defines.contains_key(name)
     }
 
     /// Preprocess source text, resolving `include directives relative to `source_path`.
