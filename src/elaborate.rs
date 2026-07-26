@@ -2408,6 +2408,107 @@ pub fn elaborate_module_with_defs(
     if let Some(defs) = all_defs {
         elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), defs);
     }
+    // §6.20 — resolve the module's own parameters to a FIXPOINT before walking
+    // the items, so a declaration whose width depends on one of them is sized
+    // correctly no matter what ORDER the parameters appear in.
+    //
+    // The walk below evaluates each parameter where it appears, so
+    // `localparam A = $clog2(B) - 6;` ahead of `localparam B = 4096;` saw
+    // nothing for B, fell back to 0, and produced -6. Read back unsigned that
+    // is 4294967290, which becomes a `[4294967289:0]` packed range and
+    // collapses the whole bus to ONE BIT — the design then simulates wrongly
+    // with only a width warning to show for it. A reference simulator resolves
+    // the declarations order-independently.
+    //
+    // Names seeded here are exempted from the duplicate-declaration check the
+    // first time the walk reaches them (and only the first time, so a genuine
+    // duplicate is still an error). Instantiation overrides are already bound
+    // and are never overwritten.
+    let mut preseeded_params: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Consumed on first encounter so a GENUINE duplicate declaration still errors.
+    let mut preseed_dup_exempt: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    {
+        let mut decls: Vec<(&str, &DataType, &Expression)> = Vec::new();
+        for item in module.items() {
+            let (ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd)) =
+                item
+            else {
+                continue;
+            };
+            let ParameterKind::Data { data_type, assignments } = &pd.kind else {
+                continue;
+            };
+            for assign in assignments {
+                let name = assign.name.name.as_str();
+                // Already bound => instantiation override; leave it alone.
+                if elab.parameters.contains_key(name) {
+                    continue;
+                }
+                if let Some(init) = &assign.init {
+                    // Only pre-seed initializers built from plain module-local
+                    // names. A package- or class-scoped reference
+                    // (`pkg::SIZE`) is not bound until the walk reaches the
+                    // import, so seeding it here would store a wrong value
+                    // that any declaration sized from it would then pick up.
+                    if expr_refs_are_all_local(init) {
+                        decls.push((name, data_type, init));
+                    }
+                }
+            }
+        }
+        for _ in 0..8 {
+            let mut changed = false;
+            for (name, data_type, init) in &decls {
+                let mut width =
+                    resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                {
+                    width = 32;
+                }
+                let subbed;
+                let init_eval: &Expression = if expr_has_call(init) {
+                    match substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
+                        .filter(|e| !expr_has_call(e))
+                    {
+                        Some(e) => {
+                            subbed = e;
+                            &subbed
+                        }
+                        None => init,
+                    }
+                } else {
+                    init
+                };
+                // Only seed once EVERY name the initializer reads is already
+                // known. Otherwise an unresolved reference silently evaluates
+                // to 0 and we would store that wrong value — the very failure
+                // this pass exists to prevent. The fixpoint lets a chain
+                // resolve one link per iteration.
+                if !expr_idents_all_known(init_eval, &elab.parameters) {
+                    continue;
+                }
+                let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
+                if is_type_signed(data_type) {
+                    v.is_signed = true;
+                }
+                if v.is_real {
+                    continue; // real parameters keep the walk's own handling
+                }
+                if elab.parameters.get(*name) != Some(&v) {
+                    elab.parameters.insert((*name).to_string(), v);
+                    preseeded_params.insert((*name).to_string());
+                    preseed_dup_exempt.insert((*name).to_string());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -3601,7 +3702,10 @@ pub fn elaborate_module_with_defs(
                         signed = true;
                     }
                     for assign in assignments {
-                        if elab.signals.contains_key(&assign.name.name) || elab.parameters.contains_key(&assign.name.name) {
+                        if (elab.signals.contains_key(&assign.name.name)
+                            || elab.parameters.contains_key(&assign.name.name))
+                            && !preseed_dup_exempt.remove(&assign.name.name)
+                        {
                             if elab.wildcard_shadowed.contains(&assign.name.name) {
                                 elab.parameters.remove(&assign.name.name);
                                 elab.signals.remove(&assign.name.name);
@@ -3651,7 +3755,9 @@ pub fn elaborate_module_with_defs(
                         let mut current_signed = signed;
 
                         if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
-                            let init_is_real = if elab.parameters.contains_key(&assign.name.name) {
+                            let init_is_real = if elab.parameters.contains_key(&assign.name.name)
+                                && !preseeded_params.contains(&assign.name.name)
+                            {
                                 elab.parameters.get(&assign.name.name).map(|v| v.is_real).unwrap_or(false)
                             } else if let Some(init) = &assign.init {
                                 eval_const_expr_val(init, &elab.parameters).is_real
@@ -3671,7 +3777,9 @@ pub fn elaborate_module_with_defs(
                             data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types);
                         let is_struct_param = struct_fields.as_ref().is_some_and(|f| !f.is_empty());
 
-                        let mut val = if elab.parameters.contains_key(&assign.name.name) {
+                        let mut val = if elab.parameters.contains_key(&assign.name.name)
+                            && !preseeded_params.contains(&assign.name.name)
+                        {
                             elab.parameters.get(&assign.name.name).cloned().unwrap_or(Value::zero(current_width))
                         } else if let Some(init) = &assign.init {
                             if expr_has_call(init) {
@@ -4086,6 +4194,14 @@ pub fn elaborate_module_with_defs(
         }
     }
 
+    // §6.20 — parameters whose initializer referenced a parameter declared
+    // LATER in the module. The walk above evaluates each one where it appears,
+    // so `localparam A = $clog2(B) - 6;` ahead of `localparam B = 4096;` saw
+    // nothing for B, fell back to 0, and produced -6 — read back unsigned that
+    // is 4294967290, which becomes a `[4294967289:0]` packed range and
+    // collapses the whole bus to ONE BIT. The only symptom is a width warning;
+    // the design then simulates wrongly. A reference simulator resolves the
+    // declarations order-independently.
     // User-defined nettype driver resolution: collapse multiple continuous
     // drivers on a nettype variable into a single OR-combined assign. This
     // approximates the common `resolve_or` resolver; other resolvers are not
@@ -6126,6 +6242,167 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
         });
         elab.implicit_nets.insert(name.clone());
         elab.nets.insert(name);
+    }
+}
+
+/// True when every identifier in `e` already has a value in `params`.
+fn expr_idents_all_known(e: &Expression, params: &HashMap<String, Value>) -> bool {
+    let mut ok = true;
+    fn walk(e: &Expression, params: &HashMap<String, Value>, ok: &mut bool) {
+        if !*ok {
+            return;
+        }
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if let Some(seg) = h.path.last() {
+                    if !params.contains_key(&seg.name.name) {
+                        *ok = false;
+                    }
+                } else {
+                    *ok = false;
+                }
+            }
+            ExprKind::Paren(i) => walk(i, params, ok),
+            ExprKind::Unary { operand, .. } => walk(operand, params, ok),
+            ExprKind::Binary { left, right, .. } => {
+                walk(left, params, ok);
+                walk(right, params, ok);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                walk(condition, params, ok);
+                walk(then_expr, params, ok);
+                walk(else_expr, params, ok);
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    walk(a, params, ok);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(e, params, &mut ok);
+    ok
+}
+
+/// True when every identifier in `e` is a plain, unqualified name — no
+/// package/class scope (`pkg::X`) and no hierarchical or member path. Such an
+/// expression can be evaluated from the module's own parameter table alone.
+fn expr_refs_are_all_local(e: &Expression) -> bool {
+    let mut ok = true;
+    fn walk(e: &Expression, ok: &mut bool) {
+        if !*ok {
+            return;
+        }
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    *ok = false;
+                }
+            }
+            ExprKind::MemberAccess { .. } => *ok = false,
+            ExprKind::Paren(i) => walk(i, ok),
+            ExprKind::Unary { operand, .. } => walk(operand, ok),
+            ExprKind::Binary { left, right, .. } => {
+                walk(left, ok);
+                walk(right, ok);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                walk(condition, ok);
+                walk(then_expr, ok);
+                walk(else_expr, ok);
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    walk(a, ok);
+                }
+            }
+            // §6.20.2: an unbased-unsized init (`'1`) is self-determined and
+            // gets dedicated handling in the walk (1-bit, fill semantics).
+            // Pre-seeding it would store a sized value and defeat that.
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => *ok = false,
+            // A real-valued parameter has its own width/real handling in the
+            // walk; pre-seeding would store an integer and lose it.
+            ExprKind::Number(NumberLiteral::Real(_)) => *ok = false,
+            ExprKind::Number(_) => {}
+            // Anything else (calls, concatenations, casts, …) is not worth
+            // pre-seeding; the walk handles it in declaration order as before.
+            _ => *ok = false,
+        }
+    }
+    walk(e, &mut ok);
+    ok
+}
+
+/// Re-evaluate parameter initializers to a FIXPOINT so a forward reference
+/// resolves. Values are only UPDATED, never inserted, and any parameter given
+/// by an instantiation override is skipped — so a correctly ordered design and
+/// an overridden parameter both re-evaluate to exactly what they already have,
+/// and the loop settles on the first pass in the common case.
+fn resolve_forward_referenced_params(
+    items: &[ModuleItem],
+    elab: &mut ElaboratedModule,
+    param_overrides: &HashMap<String, Value>,
+) {
+    let mut pending: Vec<(&str, &DataType, &Expression)> = Vec::new();
+    for item in items {
+        let (ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd)) = item
+        else {
+            continue;
+        };
+        let ParameterKind::Data { data_type, assignments } = &pd.kind else {
+            continue;
+        };
+        for assign in assignments {
+            let name = assign.name.name.as_str();
+            if param_overrides.contains_key(name) {
+                continue;
+            }
+            if let Some(init) = &assign.init {
+                pending.push((name, data_type, init));
+            }
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    for _ in 0..8 {
+        let mut changed = false;
+        for (name, data_type, init) in &pending {
+            let mut width =
+                resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+            if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                width = 32;
+            }
+            let subbed;
+            let init_eval: &Expression = if expr_has_call(init) {
+                match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                    .filter(|e| !expr_has_call(e))
+                {
+                    Some(e) => {
+                        subbed = e;
+                        &subbed
+                    }
+                    None => init,
+                }
+            } else {
+                init
+            };
+            let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
+            if is_type_signed(data_type) {
+                v.is_signed = true;
+            }
+            if elab.parameters.get(*name) != Some(&v) {
+                elab.parameters.insert((*name).to_string(), v.clone());
+                if let Some(sig) = elab.signals.get_mut(*name) {
+                    sig.value = v;
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
     }
 }
 
