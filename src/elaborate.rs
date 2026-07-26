@@ -1082,6 +1082,11 @@ pub struct ElaboratedModule {
     /// source bits to 0.
     #[serde(default)]
     pub two_state_signals: HashSet<String>,
+    /// Names of unpacked arrays whose synthesized element storage initializes
+    /// to Z rather than X. This is for arrays of nets and unconnected
+    /// input/inout ports; ordinary 4-state variable arrays still default to X.
+    #[serde(default)]
+    pub z_init_signals: HashSet<String>,
     /// Deferred-rewrite buffers (fix #7). Populated by `inline_module_items`
     /// instead of eagerly producing rewritten ASTs in `always_blocks` /
     /// `initial_blocks` / `continuous_assigns`. Drained by callers via
@@ -1269,6 +1274,7 @@ impl ElaboratedModule {
             module_timescale_exp: HashMap::default(),
             enum_members: HashMap::default(),
             two_state_signals: HashSet::default(),
+            z_init_signals: HashSet::default(),
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
@@ -2277,7 +2283,9 @@ pub fn elaborate_module_with_defs(
                     is_signed,
                     is_real,
                     direction: port.direction,
-                    value: init_val.unwrap_or_else(|| if is_real { Value::from_f64(0.0) } else { Value::new(width) }),
+                    value: init_val.unwrap_or_else(|| {
+                        default_port_value(port.direction, port.data_type.as_ref(), width, is_real)
+                    }),
                     type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
@@ -2292,6 +2300,9 @@ pub fn elaborate_module_with_defs(
                         port.data_type.as_ref().map(is_type_two_state).unwrap_or(false),
                     );
                     if let Some(dt) = &port.data_type {
+                        if matches!(port.direction, Some(PortDirection::Input | PortDirection::Inout)) {
+                            mark_array_z_init_if_4state(&mut elab, &port.name.name, dt);
+                        }
                         elab.var_decl_types.insert(port.name.name.clone(), dt.clone());
                     }
                 }
@@ -2539,17 +2550,21 @@ pub fn elaborate_module_with_defs(
                     // direction line carries an Implicit type, so keep the
                     // existing width/type; if this line DOES carry an explicit
                     // type, adopt it.
-                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                    if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_none() {
                             let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
-                            let existing = elab.signals.get_mut(&decl.name.name).unwrap();
                             existing.direction = Some(pd.direction);
                             if explicit_type {
                                 existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
                                 existing.type_name = get_type_name(&pd.data_type);
-                                existing.value = if is_real { Value::from_f64(0.0) } else { Value::new(width) };
+                                existing.value = default_port_value(
+                                    Some(pd.direction),
+                                    Some(&pd.data_type),
+                                    width,
+                                    is_real,
+                                );
                             }
                             if !elab.port_order.contains(&decl.name.name) {
                                 elab.port_order.push(decl.name.name.clone());
@@ -2567,7 +2582,12 @@ pub fn elaborate_module_with_defs(
                         is_signed,
                         is_real,
                         direction: Some(pd.direction),
-                        value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                        value: default_port_value(
+                            Some(pd.direction),
+                            Some(&pd.data_type),
+                            width,
+                            is_real,
+                        ),
                         type_name: get_type_name(&pd.data_type),
                     };
                     if !elab.port_order.contains(&decl.name.name) {
@@ -2601,8 +2621,19 @@ pub fn elaborate_module_with_defs(
                     // and just record the leaf in `nets`. Only treat it
                     // as an error if the existing entry is not a port
                     // (i.e. a true duplicate user declaration).
-                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                    if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_some() {
+                            existing.value = match nd.net_type {
+                                NetType::Supply0 => Value::zero(existing.width),
+                                NetType::Supply1 => Value::ones(existing.width),
+                                _ => {
+                                    if existing.is_real {
+                                        Value::from_f64(0.0)
+                                    } else {
+                                        Value::all_z(existing.width)
+                                    }
+                                }
+                            };
                             elab.nets.insert(decl.name.name.clone());
                             continue;
                         }
@@ -2701,6 +2732,7 @@ pub fn elaborate_module_with_defs(
                             width,
                             false,
                         );
+                        mark_array_z_init_if_4state(&mut elab, &decl.name.name, &nd.data_type);
                         elab.var_decl_types.insert(decl.name.name.clone(), nd.data_type.clone());
                         if let Some(UnpackedDimension::Range { left, right, .. }) = effective_dims.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
@@ -2838,7 +2870,12 @@ pub fn elaborate_module_with_defs(
                             existing.value = if decl_is_real {
                                 Value::from_f64(0.0)
                             } else {
-                                Value::new(width)
+                                default_port_value(
+                                    existing.direction,
+                                    Some(&dd.data_type),
+                                    width,
+                                    decl_is_real,
+                                )
                             };
                         }
                         if is_type_two_state(&dd.data_type) {
@@ -6621,17 +6658,21 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     }
                     // §23.2.2.1 non-ANSI split type/direction — merge (see the
                     // matching comment in the top-module elaboration path).
-                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                    if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_none() {
                             let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
-                            let existing = elab.signals.get_mut(&decl.name.name).unwrap();
                             existing.direction = Some(pd.direction);
                             if explicit_type {
                                 existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
                                 existing.type_name = get_type_name(&pd.data_type);
-                                existing.value = if is_real { Value::from_f64(0.0) } else { Value::new(width) };
+                                existing.value = default_port_value(
+                                    Some(pd.direction),
+                                    Some(&pd.data_type),
+                                    width,
+                                    is_real,
+                                );
                             }
                             if !elab.port_order.contains(&decl.name.name) {
                                 elab.port_order.push(decl.name.name.clone());
@@ -6645,7 +6686,13 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     }
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
-                        direction: Some(pd.direction), value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                        direction: Some(pd.direction),
+                        value: default_port_value(
+                            Some(pd.direction),
+                            Some(&pd.data_type),
+                            width,
+                            is_real,
+                        ),
                         is_real, type_name: get_type_name(&pd.data_type),
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
@@ -7654,6 +7701,26 @@ fn default_value_for_type(dt: &DataType, width: u32) -> Value {
         return Value::zero(width);
     }
     if is_type_two_state(dt) { Value::zero(width) } else { Value::new(width) }
+}
+
+fn default_port_value(
+    direction: Option<PortDirection>,
+    data_type: Option<&DataType>,
+    width: u32,
+    is_real: bool,
+) -> Value {
+    if is_real {
+        return Value::from_f64(0.0);
+    }
+    if matches!(direction, Some(PortDirection::Input | PortDirection::Inout)) {
+        if data_type.map(is_type_two_state).unwrap_or(false) {
+            Value::zero(width)
+        } else {
+            Value::all_z(width)
+        }
+    } else {
+        Value::new(width)
+    }
 }
 
 /// Returns true for 2-state types (bit, byte, shortint, int, longint) whose default is 0.
@@ -10401,6 +10468,12 @@ fn register_fixed_unpacked_array(
     }
 }
 
+fn mark_array_z_init_if_4state(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
+    if !is_type_two_state(data_type) && !is_type_real(data_type) {
+        elab.z_init_signals.insert(name.to_string());
+    }
+}
+
 fn shape_index_tuples(shape: &[(i64, i64)]) -> Vec<Vec<i64>> {
     let mut out = vec![Vec::new()];
     for &(lo, hi) in shape {
@@ -12163,7 +12236,12 @@ fn inline_module_items(
                                     is_signed: port.data_type.as_ref().map(is_type_signed).unwrap_or(false),
                                     is_real,
                                     direction: port.direction,
-                                    value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                    value: default_port_value(
+                                        port.direction,
+                                        port.data_type.as_ref(),
+                                        width,
+                                        is_real,
+                                    ),
                                     type_name: port.data_type.as_ref().and_then(get_type_name),
                                 });
                             } else {
@@ -12175,6 +12253,9 @@ fn inline_module_items(
                                     port.data_type.as_ref().map(is_type_two_state).unwrap_or(false),
                                 );
                                 if let Some(dt) = &port.data_type {
+                                    if matches!(port.direction, Some(PortDirection::Input | PortDirection::Inout)) {
+                                        mark_array_z_init_if_4state(elab, &sig_name, dt);
+                                    }
                                     elab.var_decl_types.insert(sig_name, dt.clone());
                                 }
                             }
@@ -12191,7 +12272,12 @@ fn inline_module_items(
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                         name: sig_name, width, is_signed,
                                         direction: Some(pd.direction),
-                                        value: Value::new(width),
+                                        value: default_port_value(
+                                            Some(pd.direction),
+                                            Some(&pd.data_type),
+                                            width,
+                                            is_type_real(&pd.data_type),
+                                        ),
                                         is_real: is_type_real(&pd.data_type), type_name: get_type_name(&pd.data_type),
                                     });
                                 }
@@ -12318,6 +12404,7 @@ fn inline_module_items(
                                         width,
                                         is_type_two_state(&nd.data_type),
                                     );
+                                    mark_array_z_init_if_4state(elab, &sig_name, &nd.data_type);
                                     elab.var_decl_types
                                         .insert(sig_name.clone(), nd.data_type.clone());
                                     if let Some(UnpackedDimension::Range { left, right, .. }) =
@@ -12514,6 +12601,34 @@ fn inline_module_items(
                                 let base_name = decl.name.name.clone();
                                 let sig_name = format!("{}{}", inst_prefix, base_name);
                                 let array_range = extract_array_range(&decl.dimensions, &sub_merged_params);
+                                if elab
+                                    .signals
+                                    .get(&sig_name)
+                                    .is_some_and(|s| s.direction.is_some())
+                                    && !elab.parameters.contains_key(&sig_name)
+                                {
+                                    let explicit_type = !matches!(dd.data_type, DataType::Implicit { .. });
+                                    let decl_is_real = is_type_real(&dd.data_type);
+                                    let existing = elab.signals.get_mut(&sig_name).unwrap();
+                                    if explicit_type {
+                                        existing.width = width;
+                                        existing.is_signed = is_signed;
+                                        existing.is_real = decl_is_real;
+                                        existing.type_name = get_type_name(&dd.data_type);
+                                        existing.value = default_port_value(
+                                            existing.direction,
+                                            Some(&dd.data_type),
+                                            width,
+                                            decl_is_real,
+                                        );
+                                    }
+                                    if is_type_two_state(&dd.data_type) {
+                                        elab.two_state_signals.insert(sig_name.clone());
+                                    }
+                                    elab.nets.remove(&sig_name);
+                                    elab.var_decl_types.insert(sig_name.clone(), dd.data_type.clone());
+                                    continue;
+                                }
                                 if std::env::var("XEZIM_DBG_ARR").is_ok() && sig_name.contains("ram0.mem") {
                                     let mut p: Vec<_> = sub_merged_params.iter().collect();
                                     p.sort_by_key(|(k, _)| k.as_str());
