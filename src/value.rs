@@ -1154,6 +1154,13 @@ impl Value {
             // IEEE 1800: == returns X only when ambiguous.
             // If any position has both bits known and they differ -> 0.
             let w = self.width.max(other.width) as usize;
+            // Two zero-width values (e.g. empty strings) are always equal
+            // regardless of internal X/Z bits in the storage.  Class-property
+            // string fields may have spurious X bits after allocation even
+            // when logically empty (width 0).
+            if w == 0 {
+                return Value::from_u64(1, 1);
+            }
             let sign_a = self.is_signed && (self.width as usize) < w;
             let sign_b = other.is_signed && (other.width as usize) < w;
             let top_a = if self.width > 0 { self.get_bit((self.width - 1) as usize) } else { LogicBit::Zero };
