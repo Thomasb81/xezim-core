@@ -2617,11 +2617,16 @@ pub fn elaborate_module_with_defs(
                     // element-wise `outs[0]`/`outs[1]` vars. Register the same
                     // `arrays` metadata the variable path does; `Simulator::new`
                     // synthesizes the per-element signals from it.
-                    let net_array_range = extract_array_range(&decl.dimensions, &elab.parameters);
+                    let effective_dims = normalize_unpacked_dims(
+                        &decl.dimensions,
+                        &elab.parameters,
+                        &elab.typedef_types,
+                    );
+                    let net_array_range = extract_array_range(&effective_dims, &elab.parameters);
                     let w = if net_array_range.is_some() {
                         width
                     } else {
-                        width_with_unpacked_dims(&decl.dimensions, width)
+                        width_with_unpacked_dims(&effective_dims, width)
                     };
                     // supply0 → constant 0, supply1 → constant 1.
                     // §6.6.1: an undriven wire reads high-impedance — nets
@@ -2649,7 +2654,7 @@ pub fn elaborate_module_with_defs(
                     // parent net — mirroring the variable (line ~2793) and port
                     // (line ~9002) paths, which the net arm previously omitted
                     // (member access read x).
-                    if net_array_range.is_none() && decl.dimensions.is_empty() {
+                    if net_array_range.is_none() && effective_dims.is_empty() {
                         let chain = resolve_typedef_chain(&nd.data_type, &elab.typedef_types).clone();
                         if let DataType::Struct(su) = &chain {
                             if su.packed {
@@ -2686,7 +2691,7 @@ pub fn elaborate_module_with_defs(
                     if let Some(fdims) = packed_full_dims_of(&nd.data_type, &elab.parameters) {
                         elab.packed_full_dims.insert(decl.name.name.clone(), fdims);
                     }
-                    if let Some(shape) = fixed_unpacked_shape(&decl.dimensions, &elab.parameters)
+                    if let Some(shape) = fixed_unpacked_shape(&effective_dims, &elab.parameters)
                         .filter(|shape| !shape.is_empty())
                     {
                         register_fixed_unpacked_array(
@@ -2697,7 +2702,7 @@ pub fn elaborate_module_with_defs(
                             false,
                         );
                         elab.var_decl_types.insert(decl.name.name.clone(), nd.data_type.clone());
-                        if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
+                        if let Some(UnpackedDimension::Range { left, right, .. }) = effective_dims.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
                             if l > r {
@@ -6658,7 +6663,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(width),
                         NetType::Supply1 => Value::ones(width),
-                        _ => if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                        _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(width) },
                     };
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
@@ -12270,6 +12275,11 @@ fn inline_module_items(
                             let width = resolve_type_width(&nd.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
                             for decl in &nd.declarators {
                                 let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                let effective_dims = normalize_unpacked_dims(
+                                    &decl.dimensions,
+                                    &sub_merged_params,
+                                    &elab.typedef_types,
+                                );
                                 // An UNPACKED array net inside a submodule
                                 // (`wire [15:0] pipe [0:2];`) must register its
                                 // range like the variable arm below, otherwise it
@@ -12298,7 +12308,7 @@ fn inline_module_items(
                                 // UNPACKED array net of any rank
                                 // (`wire [15:0] pipe [0:2];`, `… [0:1][0:1];`).
                                 if let Some(shape) =
-                                    fixed_unpacked_shape(&decl.dimensions, &sub_merged_params)
+                                    fixed_unpacked_shape(&effective_dims, &sub_merged_params)
                                         .filter(|shape| !shape.is_empty())
                                 {
                                     register_fixed_unpacked_array(
@@ -12311,7 +12321,7 @@ fn inline_module_items(
                                     elab.var_decl_types
                                         .insert(sig_name.clone(), nd.data_type.clone());
                                     if let Some(UnpackedDimension::Range { left, right, .. }) =
-                                        decl.dimensions.first()
+                                        effective_dims.first()
                                     {
                                         let l = const_eval_i64_with_params(left, Some(&sub_merged_params))
                                             .unwrap_or(0);
@@ -12328,7 +12338,13 @@ fn inline_module_items(
                                 let init_value = match nd.net_type {
                                     NetType::Supply0 => Value::zero(width),
                                     NetType::Supply1 => Value::ones(width),
-                                    _ => Value::new(width),
+                                    _ => {
+                                        if is_type_real(&nd.data_type) {
+                                            Value::from_f64(0.0)
+                                        } else {
+                                            Value::all_z(width)
+                                        }
+                                    }
                                 };
                                 elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
