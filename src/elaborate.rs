@@ -7948,10 +7948,29 @@ pub fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params
             // For dynamic arrays and queues, allocate a fixed-size buffer for simulation
             Some((0, 63))
         }
-        crate::ast::types::UnpackedDimension::Associative { .. } => {
-            // Associative arrays are purely dynamic
+        crate::ast::types::UnpackedDimension::Associative { data_type: Some(dt), .. } => {
+            // `[NAME]` is genuinely ambiguous in the grammar (§A.2.5): it is an
+            // ASSOCIATIVE index type when NAME is a type, and a SIZED dimension
+            // when NAME is a parameter. The parser cannot tell — it has no type
+            // table — so it commits to associative and a `wire w [COLS];` came
+            // out as a 64-entry dynamic array. Every element past 63 (and the
+            // shape of any further dimension) was then wrong, so instances
+            // bound to `w[i][j]` drove nothing and the net read z. Reinterpret
+            // it here, where the parameter table exists.
+            if let DataType::TypeReference { name, dimensions, .. } = &**dt {
+                if dimensions.is_empty() {
+                    if let Some(v) = params.get(&name.name.name) {
+                        let size = v.to_u64().unwrap_or(0) as i64;
+                        if size > 0 {
+                            return Some((0, size - 1));
+                        }
+                    }
+                }
+            }
+            // A real associative array is purely dynamic.
             None
         }
+        crate::ast::types::UnpackedDimension::Associative { .. } => None,
     }
 }
 
@@ -10061,6 +10080,12 @@ fn fixed_unpacked_shape(
     dims.iter()
         .map(|d| match d {
             UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. } => {
+                extract_array_range(std::slice::from_ref(d), params)
+            }
+            // A parameter-named dimension reaches here as Associative; only a
+            // dimension that resolves to a real size is accepted, so a genuine
+            // associative array still yields None and stays dynamic.
+            UnpackedDimension::Associative { .. } => {
                 extract_array_range(std::slice::from_ref(d), params)
             }
             _ => None,
