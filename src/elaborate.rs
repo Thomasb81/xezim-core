@@ -3365,6 +3365,47 @@ pub fn elaborate_module_with_defs(
                         // layout (element-relative offsets) under `foo` plus the
                         // element width, so `foo[i].field` resolves to
                         // `i*elem_w + field_off` in the single backing signal.
+                        // §7.4.2 packed dims written on a STRUCT TYPEDEF
+                        // (`some_t [0:0][1:0] arr;`). Registered independently of
+                        // the field-layout block below, which is skipped once
+                        // `packed_struct_fields` already holds the name — that is
+                        // exactly the case for a struct-typed declaration, so the
+                        // dimensions were never recorded and `arr[i]` decayed to a
+                        // 1-bit select.
+                        if decl.dimensions.is_empty()
+                            && !elab.packed_full_dims.contains_key(&decl.name.name)
+                        {
+                            let chain2 =
+                                resolve_typedef_chain(&dd.data_type, &elab.typedef_types).clone();
+                            if matches!(&chain2, DataType::Struct(su) if su.packed) {
+                                let sw = flatten_struct_fields(
+                                    &chain2,
+                                    &elab.parameters,
+                                    &elab.typedefs,
+                                    &elab.typedef_types,
+                                )
+                                .map(|f| f.iter().map(|(_, o, w)| o + w).max().unwrap_or(0))
+                                .unwrap_or(0);
+                                if let Some(fdims) = packed_typedef_array_dims(
+                                    &dd.data_type,
+                                    sw,
+                                    &elab.parameters,
+                                ) {
+                                    let total: i64 =
+                                        fdims.iter().map(|(l, r)| (l - r).abs() + 1).product();
+                                    let (ol, orr) = fdims[0];
+                                    let outer = (ol - orr).abs() + 1;
+                                    if outer > 0 && total > 0 {
+                                        elab.packed_signal_elem_widths.insert(
+                                            decl.name.name.clone(),
+                                            (total / outer) as u32,
+                                        );
+                                    }
+                                    elab.packed_full_dims
+                                        .insert(decl.name.name.clone(), fdims);
+                                }
+                            }
+                        }
                         if !elab.packed_struct_fields.contains_key(&decl.name.name)
                             && decl.dimensions.is_empty()
                         {
@@ -3373,7 +3414,35 @@ pub fn elaborate_module_with_defs(
                                 if su.packed {
                                     if let Some(fields) = flatten_struct_fields(&chain, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
                                         let struct_w = fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
-                                        if struct_w > 0 && width > struct_w && width % struct_w == 0 {
+                                        // Packed dims written on the TYPEDEF itself
+                                        // (`some_t [0:0][1:0] arr;`). Register the
+                                        // full dimension list — including a single
+                                        // `[0:0]`, where `width == struct_w` and the
+                                        // element gate below never fired, leaving
+                                        // `arr[0]` a 1-bit select.
+                                        if let Some(fdims) = packed_typedef_array_dims(
+                                            &dd.data_type,
+                                            struct_w,
+                                            &elab.parameters,
+                                        ) {
+                                            let total: i64 = fdims
+                                                .iter()
+                                                .map(|(l, r)| (l - r).abs() + 1)
+                                                .product();
+                                            let (ol, orr) = fdims[0];
+                                            let outer = (ol - orr).abs() + 1;
+                                            if outer > 0 && total > 0 {
+                                                elab.packed_signal_elem_widths.insert(
+                                                    decl.name.name.clone(),
+                                                    (total / outer) as u32,
+                                                );
+                                            }
+                                            elab.packed_full_dims
+                                                .insert(decl.name.name.clone(), fdims);
+                                            tls_register_struct_layout(&decl.name.name, &fields);
+                                            elab.packed_struct_fields
+                                                .insert(decl.name.name.clone(), fields);
+                                        } else if struct_w > 0 && width > struct_w && width % struct_w == 0 {
                                             elab.packed_signal_elem_widths.insert(decl.name.name.clone(), struct_w);
                                             tls_register_struct_layout(&decl.name.name, &fields);
                                             elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
@@ -3904,12 +3973,35 @@ pub fn elaborate_module_with_defs(
                 elab.covergroups.insert(cg.name.name.clone(), cg.clone());
             }
             ModuleItem::ClockingDeclaration(cd) => {
+                // §14.12 standalone designation `default clocking <name>;`
+                // arrives as an empty, clock-less marker — fold it into the
+                // real same-named block instead of overwriting it (either
+                // declaration order). A real block keeps a designation that
+                // arrived first.
+                let is_designation =
+                    cd.clock_signal.is_none() && cd.signals.is_empty() && cd.is_default;
+                if is_designation {
+                    if let Some(existing) = elab.clocking_blocks.get_mut(&cd.name.name) {
+                        existing.is_default = true;
+                    } else {
+                        elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+                    }
+                    continue;
+                }
                 let mut dirs = HashMap::default();
                 for s in &cd.signals {
                     dirs.insert(s.name.name.clone(), s.direction);
                 }
+                let was_default = elab
+                    .clocking_blocks
+                    .get(&cd.name.name)
+                    .is_some_and(|p| p.is_default && p.clock_signal.is_none());
+                let mut cd_owned = cd.clone();
+                if was_default {
+                    cd_owned.is_default = true;
+                }
                 elab.clocking_signal_dirs.insert(cd.name.name.clone(), dirs);
-                elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+                elab.clocking_blocks.insert(cd.name.name.clone(), cd_owned);
             }
             ModuleItem::ClassDeclaration(cd) => {
                 validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
@@ -4055,7 +4147,9 @@ pub fn elaborate_module_with_defs(
 
     // IEEE 1800-2017 §6.10: Implicit nets — identifiers used in continuous assigns
     // or port connections that are not explicitly declared become implicit 1-bit wires.
-    create_implicit_nets(&mut elab)?;
+    let mut port_conn_nets: Vec<String> = Vec::new();
+    collect_port_connection_net_candidates(module.items(), &mut port_conn_nets);
+    create_implicit_nets(&mut elab, &port_conn_nets)?;
 
     // Validate that all identifiers in procedural blocks are declared.
     for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::default())?; }
@@ -6053,12 +6147,54 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
 
 /// Create implicit 1-bit wire signals for identifiers referenced in continuous assigns
 /// but not declared anywhere (IEEE 1800-2017 §6.10).
-fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
+/// §6.10 candidates that appear as INSTANCE PORT ACTUALS. Walks generate
+/// constructs too, since an instantiation inside `generate`/`if`/`for` binds
+/// nets the same way. Only the connection EXPRESSION is scanned — the formal
+/// port name (`.foo` in `.foo(bar)`) names a port of the child, not a net here.
+fn collect_port_connection_net_candidates(items: &[ModuleItem], out: &mut Vec<String>) {
+    for item in items {
+        match item {
+            ModuleItem::ModuleInstantiation(inst) => {
+                for hi in &inst.instances {
+                    for c in &hi.connections {
+                        match c {
+                            PortConnection::Ordered(Some(e)) => {
+                                collect_implicit_net_candidates(e, out)
+                            }
+                            // `.name(expr)`; the parenthesis-free `.name` form
+                            // (§23.3.2.2) requires an EXISTING net, so it is
+                            // not a source of implicit declarations.
+                            PortConnection::Named { expr: Some(e), implicit: false, .. } => {
+                                collect_implicit_net_candidates(e, out)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+            }
+            ModuleItem::GenerateRegion(g) => {
+                collect_port_connection_net_candidates(&g.items, out)
+            }
+            _ => {}
+        }
+    }
+}
+
+fn create_implicit_nets(
+    elab: &mut ElaboratedModule,
+    port_conn_names: &[String],
+) -> Result<(), String> {
     let mut implicit_names = Vec::new();
     for ca in &elab.continuous_assigns {
         collect_ident_names(&ca.lhs, &mut implicit_names);
         collect_ident_names(&ca.rhs, &mut implicit_names);
     }
+    // §6.10 also covers an identifier that appears ONLY as an instance port
+    // actual — `.out(net)` on one instance and `.in(net)` on another, with
+    // `net` never declared. Those were skipped, so the name existed nowhere:
+    // reading it raised "Undeclared identifier" and it was absent from a
+    // $dumpvars trace even though the connection itself worked (the ports were
+    // wired to each other directly).
     implicit_names.sort();
     implicit_names.dedup();
     let none_active = sv_parser::default_nettype_none_seen();
@@ -6085,6 +6221,50 @@ fn create_implicit_nets(elab: &mut ElaboratedModule) -> Result<(), String> {
             elab.implicit_nets.insert(name.clone());
             elab.nets.insert(name);
         }
+    }
+
+    // Port-actual candidates are handled in a SEPARATE pass with a stricter
+    // "already declared" test. A port actual is routinely a whole UNPACKED
+    // ARRAY (`.a(data)` for `bit [1:0] data [0:2]`), and arrays live in their
+    // own maps — without those extra namespace checks such a name looks
+    // undeclared and gets a bogus 1-bit net that shadows the real array. The
+    // legacy continuous-assign pass above deliberately keeps its original,
+    // looser test: code downstream relies on the placeholder signal it creates
+    // for an array named in an assign lvalue.
+    let mut port_names: Vec<String> = port_conn_names.to_vec();
+    port_names.sort();
+    port_names.dedup();
+    for name in port_names {
+        if elab.signals.contains_key(&name)
+            || elab.parameters.contains_key(&name)
+            || elab.arrays.contains_key(&name)
+            || elab.arrays_2d.contains_key(&name)
+            || elab.arrays_nd.contains_key(&name)
+            || elab.interfaces.contains(&name)
+            || elab.nets.contains(&name)
+        {
+            continue;
+        }
+        if none_active {
+            return Err(format!(
+                "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
+                name
+            ));
+        }
+        if crate::implicit_net_warn() {
+            crate::elab_diag(format!(
+                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                 (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
+                name
+            ));
+        }
+        elab.signals.insert(name.clone(), Signal { is_const: false,
+            name: name.clone(), width: 1, is_signed: false,
+            direction: None, value: Value::new(1),
+            is_real: false, type_name: None,
+        });
+        elab.implicit_nets.insert(name.clone());
+        elab.nets.insert(name);
     }
     Ok(())
 }
@@ -6511,12 +6691,35 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
             }
             ModuleItem::ClockingDeclaration(cd) => {
+                // §14.12 standalone designation `default clocking <name>;`
+                // arrives as an empty, clock-less marker — fold it into the
+                // real same-named block instead of overwriting it (either
+                // declaration order). A real block keeps a designation that
+                // arrived first.
+                let is_designation =
+                    cd.clock_signal.is_none() && cd.signals.is_empty() && cd.is_default;
+                if is_designation {
+                    if let Some(existing) = elab.clocking_blocks.get_mut(&cd.name.name) {
+                        existing.is_default = true;
+                    } else {
+                        elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+                    }
+                    continue;
+                }
                 let mut dirs = HashMap::default();
                 for s in &cd.signals {
                     dirs.insert(s.name.name.clone(), s.direction);
                 }
+                let was_default = elab
+                    .clocking_blocks
+                    .get(&cd.name.name)
+                    .is_some_and(|p| p.is_default && p.clock_signal.is_none());
+                let mut cd_owned = cd.clone();
+                if was_default {
+                    cd_owned.is_default = true;
+                }
                 elab.clocking_signal_dirs.insert(cd.name.name.clone(), dirs);
-                elab.clocking_blocks.insert(cd.name.name.clone(), cd.clone());
+                elab.clocking_blocks.insert(cd.name.name.clone(), cd_owned);
             }
             ModuleItem::LetDeclaration(ld) => {
                 elab.lets.insert(ld.name.name.clone(), ld.clone());
@@ -7420,6 +7623,23 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                                     .map(|w| w as i64)
                             }))
                     }
+                    // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
+                    // `::` lowers to the SAME `MemberAccess` node as a struct
+                    // member select, so accept the leaf name and let the typedef
+                    // table arbitrate — a real type name hits it, a member select
+                    // misses and yields None exactly as before. Without this the
+                    // whole arm fell through to `_ => None`, so a port declared
+                    // `[$bits(some_pkg::some_t)-1:0]` elaborated to ONE BIT and
+                    // silently truncated the bus.
+                    ExprKind::MemberAccess { expr: base, member }
+                        if matches!(base.kind, ExprKind::Ident(_)) =>
+                    {
+                        TYPEDEFS_TLS.with(|td| {
+                            td.borrow().as_ref()
+                                .and_then(|m| m.get(member.name.as_str()).copied())
+                                .map(|w| w as i64)
+                        })
+                    }
                     ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => Some(*s as i64),
                     ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
                     ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
@@ -7604,6 +7824,66 @@ fn register_packed_array_elem_w(name: &str, dt: &DataType, typedefs: &HashMap<St
     }
 }
 
+/// Rewrite `$bits(<ident>)` to a literal when `<ident>` names a SIGNAL in the
+/// enclosing scope. Instance parameter overrides are const-evaluated against
+/// the parameter map only, so `#(.W($bits(some_signal)))` found nothing and
+/// evaluated to 0 — a port declared `[W-1:0]` then elaborated as `[-1:0]`,
+/// i.e. 2 bits, which surfaced as a bogus "port is 2 bit(s)" width-mismatch
+/// warning. Parameters and typedefs already resolve inside `$bits` itself and
+/// are left untouched here.
+fn prebind_bits_of_signals(
+    e: &Expression,
+    signals: &HashMap<String, Signal>,
+    params: &HashMap<String, Value>,
+    prefix: &str,
+) -> Expression {
+    let mut out = e.clone();
+    if let ExprKind::SystemCall { name, args } = &e.kind {
+        if name == "$bits" && args.len() == 1 {
+            if let ExprKind::Ident(h) = &args[0].kind {
+                let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                if !leaf.is_empty() && !params.contains_key(leaf) {
+                    let w = signals
+                        .get(&format!("{}{}", prefix, leaf))
+                        .or_else(|| signals.get(leaf))
+                        .map(|sig| sig.width);
+                    if let Some(w) = w.filter(|w| *w > 0) {
+                        out.kind = ExprKind::Number(NumberLiteral::Integer {
+                            size: None,
+                            signed: false,
+                            base: crate::ast::expr::NumberBase::Decimal,
+                            value: w.to_string(),
+                            cached_val: std::cell::Cell::new(None),
+                        });
+                        return out;
+                    }
+                }
+            }
+            return out;
+        }
+    }
+    // Recurse into the common composite forms so `$bits(sig)-1` works.
+    match &mut out.kind {
+        ExprKind::Binary { left, right, .. } => {
+            **left = prebind_bits_of_signals(left, signals, params, prefix);
+            **right = prebind_bits_of_signals(right, signals, params, prefix);
+        }
+        ExprKind::Unary { operand, .. } => {
+            **operand = prebind_bits_of_signals(operand, signals, params, prefix);
+        }
+        ExprKind::Paren(inner) => {
+            **inner = prebind_bits_of_signals(inner, signals, params, prefix);
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args.iter_mut() {
+                *a = prebind_bits_of_signals(a, signals, params, prefix);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
 /// Run `f` with `typedefs` installed as the thread-local typedef table
 /// consulted by const-eval `$bits(typedef_name)`. The previous binding
 /// is restored on exit so nested calls compose correctly.
@@ -7692,10 +7972,29 @@ pub fn extract_array_range(dims: &[crate::ast::types::UnpackedDimension], params
             // For dynamic arrays and queues, allocate a fixed-size buffer for simulation
             Some((0, 63))
         }
-        crate::ast::types::UnpackedDimension::Associative { .. } => {
-            // Associative arrays are purely dynamic
+        crate::ast::types::UnpackedDimension::Associative { data_type: Some(dt), .. } => {
+            // `[NAME]` is genuinely ambiguous in the grammar (§A.2.5): it is an
+            // ASSOCIATIVE index type when NAME is a type, and a SIZED dimension
+            // when NAME is a parameter. The parser cannot tell — it has no type
+            // table — so it commits to associative and a `wire w [COLS];` came
+            // out as a 64-entry dynamic array. Every element past 63 (and the
+            // shape of any further dimension) was then wrong, so instances
+            // bound to `w[i][j]` drove nothing and the net read z. Reinterpret
+            // it here, where the parameter table exists.
+            if let DataType::TypeReference { name, dimensions, .. } = &**dt {
+                if dimensions.is_empty() {
+                    if let Some(v) = params.get(&name.name.name) {
+                        let size = v.to_u64().unwrap_or(0) as i64;
+                        if size > 0 {
+                            return Some((0, size - 1));
+                        }
+                    }
+                }
+            }
+            // A real associative array is purely dynamic.
             None
         }
+        crate::ast::types::UnpackedDimension::Associative { .. } => None,
     }
 }
 
@@ -7884,6 +8183,39 @@ pub fn packed_elem_lsb_offset(dims: &[(i64, i64)], idx: &[i64], elem_w: u32) -> 
         msb_off += slot * w_j;
     }
     Some((total - msb_off - elem_w as u64) as u32)
+}
+
+/// §7.4.2 — packed dimensions applied to a STRUCT/TYPEDEF base
+/// (`some_t [0:0][1:0] arr;`). `packed_full_dims_of` and
+/// `packed_inner_elem_width` only understand `IntegerVector`/`Implicit`, so a
+/// typedef base registered nothing and `arr[i]` degraded to a 1-BIT select
+/// (`$bits(arr[0])` came back 1 instead of the struct width). Model the struct
+/// as one extra trailing `[base_w-1:0]` dimension: the ordinary element-select
+/// machinery then applies unchanged, so `arr[i]` strips the outer dimension and
+/// keeps the rest (`arr2[0]` = the whole `[1:0]` sub-array, `arr2[0][0]` = one
+/// struct).
+fn packed_typedef_array_dims(
+    dt: &DataType,
+    base_w: u32,
+    params: &HashMap<String, Value>,
+) -> Option<Vec<(i64, i64)>> {
+    let DataType::TypeReference { dimensions, .. } = dt else {
+        return None;
+    };
+    if dimensions.is_empty() || base_w == 0 {
+        return None;
+    }
+    let mut out: Vec<(i64, i64)> = Vec::with_capacity(dimensions.len() + 1);
+    for d in dimensions {
+        let PackedDimension::Range { left, right, .. } = d else {
+            return None;
+        };
+        let l = const_eval_i64_with_params(left, Some(params))?;
+        let r = const_eval_i64_with_params(right, Some(params))?;
+        out.push((l, r));
+    }
+    out.push((base_w as i64 - 1, 0));
+    Some(out)
 }
 
 pub fn packed_inner_elem_width(
@@ -8562,6 +8894,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     params.get(n).map(|v| v.width)
                         .or_else(|| TYPEDEFS_TLS.with(|td|
                             td.borrow().as_ref().and_then(|m| m.get(n).copied())))
+                        .unwrap_or(0)
+                }
+                // §26.3 package-/class-scoped type — see the matching arm in
+                // `const_eval_i64_with_params`.
+                ExprKind::MemberAccess { expr: base, member }
+                    if matches!(base.kind, ExprKind::Ident(_)) =>
+                {
+                    TYPEDEFS_TLS.with(|td|
+                        td.borrow().as_ref().and_then(|m| m.get(member.name.as_str()).copied()))
                         .unwrap_or(0)
                 }
                 ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => *s,
@@ -9765,6 +10106,12 @@ fn fixed_unpacked_shape(
             UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. } => {
                 extract_array_range(std::slice::from_ref(d), params)
             }
+            // A parameter-named dimension reaches here as Associative; only a
+            // dimension that resolves to a real size is accepted, so a genuine
+            // associative array still yields None and stays dynamic.
+            UnpackedDimension::Associative { .. } => {
+                extract_array_range(std::slice::from_ref(d), params)
+            }
             _ => None,
         })
         .collect()
@@ -10507,10 +10854,28 @@ fn port_conn_width(e: &Expression, elab: &ElaboratedModule) -> Option<u32> {
             }
             None
         }
-        EK::RangeSelect { left, right, kind: crate::ast::expr::RangeKind::Constant, .. } => {
+        EK::RangeSelect { expr: base, left, right, kind: crate::ast::expr::RangeKind::Constant, .. } => {
             let l = const_eval_i64_with_params(left, Some(&elab.parameters))?;
             let r = const_eval_i64_with_params(right, Some(&elab.parameters))?;
-            Some(((l - r).unsigned_abs() + 1) as u32)
+            let count = ((l - r).unsigned_abs() + 1) as u32;
+            // §7.4.1: a constant range on a packed MULTI-D base selects
+            // ELEMENTS, so the connection carries count × elem_w bits.
+            // `.p(arr[1:0])` on a packed array of 128-bit structs is 256
+            // bits, and reporting 2 here mis-sized the port cont-assign.
+            if let EK::Ident(h) = &base.kind {
+                let name = h
+                    .path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".");
+                if let Some(&ew) = elab.packed_signal_elem_widths.get(&name) {
+                    if ew > 1 {
+                        return Some(count * ew);
+                    }
+                }
+            }
+            Some(count)
         }
         EK::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(sz), .. }) => Some(*sz),
         EK::Concatenation(parts) => {
@@ -10746,6 +11111,75 @@ fn inline_module_items(
                 }
                 // Was: `let scoped_eval_params = local_params.clone();` — wasted clone, only read.
                 let scoped_eval_params: &HashMap<String, Value> = local_params;
+
+                // §6.10 implicit nets bound by port connections INSIDE the
+                // module being inlined. The top-level pass only sees the top
+                // module's instantiations, and the pending pass only sees
+                // cont-assign bodies, so a net that exists solely as a port
+                // actual one level down (a clock net bound only as an actual
+                // inside an instantiated wrapper) was never registered as a
+                // signal. Its
+                // driver then had NO write id and its reader NO read id: the
+                // hop stayed out of the settle dependency graph and updated
+                // only when some unrelated change forced a settle, silently
+                // dropping most transitions on a fast clock. Register it here,
+                // under this instance's prefix, exactly as a declared net.
+                {
+                    let sub_mod_port_names: std::collections::HashSet<String> = match sub_mod.ports() {
+                        PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
+                        PortList::NonAnsi(ps) => ps.iter().map(|p| p.name.clone()).collect(),
+                        _ => std::collections::HashSet::default(),
+                    };
+                    let sub_mod_declares: std::collections::HashSet<String> = {
+                        let mut v = Vec::new();
+                        collect_decl_names_in_items(sub_mod.items(), &mut v);
+                        v.into_iter().collect()
+                    };
+                    let mut cands: Vec<String> = Vec::new();
+                    collect_port_connection_net_candidates(sub_mod.items(), &mut cands);
+                    cands.sort();
+                    cands.dedup();
+                    for name in cands {
+                        // A formal port of the sub-module is bound to the
+                        // parent's expression, not declared here.
+                        if sub_mod_port_names.contains(&name) {
+                            continue;
+                        }
+                        let scoped = format!("{}{}", inst_prefix, name);
+                        if elab.signals.contains_key(&scoped)
+                            || elab.signals.contains_key(&name)
+                            || elab.parameters.contains_key(&name)
+                            || elab.parameters.contains_key(&scoped)
+                            || elab.nets.contains(&scoped)
+                            || elab.arrays.contains_key(&scoped)
+                            || elab.arrays_2d.contains_key(&scoped)
+                            || elab.arrays_nd.contains_key(&scoped)
+                            || elab.interfaces.contains(&scoped)
+                        {
+                            continue;
+                        }
+                        // Declared inside the sub-module itself (a net/var
+                        // declaration or one of its own ports) — the regular
+                        // inline paths create those.
+                        if sub_mod_declares.contains(&name) {
+                            continue;
+                        }
+                        if crate::implicit_net_warn() {
+                            crate::elab_diag(format!(
+                                "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
+                                 (IEEE 1800-2017 §6.10, instance port connection). Add an explicit declaration to silence.",
+                                scoped
+                            ));
+                        }
+                        elab.signals.insert(scoped.clone(), Signal { is_const: false,
+                            name: scoped.clone(), width: 1, is_signed: false,
+                            direction: None, value: Value::new(1),
+                            is_real: false, type_name: None,
+                        });
+                        elab.implicit_nets.insert(scoped.clone());
+                        elab.nets.insert(scoped);
+                    }
+                }
 
                 // Build port map and interface map
                 let mut port_map = HashMap::default();
@@ -10986,6 +11420,9 @@ fn inline_module_items(
                                     }
                                 }
                                 if let Some(ParamValue::Expr(v)) = value {
+                                    let v = &prebind_bits_of_signals(
+                                        v, &elab.signals, scoped_eval_params, prefix,
+                                    );
                                     let mut val = eval_const_expr_val(v, scoped_eval_params);
                                     // Check if target parameter is real or implicit real
                                     for p_decl in sub_mod.params() {
@@ -11418,11 +11855,48 @@ fn inline_module_items(
                             // sample_t out`) resolves the field — otherwise the
                             // write was dropped and the output stayed X.
                             if let Some(dt) = &port.data_type {
+                                let mut struct_w: u32 = 0;
                                 if let Some(fields) = flatten_struct_fields(dt, &sub_merged_params, &elab.typedefs, &elab.typedef_types) {
                                     if !fields.is_empty() {
+                                        struct_w =
+                                            fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
                                         tls_register_struct_layout(&sig_name, &fields);
                                         elab.packed_struct_fields.insert(sig_name.clone(), fields);
                                     }
+                                }
+                                // Packed multi-D PORT (`output [3:0][7:0] opv`):
+                                // record the element width and dimensions like a
+                                // net/variable declaration would, so element and
+                                // element-RANGE selects on the inlined signal
+                                // (`u_s.opv[2:1] = …` from the submodule's own
+                                // assigns) slice elements instead of bits.
+                                if let Some(ew) = packed_inner_elem_width(dt, &sub_merged_params, &elab.typedefs) {
+                                    elab.packed_signal_elem_widths.insert(sig_name.clone(), ew);
+                                }
+                                if let Some(fdims) = packed_full_dims_of(dt, &sub_merged_params) {
+                                    elab.packed_full_dims.insert(sig_name.clone(), fdims);
+                                }
+                                // Packed array of a STRUCT TYPEDEF as a PORT
+                                // (`output some_t [1:0] o`). Both helpers above
+                                // return None for a TypeReference base, so such a
+                                // port registered no element metadata: the
+                                // submodule's own `o[0].member = …` writes had no
+                                // element width to slice by and every member of
+                                // every element stayed X.
+                                if let Some(fdims) =
+                                    packed_typedef_array_dims(dt, struct_w, &sub_merged_params)
+                                {
+                                    let total: i64 =
+                                        fdims.iter().map(|(l, r)| (l - r).abs() + 1).product();
+                                    let (ol, orr) = fdims[0];
+                                    let outer = (ol - orr).abs() + 1;
+                                    if outer > 0 && total > 0 {
+                                        elab.packed_signal_elem_widths.insert(
+                                            sig_name.clone(),
+                                            (total / outer) as u32,
+                                        );
+                                    }
+                                    elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
                             }
                             if port_shape.is_empty() {
@@ -11517,9 +11991,23 @@ fn inline_module_items(
                                 }
                             }
                             elab.typedefs.insert(td.name.name.clone(), base_width);
+                            elab.typedef_types
+                                .entry(td.name.name.clone())
+                                .or_insert_with(|| td.data_type.clone());
                         } else {
                             let w = resolve_type_width(&td.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
                             elab.typedefs.insert(td.name.name.clone(), w);
+                            // Register the TYPE too (not just its width) so a
+                            // struct/union member access (`s.m0`) on a submodule
+                            // variable of this typedef can resolve to its bit
+                            // layout. Only the width was recorded before, so
+                            // `flatten_struct_fields` below found nothing and the
+                            // member cont-assign was silently dropped (struct
+                            // stayed X). `entry().or_insert` = first-declared
+                            // wins, matching the enum-member shadowing rule.
+                            elab.typedef_types
+                                .entry(td.name.name.clone())
+                                .or_insert_with(|| td.data_type.clone());
                         }
                     }
                 }
@@ -11529,6 +12017,61 @@ fn inline_module_items(
                             let width = resolve_type_width(&nd.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
                             for decl in &nd.declarators {
                                 let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                // An UNPACKED array net inside a submodule
+                                // (`wire [15:0] pipe [0:2];`) must register its
+                                // range like the variable arm below, otherwise it
+                                // collapses to a single scalar signal and every
+                                // element select degrades to a 1-BIT select —
+                                // `$bits(pipe[0])` came back 1 instead of 16 and a
+                                // port fed from `pipe[i]` carried one bit. The same
+                                // declaration at TOP level always worked, which is
+                                // what made this look like a generate/genvar bug.
+                                // Packed multi-D net (`wire [1:0][15:0] a;`):
+                                // record the element width / full dimensions so
+                                // `a[i]` slices instead of bit-selecting.
+                                if let Some(elem_w) = packed_inner_elem_width(
+                                    &nd.data_type,
+                                    &sub_merged_params,
+                                    &elab.typedefs,
+                                ) {
+                                    elab.packed_signal_elem_widths
+                                        .insert(sig_name.clone(), elem_w);
+                                }
+                                if let Some(fdims) =
+                                    packed_full_dims_of(&nd.data_type, &sub_merged_params)
+                                {
+                                    elab.packed_full_dims.insert(sig_name.clone(), fdims);
+                                }
+                                // UNPACKED array net of any rank
+                                // (`wire [15:0] pipe [0:2];`, `… [0:1][0:1];`).
+                                if let Some(shape) =
+                                    fixed_unpacked_shape(&decl.dimensions, &sub_merged_params)
+                                        .filter(|shape| !shape.is_empty())
+                                {
+                                    register_fixed_unpacked_array(
+                                        elab,
+                                        &sig_name,
+                                        &shape,
+                                        width,
+                                        is_type_two_state(&nd.data_type),
+                                    );
+                                    elab.var_decl_types
+                                        .insert(sig_name.clone(), nd.data_type.clone());
+                                    if let Some(UnpackedDimension::Range { left, right, .. }) =
+                                        decl.dimensions.first()
+                                    {
+                                        let l = const_eval_i64_with_params(left, Some(&sub_merged_params))
+                                            .unwrap_or(0);
+                                        let r = const_eval_i64_with_params(right, Some(&sub_merged_params))
+                                            .unwrap_or(0);
+                                        if l > r {
+                                            elab.descending_arrays.insert(sig_name.clone());
+                                        }
+                                    }
+                                    // Per-element Signals are synthesized by
+                                    // Simulator::new from the array metadata.
+                                    continue;
+                                }
                                 let init_value = match nd.net_type {
                                     NetType::Supply0 => Value::zero(width),
                                     NetType::Supply1 => Value::ones(width),
@@ -11609,8 +12152,89 @@ fn inline_module_items(
                                     elab.packed_full_dims.insert(scoped, fdims.clone());
                                 }
                             }
+                            // PACKED-STRUCT member layout for a submodule variable
+                            // (`typedef struct packed {...} t; t s;`). The top-
+                            // level DataDeclaration arm registers this; the
+                            // submodule arm did NOT, so `s.m0 = v` had no bit
+                            // offset to resolve and was DROPPED (struct read back
+                            // X). Register under BOTH the bare name and the
+                            // instance-scoped name, mirroring the packed-dim
+                            // blocks above. Only PACKED structs (contiguous bit
+                            // layout); unpacked structs keep per-member signals.
+                            if let DataType::Struct(su) = &resolve_typedef_chain(
+                                &dd.data_type,
+                                &elab.typedef_types,
+                            ) {
+                                if su.packed {
+                                    if let Some(fields) = flatten_struct_fields(
+                                        &dd.data_type,
+                                        &sub_merged_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            let struct_w = fields
+                                                .iter()
+                                                .map(|(_, o, w)| o + w)
+                                                .max()
+                                                .unwrap_or(0);
+                                            for decl in &dd.declarators {
+                                                if !decl.dimensions.is_empty() {
+                                                    continue;
+                                                }
+                                                let bare = decl.name.name.clone();
+                                                let scoped = format!("{}{}", inst_prefix, bare);
+                                                tls_register_struct_layout(&bare, &fields);
+                                                tls_register_struct_layout(&scoped, &fields);
+                                                elab.packed_struct_fields
+                                                    .insert(bare, fields.clone());
+                                                elab.packed_struct_fields
+                                                    .insert(scoped.clone(), fields.clone());
+                                                // Packed dims written on the
+                                                // typedef itself (`some_t [1:0] g;`)
+                                                // — register the element metadata
+                                                // under the SCOPED name, like the
+                                                // top-level and port paths already
+                                                // do. Without it `g[0]` inside the
+                                                // submodule was a 1-BIT select:
+                                                // `$bits(g[0])` read 1 and an
+                                                // element assign wrote one bit.
+                                                if let Some(fdims) = packed_typedef_array_dims(
+                                                    &dd.data_type,
+                                                    struct_w,
+                                                    &sub_merged_params,
+                                                ) {
+                                                    let total: i64 = fdims
+                                                        .iter()
+                                                        .map(|(l, r)| (l - r).abs() + 1)
+                                                        .product();
+                                                    let (ol, orr) = fdims[0];
+                                                    let outer = (ol - orr).abs() + 1;
+                                                    if outer > 0 && total > 0 {
+                                                        elab.packed_signal_elem_widths.insert(
+                                                            scoped.clone(),
+                                                            (total / outer) as u32,
+                                                        );
+                                                    }
+                                                    elab.packed_full_dims
+                                                        .insert(scoped, fdims);
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
                             let width = match &dd.data_type {
-                                DataType::TypeReference { name, .. } => {
+                                // Packed dims on the reference (`some_t [1:0] g`)
+                                // multiply the typedef's width — the bare-typedef
+                                // shortcut is only valid without them. Taking it
+                                // anyway sized a two-element struct array at ONE
+                                // element, so the second element's writes were
+                                // clamped away and it read X (the top-level arms
+                                // already carry this exact guard).
+                                DataType::TypeReference { name, dimensions, .. }
+                                    if dimensions.is_empty() =>
+                                {
                                     elab.typedefs.get(&name.name.name).copied()
                                         .unwrap_or(resolve_type_width(&dd.data_type, Some(&sub_merged_params), Some(&elab.typedefs)))
                                 }
@@ -11644,6 +12268,37 @@ fn inline_module_items(
                                         elab.associative_arrays.insert(sig_name.clone(), is_str);
                                     }
                                     _ => {}
+                                }
+                                // A MULTI-dimensional unpacked variable in a
+                                // submodule (`logic [15:0] grid [0:1][0:1];`).
+                                // `extract_array_range` only understands ONE
+                                // dimension, so a 2-D/N-D declarator fell through
+                                // to the scalar branch below and no element
+                                // storage existed at all — writes to `grid[i][j]`
+                                // went nowhere and reads came back X. The same
+                                // declaration at top level registers via
+                                // `fixed_unpacked_shape`; mirror that here.
+                                {
+                                    // Checked BEFORE `array_range`, which reports
+                                    // only the FIRST dimension and so claims a 2-D
+                                    // declarator as 1-D (storage came out as
+                                    // `grid[0]`/`grid[1]` instead of
+                                    // `grid[i][j]`).
+                                    if let Some(shape) =
+                                        fixed_unpacked_shape(&decl.dimensions, &sub_merged_params)
+                                            .filter(|sh| sh.len() > 1)
+                                    {
+                                        register_fixed_unpacked_array(
+                                            elab,
+                                            &sig_name,
+                                            &shape,
+                                            width,
+                                            is_type_two_state(&dd.data_type),
+                                        );
+                                        elab.var_decl_types
+                                            .insert(sig_name.clone(), dd.data_type.clone());
+                                        continue;
+                                    }
                                 }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));

@@ -1328,7 +1328,7 @@ impl Preprocessor {
                 b')' if !in_string => {
                     paren_depth -= 1;
                     if paren_depth == 0 {
-                        let arg = line[arg_start..*i].trim_start().trim_end_matches(|c: char| c == '\n' || c == '\r' || c == '\t').to_string();
+                        let arg = line[arg_start..*i].trim().to_string();
                         if !arg.is_empty() || !args.is_empty() {
                             args.push(arg);
                         }
@@ -1341,7 +1341,7 @@ impl Preprocessor {
                 b'[' if !in_string => bracket_depth += 1,
                 b']' if !in_string => if bracket_depth > 0 { bracket_depth -= 1; },
                 b',' if !in_string && paren_depth == 1 && brace_depth == 0 && bracket_depth == 0 => {
-                    args.push(line[arg_start..*i].trim_start().trim_end_matches(|c: char| c == '\n' || c == '\r' || c == '\t').to_string());
+                    args.push(line[arg_start..*i].trim().to_string());
                     arg_start = *i + 1;
                 }
                 _ => {}

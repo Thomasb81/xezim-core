@@ -197,7 +197,39 @@ impl Parser {
                         // Simple operands or parenthesised expressions
                         // remain supported.
                         let center = if crate::is_sv2023() {
-                            self.parse_expr_bp(21)
+                            let mut center = self.parse_expr_bp(21);
+                            // A bare `+`/`-` here (not the start of a
+                            // `+/-`/`+%-` tolerance marker) means the
+                            // lower/centre bound is itself an additive
+                            // expression, e.g. `[A+B:C]` — fold it into
+                            // `center` instead of leaving it for the
+                            // tolerance check below to misparse.
+                            loop {
+                                let is_tol_abs = self.at(TokenKind::Plus)
+                                    && self.peek_kind() == TokenKind::Slash
+                                    && self.peek_kind_n(2) == TokenKind::Minus;
+                                let is_tol_pct = self.at(TokenKind::Plus)
+                                    && self.peek_kind() == TokenKind::Percent
+                                    && self.peek_kind_n(2) == TokenKind::Minus;
+                                if is_tol_abs || is_tol_pct {
+                                    break;
+                                }
+                                let op = if self.at(TokenKind::Plus) {
+                                    BinaryOp::Add
+                                } else if self.at(TokenKind::Minus) {
+                                    BinaryOp::Sub
+                                } else {
+                                    break;
+                                };
+                                self.bump();
+                                let rhs = self.parse_expr_bp(20);
+                                center = Expression::new(ExprKind::Binary {
+                                    op,
+                                    left: Box::new(center),
+                                    right: Box::new(rhs),
+                                }, self.span_from(start));
+                            }
+                            center
                         } else {
                             self.parse_expression()
                         };
