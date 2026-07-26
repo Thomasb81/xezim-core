@@ -1190,7 +1190,50 @@ impl Value {
         }
     }
 
+    #[inline(always)]
     pub fn case_eq(&self, other: &Value) -> Value {
+        // Nearly every dynamic case comparison in RTL is an inline value.
+        // Compare its packed 4-state encoding a word at a time instead of
+        // dispatching get_bit() for every bit. Preserve the LRM's signed
+        // extension rule, including replication of an X/Z sign bit.
+        if !self.is_fill && !other.is_fill {
+            if let (Some((mut av, mut ax)), Some((mut bv, mut bx))) =
+                (self.inline_bits(), other.inline_bits())
+            {
+                let w = self.width.max(other.width);
+                let mask = Self::mask(w);
+                if self.is_signed && other.is_signed {
+                    if self.width > 0 && self.width < w {
+                        let ext = mask & !Self::mask(self.width);
+                        let sign = 1u64 << (self.width - 1);
+                        if av & sign != 0 {
+                            av |= ext;
+                        }
+                        if ax & sign != 0 {
+                            ax |= ext;
+                        }
+                    }
+                    if other.width > 0 && other.width < w {
+                        let ext = mask & !Self::mask(other.width);
+                        let sign = 1u64 << (other.width - 1);
+                        if bv & sign != 0 {
+                            bv |= ext;
+                        }
+                        if bx & sign != 0 {
+                            bx |= ext;
+                        }
+                    }
+                }
+                let equal = (av & mask) == (bv & mask) && (ax & mask) == (bx & mask);
+                return Value::from_u64(equal as u64, 1);
+            }
+        }
+        self.case_eq_slow(other)
+    }
+
+    #[cold]
+    #[inline(never)]
+    fn case_eq_slow(&self, other: &Value) -> Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.case_eq(&b);
         }
@@ -1740,6 +1783,67 @@ mod tests {
         let one = Value::from_u64(1, 8);
         assert!(x.add(&one).has_xz());
         assert!(x.is_equal(&one).has_xz());
+    }
+
+    #[test]
+    fn case_eq_inline_preserves_four_state_extension() {
+        let mut signed_x = Value::from_str_radix("x001", 2, 4);
+        signed_x.is_signed = true;
+        let mut extended_x = Value::from_str_radix("xxxxx001", 2, 8);
+        extended_x.is_signed = true;
+        assert!(signed_x.case_eq(&extended_x).is_true());
+
+        let mut signed_z = Value::from_str_radix("z001", 2, 4);
+        signed_z.is_signed = true;
+        let mut extended_z = Value::from_str_radix("zzzzz001", 2, 8);
+        extended_z.is_signed = true;
+        assert!(signed_z.case_eq(&extended_z).is_true());
+
+        let unsigned_x = Value::from_str_radix("x001", 2, 4);
+        assert!(!unsigned_x.case_eq(&extended_x).is_true());
+        assert!(Value::fill_of('z').case_eq(&Value::all_z(8)).is_true());
+    }
+
+    #[test]
+    fn case_eq_inline_matches_bitwise_reference() {
+        fn four_state_value(mut code: usize, width: u32, signed: bool) -> Value {
+            let mut value = Value::zero(width);
+            value.is_signed = signed;
+            for bit_idx in 0..width as usize {
+                let bit = match code & 3 {
+                    0 => LogicBit::Zero,
+                    1 => LogicBit::One,
+                    2 => LogicBit::X,
+                    _ => LogicBit::Z,
+                };
+                value.set_bit(bit_idx, bit);
+                code >>= 2;
+            }
+            value
+        }
+
+        for left_width in 1..=4 {
+            for right_width in 1..=4 {
+                for left_signed in [false, true] {
+                    for right_signed in [false, true] {
+                        let left_count = 1usize << (2 * left_width);
+                        let right_count = 1usize << (2 * right_width);
+                        for left_code in 0..left_count {
+                            let left =
+                                four_state_value(left_code, left_width, left_signed);
+                            for right_code in 0..right_count {
+                                let right =
+                                    four_state_value(right_code, right_width, right_signed);
+                                assert_eq!(
+                                    left.case_eq(&right).to_u64(),
+                                    left.case_eq_slow(&right).to_u64()
+                                );
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     fn bit(b: LogicBit) -> Value {
