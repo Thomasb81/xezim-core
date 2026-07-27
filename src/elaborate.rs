@@ -1082,6 +1082,11 @@ pub struct ElaboratedModule {
     /// source bits to 0.
     #[serde(default)]
     pub two_state_signals: HashSet<String>,
+    /// Names of unpacked arrays whose synthesized element storage initializes
+    /// to Z rather than X. This is for arrays of nets and unconnected
+    /// input/inout ports; ordinary 4-state variable arrays still default to X.
+    #[serde(default)]
+    pub z_init_signals: HashSet<String>,
     /// Deferred-rewrite buffers (fix #7). Populated by `inline_module_items`
     /// instead of eagerly producing rewritten ASTs in `always_blocks` /
     /// `initial_blocks` / `continuous_assigns`. Drained by callers via
@@ -1269,6 +1274,7 @@ impl ElaboratedModule {
             module_timescale_exp: HashMap::default(),
             enum_members: HashMap::default(),
             two_state_signals: HashSet::default(),
+            z_init_signals: HashSet::default(),
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
@@ -2277,7 +2283,9 @@ pub fn elaborate_module_with_defs(
                     is_signed,
                     is_real,
                     direction: port.direction,
-                    value: init_val.unwrap_or_else(|| if is_real { Value::from_f64(0.0) } else { Value::new(width) }),
+                    value: init_val.unwrap_or_else(|| {
+                        default_port_value(port.direction, port.data_type.as_ref(), width, is_real)
+                    }),
                     type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
@@ -2292,6 +2300,9 @@ pub fn elaborate_module_with_defs(
                         port.data_type.as_ref().map(is_type_two_state).unwrap_or(false),
                     );
                     if let Some(dt) = &port.data_type {
+                        if matches!(port.direction, Some(PortDirection::Input | PortDirection::Inout)) {
+                            mark_array_z_init_if_4state(&mut elab, &port.name.name, dt);
+                        }
                         elab.var_decl_types.insert(port.name.name.clone(), dt.clone());
                     }
                 }
@@ -2408,6 +2419,107 @@ pub fn elaborate_module_with_defs(
     if let Some(defs) = all_defs {
         elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), defs);
     }
+    // §6.20 — resolve the module's own parameters to a FIXPOINT before walking
+    // the items, so a declaration whose width depends on one of them is sized
+    // correctly no matter what ORDER the parameters appear in.
+    //
+    // The walk below evaluates each parameter where it appears, so
+    // `localparam A = $clog2(B) - 6;` ahead of `localparam B = 4096;` saw
+    // nothing for B, fell back to 0, and produced -6. Read back unsigned that
+    // is 4294967290, which becomes a `[4294967289:0]` packed range and
+    // collapses the whole bus to ONE BIT — the design then simulates wrongly
+    // with only a width warning to show for it. A reference simulator resolves
+    // the declarations order-independently.
+    //
+    // Names seeded here are exempted from the duplicate-declaration check the
+    // first time the walk reaches them (and only the first time, so a genuine
+    // duplicate is still an error). Instantiation overrides are already bound
+    // and are never overwritten.
+    let mut preseeded_params: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    // Consumed on first encounter so a GENUINE duplicate declaration still errors.
+    let mut preseed_dup_exempt: std::collections::HashSet<String> =
+        std::collections::HashSet::new();
+    {
+        let mut decls: Vec<(&str, &DataType, &Expression)> = Vec::new();
+        for item in module.items() {
+            let (ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd)) =
+                item
+            else {
+                continue;
+            };
+            let ParameterKind::Data { data_type, assignments } = &pd.kind else {
+                continue;
+            };
+            for assign in assignments {
+                let name = assign.name.name.as_str();
+                // Already bound => instantiation override; leave it alone.
+                if elab.parameters.contains_key(name) {
+                    continue;
+                }
+                if let Some(init) = &assign.init {
+                    // Only pre-seed initializers built from plain module-local
+                    // names. A package- or class-scoped reference
+                    // (`pkg::SIZE`) is not bound until the walk reaches the
+                    // import, so seeding it here would store a wrong value
+                    // that any declaration sized from it would then pick up.
+                    if expr_refs_are_all_local(init) {
+                        decls.push((name, data_type, init));
+                    }
+                }
+            }
+        }
+        for _ in 0..8 {
+            let mut changed = false;
+            for (name, data_type, init) in &decls {
+                let mut width =
+                    resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                {
+                    width = 32;
+                }
+                let subbed;
+                let init_eval: &Expression = if expr_has_call(init) {
+                    match substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
+                        .filter(|e| !expr_has_call(e))
+                    {
+                        Some(e) => {
+                            subbed = e;
+                            &subbed
+                        }
+                        None => init,
+                    }
+                } else {
+                    init
+                };
+                // Only seed once EVERY name the initializer reads is already
+                // known. Otherwise an unresolved reference silently evaluates
+                // to 0 and we would store that wrong value — the very failure
+                // this pass exists to prevent. The fixpoint lets a chain
+                // resolve one link per iteration.
+                if !expr_idents_all_known(init_eval, &elab.parameters) {
+                    continue;
+                }
+                let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
+                if is_type_signed(data_type) {
+                    v.is_signed = true;
+                }
+                if v.is_real {
+                    continue; // real parameters keep the walk's own handling
+                }
+                if elab.parameters.get(*name) != Some(&v) {
+                    elab.parameters.insert((*name).to_string(), v);
+                    preseeded_params.insert((*name).to_string());
+                    preseed_dup_exempt.insert((*name).to_string());
+                    changed = true;
+                }
+            }
+            if !changed {
+                break;
+            }
+        }
+    }
+
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -2438,17 +2550,21 @@ pub fn elaborate_module_with_defs(
                     // direction line carries an Implicit type, so keep the
                     // existing width/type; if this line DOES carry an explicit
                     // type, adopt it.
-                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                    if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_none() {
                             let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
-                            let existing = elab.signals.get_mut(&decl.name.name).unwrap();
                             existing.direction = Some(pd.direction);
                             if explicit_type {
                                 existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
                                 existing.type_name = get_type_name(&pd.data_type);
-                                existing.value = if is_real { Value::from_f64(0.0) } else { Value::new(width) };
+                                existing.value = default_port_value(
+                                    Some(pd.direction),
+                                    Some(&pd.data_type),
+                                    width,
+                                    is_real,
+                                );
                             }
                             if !elab.port_order.contains(&decl.name.name) {
                                 elab.port_order.push(decl.name.name.clone());
@@ -2466,7 +2582,12 @@ pub fn elaborate_module_with_defs(
                         is_signed,
                         is_real,
                         direction: Some(pd.direction),
-                        value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                        value: default_port_value(
+                            Some(pd.direction),
+                            Some(&pd.data_type),
+                            width,
+                            is_real,
+                        ),
                         type_name: get_type_name(&pd.data_type),
                     };
                     if !elab.port_order.contains(&decl.name.name) {
@@ -2500,8 +2621,19 @@ pub fn elaborate_module_with_defs(
                     // and just record the leaf in `nets`. Only treat it
                     // as an error if the existing entry is not a port
                     // (i.e. a true duplicate user declaration).
-                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                    if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_some() {
+                            existing.value = match nd.net_type {
+                                NetType::Supply0 => Value::zero(existing.width),
+                                NetType::Supply1 => Value::ones(existing.width),
+                                _ => {
+                                    if existing.is_real {
+                                        Value::from_f64(0.0)
+                                    } else {
+                                        Value::all_z(existing.width)
+                                    }
+                                }
+                            };
                             elab.nets.insert(decl.name.name.clone());
                             continue;
                         }
@@ -2516,11 +2648,16 @@ pub fn elaborate_module_with_defs(
                     // element-wise `outs[0]`/`outs[1]` vars. Register the same
                     // `arrays` metadata the variable path does; `Simulator::new`
                     // synthesizes the per-element signals from it.
-                    let net_array_range = extract_array_range(&decl.dimensions, &elab.parameters);
+                    let effective_dims = normalize_unpacked_dims(
+                        &decl.dimensions,
+                        &elab.parameters,
+                        &elab.typedef_types,
+                    );
+                    let net_array_range = extract_array_range(&effective_dims, &elab.parameters);
                     let w = if net_array_range.is_some() {
                         width
                     } else {
-                        width_with_unpacked_dims(&decl.dimensions, width)
+                        width_with_unpacked_dims(&effective_dims, width)
                     };
                     // supply0 → constant 0, supply1 → constant 1.
                     // §6.6.1: an undriven wire reads high-impedance — nets
@@ -2548,7 +2685,7 @@ pub fn elaborate_module_with_defs(
                     // parent net — mirroring the variable (line ~2793) and port
                     // (line ~9002) paths, which the net arm previously omitted
                     // (member access read x).
-                    if net_array_range.is_none() && decl.dimensions.is_empty() {
+                    if net_array_range.is_none() && effective_dims.is_empty() {
                         let chain = resolve_typedef_chain(&nd.data_type, &elab.typedef_types).clone();
                         if let DataType::Struct(su) = &chain {
                             if su.packed {
@@ -2585,7 +2722,7 @@ pub fn elaborate_module_with_defs(
                     if let Some(fdims) = packed_full_dims_of(&nd.data_type, &elab.parameters) {
                         elab.packed_full_dims.insert(decl.name.name.clone(), fdims);
                     }
-                    if let Some(shape) = fixed_unpacked_shape(&decl.dimensions, &elab.parameters)
+                    if let Some(shape) = fixed_unpacked_shape(&effective_dims, &elab.parameters)
                         .filter(|shape| !shape.is_empty())
                     {
                         register_fixed_unpacked_array(
@@ -2595,8 +2732,9 @@ pub fn elaborate_module_with_defs(
                             width,
                             false,
                         );
+                        mark_array_z_init_if_4state(&mut elab, &decl.name.name, &nd.data_type);
                         elab.var_decl_types.insert(decl.name.name.clone(), nd.data_type.clone());
-                        if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
+                        if let Some(UnpackedDimension::Range { left, right, .. }) = effective_dims.first() {
                             let l = const_eval_i64_with_params(left, Some(&elab.parameters)).unwrap_or(0);
                             let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
                             if l > r {
@@ -2732,7 +2870,12 @@ pub fn elaborate_module_with_defs(
                             existing.value = if decl_is_real {
                                 Value::from_f64(0.0)
                             } else {
-                                Value::new(width)
+                                default_port_value(
+                                    existing.direction,
+                                    Some(&dd.data_type),
+                                    width,
+                                    decl_is_real,
+                                )
                             };
                         }
                         if is_type_two_state(&dd.data_type) {
@@ -3601,7 +3744,10 @@ pub fn elaborate_module_with_defs(
                         signed = true;
                     }
                     for assign in assignments {
-                        if elab.signals.contains_key(&assign.name.name) || elab.parameters.contains_key(&assign.name.name) {
+                        if (elab.signals.contains_key(&assign.name.name)
+                            || elab.parameters.contains_key(&assign.name.name))
+                            && !preseed_dup_exempt.remove(&assign.name.name)
+                        {
                             if elab.wildcard_shadowed.contains(&assign.name.name) {
                                 elab.parameters.remove(&assign.name.name);
                                 elab.signals.remove(&assign.name.name);
@@ -3651,7 +3797,9 @@ pub fn elaborate_module_with_defs(
                         let mut current_signed = signed;
 
                         if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
-                            let init_is_real = if elab.parameters.contains_key(&assign.name.name) {
+                            let init_is_real = if elab.parameters.contains_key(&assign.name.name)
+                                && !preseeded_params.contains(&assign.name.name)
+                            {
                                 elab.parameters.get(&assign.name.name).map(|v| v.is_real).unwrap_or(false)
                             } else if let Some(init) = &assign.init {
                                 eval_const_expr_val(init, &elab.parameters).is_real
@@ -3671,7 +3819,9 @@ pub fn elaborate_module_with_defs(
                             data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types);
                         let is_struct_param = struct_fields.as_ref().is_some_and(|f| !f.is_empty());
 
-                        let mut val = if elab.parameters.contains_key(&assign.name.name) {
+                        let mut val = if elab.parameters.contains_key(&assign.name.name)
+                            && !preseeded_params.contains(&assign.name.name)
+                        {
                             elab.parameters.get(&assign.name.name).cloned().unwrap_or(Value::zero(current_width))
                         } else if let Some(init) = &assign.init {
                             if expr_has_call(init) {
@@ -4102,6 +4252,14 @@ pub fn elaborate_module_with_defs(
         }
     }
 
+    // §6.20 — parameters whose initializer referenced a parameter declared
+    // LATER in the module. The walk above evaluates each one where it appears,
+    // so `localparam A = $clog2(B) - 6;` ahead of `localparam B = 4096;` saw
+    // nothing for B, fell back to 0, and produced -6 — read back unsigned that
+    // is 4294967290, which becomes a `[4294967289:0]` packed range and
+    // collapses the whole bus to ONE BIT. The only symptom is a width warning;
+    // the design then simulates wrongly. A reference simulator resolves the
+    // declarations order-independently.
     // User-defined nettype driver resolution: collapse multiple continuous
     // drivers on a nettype variable into a single OR-combined assign. This
     // approximates the common `resolve_or` resolver; other resolvers are not
@@ -6145,6 +6303,167 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
     }
 }
 
+/// True when every identifier in `e` already has a value in `params`.
+fn expr_idents_all_known(e: &Expression, params: &HashMap<String, Value>) -> bool {
+    let mut ok = true;
+    fn walk(e: &Expression, params: &HashMap<String, Value>, ok: &mut bool) {
+        if !*ok {
+            return;
+        }
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if let Some(seg) = h.path.last() {
+                    if !params.contains_key(&seg.name.name) {
+                        *ok = false;
+                    }
+                } else {
+                    *ok = false;
+                }
+            }
+            ExprKind::Paren(i) => walk(i, params, ok),
+            ExprKind::Unary { operand, .. } => walk(operand, params, ok),
+            ExprKind::Binary { left, right, .. } => {
+                walk(left, params, ok);
+                walk(right, params, ok);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                walk(condition, params, ok);
+                walk(then_expr, params, ok);
+                walk(else_expr, params, ok);
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    walk(a, params, ok);
+                }
+            }
+            _ => {}
+        }
+    }
+    walk(e, params, &mut ok);
+    ok
+}
+
+/// True when every identifier in `e` is a plain, unqualified name — no
+/// package/class scope (`pkg::X`) and no hierarchical or member path. Such an
+/// expression can be evaluated from the module's own parameter table alone.
+fn expr_refs_are_all_local(e: &Expression) -> bool {
+    let mut ok = true;
+    fn walk(e: &Expression, ok: &mut bool) {
+        if !*ok {
+            return;
+        }
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if h.path.len() != 1 || !h.path[0].selects.is_empty() {
+                    *ok = false;
+                }
+            }
+            ExprKind::MemberAccess { .. } => *ok = false,
+            ExprKind::Paren(i) => walk(i, ok),
+            ExprKind::Unary { operand, .. } => walk(operand, ok),
+            ExprKind::Binary { left, right, .. } => {
+                walk(left, ok);
+                walk(right, ok);
+            }
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                walk(condition, ok);
+                walk(then_expr, ok);
+                walk(else_expr, ok);
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    walk(a, ok);
+                }
+            }
+            // §6.20.2: an unbased-unsized init (`'1`) is self-determined and
+            // gets dedicated handling in the walk (1-bit, fill semantics).
+            // Pre-seeding it would store a sized value and defeat that.
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => *ok = false,
+            // A real-valued parameter has its own width/real handling in the
+            // walk; pre-seeding would store an integer and lose it.
+            ExprKind::Number(NumberLiteral::Real(_)) => *ok = false,
+            ExprKind::Number(_) => {}
+            // Anything else (calls, concatenations, casts, …) is not worth
+            // pre-seeding; the walk handles it in declaration order as before.
+            _ => *ok = false,
+        }
+    }
+    walk(e, &mut ok);
+    ok
+}
+
+/// Re-evaluate parameter initializers to a FIXPOINT so a forward reference
+/// resolves. Values are only UPDATED, never inserted, and any parameter given
+/// by an instantiation override is skipped — so a correctly ordered design and
+/// an overridden parameter both re-evaluate to exactly what they already have,
+/// and the loop settles on the first pass in the common case.
+fn resolve_forward_referenced_params(
+    items: &[ModuleItem],
+    elab: &mut ElaboratedModule,
+    param_overrides: &HashMap<String, Value>,
+) {
+    let mut pending: Vec<(&str, &DataType, &Expression)> = Vec::new();
+    for item in items {
+        let (ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd)) = item
+        else {
+            continue;
+        };
+        let ParameterKind::Data { data_type, assignments } = &pd.kind else {
+            continue;
+        };
+        for assign in assignments {
+            let name = assign.name.name.as_str();
+            if param_overrides.contains_key(name) {
+                continue;
+            }
+            if let Some(init) = &assign.init {
+                pending.push((name, data_type, init));
+            }
+        }
+    }
+    if pending.is_empty() {
+        return;
+    }
+    for _ in 0..8 {
+        let mut changed = false;
+        for (name, data_type, init) in &pending {
+            let mut width =
+                resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+            if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                width = 32;
+            }
+            let subbed;
+            let init_eval: &Expression = if expr_has_call(init) {
+                match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                    .filter(|e| !expr_has_call(e))
+                {
+                    Some(e) => {
+                        subbed = e;
+                        &subbed
+                    }
+                    None => init,
+                }
+            } else {
+                init
+            };
+            let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
+            if is_type_signed(data_type) {
+                v.is_signed = true;
+            }
+            if elab.parameters.get(*name) != Some(&v) {
+                elab.parameters.insert((*name).to_string(), v.clone());
+                if let Some(sig) = elab.signals.get_mut(*name) {
+                    sig.value = v;
+                }
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+}
+
 /// Create implicit 1-bit wire signals for identifiers referenced in continuous assigns
 /// but not declared anywhere (IEEE 1800-2017 §6.10).
 /// §6.10 candidates that appear as INSTANCE PORT ACTUALS. Walks generate
@@ -6355,17 +6674,21 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     }
                     // §23.2.2.1 non-ANSI split type/direction — merge (see the
                     // matching comment in the top-module elaboration path).
-                    if let Some(existing) = elab.signals.get(&decl.name.name) {
+                    if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_none() {
                             let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
-                            let existing = elab.signals.get_mut(&decl.name.name).unwrap();
                             existing.direction = Some(pd.direction);
                             if explicit_type {
                                 existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
                                 existing.type_name = get_type_name(&pd.data_type);
-                                existing.value = if is_real { Value::from_f64(0.0) } else { Value::new(width) };
+                                existing.value = default_port_value(
+                                    Some(pd.direction),
+                                    Some(&pd.data_type),
+                                    width,
+                                    is_real,
+                                );
                             }
                             if !elab.port_order.contains(&decl.name.name) {
                                 elab.port_order.push(decl.name.name.clone());
@@ -6379,7 +6702,13 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     }
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
-                        direction: Some(pd.direction), value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                        direction: Some(pd.direction),
+                        value: default_port_value(
+                            Some(pd.direction),
+                            Some(&pd.data_type),
+                            width,
+                            is_real,
+                        ),
                         is_real, type_name: get_type_name(&pd.data_type),
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
@@ -6397,7 +6726,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(width),
                         NetType::Supply1 => Value::ones(width),
-                        _ => if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                        _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(width) },
                     };
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
@@ -7396,6 +7725,26 @@ fn default_value_for_type(dt: &DataType, width: u32) -> Value {
         return Value::zero(width);
     }
     if is_type_two_state(dt) { Value::zero(width) } else { Value::new(width) }
+}
+
+fn default_port_value(
+    direction: Option<PortDirection>,
+    data_type: Option<&DataType>,
+    width: u32,
+    is_real: bool,
+) -> Value {
+    if is_real {
+        return Value::from_f64(0.0);
+    }
+    if matches!(direction, Some(PortDirection::Input | PortDirection::Inout)) {
+        if data_type.map(is_type_two_state).unwrap_or(false) {
+            Value::zero(width)
+        } else {
+            Value::all_z(width)
+        }
+    } else {
+        Value::new(width)
+    }
 }
 
 /// Returns true for 2-state types (bit, byte, shortint, int, longint) whose default is 0.
@@ -10143,6 +10492,12 @@ fn register_fixed_unpacked_array(
     }
 }
 
+fn mark_array_z_init_if_4state(elab: &mut ElaboratedModule, name: &str, data_type: &DataType) {
+    if !is_type_two_state(data_type) && !is_type_real(data_type) {
+        elab.z_init_signals.insert(name.to_string());
+    }
+}
+
 fn shape_index_tuples(shape: &[(i64, i64)]) -> Vec<Vec<i64>> {
     let mut out = vec![Vec::new()];
     for &(lo, hi) in shape {
@@ -11905,7 +12260,12 @@ fn inline_module_items(
                                     is_signed: port.data_type.as_ref().map(is_type_signed).unwrap_or(false),
                                     is_real,
                                     direction: port.direction,
-                                    value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
+                                    value: default_port_value(
+                                        port.direction,
+                                        port.data_type.as_ref(),
+                                        width,
+                                        is_real,
+                                    ),
                                     type_name: port.data_type.as_ref().and_then(get_type_name),
                                 });
                             } else {
@@ -11917,6 +12277,9 @@ fn inline_module_items(
                                     port.data_type.as_ref().map(is_type_two_state).unwrap_or(false),
                                 );
                                 if let Some(dt) = &port.data_type {
+                                    if matches!(port.direction, Some(PortDirection::Input | PortDirection::Inout)) {
+                                        mark_array_z_init_if_4state(elab, &sig_name, dt);
+                                    }
                                     elab.var_decl_types.insert(sig_name, dt.clone());
                                 }
                             }
@@ -11933,7 +12296,12 @@ fn inline_module_items(
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                         name: sig_name, width, is_signed,
                                         direction: Some(pd.direction),
-                                        value: Value::new(width),
+                                        value: default_port_value(
+                                            Some(pd.direction),
+                                            Some(&pd.data_type),
+                                            width,
+                                            is_type_real(&pd.data_type),
+                                        ),
                                         is_real: is_type_real(&pd.data_type), type_name: get_type_name(&pd.data_type),
                                     });
                                 }
@@ -12017,6 +12385,11 @@ fn inline_module_items(
                             let width = resolve_type_width(&nd.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
                             for decl in &nd.declarators {
                                 let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                let effective_dims = normalize_unpacked_dims(
+                                    &decl.dimensions,
+                                    &sub_merged_params,
+                                    &elab.typedef_types,
+                                );
                                 // An UNPACKED array net inside a submodule
                                 // (`wire [15:0] pipe [0:2];`) must register its
                                 // range like the variable arm below, otherwise it
@@ -12045,7 +12418,7 @@ fn inline_module_items(
                                 // UNPACKED array net of any rank
                                 // (`wire [15:0] pipe [0:2];`, `… [0:1][0:1];`).
                                 if let Some(shape) =
-                                    fixed_unpacked_shape(&decl.dimensions, &sub_merged_params)
+                                    fixed_unpacked_shape(&effective_dims, &sub_merged_params)
                                         .filter(|shape| !shape.is_empty())
                                 {
                                     register_fixed_unpacked_array(
@@ -12055,10 +12428,11 @@ fn inline_module_items(
                                         width,
                                         is_type_two_state(&nd.data_type),
                                     );
+                                    mark_array_z_init_if_4state(elab, &sig_name, &nd.data_type);
                                     elab.var_decl_types
                                         .insert(sig_name.clone(), nd.data_type.clone());
                                     if let Some(UnpackedDimension::Range { left, right, .. }) =
-                                        decl.dimensions.first()
+                                        effective_dims.first()
                                     {
                                         let l = const_eval_i64_with_params(left, Some(&sub_merged_params))
                                             .unwrap_or(0);
@@ -12075,7 +12449,13 @@ fn inline_module_items(
                                 let init_value = match nd.net_type {
                                     NetType::Supply0 => Value::zero(width),
                                     NetType::Supply1 => Value::ones(width),
-                                    _ => Value::new(width),
+                                    _ => {
+                                        if is_type_real(&nd.data_type) {
+                                            Value::from_f64(0.0)
+                                        } else {
+                                            Value::all_z(width)
+                                        }
+                                    }
                                 };
                                 elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
@@ -12245,6 +12625,34 @@ fn inline_module_items(
                                 let base_name = decl.name.name.clone();
                                 let sig_name = format!("{}{}", inst_prefix, base_name);
                                 let array_range = extract_array_range(&decl.dimensions, &sub_merged_params);
+                                if elab
+                                    .signals
+                                    .get(&sig_name)
+                                    .is_some_and(|s| s.direction.is_some())
+                                    && !elab.parameters.contains_key(&sig_name)
+                                {
+                                    let explicit_type = !matches!(dd.data_type, DataType::Implicit { .. });
+                                    let decl_is_real = is_type_real(&dd.data_type);
+                                    let existing = elab.signals.get_mut(&sig_name).unwrap();
+                                    if explicit_type {
+                                        existing.width = width;
+                                        existing.is_signed = is_signed;
+                                        existing.is_real = decl_is_real;
+                                        existing.type_name = get_type_name(&dd.data_type);
+                                        existing.value = default_port_value(
+                                            existing.direction,
+                                            Some(&dd.data_type),
+                                            width,
+                                            decl_is_real,
+                                        );
+                                    }
+                                    if is_type_two_state(&dd.data_type) {
+                                        elab.two_state_signals.insert(sig_name.clone());
+                                    }
+                                    elab.nets.remove(&sig_name);
+                                    elab.var_decl_types.insert(sig_name.clone(), dd.data_type.clone());
+                                    continue;
+                                }
                                 if std::env::var("XEZIM_DBG_ARR").is_ok() && sig_name.contains("ram0.mem") {
                                     let mut p: Vec<_> = sub_merged_params.iter().collect();
                                     p.sort_by_key(|(k, _)| k.as_str());

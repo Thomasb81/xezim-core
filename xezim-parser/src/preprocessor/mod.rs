@@ -132,6 +132,16 @@ impl Preprocessor {
         &self.errors
     }
 
+    fn push_error_here(&mut self, message: String) {
+        let file = if self.current_file.is_empty() {
+            "<input>"
+        } else {
+            self.current_file.as_str()
+        };
+        self.errors
+            .push(format!("{}:{}: {}", file, self.current_line.max(1), message));
+    }
+
     /// True when `trimmed` is the directive `\`<name>` followed by whitespace
     /// or end-of-line (so `\`line` matches but `\`linefoo` does not).
     fn is_directive(trimmed: &str, name: &str) -> bool {
@@ -187,7 +197,7 @@ impl Preprocessor {
             bad = true; why = "unterminated filename string".into();
         }
         if bad {
-            self.errors.push(format!(
+            self.push_error_here(format!(
                 "illegal `line directive (IEEE 1800-2017 §22.12): {}", why));
         }
     }
@@ -282,7 +292,7 @@ impl Preprocessor {
     }
 
     pub fn is_defined(&self, name: &str) -> bool {
-        self.defines.contains_key(name)
+        matches!(name, "__FILE__" | "__LINE__") || self.defines.contains_key(name)
     }
 
     /// Preprocess source text, resolving `include directives relative to `source_path`.
@@ -789,7 +799,7 @@ impl Preprocessor {
                 if crate::strict_checks()
                     && trimmed["`pragma".len()..].trim().is_empty()
                 {
-                    self.errors.push(
+                    self.push_error_here(
                         "`pragma requires a pragma_name (IEEE 1800-2017 §22.11)".into());
                 }
                 output.push('\n');
@@ -799,7 +809,7 @@ impl Preprocessor {
             // interface, package, program, …).
             if Self::is_directive(trimmed, "resetall") {
                 if crate::strict_checks() && self.design_element_depth > 0 {
-                    self.errors.push(
+                    self.push_error_here(
                         "`resetall is illegal inside a design element \
                          (IEEE 1800-2017 §22.3)".into());
                 }
@@ -1007,7 +1017,7 @@ impl Preprocessor {
                     "__FILE__", "__LINE__",
                 ];
                 if DIRECTIVES.contains(&name.as_str()) {
-                    self.errors.push(format!(
+                    self.push_error_here(format!(
                         "`{}` is a compiler directive and cannot be redefined as \
                          a macro (IEEE 1800-2017 §22.5.1)", name));
                 }
@@ -1019,7 +1029,7 @@ impl Preprocessor {
                     match c { '\\' => esc = true, '"' => quotes += 1, _ => {} }
                 }
                 if quotes % 2 == 1 {
-                    self.errors.push(format!(
+                    self.push_error_here(format!(
                         "macro `{}` text has an unterminated string literal \
                          (IEEE 1800-2017 §22.5.1)", name));
                 }
