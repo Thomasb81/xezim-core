@@ -569,6 +569,9 @@ pub struct AlwaysConstruct {
     pub kind: AlwaysKind,
     pub stmt: Statement,
     pub span: Span,
+    /// §21.2.1.7: generate block scope prefix for %m hierarchy.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gen_scope: String,
 }
 
 #[derive(Debug, Clone)]
@@ -576,6 +579,9 @@ pub struct AlwaysConstruct {
 pub struct InitialConstruct {
     pub stmt: Statement,
     pub span: Span,
+    /// §21.2.1.7: generate block scope prefix for %m hierarchy.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub gen_scope: String,
 }
 
 #[derive(Debug, Clone)]

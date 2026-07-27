@@ -428,10 +428,10 @@ impl Parser {
                 // standalone-line attributes; inline ones reach the parser.
                 self.skip_optional_attribute();
                 let stmt = self.parse_statement();
-                Some(ModuleItem::AlwaysConstruct(AlwaysConstruct { kind, stmt, span: self.span_from(start) }))
+                Some(ModuleItem::AlwaysConstruct(AlwaysConstruct { kind, stmt, span: self.span_from(start), gen_scope: String::new() }))
             }
             TokenKind::KwInitial => { self.bump(); let st = self.parse_statement();
-                Some(ModuleItem::InitialConstruct(InitialConstruct { stmt: st, span: self.span_from(start) })) }
+                Some(ModuleItem::InitialConstruct(InitialConstruct { stmt: st, span: self.span_from(start), gen_scope: String::new() })) }
             TokenKind::KwFinal => { self.bump(); let st = self.parse_statement();
                 Some(ModuleItem::FinalConstruct(FinalConstruct { stmt: st, span: self.span_from(start) })) }
             TokenKind::KwAssign => {

@@ -159,12 +159,18 @@ pub struct PendingAlways {
     /// instances of the same submodule all point at the same Rc<Statement>.
     pub source: std::rc::Rc<Statement>,
     pub ctx: std::rc::Rc<RewriteCtx>,
+    /// §21.2.1.7: generate block scope for %m hierarchy. If this always block
+    /// was inside a generate block, this contains the generate block's scope name.
+    pub gen_scope: String,
 }
 
 #[derive(Debug, Clone)]
 pub struct PendingInitial {
     pub source: std::rc::Rc<Statement>,
     pub ctx: std::rc::Rc<RewriteCtx>,
+    /// §21.2.1.7: generate block scope for %m hierarchy. If this initial block
+    /// was inside a generate block, this contains the generate block's scope name.
+    pub gen_scope: String,
 }
 
 #[derive(Debug, Clone)]
@@ -186,7 +192,15 @@ impl PendingAlways {
         );
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope, like PendingInitial.
-        let scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        // §21.2.1.7: if this block was inside a generate block, append the
+        // generate block scope to the instance path.
+        let mut scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        if !self.gen_scope.is_empty() {
+            if !scope.is_empty() {
+                scope.push('.');
+            }
+            scope.push_str(&self.gen_scope);
+        }
         AlwaysBlock { kind: self.kind, stmt, scope }
     }
 }
@@ -202,7 +216,15 @@ impl PendingInitial {
         );
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope for name resolution.
-        let scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        // §21.2.1.7: if this block was inside a generate block, append the
+        // generate block scope to the instance path.
+        let mut scope = self.ctx.prefix.trim_end_matches('.').to_string();
+        if !self.gen_scope.is_empty() {
+            if !scope.is_empty() {
+                scope.push('.');
+            }
+            scope.push_str(&self.gen_scope);
+        }
         InitialBlock { stmt, scope }
     }
 }
@@ -4054,13 +4076,18 @@ pub fn elaborate_module_with_defs(
                 gate_inst_to_assigns(gi, &mut elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
-                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: String::new() });
+                // §21.2.1.7: include generate block scope in the instance path for %m.
+                // If this always block was inside a generate block, ac.gen_scope
+                // contains the generate block's scope name and should be included
+                // in the block's scope.
+                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: ac.gen_scope.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                     eprintln!("[xezim][elab] elaborate_items: pushing initial (top-level path)");
                 }
-                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone(), scope: String::new(), });
+                // §21.2.1.7: include generate block scope in the instance path for %m.
+                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone(), scope: ic.gen_scope.clone(), });
             }
             // LRM §16.5: module-level `assert/assume/cover property (…)`.
             // Previously the elaborator ignored AssertionItem entirely,
@@ -6943,13 +6970,15 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 gate_inst_to_assigns(gi, elab);
             }
             ModuleItem::AlwaysConstruct(ac) => {
-                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: String::new() });
+                // §21.2.1.7: include generate block scope in the instance path for %m.
+                elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: ac.gen_scope.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
                 if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                     eprintln!("[xezim][elab] @2453 pushing initial (other path)");
                 }
-                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone(), scope: String::new(), });
+                // §21.2.1.7: include generate block scope in the instance path for %m.
+                elab.initial_blocks.push(InitialBlock { stmt: ic.stmt.clone(), scope: ic.gen_scope.clone(), });
             }
             // Mirror the AssertionItem hoist in elaborate_module_with_defs
             // so module-level `assert/assume/cover property (…)` inside
@@ -9891,10 +9920,12 @@ fn rename_item_decls(
             kind: ac.kind,
             stmt: rewrite_stmt(&ac.stmt, "", port_map, local_names, interface_map),
             span: ac.span,
+            gen_scope: ac.gen_scope.clone(),
         }),
         ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
             stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
             span: ic.span,
+            gen_scope: ic.gen_scope.clone(),
         }),
         ModuleItem::FunctionDeclaration(fd) => {
             let mut new_fd = fd.clone();
@@ -10066,10 +10097,12 @@ fn substitute_in_module_item(
             kind: ac.kind,
             stmt: rewrite_stmt(&ac.stmt, "", port_map, local_names, interface_map),
             span: ac.span,
+            gen_scope: ac.gen_scope.clone(),
         }),
         ModuleItem::InitialConstruct(ic) => ModuleItem::InitialConstruct(InitialConstruct {
             stmt: rewrite_stmt(&ic.stmt, "", port_map, local_names, interface_map),
             span: ic.span,
+            gen_scope: ic.gen_scope.clone(),
         }),
         ModuleItem::FunctionDeclaration(fd) => {
             let mut new_fd = fd.clone();
@@ -10240,6 +10273,9 @@ fn gen_scope_name(label: Option<&String>, ordinal: u32) -> String {
 /// Prepend `scope.` to the instance names of every module/gate instantiation
 /// in an already-flattened item list. Declarations, assigns and processes are
 /// left alone: xezim's flattening keeps those in the parent namespace.
+/// 
+/// Also sets the `gen_scope` field on AlwaysConstruct and InitialConstruct
+/// so that %m reports the full hierarchical path including generate block names.
 fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
     for item in items.iter_mut() {
         match item {
@@ -10253,6 +10289,22 @@ fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
                     if let Some(n) = &mut gi.name {
                         n.name = format!("{}.{}", scope, n.name);
                     }
+                }
+            }
+            ModuleItem::AlwaysConstruct(ac) => {
+                // §21.2.1.7: generate block scope prefix for %m hierarchy.
+                // If this always block is inside a generate block, set gen_scope
+                // to the generate block's scope name so it appears in %m output.
+                if ac.gen_scope.is_empty() {
+                    ac.gen_scope = scope.to_string();
+                }
+            }
+            ModuleItem::InitialConstruct(ic) => {
+                // §21.2.1.7: generate block scope prefix for %m hierarchy.
+                // If this initial block is inside a generate block, set gen_scope
+                // to the generate block's scope name so it appears in %m output.
+                if ic.gen_scope.is_empty() {
+                    ic.gen_scope = scope.to_string();
                 }
             }
             _ => {}
@@ -10837,8 +10889,8 @@ enum BodySource {
     ContAssign(Vec<(std::rc::Rc<Expression>, std::rc::Rc<Expression>)>),
     GateInst(Vec<(std::rc::Rc<Expression>, std::rc::Rc<Expression>)>),
     NetInits(Vec<(String, std::rc::Rc<Expression>)>),
-    Always(AlwaysKind, std::rc::Rc<Statement>),
-    Initial(std::rc::Rc<Statement>),
+    Always(AlwaysKind, std::rc::Rc<Statement>, String),
+    Initial(std::rc::Rc<Statement>, String),
     Other,
 }
 
@@ -11121,8 +11173,8 @@ fn prepare_module_items(
                     .filter_map(|d| d.init.as_ref().map(|init| (d.name.name.clone(), std::rc::Rc::new(init.clone()))))
                     .collect()
             ),
-            ModuleItem::AlwaysConstruct(ac) => BodySource::Always(ac.kind, std::rc::Rc::new(ac.stmt.clone())),
-            ModuleItem::InitialConstruct(ic) => BodySource::Initial(std::rc::Rc::new(ic.stmt.clone())),
+            ModuleItem::AlwaysConstruct(ac) => BodySource::Always(ac.kind, std::rc::Rc::new(ac.stmt.clone()), ac.gen_scope.clone()),
+            ModuleItem::InitialConstruct(ic) => BodySource::Initial(std::rc::Rc::new(ic.stmt.clone()), ic.gen_scope.clone()),
             _ => BodySource::Other,
         }
     }).collect();
@@ -13018,22 +13070,24 @@ fn inline_module_items(
                         }
                     }
                     if matches!(sub_item, ModuleItem::AlwaysConstruct(_)) {
-                        if let BodySource::Always(kind, stmt_rc) = body_src {
+                        if let BodySource::Always(kind, stmt_rc, gen_scope) = body_src {
                             elab.pending_always.push(PendingAlways {
                                 kind: *kind,
                                 source: std::rc::Rc::clone(stmt_rc),
                                 ctx: std::rc::Rc::clone(&pend_ctx),
+                                gen_scope: gen_scope.clone(),
                             });
                         }
                     }
                     if matches!(sub_item, ModuleItem::InitialConstruct(_)) {
-                        if let BodySource::Initial(stmt_rc) = body_src {
+                        if let BodySource::Initial(stmt_rc, gen_scope) = body_src {
                             if std::env::var("XEZIM_TRACE_INIT").ok().as_deref() == Some("1") {
                                 eprintln!("[xezim][elab] inline_module: pushing initial from {}", inst_prefix);
                             }
                             elab.pending_initial.push(PendingInitial {
                                 source: std::rc::Rc::clone(stmt_rc),
                                 ctx: std::rc::Rc::clone(&pend_ctx),
+                                gen_scope: gen_scope.clone(),
                             });
                         }
                     }
