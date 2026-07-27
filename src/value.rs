@@ -34,6 +34,30 @@ impl LogicBit {
     pub fn is_known(self) -> bool {
         matches!(self, Self::Zero | Self::One)
     }
+
+    /// Convert from 2-bit code (for packed storage).
+    /// 00 = Zero, 01 = One, 10 = X, 11 = Z
+    #[inline]
+    pub fn from_code(code: u8) -> Self {
+        match code & 0b11 {
+            0b00 => Self::Zero,
+            0b01 => Self::One,
+            0b10 => Self::X,
+            _ => Self::Z,  // 0b11
+        }
+    }
+
+    /// Convert to 2-bit code (for packed storage).
+    /// Zero = 00, One = 01, X = 10, Z = 11
+    #[inline]
+    pub fn to_code(self) -> u8 {
+        match self {
+            Self::Zero => 0b00,
+            Self::One => 0b01,
+            Self::X => 0b10,
+            Self::Z => 0b11,
+        }
+    }
 }
 
 impl fmt::Display for LogicBit {

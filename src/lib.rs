@@ -2,6 +2,7 @@
 //! artifact format used by both the `xezim` bytecode interpreter and the
 //! `xezim-b` native compiler.
 
+pub mod packed_value;
 pub mod value;
 pub mod bits2;
 pub mod elaborate;
