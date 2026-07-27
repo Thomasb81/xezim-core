@@ -61,7 +61,49 @@ pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x0c";
 /// default — strong compression at high throughput. Empirically shrinks
 /// the elaborated-bincode stream ~27×, which more than pays for the
 /// compute via reduced disk I/O.
-const XEZIM_ZSTD_LEVEL: i32 = 3;
+/// 
+/// Can be overridden at runtime via `set_zstd_level()`. Default is 3.
+const XEZIM_ZSTD_LEVEL_DEFAULT: i32 = 3;
+
+/// Thread-local compression level setting. Defaults to XEZIM_ZSTD_LEVEL_DEFAULT.
+/// Use `set_zstd_level()` to change it before calling `write_compiled`.
+static ZSTD_LEVEL: std::sync::OnceLock<std::sync::RwLock<i32>> = std::sync::OnceLock::new();
+
+/// Flag to enable compression statistics output. When enabled, `write_compiled`
+/// and `read_compiled` will print statistics about compression ratios.
+static COMPRESSION_STATS: std::sync::OnceLock<std::sync::atomic::AtomicBool> = std::sync::OnceLock::new();
+
+/// Set the zstd compression level (1-22). Must be called before `write_compiled`.
+/// Higher levels = better compression but slower. Level 3 is the default.
+pub fn set_zstd_level(level: i32) {
+    let cell = ZSTD_LEVEL.get_or_init(|| std::sync::RwLock::new(XEZIM_ZSTD_LEVEL_DEFAULT));
+    if let Ok(mut guard) = cell.write() {
+        *guard = level.clamp(1, 22);
+    }
+}
+
+/// Get the current zstd compression level.
+pub fn get_zstd_level() -> i32 {
+    ZSTD_LEVEL
+        .get_or_init(|| std::sync::RwLock::new(XEZIM_ZSTD_LEVEL_DEFAULT))
+        .read()
+        .map(|g| *g)
+        .unwrap_or(XEZIM_ZSTD_LEVEL_DEFAULT)
+}
+
+/// Enable or disable compression statistics output.
+pub fn set_compression_stats(enabled: bool) {
+    let cell = COMPRESSION_STATS.get_or_init(|| std::sync::atomic::AtomicBool::new(false));
+    cell.store(enabled, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Check if compression statistics are enabled.
+fn compression_stats_enabled() -> bool {
+    COMPRESSION_STATS
+        .get()
+        .map(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+        .unwrap_or(false)
+}
 
 /// Bincode configuration for xezim compiled artifacts. Variable-int encoding
 /// shrinks length tags, enum discriminants, and small integers; the wire
@@ -89,27 +131,100 @@ fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
 /// Serialize a compiled ElaboratedModule to a file. Streams bincode through
 /// a zstd encoder into the file; never holds the full serialized blob in
 /// memory, and writes ~27× less to disk than the raw bincode stream.
+/// 
+/// Uses the compression level set via `set_zstd_level()` (default: 3).
+/// If compression statistics are enabled via `set_compression_stats(true)`,
+/// prints the compression ratio after writing.
 pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<(), String> {
     use bincode::Options;
     use std::io::Write;
+    
+    let level = get_zstd_level();
+    let stats_enabled = compression_stats_enabled();
+    
     let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
     let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
     w.write_all(XEZIM_BYTECODE_MAGIC).map_err(|e| format!("write '{}': {}", path, e))?;
-    let mut enc = zstd::stream::Encoder::new(w, XEZIM_ZSTD_LEVEL)
+    
+    // Create a wrapper to count bytes written
+    let mut enc = zstd::stream::Encoder::new(w, level)
         .map_err(|e| format!("zstd init: {}", e))?;
-    xez_bincode_options()
-        .serialize_into(&mut enc, elab)
-        .map_err(|e| format!("serialize: {}", e))?;
-    let mut w = enc.finish().map_err(|e| format!("zstd finish: {}", e))?;
-    w.flush().map_err(|e| format!("flush '{}': {}", path, e))
+    
+    // We need to measure uncompressed size for statistics
+    // Unfortunately zstd::Encoder doesn't expose this directly, so we'll
+    // serialize to a separate buffer first to measure, then compress
+    if stats_enabled {
+        // First, serialize to measure uncompressed size
+        let mut uncompressed = Vec::new();
+        xez_bincode_options()
+            .serialize_into(&mut uncompressed, elab)
+            .map_err(|e| format!("serialize: {}", e))?;
+        let uncompressed_size = uncompressed.len();
+        
+        // Now compress and write
+        let f2 = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
+        let mut w2 = std::io::BufWriter::with_capacity(1 << 20, f2);
+        w2.write_all(XEZIM_BYTECODE_MAGIC).map_err(|e| format!("write '{}': {}", path, e))?;
+        let mut enc2 = zstd::stream::Encoder::new(w2, level)
+            .map_err(|e| format!("zstd init: {}", e))?;
+        enc2.write_all(&uncompressed)
+            .map_err(|e| format!("zstd write: {}", e))?;
+        let mut w2 = enc2.finish().map_err(|e| format!("zstd finish: {}", e))?;
+        w2.flush().map_err(|e| format!("flush '{}': {}", path, e))?;
+        
+        // Get compressed size
+        let compressed_size = std::fs::metadata(path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        
+        let ratio = if uncompressed_size > 0 {
+            compressed_size as f64 / uncompressed_size as f64
+        } else {
+            1.0
+        };
+        
+        eprintln!(
+            "[CACHE][COMPRESS] {}: {} bytes -> {} bytes ({:.2}× ratio, level {})",
+            path,
+            uncompressed_size,
+            compressed_size,
+            1.0 / ratio,
+            level
+        );
+        
+        Ok(())
+    } else {
+        // Standard path without statistics
+        xez_bincode_options()
+            .serialize_into(&mut enc, elab)
+            .map_err(|e| format!("serialize: {}", e))?;
+        let mut w = enc.finish().map_err(|e| format!("zstd finish: {}", e))?;
+        w.flush().map_err(|e| format!("flush '{}': {}", path, e))
+    }
 }
 
 /// Read a compiled artifact from a file. Returns Ok(Some(elab)) if the file is
 /// a valid artifact, Ok(None) if it lacks the magic header, Err on I/O,
 /// version-mismatch, or deserialization failure.
+/// 
+/// If compression statistics are enabled via `set_compression_stats(true)`,
+/// prints the file size and decompression info.
 pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, String> {
     use bincode::Options;
     use std::io::Read;
+    
+    let stats_enabled = compression_stats_enabled();
+    
+    if stats_enabled {
+        let file_size = std::fs::metadata(path)
+            .map(|m| m.len())
+            .unwrap_or(0);
+        eprintln!(
+            "[CACHE][COMPRESS] reading {}: {} bytes (compressed)",
+            path, file_size
+        );
+    }
+    
     let f = std::fs::File::open(path).map_err(|e| format!("read '{}': {}", path, e))?;
     let mut r = std::io::BufReader::with_capacity(1 << 20, f);
     let mut magic = [0u8; 8];
