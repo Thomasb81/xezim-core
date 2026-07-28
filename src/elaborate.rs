@@ -323,6 +323,17 @@ pub struct ElaboratedClass {
     /// does not call `super.new` explicitly.
     #[serde(default)]
     pub extends_args: Vec<Expression>,
+    /// Declared `DataType` of each property, keyed by property name.
+    ///
+    /// `properties[p].width` is the width under the class's DEFAULT parameter
+    /// values, which is all a single `ElaboratedClass` per base-class name can
+    /// record. A property whose packed range depends on a class parameter
+    /// (`class box #(parameter int W = 8); bit [W-1:0] data;`) has a different
+    /// width in every specialization, so the runtime re-resolves this type
+    /// against the parameter bindings the instance carries — see
+    /// `Simulator::respec_packed_width`.
+    #[serde(default)]
+    pub property_types: HashMap<String, DataType>,
     /// ALL arguments in the `extends Base#(arg1, arg2, ...)` clause as textual
     /// fragments, preserving order (both type and value params). Used to
     /// resolve ancestor type/value parameters: when a method of
@@ -447,6 +458,71 @@ fn install_ooc_constraint_body(
 }
 
 pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
+    elaborate_class_with_params(c, None)
+}
+
+/// Collect the constant bindings visible to a class's own declarations:
+/// the enclosing scope's parameters (module / package / `$unit`) overlaid
+/// with the class's own value parameters and body `localparam`s, each
+/// evaluated in declaration order so a later default may reference an
+/// earlier one (§6.20.2).
+///
+/// Without this, `class box #(parameter int W = 8); bit [W-1:0] data;` sized
+/// `data` with NO parameters in scope: `const_eval_i64_with_params` returned
+/// `None` for `W-1`, `resolve_type_width` silently skipped the dimension, and
+/// the property came out **1 bit** — truncating every store through
+/// `fit_class_prop` and reporting `$bits() == 1`. The same held for any
+/// module/package/`$unit` parameter used in a class property's packed range.
+fn class_const_scope(
+    c: &ClassDeclaration,
+    scope_params: Option<&HashMap<String, Value>>,
+) -> HashMap<String, Value> {
+    let mut params: HashMap<String, Value> = scope_params.cloned().unwrap_or_default();
+    let mut bind = |name: &str, init: Option<&crate::ast::expr::Expression>| {
+        // A parameter with no default (`#(parameter int W)`) contributes
+        // nothing — leave it unbound so the dimension stays unresolved
+        // rather than silently binding zero.
+        if let Some(init) = init {
+            let v = eval_const_expr_val(init, &params);
+            params.insert(name.to_string(), v);
+        }
+    };
+    for p in &c.params {
+        if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &p.kind {
+            for a in assignments {
+                bind(&a.name.name, a.init.as_ref());
+            }
+        }
+    }
+    // Class-body `localparam`s are class constants and may be used to size a
+    // property declared after them.
+    for item in &c.items {
+        if let ClassItem::Parameter(pd) = item {
+            if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                for a in assignments {
+                    bind(&a.name.name, a.init.as_ref());
+                }
+            }
+        }
+    }
+    params
+}
+
+/// Elaborate a class, sizing its declarations against `scope_params` (the
+/// enclosing module/package parameter map) in addition to the class's own
+/// parameters. Callers without a parameter map in scope use
+/// [`elaborate_class`].
+pub fn elaborate_class_with_params(
+    c: &ClassDeclaration,
+    scope_params: Option<&HashMap<String, Value>>,
+) -> ElaboratedClass {
+    let const_scope = class_const_scope(c, scope_params);
+    let class_params = Some(&const_scope);
+    // Declared type of each property, retained so the runtime can re-size a
+    // property whose packed range depends on a class parameter for a
+    // specialization other than the default (`box#(16)` vs `box#(8)`).
+    // `Signal::width` below holds the DEFAULT-specialization width.
+    let mut property_types: HashMap<String, DataType> = HashMap::default();
     let mut properties = HashMap::default();
     let mut property_order: Vec<String> = Vec::new();
     let mut string_properties: HashSet<String> = HashSet::default();
@@ -485,7 +561,8 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                 // `resolve_type_width`'s TypeReference branch, which returns a
                 // flat 32 when it has no table — so every such property was
                 // recorded 32 bits wide however narrow its type.
-                let width = typedefs_snapshot(|td| resolve_type_width(&p.data_type, None, td));
+                let width =
+                    typedefs_snapshot(|td| resolve_type_width(&p.data_type, class_params, td));
                 let is_signed = is_type_signed(&p.data_type);
                 let is_rand = p.qualifiers.contains(&ClassQualifier::Rand) || p.qualifiers.contains(&ClassQualifier::Randc);
                 let is_randc = p.qualifiers.contains(&ClassQualifier::Randc);
@@ -527,6 +604,9 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
                     if let Some(info) = &virtual_iface_info {
                         virtual_iface_properties.insert(decl.name.name.clone(), info.clone());
                     }
+                    // Retained for per-specialization re-sizing; see
+                    // `ElaboratedClass::property_types`.
+                    property_types.insert(decl.name.name.clone(), p.data_type.clone());
                     // Static member collections share one global store; route
                     // them out of the per-instance maps.
                     if is_static {
@@ -712,9 +792,22 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
     // Collect class parameters (name + optional default expression).
     let mut param_defaults: Vec<(String, Option<crate::ast::expr::Expression>)> = Vec::new();
     for p in &c.params {
-        if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &p.kind {
+        if let crate::ast::decl::ParameterKind::Data {
+            data_type,
+            assignments,
+            ..
+        } = &p.kind
+        {
             for a in assignments {
                 param_defaults.push((a.name.name.clone(), a.init.clone()));
+                // A value parameter is bound as an INSTANCE PROPERTY at
+                // construction (§8.25), so record its declared type in the same
+                // map — that is what lets an indexed read of a packed-array
+                // parameter (`parameter bit [1:0][7:0] V;` … `obj.V[1]`) select
+                // an element rather than a bit.
+                property_types
+                    .entry(a.name.name.clone())
+                    .or_insert_with(|| data_type.clone());
             }
         }
     }
@@ -797,6 +890,7 @@ pub fn elaborate_class(c: &ClassDeclaration) -> ElaboratedClass {
             e.args.iter().map(param_value_to_arg_string).collect()
         }).unwrap_or_default(),
         properties,
+        property_types,
         property_order,
         string_properties,
         methods,
@@ -2019,7 +2113,10 @@ pub fn elaborate_module_with_defs(
                 Definition::Class(c) => {
                     validate_class_constraints(c, Some(defs), Some(&elab.enum_members))?;
                     register_class_enum_members(c, &mut elab);
-                    elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                    elab.classes.insert(
+                        c.name.name.clone(),
+                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                    );
                     // §18.5.1: a `constraint Class::name {...}` written at
                     // $unit scope fills this class's extern prototype.
                     for (cn, nn, items) in seed_ooc_constraints {
@@ -2051,8 +2148,11 @@ pub fn elaborate_module_with_defs(
                             // `pkg::Class::method`.
                             crate::ast::decl::PackageItem::Class(c) => {
                                 register_class_enum_members(c, &mut elab);
+                                // Snapshot so the closure does not hold a borrow
+                                // of `elab` while `elab.classes` is borrowed.
+                                let params_snapshot = elab.parameters.clone();
                                 elab.classes.entry(c.name.name.clone())
-                                    .or_insert_with(|| elaborate_class(c));
+                                    .or_insert_with(|| elaborate_class_with_params(c, Some(&params_snapshot)));
                             }
                             // Hoist package typedefs (loads enum members + typedef
                             // widths) so an explicit scoped reference `pkg::CONST`
@@ -2409,7 +2509,10 @@ pub fn elaborate_module_with_defs(
                 crate::ast::decl::PackageItem::Class(c) => {
                     validate_class_constraints(c, all_defs, Some(&elab.enum_members))?;
                     register_class_enum_members(c, &mut elab);
-                    elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                    elab.classes.insert(
+                        c.name.name.clone(),
+                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                    );
                 }
                 crate::ast::decl::PackageItem::Let(l) => {
                     elab.lets.insert(l.name.name.clone(), l.clone());
@@ -3781,11 +3884,21 @@ pub fn elaborate_module_with_defs(
                         // associative-array typed parameters. Materialize
                         // `'{ "K": V, ... }` as `<param>["K"]` signals so
                         // `WEIGHT["HIGH"]` reads back the supplied value.
+                        //
+                        // An index-keyed pattern on a MULTI-DIM PACKED vector
+                        // (`parameter bit [1:0][7:0] K = '{1: v1, 0: v0}`,
+                        // §10.9.1) is NOT an associative literal — pack it
+                        // by element instead; the assoc materialization
+                        // would leave the parameter itself x.
                         if let Some(init) = &assign.init {
                             if let ExprKind::AssignmentPattern(items) = &init.kind {
                                 let all_keyed = !items.is_empty()
                                     && items.iter().all(|it| matches!(it, AssignmentPatternItem::Keyed(_, _)));
-                                if all_keyed {
+                                if all_keyed
+                                    && pack_packed_vector_pattern(
+                                        data_type, init, &elab.parameters, &elab.typedef_types,
+                                    ).is_none()
+                                {
                                     elab.associative_arrays
                                         .insert(assign.name.name.clone(), true);
                                     for it in items {
@@ -3813,6 +3926,15 @@ pub fn elaborate_module_with_defs(
                                     continue;
                                 }
                             }
+                        }
+                        // Same element-width/full-dims registration the
+                        // variable path does: `PARAM[i]` on a multi-dim packed
+                        // parameter must element-select, not bit-select.
+                        if let Some(elem_w) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs) {
+                            elab.packed_signal_elem_widths.insert(assign.name.name.clone(), elem_w);
+                        }
+                        if let Some(fdims) = packed_full_dims_of(data_type, &elab.parameters) {
+                            elab.packed_full_dims.insert(assign.name.name.clone(), fdims);
                         }
                         let mut current_width = width;
                         let mut current_is_real = is_real;
@@ -3867,15 +3989,15 @@ pub fn elaborate_module_with_defs(
                                 v
                                 }
                             } else {
-                                let mut v = if is_struct_param {
-                                    pack_struct_const_value(
-                                        data_type, init, &elab.parameters,
-                                        &elab.typedefs, &elab.typedef_types)
-                                    .map(|sv| sv.resize(current_width))
-                                    .unwrap_or_else(|| eval_init_for_width(init, &elab.parameters, current_width))
-                                } else {
-                                    eval_init_for_width(init, &elab.parameters, current_width)
-                                };
+                                // eval_param_value = struct-pattern packing +
+                                // packed-vector-pattern packing + the plain
+                                // const-eval fallback, so this covers the old
+                                // is_struct_param branch and also gives
+                                // `parameter bit [1:0][7:0] M = '{..}` a value
+                                // instead of 0.
+                                let mut v = eval_param_value(
+                                    data_type, init, &elab.parameters,
+                                    &elab.typedefs, &elab.typedef_types, current_width);
                                 if current_signed { v.is_signed = true; }
                                 v
                             }
@@ -4166,7 +4288,10 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::ClassDeclaration(cd) => {
                 validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
-                elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
+                elab.classes.insert(
+                    cd.name.name.clone(),
+                    elaborate_class_with_params(cd, Some(&elab.parameters)),
+                );
             }
             ModuleItem::LetDeclaration(ld) => {
                 elab.lets.insert(ld.name.name.clone(), ld.clone());
@@ -5507,10 +5632,45 @@ fn param_value_to_arg_string(pv: &ParamValue) -> String {
 /// the shapes that can legally be a type-parameter default are handled
 /// (class/type-reference and simple built-ins); anything else yields None so
 /// the caller leaves that param position un-padded.
-fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
+pub fn data_type_to_spec_fragment(dt: &DataType) -> Option<String> {
+    use crate::ast::types::{IntegerAtomType, IntegerVectorType, RealType};
     match dt {
         DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
         DataType::Simple { kind, .. } => Some(format!("{:?}", kind).to_lowercase()),
+        // Built-in types are just as valid a DEFAULT for a type parameter as a
+        // named one (`class C #(type T = int);`). Without these arms the
+        // default was dropped, so `T` was left unbound on an unspecialized
+        // instance and a property declared `T p;` had no type to clamp to.
+        DataType::IntegerAtom { kind, .. } => Some(
+            match kind {
+                IntegerAtomType::Byte => "byte",
+                IntegerAtomType::ShortInt => "shortint",
+                IntegerAtomType::Int => "int",
+                IntegerAtomType::LongInt => "longint",
+                IntegerAtomType::Integer => "integer",
+                IntegerAtomType::Time => "time",
+            }
+            .to_string(),
+        ),
+        // The packed range is intentionally not rendered: a type ARGUMENT
+        // loses its range at parse time too, so keeping the bare keyword here
+        // matches what an explicit `#(logic [63:0])` produces.
+        DataType::IntegerVector { kind, .. } => Some(
+            match kind {
+                IntegerVectorType::Bit => "bit",
+                IntegerVectorType::Logic => "logic",
+                IntegerVectorType::Reg => "reg",
+            }
+            .to_string(),
+        ),
+        DataType::Real { kind, .. } => Some(
+            match kind {
+                RealType::Real => "real",
+                RealType::ShortReal => "shortreal",
+                RealType::RealTime => "realtime",
+            }
+            .to_string(),
+        ),
         _ => None,
     }
 }
@@ -7030,7 +7190,10 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
 
             ModuleItem::ClassDeclaration(cd) => {
                 validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
-                elab.classes.insert(cd.name.name.clone(), elaborate_class(cd));
+                elab.classes.insert(
+                    cd.name.name.clone(),
+                    elaborate_class_with_params(cd, Some(&elab.parameters)),
+                );
             }
             ModuleItem::ClockingDeclaration(cd) => {
                 // §14.12 standalone designation `default clocking <name>;`
@@ -8720,6 +8883,123 @@ fn pack_packed_array_const_value(
 /// then single struct pattern, else the generic const-eval. Centralises the
 /// black-parrot config-table packing so every param-load site resolves
 /// `all_cfgs_gp` (and struct params) consistently.
+/// §10.9 / §6.20.2: pack an assignment-pattern value against a MULTI-DIM
+/// packed VECTOR type (`parameter bit [1:0][7:0] M = '{8'hAA, 8'hBB}`).
+///
+/// The generic const-eval cannot pack a pattern — it has no type to take
+/// element widths from — so such a parameter silently evaluated to 0, both as
+/// a declared default and as an instance `#(.M('{...}))` override, in module,
+/// package and interface scope alike. (`pack_packed_array_const_value` above
+/// only covers typedef'd STRUCT element types.)
+///
+/// The pattern's first element corresponds to the leftmost index of the outer
+/// dimension, which is the MS end of packed storage for descending and
+/// ascending ranges alike, so filled slots concatenate in slot order. Returns
+/// `None` — callers fall back to the previous behavior — for anything not a
+/// resolvable ≥2-dimension packed vector or any pattern shape not understood.
+pub(crate) fn pack_packed_vector_pattern(
+    dt: &DataType,
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Value> {
+    let resolved;
+    let dt = match dt {
+        DataType::TypeReference { name, dimensions, .. } if dimensions.is_empty() => {
+            resolved = resolve_typedef_chain(typedef_types.get(&name.name.name)?, typedef_types).clone();
+            &resolved
+        }
+        other => other,
+    };
+    let dims = match dt {
+        DataType::IntegerVector { dimensions, .. } => dimensions,
+        DataType::Implicit { dimensions, .. } => dimensions,
+        _ => return None,
+    };
+    if dims.len() < 2 {
+        return None;
+    }
+    pack_vector_pattern_dims(dims, expr, params)
+}
+
+/// Recursive core of [`pack_packed_vector_pattern`], over a packed-dimension
+/// slice so nested patterns (`'{'{..}, '{..}}` on a 3-D vector) reuse it.
+fn pack_vector_pattern_dims(
+    dims: &[PackedDimension],
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+) -> Option<Value> {
+    use crate::ast::expr::AssignmentPatternItem;
+    let ExprKind::AssignmentPattern(items) = &expr.kind else {
+        return None;
+    };
+    let bounds = |d: &PackedDimension| -> Option<(i64, i64)> {
+        let PackedDimension::Range { left, right, .. } = d else {
+            return None;
+        };
+        Some((
+            const_eval_i64_with_params(left, Some(params))?,
+            const_eval_i64_with_params(right, Some(params))?,
+        ))
+    };
+    let (l, r) = bounds(dims.first()?)?;
+    let n = ((l - r).unsigned_abs() + 1) as usize;
+    let inner = &dims[1..];
+    let mut elem_w: u32 = 1;
+    for d in inner {
+        let (il, ir) = bounds(d)?;
+        elem_w = elem_w.checked_mul(((il - ir).unsigned_abs() + 1) as u32)?;
+    }
+    let eval_elem = |e: &Expression| -> Option<Value> {
+        if inner.len() >= 2 && matches!(e.kind, ExprKind::AssignmentPattern(_)) {
+            return pack_vector_pattern_dims(inner, e, params);
+        }
+        Some(eval_init_for_width(e, params, elem_w))
+    };
+    // Slot 0 = leftmost index = MS position.
+    let slot_of = |idx: i64| -> Option<usize> {
+        if idx < l.min(r) || idx > l.max(r) {
+            return None;
+        }
+        Some(if l >= r { (l - idx) as usize } else { (idx - l) as usize })
+    };
+    let mut slots: Vec<Option<Value>> = vec![None; n];
+    let mut default_v: Option<Value> = None;
+    let mut next_ordered = 0usize;
+    for it in items {
+        match it {
+            AssignmentPatternItem::Ordered(v) => {
+                if next_ordered >= n {
+                    return None; // more elements than slots — malformed, bail
+                }
+                slots[next_ordered] = Some(eval_elem(v)?);
+                next_ordered += 1;
+            }
+            AssignmentPatternItem::Keyed(k, v) => {
+                let idx = const_eval_i64_with_params(k, Some(params))?;
+                *slots.get_mut(slot_of(idx)?)? = Some(eval_elem(v)?);
+            }
+            AssignmentPatternItem::Default(v) => {
+                default_v = Some(eval_elem(v)?);
+            }
+            // `'{member: v}` names struct members and `'{type_t: v}` keys by
+            // type — neither applies to a plain vector.
+            AssignmentPatternItem::Named(..) | AssignmentPatternItem::Typed(..) => return None,
+        }
+    }
+    let mut parts: Vec<Value> = Vec::with_capacity(n);
+    for s in slots {
+        match (s, &default_v) {
+            (Some(v), _) => parts.push(v.resize(elem_w)),
+            (None, Some(d)) => parts.push(d.clone().resize(elem_w)),
+            // An unfilled slot with no default — incomplete pattern; bail
+            // rather than guess.
+            (None, None) => return None,
+        }
+    }
+    Some(Value::concat(&parts))
+}
+
 fn eval_param_value(
     dt: &DataType,
     init: &Expression,
@@ -8732,6 +9012,9 @@ fn eval_param_value(
         return v.resize(width);
     }
     if let Some(v) = pack_struct_const_value(dt, init, params, typedefs, typedef_types) {
+        return v.resize(width);
+    }
+    if let Some(v) = pack_packed_vector_pattern(dt, init, params, typedef_types) {
         return v.resize(width);
     }
     eval_init_for_width(init, params, width)
@@ -9454,7 +9737,10 @@ pub fn inline_instantiations(
     // Populate class and covergroup definitions from global scope
     for (name, def) in definitions {
         match def {
-            Definition::Class(c) => { elab.classes.insert(name.clone(), elaborate_class(c)); }
+            Definition::Class(c) => {
+                let cls = elaborate_class_with_params(c, Some(&elab.parameters));
+                elab.classes.insert(name.clone(), cls);
+            }
             Definition::Covergroup(cg) => { elab.covergroups.insert(name.clone(), (*cg).clone()); }
             Definition::Package(p) => {
                 elab.packages.insert(name.clone());
@@ -9524,7 +9810,10 @@ pub fn inline_instantiations(
                 for item in &p.items {
                     match item {
                         crate::ast::decl::PackageItem::Class(c) => {
-                            elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                            elab.classes.insert(
+                        c.name.name.clone(),
+                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                    );
                         }
                         crate::ast::decl::PackageItem::Typedef(td) => {
                             process_typedef(td, elab);
@@ -11817,6 +12106,16 @@ fn inline_module_items(
                                                     && val.is_real {
                                                         val = Value::from_f64(val.to_f64());
                                                     }
+                                                // An assignment-pattern override
+                                                // (`.M('{8'hAA, 8'hBB})`) needs the
+                                                // formal's type to pack; the plain
+                                                // const-eval above yields 0 for it.
+                                                if let Some(pv) = pack_packed_vector_pattern(
+                                                    data_type, v, scoped_eval_params,
+                                                    &elab.typedef_types,
+                                                ) {
+                                                    val = pv;
+                                                }
                                                 break;
                                             }
                                         }
@@ -11868,6 +12167,14 @@ fn inline_module_items(
                                                 && val.is_real {
                                                     val = Value::from_f64(val.to_f64());
                                                 }
+                                            // See the Named branch: a pattern
+                                            // override needs the formal's type.
+                                            if let Some(pv) = pack_packed_vector_pattern(
+                                                data_type, v, scoped_eval_params,
+                                                &elab.typedef_types,
+                                            ) {
+                                                val = pv;
+                                            }
                                             sub_params.insert(assignments[0].name.name.clone(), val);
                                         }
                                     }
@@ -12023,6 +12330,17 @@ fn inline_module_items(
                 for p_decl in sub_mod.params() {
                     if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
                         for assign in assignments {
+                            // Element-select support for a multi-dim packed
+                            // parameter of THIS instance (`inst.PARAM[i]`) —
+                            // mirror of the module-scope registration.
+                            if let Some(elem_w) = packed_inner_elem_width(data_type, &sub_local_params, &elab.typedefs) {
+                                elab.packed_signal_elem_widths
+                                    .insert(format!("{}{}", inst_prefix, assign.name.name), elem_w);
+                            }
+                            if let Some(fdims) = packed_full_dims_of(data_type, &sub_local_params) {
+                                elab.packed_full_dims
+                                    .insert(format!("{}{}", inst_prefix, assign.name.name), fdims);
+                            }
                             // §6.20.2 unpacked-array parameter. This runs even when the
                             // parameter is OVERRIDDEN: the override arrives as a single
                             // packed value, so without slicing it here no element ever
@@ -12047,7 +12365,16 @@ fn inline_module_items(
                                         let all_keyed = !items.is_empty()
                                             && items.iter().all(|it|
                                                 matches!(it, AssignmentPatternItem::Keyed(_, _)));
-                                        if all_keyed {
+                                        // See the module-scope twin: an
+                                        // index-keyed pattern on a multi-dim
+                                        // packed vector packs by element and
+                                        // must not become an assoc literal.
+                                        if all_keyed
+                                            && pack_packed_vector_pattern(
+                                                data_type, init, &sub_local_params,
+                                                &elab.typedef_types,
+                                            ).is_none()
+                                        {
                                             let elem_w = resolve_type_width(
                                                 data_type,
                                                 Some(&sub_local_params),
@@ -12117,6 +12444,17 @@ fn inline_module_items(
                                         && val.is_real {
                                             val = Value::from_f64(val.to_f64());
                                         }
+                                    // Non-keyed assignment-pattern DEFAULT on a
+                                    // multi-dim packed vector (`parameter bit
+                                    // [1:0][7:0] M = '{8'h0F, 8'hF0}`): the
+                                    // plain const-eval above yields 0; pack by
+                                    // element like the override path does.
+                                    if let Some(pv) = pack_packed_vector_pattern(
+                                        data_type, init_eval, &sub_local_params,
+                                        &elab.typedef_types,
+                                    ) {
+                                        val = pv;
+                                    }
                                     sub_local_params.insert(assign.name.name.clone(), val);
                                 }
                             }
@@ -14763,7 +15101,10 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             }
                         PackageItem::Class(c)
                             if &c.name.name == sym_name => {
-                                elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                                elab.classes.insert(
+                        c.name.name.clone(),
+                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                    );
                                 found = true;
                             }
                         PackageItem::Data(dd)
@@ -14907,7 +15248,10 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             register_dpi_import(di, elab)?;
                         }
                         PackageItem::Class(c) => {
-                            elab.classes.insert(c.name.name.clone(), elaborate_class(c));
+                            elab.classes.insert(
+                        c.name.name.clone(),
+                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                    );
                         }
                         PackageItem::Data(dd) => {
                             let width = match &dd.data_type {
