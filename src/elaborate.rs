@@ -1098,6 +1098,20 @@ pub struct ElaboratedModule {
     pub clocking_signal_dirs: HashMap<String, HashMap<String, PortDirection>>,
     /// Specify path delays: destination signal name -> delay (time units).
     pub specify_delays: HashMap<String, u64>,
+    /// §6.6.2/§6.6.3 nets whose MULTI-DRIVER resolution or undriven value is
+    /// not plain `wire`: wand/triand, wor/trior, tri0, tri1. Only these kinds
+    /// are recorded — a plain wire needs no entry. Consumed by
+    /// `resolve_multi_driver_nets` (which picks the fold function) and by the
+    /// tri0/tri1 pull driver below.
+    #[serde(default)]
+    pub resolved_net_kinds: HashMap<String, ResolvedNetKind>,
+    /// §28.11 gate FALL delays, keyed by the lowered gate's LHS net name. A
+    /// gate lowers to a `ContinuousAssignment` carrying one `delay` (the rise
+    /// value); the fall value rides here so the runtime can pick per
+    /// transition direction. Absent = the single-delay form, where rise
+    /// governs both edges.
+    #[serde(default)]
+    pub gate_fall_delays: HashMap<String, u64>,
     /// Associative array default values.
     pub assoc_defaults: HashMap<String, Expression>,
     /// Dynamic arrays / queues (size starts at 0, not pre-allocated range).
@@ -1355,7 +1369,7 @@ impl ElaboratedModule {
     /// `output [31:0] x; T x;`). Implicit types (a bare `output x;` direction
     /// line, or `wire x;`) are ignored, so the legal non-ANSI split where only
     /// one declaration carries a type still elaborates.
-    fn note_explicit_type(&mut self, name: &str, dt: &DataType) -> Result<(), String> {
+    fn note_explicit_type(&mut self, name: &str, dt: &DataType, span: Span) -> Result<(), String> {
         // A *bare* implicit type — `output x;` / `wire x;` (no range, no
         // signing) — carries no type; it is the legal half of a non-ANSI split
         // and is ignored here.
@@ -1374,7 +1388,7 @@ impl ElaboratedModule {
             | DataType::Simple { .. } | DataType::Struct(_) | DataType::Enum(_));
         if let Some(&prev_incompat) = self.typed_decls.get(name) {
             if incompat || prev_incompat {
-                return Err(format!("Duplicate declaration of '{}'", name));
+                return Err(duplicate_decl_error(self, name, span, "this"));
             }
         }
         self.typed_decls.entry(name.to_string())
@@ -1416,6 +1430,8 @@ impl ElaboratedModule {
             modport_views: HashMap::default(),
             clocking_signal_dirs: HashMap::default(),
             specify_delays: HashMap::default(),
+            resolved_net_kinds: HashMap::default(),
+            gate_fall_delays: HashMap::default(),
             assoc_defaults: HashMap::default(),
             dynamic_arrays: HashSet::default(),
             net_strengths: HashMap::default(),
@@ -2724,10 +2740,10 @@ pub fn elaborate_module_with_defs(
                             elab.parameters.remove(&decl.name.name);
                             elab.signals.remove(&decl.name.name);
                         } else {
-                            return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                            return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
                         }
                     }
-                    elab.note_explicit_type(&decl.name.name, &pd.data_type)?;
+                    elab.note_explicit_type(&decl.name.name, &pd.data_type, decl.name.span)?;
                     // §23.2.2.1 non-ANSI ports: the data type and the direction
                     // may be declared in separate statements (`byte x; output x;`).
                     // If `x` was already registered (by a prior data/net decl)
@@ -2760,7 +2776,7 @@ pub fn elaborate_module_with_defs(
                             }
                             continue;
                         }
-                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
                     }
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(),
@@ -2795,10 +2811,10 @@ pub fn elaborate_module_with_defs(
                             elab.parameters.remove(&decl.name.name);
                             elab.signals.remove(&decl.name.name);
                         } else {
-                            return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                            return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
                         }
                     }
-                    elab.note_explicit_type(&decl.name.name, &nd.data_type)?;
+                    elab.note_explicit_type(&decl.name.name, &nd.data_type, decl.name.span)?;
                     // A `wire X;` (or other NetDeclaration) following an
                     // `input X;` / `output X;` port declaration is the
                     // legal SystemVerilog idiom that explicitly attaches a
@@ -2823,7 +2839,7 @@ pub fn elaborate_module_with_defs(
                             elab.nets.insert(decl.name.name.clone());
                             continue;
                         }
-                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
                     }
                     // §7.4.2: an unpacked NET array (`wire [3:0] outs [0:1];`) is
                     // an ARRAY OF NETS, exactly like the variable form
@@ -2849,9 +2865,17 @@ pub fn elaborate_module_with_defs(
                     // §6.6.1: an undriven wire reads high-impedance — nets
                     // default to Z, not X (bits with drivers are overwritten
                     // at the first settle; bits nothing drives stay z).
+                    if let Some(k) = ResolvedNetKind::from_net_type(nd.net_type) {
+                        elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
+                    }
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(w),
                         NetType::Supply1 => Value::ones(w),
+                        // §6.6.3: an UNDRIVEN tri0/tri1 reads its pull value,
+                        // not z. A driven one is resolved in the multi-driver
+                        // fold, which overwrites this at settle.
+                        NetType::Tri0 => Value::zero(w),
+                        NetType::Tri1 => Value::ones(w),
                         _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(w) },
                     };
                     let sig = Signal { is_const: false,
@@ -3028,7 +3052,7 @@ pub fn elaborate_module_with_defs(
                 }
                 let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                 for decl in &dd.declarators {
-                    elab.note_explicit_type(&decl.name.name, &dd.data_type)?;
+                    elab.note_explicit_type(&decl.name.name, &dd.data_type, decl.name.span)?;
                     // §23.2.2.1 non-ANSI port completion: a variable declaration
                     // may supply the data type of an already-declared port —
                     //   output [W-1:0] Q_out;   // direction (implicit net type)
@@ -3089,9 +3113,11 @@ pub fn elaborate_module_with_defs(
                         // collision; --no-strict keeps those designs elaborating
                         // until that scope-merge is fixed.
                         if sv_parser::strict_checks() {
-                            return Err(format!(
-                                "duplicate declaration of '{}' in the same scope",
-                                decl.name.name
+                            return Err(duplicate_decl_error(
+                                &elab,
+                                &decl.name.name,
+                                decl.name.span,
+                                "data",
                             ));
                         }
                         eprintln!("[xezim][warning] duplicate declaration of '{}' (data); keeping first definition", decl.name.name);
@@ -3938,7 +3964,7 @@ pub fn elaborate_module_with_defs(
                                 elab.parameters.remove(&assign.name.name);
                                 elab.signals.remove(&assign.name.name);
                             } else {
-                                return Err(format!("Duplicate declaration of '{}'", assign.name.name));
+                                return Err(duplicate_decl_error(&elab, &assign.name.name, assign.name.span, "parameter"));
                             }
                         }
                         // IEEE 1800-2023: keyed assignment-pattern init for
@@ -6922,7 +6948,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             elab.parameters.remove(&decl.name.name);
                             elab.signals.remove(&decl.name.name);
                         } else {
-                            return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                            return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
                         }
                     }
                     // §23.2.2.1 non-ANSI split type/direction — merge (see the
@@ -6951,7 +6977,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             }
                             continue;
                         }
-                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
                     }
                     let sig = Signal { is_const: false,
                         name: decl.name.name.clone(), width, is_signed,
@@ -6976,9 +7002,17 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 let is_signed = is_type_signed(&nd.data_type);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
+                    if let Some(k) = ResolvedNetKind::from_net_type(nd.net_type) {
+                        elab.resolved_net_kinds.insert(decl.name.name.clone(), k);
+                    }
                     let init_value = match nd.net_type {
                         NetType::Supply0 => Value::zero(width),
                         NetType::Supply1 => Value::ones(width),
+                        // §6.6.3: an UNDRIVEN tri0/tri1 reads its pull value,
+                        // not z. A driven one is resolved in the multi-driver
+                        // fold, which overwrites this at settle.
+                        NetType::Tri0 => Value::zero(width),
+                        NetType::Tri1 => Value::ones(width),
                         _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(width) },
                     };
                     let sig = Signal { is_const: false,
@@ -7044,7 +7078,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 let is_real = is_type_real(&dd.data_type);
                 for decl in &dd.declarators {
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
-                        return Err(format!("Duplicate declaration of '{}'", decl.name.name));
+                        return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
                     }
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = decl.dimensions.first() {
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
@@ -7128,7 +7162,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                 elab.parameters.remove(&assign.name.name);
                                 elab.signals.remove(&assign.name.name);
                             } else {
-                                return Err(format!("Duplicate declaration of '{}'", assign.name.name));
+                                return Err(duplicate_decl_error(&elab, &assign.name.name, assign.name.span, "parameter"));
                             }
                         }
                         if !elab.parameters.contains_key(&assign.name.name) {
@@ -7732,6 +7766,9 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
             // `buf #(4) g(y, a);` — gate delays likewise count timeunits.
             ModuleItem::GateInstantiation(gi) => {
                 if let Some(d) = gi.delay.as_mut() {
+                    rewrite_delay_expr(d, unit_s, tick_s);
+                }
+                if let Some(d) = gi.delay_fall.as_mut() {
                     rewrite_delay_expr(d, unit_s, tick_s);
                 }
             }
@@ -13658,6 +13695,17 @@ fn inline_module_items(
 }
 
 /// Build a high-impedance (`'z`) literal expression for tristate gate models.
+/// `'0` / `'1` — an unbased-unsized fill, which replicates to the consuming
+/// width. Used as the implicit weak driver of a tri0/tri1 net (§6.6.3).
+fn make_fill_expr(one: bool, span: Span) -> Expression {
+    Expression::new(
+        ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized(
+            if one { '1' } else { '0' },
+        )),
+        span,
+    )
+}
+
 fn make_z_expr(span: Span) -> Expression {
     Expression::new(ExprKind::Number(crate::ast::expr::NumberLiteral::UnbasedUnsized('z')), span)
 }
@@ -14321,6 +14369,134 @@ fn make_i64_literal(v: i64, span: crate::ast::Span) -> Expression {
     }
 }
 
+/// §6.6.2/§6.6.3 net kinds that need something other than plain wire
+/// resolution. `Wand`/`Wor` cover their `triand`/`trior` synonyms.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub enum ResolvedNetKind {
+    /// Wired AND: all drivers ANDed together.
+    Wand,
+    /// Wired OR: all drivers ORed together.
+    Wor,
+    /// Pulls to 0 on bits no driver is driving.
+    Tri0,
+    /// Pulls to 1 on bits no driver is driving.
+    Tri1,
+}
+
+impl ResolvedNetKind {
+    fn from_net_type(nt: NetType) -> Option<Self> {
+        match nt {
+            NetType::Wand | NetType::TriAnd => Some(Self::Wand),
+            NetType::Wor | NetType::TriOr => Some(Self::Wor),
+            NetType::Tri0 => Some(Self::Tri0),
+            NetType::Tri1 => Some(Self::Tri1),
+            _ => None,
+        }
+    }
+}
+
+thread_local! {
+    /// Preprocessed source texts + file names, published BEFORE elaboration so
+    /// elaboration-time diagnostics can resolve a span to `file:line`.
+    /// `ElaboratedModule::source_texts` is only assigned once elaboration has
+    /// already returned, which is too late for an error raised during it.
+    /// Moved in and back out (never cloned) so this costs no extra memory.
+    static ELAB_SOURCES_TLS: std::cell::RefCell<(Vec<String>, Vec<String>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Publish the preprocessed sources for elaboration-time diagnostics. Takes
+/// ownership; call `take_elab_sources` afterwards to move them into the
+/// elaborated module.
+pub fn set_elab_sources(texts: Vec<String>, files: Vec<String>) {
+    ELAB_SOURCES_TLS.with(|c| *c.borrow_mut() = (texts, files));
+}
+
+/// Move the published sources back out (leaving the slot empty).
+pub fn take_elab_sources() -> (Vec<String>, Vec<String>) {
+    ELAB_SOURCES_TLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
+}
+
+/// Resolve a `Span` (a byte offset into its own file's PREPROCESSED text) to
+/// `file:line`, for elaboration diagnostics. Mirrors the simulator's
+/// `span_file_line_in`: when several retained sources could contain the
+/// offset the location is ambiguous, and printing a wrong file is worse than
+/// printing none.
+pub fn span_location(elab: &ElaboratedModule, span: Span) -> Option<String> {
+    if span.start == 0 && span.end == 0 {
+        return None; // Span::dummy() — synthesized, no source
+    }
+    // During elaboration the module's own copy is still empty; the sources
+    // live in the TLS published by `set_elab_sources`.
+    let resolve = |texts: &[String], files: &[String]| -> Option<String> {
+        let mut hit: Option<usize> = None;
+        for (i, t) in texts.iter().enumerate() {
+            if span.start < t.len() {
+                if hit.is_some() {
+                    return None; // ambiguous across files
+                }
+                hit = Some(i);
+            }
+        }
+        let i = hit?;
+        let line = 1 + texts[i].as_bytes()[..span.start]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        match files.get(i).filter(|f| !f.is_empty()) {
+            Some(f) => Some(format!("{}:{}", f, line)),
+            None => Some(format!("line {}", line)),
+        }
+    };
+    if !elab.source_texts.is_empty() {
+        return resolve(&elab.source_texts, &elab.source_files);
+    }
+    ELAB_SOURCES_TLS.with(|c| {
+        let b = c.borrow();
+        resolve(&b.0, &b.1)
+    })
+}
+
+/// Build the message for an illegal re-declaration (§6.x). The bare
+/// "duplicate declaration of 'X'" gave a user no way to find either
+/// declaration in a large multi-file design, so report WHERE the offending
+/// declaration is, WHAT the name already refers to (a signal/net or a
+/// parameter — often the actual surprise, e.g. a wildcard-imported package
+/// parameter), and how to downgrade the check.
+pub fn duplicate_decl_error(
+    elab: &ElaboratedModule,
+    name: &str,
+    span: Span,
+    kind: &str,
+) -> String {
+    let mut m = format!("duplicate declaration of '{}' in the same scope", name);
+    if let Some(loc) = span_location(elab, span) {
+        m.push_str(&format!("\n  {} declaration is at {}", kind, loc));
+    }
+    let prior = if elab.parameters.contains_key(name) {
+        Some("a parameter/localparam")
+    } else if elab.nets.contains(name) {
+        Some("a net")
+    } else if elab.signals.contains_key(name) {
+        Some("a variable/signal")
+    } else {
+        None
+    };
+    if let Some(p) = prior {
+        m.push_str(&format!("\n  '{}' is already declared as {} in this scope", name, p));
+        if elab.wildcard_shadowed.contains(name) {
+            m.push_str(" (via a wildcard package import)");
+        }
+    }
+    if !elab.name.is_empty() {
+        m.push_str(&format!("\n  while elaborating '{}'", elab.name));
+    }
+    m.push_str(
+        "\n  hint: rename one declaration, or pass --no-strict to downgrade this to a warning",
+    );
+    m
+}
+
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     let mut counts: HashMap<String, usize> = HashMap::default();
     for ca in &elab.continuous_assigns {
@@ -14351,11 +14527,27 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     for n in pending_lhs.iter().flatten() {
         *counts.entry(n.clone()).or_insert(0) += 1;
     }
-    let multi: HashSet<String> = counts
-        .into_iter()
-        .filter(|(n, c)| *c > 1 && elab.nets.contains(n))
-        .map(|(n, _)| n)
+    // A tri0/tri1 net needs the fold even with a SINGLE driver, because the
+    // implicit pull is a second (weak) driver: `strong` alone would leave the
+    // bits that driver holds at z reading z instead of pulling. Nets with NO
+    // driver never reach the fold at all and are handled by their declared
+    // initial value instead (see the net-declaration sites).
+    let mut multi: HashSet<String> = counts
+        .iter()
+        .filter(|(n, c)| **c > 1 && elab.nets.contains(*n))
+        .map(|(n, _)| n.clone())
         .collect();
+    for (n, c) in &counts {
+        if *c >= 1
+            && elab.nets.contains(n)
+            && matches!(
+                elab.resolved_net_kinds.get(n),
+                Some(ResolvedNetKind::Tri0) | Some(ResolvedNetKind::Tri1)
+            )
+        {
+            multi.insert(n.clone());
+        }
+    }
     if multi.is_empty() {
         return;
     }
@@ -14408,11 +14600,36 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             order.push(name.clone());
             Acc { lhs: make_ident_expr(&name), delay: ca.delay, strong: None, weak: None }
         });
+        // §6.6.2: a wand/triand net ANDs its drivers and a wor/trior net ORs
+        // them, instead of the wire rule (z yields, equal passes, conflict ->
+        // x). Plain wires and the weak pull chain keep `$__wres`.
+        let fold_op = match elab.resolved_net_kinds.get(&name) {
+            Some(ResolvedNetKind::Wand) if !weak => "$__wand",
+            Some(ResolvedNetKind::Wor) if !weak => "$__wor",
+            _ => "$__wres",
+        };
         let chain = if weak { &mut slot.weak } else { &mut slot.strong };
         *chain = Some(match chain.take() {
-            Some(acc) => make_syscall("$__wres", vec![acc, rhs], span),
+            Some(acc) => make_syscall(fold_op, vec![acc, rhs], span),
             None => rhs,
         });
+    }
+    // §6.6.3 tri0/tri1: bits that no driver is driving pull to 0/1. Model that
+    // as an implicit WEAK driver, which is exactly what `$__wres_pull` already
+    // resolves against the strong chain — so a real driver still wins and only
+    // undriven (z) bits take the pull.
+    for (name, acc) in folded.iter_mut() {
+        let pull_bit = match elab.resolved_net_kinds.get(name) {
+            Some(ResolvedNetKind::Tri0) => Some(false),
+            Some(ResolvedNetKind::Tri1) => Some(true),
+            _ => None,
+        };
+        if let Some(one) = pull_bit {
+            if acc.weak.is_none() {
+                let span = acc.lhs.span;
+                acc.weak = Some(make_fill_expr(one, span));
+            }
+        }
     }
     for name in order {
         if let Some(acc) = folded.remove(&name) {
@@ -14565,8 +14782,22 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
         .as_ref()
         .map(|d| eval_const_expr(d, &elab.parameters))
         .unwrap_or(0);
+    // §28.11 `#(rise, fall)`: record the fall value per driven net so the
+    // runtime can pick it for 1->0 transitions. Only recorded when it differs
+    // from the rise value, so the common single-delay form costs nothing.
+    let fall = gi
+        .delay_fall
+        .as_ref()
+        .map(|d| eval_const_expr(d, &elab.parameters));
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
+        if let Some(f) = fall {
+            if f != delay {
+                if let Some(n) = ident_flat_name(&lhs) {
+                    elab.gate_fall_delays.insert(n, f);
+                }
+            }
+        }
         elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay });
     }
 }

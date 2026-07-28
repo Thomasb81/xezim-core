@@ -549,10 +549,17 @@ pub fn parse_and_elaborate_multi(
     let lib_defines = pp.snapshot_defines();
     let module_timescales = pp.module_timescales.clone();
     let module_ts_own_file = pp.module_ts_own_file.clone();
-    let (defs, mut elab) =
-        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales, &module_ts_own_file)?;
-    elab.source_texts = preprocessed_texts;
-    elab.source_files = source_files.to_vec();
+    // Publish the sources BEFORE elaborating so an error raised during
+    // elaboration (e.g. a duplicate declaration) can report `file:line`;
+    // `elab.source_texts` below is assigned too late for that. Moved, not
+    // cloned, then moved back out.
+    elaborate::set_elab_sources(preprocessed_texts, source_files.to_vec());
+    let elaborated =
+        parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales, &module_ts_own_file);
+    let (texts, files) = elaborate::take_elab_sources();
+    let (defs, mut elab) = elaborated?;
+    elab.source_texts = texts;
+    elab.source_files = files;
     elab.src_file_of_module = src_file_of_module;
     Ok((defs, elab))
 }
