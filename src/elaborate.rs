@@ -364,7 +364,7 @@ pub struct ElaboratedClass {
     /// `ElaboratedModule::class_type_args`; but class properties had neither,
     /// so a later `this.a1 = new(...)` constructed with NO type-args and the
     /// value parameter `N` defaulted — collapsing `#(1)`/`#(2)` properties
-    /// to `#(0)` (UVM 09callbacks/25params). Looked up by the runtime at
+    /// to `#(0)` (a UVM callbacks specialization case). Looked up by the runtime at
     /// construction time via the `this` instance's class definition.
     #[serde(default)]
     pub property_type_args: HashMap<String, Vec<Expression>>,
@@ -1766,7 +1766,7 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
 ///    class uvm_phase and was invisible to `port_is_assoc_array`; and (b)
 ///    config_db / type-handle equality resolves the class-local type.
 ///    Without it the phase-DAG successor writeback was silently lost and every
-///    UVM test stalled at t=0.
+///    such test stalled at t=0.
 pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedModule) {
     for item in &c.items {
         if let ClassItem::Typedef(td) = item {
@@ -4195,7 +4195,14 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 for it in &fd.items { check_fn_fork(it)?; }
-                elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                // Out-of-class method definitions (`function Class::method`)
+                // have `scope.is_some()` — they belong in the class, not in
+                // the module's free-function namespace. Inserting them here
+                // silently overrides same-named free functions, so a bare call
+                // dispatches the class body without `this` binding.
+                if fd.name.scope.is_none() {
+                    elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                }
             }
             ModuleItem::TaskDeclaration(td) => {
                 fn check_no_return_in_fork(s: &crate::ast::stmt::Statement, in_fork: bool) -> Result<(), String> {
@@ -4217,7 +4224,16 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 for it in &td.items { check_no_return_in_fork(it, false)?; }
-                elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                // Out-of-class method definitions (`task Class::method`) have
+                // `scope.is_some()` — they belong in the class, not in the
+                // module's free-task namespace. Inserting them here silently
+                // overrides same-named free tasks (e.g. `task run_test` in
+                // uvm_globals.svh is replaced by `task uvm_root::run_test`),
+                // so a bare `run_test()` dispatches the class body without
+                // `this` binding and crashes.
+                if td.name.scope.is_none() {
+                    elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                }
             }
             ModuleItem::ContinuousAssign(ca) => {
                 let delay = ca.delay.as_ref().map(|d| eval_const_expr(d, &elab.parameters)).unwrap_or(0);
@@ -7392,7 +7408,11 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     }
                 }
                 for it in &fd.items { check_fn_fork(it)?; }
-                elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                // Same scope filter as above: out-of-class method definitions
+                // must not override free functions.
+                if fd.name.scope.is_none() {
+                    elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                }
             }
             ModuleItem::TaskDeclaration(td) => {
                 fn check_no_return_in_fork(s: &crate::ast::stmt::Statement, in_fork: bool) -> Result<(), String> {
@@ -7414,7 +7434,11 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     }
                 }
                 for it in &td.items { check_no_return_in_fork(it, false)?; }
-                elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                // Same scope filter: don't let out-of-class method definitions
+                // override free tasks in the module namespace.
+                if td.name.scope.is_none() {
+                    elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                }
             }
             ModuleItem::ImportDeclaration(imp) => {
                 if let Some(defs) = all_defs {
@@ -15297,13 +15321,13 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 found = true;
                             }
                         PackageItem::Function(fd)
-                            if &fd.name.name.name == sym_name => {
+                            if &fd.name.name.name == sym_name && fd.name.scope.is_none() => {
                                 elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                                 elab.func_decl_scope.insert(fd.name.name.name.clone(), pkg_name.clone());
                                 found = true;
                             }
                         PackageItem::Task(td)
-                            if &td.name.name.name == sym_name => {
+                            if &td.name.name.name == sym_name && td.name.scope.is_none() => {
                                 elab.tasks.insert(td.name.name.name.clone(), td.clone());
                                 elab.func_decl_scope.insert(td.name.name.name.clone(), pkg_name.clone());
                                 found = true;
@@ -15451,11 +15475,11 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         PackageItem::Typedef(td) => {
                             process_typedef(td, elab);
                         }
-                        PackageItem::Function(fd) => {
+                        PackageItem::Function(fd) if fd.name.scope.is_none() => {
                             elab.func_decl_scope.insert(fd.name.name.name.clone(), pkg_name.clone());
                             elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                         }
-                        PackageItem::Task(td) => {
+                        PackageItem::Task(td) if td.name.scope.is_none() => {
                             elab.func_decl_scope.insert(td.name.name.name.clone(), pkg_name.clone());
                             elab.tasks.insert(td.name.name.name.clone(), td.clone());
                         }

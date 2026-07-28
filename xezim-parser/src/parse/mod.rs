@@ -245,9 +245,22 @@ impl Parser {
                 // Compilation-unit ($unit) scope data declaration like
                 // `string label = "...";`. Surface it as a PackageItem::Data so
                 // elaboration can hoist it into modules (and thus make it
-                // visible to class methods that reference it — UVM tests do
+                // visible to class methods that reference it — UVM code does
                 // `string label = "X"; … \`uvm_info(label, …)`).
-                if self.is_data_type_keyword() || self.at(TokenKind::KwVar) || self.at(TokenKind::KwConst) {
+                //
+                // Also accept a USER-DEFINED type (class/typedef name): at
+                // $unit scope a leading Identifier is always a data
+                // declaration (module instances cannot exist at $unit scope,
+                // LRM §23.3), e.g. `rw_tr q[$];` or `pkg::T x;`. Without this
+                // the guard only admitted builtin type keywords, leaving
+                // `rw_tr q[$];` as an unexpected token.
+                let is_user_type_decl = self.at(TokenKind::Identifier)
+                    && matches!(self.peek_kind(),
+                        TokenKind::Identifier | TokenKind::DoubleColon
+                        | TokenKind::Hash | TokenKind::LBracket);
+                if self.is_data_type_keyword() || self.at(TokenKind::KwVar)
+                    || self.at(TokenKind::KwConst) || is_user_type_decl
+                {
                     let before = self.pos;
                     let decl = self.parse_data_declaration();
                     // Guard against a parse that made no progress (avoid a
