@@ -538,6 +538,13 @@ fn parse_enum_type(&mut self) -> DataType {
             StructUnionKind::Struct
         };
         let tagged1 = self.eat(TokenKind::KwTagged).is_some();
+        // §7.3.2 `union soft [packed]`. Gated on --sv2023 and on the aggregate
+        // actually being a union: `struct soft` has no meaning, so leaving
+        // `soft` unconsumed there lets the usual "unexpected token" diagnostic
+        // fire rather than silently accepting it.
+        let soft = crate::is_sv2023()
+            && matches!(kind, StructUnionKind::Union)
+            && self.eat(TokenKind::KwSoft).is_some();
         let packed = self.eat(TokenKind::KwPacked).is_some();
         let tagged2 = self.eat(TokenKind::KwTagged).is_some();
         let tagged = tagged1 || tagged2;
@@ -550,7 +557,7 @@ fn parse_enum_type(&mut self) -> DataType {
         // pushing members until the process OOMs.
         if !self.at(TokenKind::LBrace) {
             return DataType::Struct(StructUnionType {
-                kind, packed, tagged, signing, members: Vec::new(),
+                kind, packed, tagged, soft, signing, members: Vec::new(),
                 dimensions: Vec::new(),
                 span: self.span_from(start),
             });
@@ -586,7 +593,7 @@ fn parse_enum_type(&mut self) -> DataType {
         self.expect(TokenKind::RBrace);
         // Packed array dimensions after the body: `struct packed {...} [N-1:0] x;`
         let dimensions = self.parse_packed_dimensions();
-        DataType::Struct(StructUnionType { kind, packed, tagged, signing, members, dimensions, span: self.span_from(start) })
+        DataType::Struct(StructUnionType { kind, packed, tagged, soft, signing, members, dimensions, span: self.span_from(start) })
     }
 
     pub(super) fn parse_optional_direction(&mut self) -> Option<PortDirection> {

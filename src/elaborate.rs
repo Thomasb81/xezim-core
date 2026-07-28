@@ -7611,6 +7611,29 @@ fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
         use std::sync::{Mutex, OnceLock};
         static WARNED: OnceLock<Mutex<std::collections::HashSet<String>>> = OnceLock::new();
         let seen = WARNED.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
+        // Two very different causes land here and they need different answers:
+        //
+        //  * A genuine UNDERFLOW — `[N-1:0]` with N resolving to 0 wraps `N-1`
+        //    to ~u32::MAX. The slice carries no meaningful data, so collapsing
+        //    it to 1 bit is right.
+        //
+        //  * A LEGITIMATELY LARGE vector — e.g. `wire [N*W-1:0]` with
+        //    N*W = 4_194_304. That is real, declarable data that merely
+        //    exceeds our cap. Collapsing it to 1 bit used to manufacture
+        //    downstream breakage: a later `flat[i*W +: W]` then selects bits
+        //    far above the (now 1-bit) signal, which underflowed
+        //    `high_eff - low` in the write paths. Clamp to the cap instead, so
+        //    the low bits still behave and out-of-range selects are simply
+        //    no-ops.
+        //
+        // Anything at or past 2^31 could not have been written deliberately
+        // and is treated as the wraparound case.
+        let is_wraparound = w >= (1u64 << 31);
+        let replacement = if is_wraparound {
+            UNDERFLOW_WIDTH_PLACEHOLDER
+        } else {
+            SANE_MAX_PACKED_WIDTH
+        };
         let key = format!("{}|{}", ctx, detail);
         if seen.lock().map(|mut g| g.insert(key)).unwrap_or(false) {
             let detail_part = if detail.is_empty() {
@@ -7618,11 +7641,18 @@ fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
             } else {
                 format!(", {}", detail)
             };
-            crate::elab_diag(format!("[xezim][warning] packed width {} exceeds sane cap {} ({}{}); collapsing to \
-                       {} bit — a parameter likely resolved to 0 causing an `[N-1:0]` underflow",
-                w, SANE_MAX_PACKED_WIDTH, ctx, detail_part, UNDERFLOW_WIDTH_PLACEHOLDER));
+            let cause = if is_wraparound {
+                "a parameter likely resolved to 0 causing an `[N-1:0]` underflow"
+            } else {
+                "the declared width is genuinely larger than xezim's cap; \
+                 selects above the cap read/write nothing"
+            };
+            crate::elab_diag(format!(
+                "[xezim][warning] packed width {} exceeds sane cap {} ({}{}); \
+                 clamping to {} bit — {}",
+                w, SANE_MAX_PACKED_WIDTH, ctx, detail_part, replacement, cause));
         }
-        UNDERFLOW_WIDTH_PLACEHOLDER
+        replacement
     } else {
         w as u32
     }

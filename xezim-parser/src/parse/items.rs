@@ -1949,6 +1949,11 @@ impl Parser {
         match self.current_kind() {
             TokenKind::KwCoverpoint => {
                 self.bump();
+                // §19.5 (SV-2023) `coverpoint real <expr>`. Gated on --sv2023
+                // so that under SV-2017 `real` stays whatever it was before
+                // (an ordinary expression token) rather than being silently
+                // swallowed as a modifier.
+                let is_real = crate::is_sv2023() && self.eat(TokenKind::KwReal).is_some();
                 // `parse_expression` includes `iff` as a low-precedence
                 // binary op (`BinaryOp::Iff`), so `v iff (guard)` parses
                 // as `Binary(Iff, v, guard)` — split that back into
@@ -2105,7 +2110,7 @@ impl Parser {
                 } else {
                     self.expect(TokenKind::Semicolon);
                 }
-                CovergroupItem::Coverpoint(Coverpoint { name, expr, iff_guard, bins, options: cp_options, span: self.span_from(start) })
+                CovergroupItem::Coverpoint(Coverpoint { name, expr, is_real, iff_guard, bins, options: cp_options, span: self.span_from(start) })
             }
             TokenKind::KwCross => {
                 self.bump();
