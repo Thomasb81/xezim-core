@@ -150,6 +150,13 @@ pub struct RewriteCtx {
     /// Interface-port substitutions (interface name → parent path). Per-branch
     /// in the recursion tree; cloning the small map is cheap.
     pub interface_map: HashMap<String, String>,
+    /// This instance's TYPE-PARAMETER bindings (name → resolved concrete
+    /// DataType), overrides and defaults alike. Behavioral items are inlined
+    /// per instance, but the global `typedef_types` entry for a type param is
+    /// restored after each instance — so a `CLASS_T obj;` in an initial block
+    /// had no binding left at run time and `obj = new()` never constructed.
+    /// `materialize` substitutes these into cloned statements' declarations.
+    pub type_binds: HashMap<String, DataType>,
 }
 
 #[derive(Debug, Clone)]
@@ -190,6 +197,7 @@ impl PendingAlways {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
+        let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope, like PendingInitial.
         // §21.2.1.7: if this block was inside a generate block, append the
@@ -214,6 +222,7 @@ impl PendingInitial {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
+        let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
         // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
         // record it (dot-trimmed) as the block's scope for name resolution.
         // §21.2.1.7: if this block was inside a generate block, append the
@@ -518,6 +527,30 @@ pub fn elaborate_class_with_params(
 ) -> ElaboratedClass {
     let const_scope = class_const_scope(c, scope_params);
     let class_params = Some(&const_scope);
+    // Scope for sizing UNPACKED dimensions (`bit [7:0] mem [N];`): the
+    // enclosing scope's parameters plus class-body localparams — both fixed
+    // per class. Header VALUE parameters are deliberately EXCLUDED: they can
+    // differ per specialization, and one ElaboratedClass records one array
+    // shape, so sizing from the default would give an overridden
+    // specialization a wrong FIXED size. Such properties stay queue-backed
+    // (indexing works; `size()`/`foreach` see the pushed elements only).
+    let unpacked_scope: HashMap<String, Value> = {
+        let mut m = scope_params.cloned().unwrap_or_default();
+        for item in &c.items {
+            if let ClassItem::Parameter(pd) = item {
+                if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for a in assignments {
+                        if let Some(init) = &a.init {
+                            let v = eval_const_expr_val(init, &m);
+                            m.insert(a.name.name.clone(), v);
+                        }
+                    }
+                }
+            }
+        }
+        m
+    };
+    let unpacked_params = Some(&unpacked_scope);
     // Declared type of each property, retained so the runtime can re-size a
     // property whose packed range depends on a class parameter for a
     // specialization other than the default (`box#(16)` vs `box#(8)`).
@@ -598,6 +631,34 @@ pub fn elaborate_class_with_params(
                     } else {
                         decl.dimensions.clone()
                     };
+                    // `mem[N]` parses as an ASSOCIATIVE dimension keyed by
+                    // "type N" (a bare identifier before `]` reads as a type).
+                    // When `N` is a known constant and NOT a typedef, rewrite
+                    // it to a fixed dimension — the class-property twin of
+                    // `normalize_unpacked_dims`. Without this the property was
+                    // classified associative/queue-backed: indexing worked but
+                    // `size()` lied and `foreach` iterated ZERO times.
+                    let effective_dims: Vec<UnpackedDimension> = effective_dims
+                        .into_iter()
+                        .map(|d| match d {
+                            UnpackedDimension::Associative { data_type: Some(dt), span } => {
+                                if let DataType::TypeReference { name, .. } = dt.as_ref() {
+                                    let n = name.name.name.clone();
+                                    let is_type = typedefs_snapshot(|td| {
+                                        td.is_some_and(|t| t.contains_key(&n))
+                                    });
+                                    if !is_type && unpacked_scope.contains_key(&n) {
+                                        return UnpackedDimension::Expression {
+                                            expr: Box::new(make_ident_expr(&n)),
+                                            span,
+                                        };
+                                    }
+                                }
+                                UnpackedDimension::Associative { data_type: Some(dt), span }
+                            }
+                            other => other,
+                        })
+                        .collect();
                     // Track virtual-interface properties for L4 binding +
                     // late-dispatch. See the comment on
                     // `ElaboratedClass::virtual_iface_properties`.
@@ -646,15 +707,15 @@ pub fn elaborate_class_with_params(
                             .map(|dm| match dm {
                                 UnpackedDimension::Range { left, right, .. } => {
                                     match (
-                                        const_eval_i64_with_params(left, None),
-                                        const_eval_i64_with_params(right, None),
+                                        const_eval_i64_with_params(left, unpacked_params),
+                                        const_eval_i64_with_params(right, unpacked_params),
                                     ) {
                                         (Some(l), Some(r)) => Some((l.min(r), l.max(r))),
                                         _ => None,
                                     }
                                 }
                                 UnpackedDimension::Expression { expr, .. } => {
-                                    match const_eval_i64_with_params(expr, None) {
+                                    match const_eval_i64_with_params(expr, unpacked_params) {
                                         Some(n) if n > 0 => Some((0, n - 1)),
                                         _ => None,
                                     }
@@ -672,7 +733,7 @@ pub fn elaborate_class_with_params(
                     match effective_dims.first() {
                         Some(UnpackedDimension::Queue { max_size, .. }) => {
                             let cap = max_size.as_ref().and_then(|e|
-                                const_eval_i64_with_params(e, None)).map(|n| (n + 1).max(1) as u32);
+                                const_eval_i64_with_params(e, unpacked_params)).map(|n| (n + 1).max(1) as u32);
                             queue_properties.insert(decl.name.name.clone(), (width.max(1), cap));
                         }
                         Some(UnpackedDimension::Unsized(_)) => {
@@ -688,7 +749,7 @@ pub fn elaborate_class_with_params(
                         // as a real fixed array (so `gpr[0]` defaults to its
                         // element value, not an empty-queue read of 0).
                         Some(UnpackedDimension::Expression { expr, .. }) => {
-                            match const_eval_i64_with_params(expr, None) {
+                            match const_eval_i64_with_params(expr, unpacked_params) {
                                 Some(n) if n > 0 => {
                                     array_properties.insert(
                                         decl.name.name.clone(),
@@ -704,8 +765,8 @@ pub fn elaborate_class_with_params(
                         // `m[lo:hi]` fixed unpacked array with constant bounds.
                         Some(UnpackedDimension::Range { left, right, .. }) => {
                             if let (Some(l), Some(r)) = (
-                                const_eval_i64_with_params(left, None),
-                                const_eval_i64_with_params(right, None),
+                                const_eval_i64_with_params(left, unpacked_params),
+                                const_eval_i64_with_params(right, unpacked_params),
                             ) {
                                 array_properties.insert(
                                     decl.name.name.clone(),
@@ -4288,6 +4349,11 @@ pub fn elaborate_module_with_defs(
             }
             ModuleItem::ClassDeclaration(cd) => {
                 validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
+                // Class-body enum typedef members are class constants; without
+                // this, `CB` in a method and `box::CB` both read x for classes
+                // declared in a MODULE body (package/$unit classes already
+                // registered).
+                register_class_enum_members(cd, &mut elab);
                 elab.classes.insert(
                     cd.name.name.clone(),
                     elaborate_class_with_params(cd, Some(&elab.parameters)),
@@ -7190,6 +7256,11 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
 
             ModuleItem::ClassDeclaration(cd) => {
                 validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
+                // Class-body enum typedef members are class constants; without
+                // this, `CB` in a method and `box::CB` both read x for classes
+                // declared in a MODULE body (package/$unit classes already
+                // registered).
+                register_class_enum_members(cd, elab);
                 elab.classes.insert(
                     cd.name.name.clone(),
                     elaborate_class_with_params(cd, Some(&elab.parameters)),
@@ -9738,6 +9809,7 @@ pub fn inline_instantiations(
     for (name, def) in definitions {
         match def {
             Definition::Class(c) => {
+                register_class_enum_members(c, elab);
                 let cls = elaborate_class_with_params(c, Some(&elab.parameters));
                 elab.classes.insert(name.clone(), cls);
             }
@@ -9810,6 +9882,7 @@ pub fn inline_instantiations(
                 for item in &p.items {
                     match item {
                         crate::ast::decl::PackageItem::Class(c) => {
+                            register_class_enum_members(c, elab);
                             elab.classes.insert(
                         c.name.name.clone(),
                         elaborate_class_with_params(c, Some(&elab.parameters)),
@@ -12107,13 +12180,17 @@ fn inline_module_items(
                                                         val = Value::from_f64(val.to_f64());
                                                     }
                                                 // An assignment-pattern override
-                                                // (`.M('{8'hAA, 8'hBB})`) needs the
+                                                // (`.M('{8'hAA, 8'hBB})` or a struct
+                                                // pattern `.CFG('{tag: ..})`) needs the
                                                 // formal's type to pack; the plain
                                                 // const-eval above yields 0 for it.
                                                 if let Some(pv) = pack_packed_vector_pattern(
                                                     data_type, v, scoped_eval_params,
                                                     &elab.typedef_types,
-                                                ) {
+                                                ).or_else(|| pack_struct_const_value(
+                                                    data_type, v, scoped_eval_params,
+                                                    &elab.typedefs, &elab.typedef_types,
+                                                )) {
                                                     val = pv;
                                                 }
                                                 break;
@@ -12172,7 +12249,10 @@ fn inline_module_items(
                                             if let Some(pv) = pack_packed_vector_pattern(
                                                 data_type, v, scoped_eval_params,
                                                 &elab.typedef_types,
-                                            ) {
+                                            ).or_else(|| pack_struct_const_value(
+                                                data_type, v, scoped_eval_params,
+                                                &elab.typedefs, &elab.typedef_types,
+                                            )) {
                                                 val = pv;
                                             }
                                             sub_params.insert(assignments[0].name.name.clone(), val);
@@ -12446,13 +12526,17 @@ fn inline_module_items(
                                         }
                                     // Non-keyed assignment-pattern DEFAULT on a
                                     // multi-dim packed vector (`parameter bit
-                                    // [1:0][7:0] M = '{8'h0F, 8'hF0}`): the
-                                    // plain const-eval above yields 0; pack by
+                                    // [1:0][7:0] M = '{8'h0F, 8'hF0}`) or a
+                                    // struct pattern (`'{tag: ..}`): the plain
+                                    // const-eval above yields 0; pack by
                                     // element like the override path does.
                                     if let Some(pv) = pack_packed_vector_pattern(
                                         data_type, init_eval, &sub_local_params,
                                         &elab.typedef_types,
-                                    ) {
+                                    ).or_else(|| pack_struct_const_value(
+                                        data_type, init_eval, &sub_local_params,
+                                        &elab.typedefs, &elab.typedef_types,
+                                    )) {
                                         val = pv;
                                     }
                                     sub_local_params.insert(assign.name.name.clone(), val);
@@ -13215,11 +13299,31 @@ fn inline_module_items(
                 // the duplicated port-map entries (on c910: ~10.8M -> ~1.2M),
                 // the dominant elaboration memory cost. `local_names` was already
                 // Rc-shared across sibling instances.
+                // Per-instance type-parameter bindings for statement
+                // substitution — see `RewriteCtx::type_binds`.
+                let mut pend_type_binds: HashMap<String, DataType> = HashMap::default();
+                for p_decl in sub_mod.params() {
+                    if let ParameterKind::Type { assignments } = &p_decl.kind {
+                        for a in assignments {
+                            let dt = type_overrides
+                                .iter()
+                                .find(|(n, _)| n == &a.name.name)
+                                .map(|(_, d)| d.clone())
+                                .or_else(|| a.init.clone());
+                            if let Some(dt) = dt {
+                                let resolved =
+                                    resolve_typedef_chain(&dt, &elab.typedef_types).clone();
+                                pend_type_binds.insert(a.name.name.clone(), resolved);
+                            }
+                        }
+                    }
+                }
                 let pend_ctx = std::rc::Rc::new(RewriteCtx {
                     prefix: inst_prefix.clone(),
                     port_map: rewrite_port_map.clone(),
                     local_names: std::rc::Rc::clone(&prepared_sub.local_names),
                     interface_map: sub_interface_map.clone(),
+                    type_binds: pend_type_binds,
                 });
 
                 // A task/function formal whose width uses a MODULE PARAMETER
@@ -14748,6 +14852,96 @@ fn rewrite_pattern(
     }
 }
 
+/// Substitute an instance's TYPE-PARAMETER bindings into the declarations of
+/// a cloned behavioral statement — see `RewriteCtx::type_binds`. Only a
+/// `VarDecl` whose type is a bare `TypeReference` naming a bound parameter is
+/// rewritten (to the full resolved concrete DataType); everything else passes
+/// through untouched, recursing into compound statements. No-op (identity,
+/// no clone churn beyond the move) when the binding map is empty.
+fn substitute_type_params_stmt(
+    stmt: Statement,
+    binds: &HashMap<String, DataType>,
+) -> Statement {
+    if binds.is_empty() {
+        return stmt;
+    }
+    let Statement { kind, span } = stmt;
+    let sub = |st: Box<Statement>| Box::new(substitute_type_params_stmt(*st, binds));
+    let kind = match kind {
+        StatementKind::VarDecl { data_type, lifetime, declarators } => {
+            let data_type = match &data_type {
+                DataType::TypeReference { name, dimensions, type_args, .. }
+                    if dimensions.is_empty()
+                        && type_args.is_empty()
+                        && name.scope.is_none()
+                        && binds.contains_key(&name.name.name) =>
+                {
+                    binds[&name.name.name].clone()
+                }
+                _ => data_type,
+            };
+            StatementKind::VarDecl { data_type, lifetime, declarators }
+        }
+        StatementKind::If { unique_priority, condition, then_stmt, else_stmt } => {
+            StatementKind::If {
+                unique_priority,
+                condition,
+                then_stmt: sub(then_stmt),
+                else_stmt: else_stmt.map(sub),
+            }
+        }
+        StatementKind::Case { unique_priority, kind, expr, items } => StatementKind::Case {
+            unique_priority,
+            kind,
+            expr,
+            items: items
+                .into_iter()
+                .map(|it| CaseItem {
+                    stmt: substitute_type_params_stmt(it.stmt, binds),
+                    ..it
+                })
+                .collect(),
+        },
+        StatementKind::For { init, condition, step, body } => {
+            StatementKind::For { init, condition, step, body: sub(body) }
+        }
+        StatementKind::Foreach { array, vars, body } => {
+            StatementKind::Foreach { array, vars, body: sub(body) }
+        }
+        StatementKind::While { condition, body } => {
+            StatementKind::While { condition, body: sub(body) }
+        }
+        StatementKind::DoWhile { body, condition } => {
+            StatementKind::DoWhile { body: sub(body), condition }
+        }
+        StatementKind::Repeat { count, body } => StatementKind::Repeat { count, body: sub(body) },
+        StatementKind::Forever { body } => StatementKind::Forever { body: sub(body) },
+        StatementKind::SeqBlock { name, stmts } => StatementKind::SeqBlock {
+            name,
+            stmts: stmts
+                .into_iter()
+                .map(|st| substitute_type_params_stmt(st, binds))
+                .collect(),
+        },
+        StatementKind::ParBlock { name, join_type, stmts } => StatementKind::ParBlock {
+            name,
+            join_type,
+            stmts: stmts
+                .into_iter()
+                .map(|st| substitute_type_params_stmt(st, binds))
+                .collect(),
+        },
+        StatementKind::TimingControl { control, stmt } => {
+            StatementKind::TimingControl { control, stmt: sub(stmt) }
+        }
+        StatementKind::Wait { condition, stmt } => {
+            StatementKind::Wait { condition, stmt: sub(stmt) }
+        }
+        other => other,
+    };
+    Statement { kind, span }
+}
+
 fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Statement {
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
@@ -15101,6 +15295,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             }
                         PackageItem::Class(c)
                             if &c.name.name == sym_name => {
+                                register_class_enum_members(c, elab);
                                 elab.classes.insert(
                         c.name.name.clone(),
                         elaborate_class_with_params(c, Some(&elab.parameters)),
@@ -15248,6 +15443,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             register_dpi_import(di, elab)?;
                         }
                         PackageItem::Class(c) => {
+                            register_class_enum_members(c, elab);
                             elab.classes.insert(
                         c.name.name.clone(),
                         elaborate_class_with_params(c, Some(&elab.parameters)),
