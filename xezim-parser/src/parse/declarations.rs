@@ -583,6 +583,16 @@ impl Parser {
                     self.bump();
                 }
                 let iface_name = self.parse_identifier();
+                // §25.9: the interface may be PARAMETERIZED —
+                // `virtual bus_if #(D, A) vif`. Without consuming the
+                // `#(...)` here the formal failed to parse entirely (the
+                // class-property form already accepted it via
+                // `parse_data_type`). The args are consumed and discarded like
+                // the modport below: the data type records only the interface,
+                // and the binding is resolved by name at elaboration.
+                if self.at(TokenKind::Hash) {
+                    let _ = self.parse_param_args();
+                }
                 // Optional `.<modport>` suffix — for now consumed and
                 // discarded (the data_type just records the iface).
                 if self.at(TokenKind::Dot) {
