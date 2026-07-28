@@ -9040,6 +9040,26 @@ fn pack_vector_pattern_dims(
     for it in items {
         match it {
             AssignmentPatternItem::Ordered(v) => {
+                // §10.9.1: inside an assignment pattern `N{expr…}` replicates
+                // pattern ELEMENTS, not bits — `'{4{8'h7E}}` is four 8-bit
+                // elements. Treating it as one element left the remaining
+                // slots unfilled, so the whole pattern bailed to 0.
+                if let ExprKind::Replication { count, exprs } = &v.kind {
+                    let reps = const_eval_i64_with_params(count, Some(params))?;
+                    if reps < 0 {
+                        return None;
+                    }
+                    for _ in 0..reps {
+                        for e in exprs {
+                            if next_ordered >= n {
+                                return None;
+                            }
+                            slots[next_ordered] = Some(eval_elem(e)?);
+                            next_ordered += 1;
+                        }
+                    }
+                    continue;
+                }
                 if next_ordered >= n {
                     return None; // more elements than slots — malformed, bail
                 }
