@@ -71,6 +71,12 @@ pub struct StructUnionType {
     pub kind: StructUnionKind,
     pub packed: bool,
     pub tagged: bool,
+    /// IEEE 1800-2023 §7.3.2 `union soft` — a packed union whose members need
+    /// not all be the same size; writing one member leaves the others'
+    /// unwritten bits unchanged rather than making them invalid. Only legal on
+    /// a `union`; `struct soft` is not a thing.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub soft: bool,
     pub signing: Option<Signing>,
     pub members: Vec<StructMember>,
     /// Packed array dimensions written AFTER the struct/union body

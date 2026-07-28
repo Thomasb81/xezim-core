@@ -144,6 +144,27 @@ impl Preprocessor {
 
     /// True when `trimmed` is the directive `\`<name>` followed by whitespace
     /// or end-of-line (so `\`line` matches but `\`linefoo` does not).
+    /// §34.2: does this `pragma`'s argument list OPEN a protected envelope?
+    /// Matches both `protect begin_protected` and the short `protect begin`.
+    /// A `begin_protected` may be followed by further arguments on the same
+    /// line, so only the leading keywords are inspected.
+    fn protect_envelope_opens(args: &str) -> bool {
+        let mut it = args.split_whitespace();
+        if it.next() != Some("protect") {
+            return false;
+        }
+        matches!(it.next(), Some("begin_protected") | Some("begin"))
+    }
+
+    /// §34.2: does this `pragma`'s argument list CLOSE a protected envelope?
+    fn protect_envelope_closes(args: &str) -> bool {
+        let mut it = args.split_whitespace();
+        if it.next() != Some("protect") {
+            return false;
+        }
+        matches!(it.next(), Some("end_protected") | Some("end"))
+    }
+
     fn is_directive(trimmed: &str, name: &str) -> bool {
         let tick = format!("`{}", name);
         if let Some(rest) = trimmed.strip_prefix(&tick) {
@@ -796,11 +817,32 @@ impl Preprocessor {
             }
             // §22.11 `pragma <pragma_name> ...` — the name is required.
             if Self::is_directive(trimmed, "pragma") {
-                if crate::strict_checks()
-                    && trimmed["`pragma".len()..].trim().is_empty()
-                {
+                let args = trimmed["`pragma".len()..].trim();
+                if crate::strict_checks() && args.is_empty() {
                     self.push_error_here(
                         "`pragma requires a pragma_name (IEEE 1800-2017 §22.11)".into());
+                }
+                // §34.2 protect pragmas: everything between
+                // `pragma protect begin_protected` and the matching
+                // `end_protected` (or the short `begin` / `end` pair) is
+                // PROTECTED payload — typically encrypted, and in general not
+                // valid SystemVerilog. It must never reach the lexer, where it
+                // explodes into Unknown tokens and unbalances the surrounding
+                // module. Skip to the matching end, emitting a newline per
+                // skipped line so diagnostics keep their line numbers.
+                if Self::protect_envelope_opens(args) {
+                    output.push('\n');
+                    for skipped in lines.by_ref() {
+                        self.current_line += 1;
+                        output.push('\n');
+                        let st = skipped.trim();
+                        if Self::is_directive(st, "pragma")
+                            && Self::protect_envelope_closes(st["`pragma".len()..].trim())
+                        {
+                            break;
+                        }
+                    }
+                    continue;
                 }
                 output.push('\n');
                 continue;

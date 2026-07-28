@@ -289,6 +289,11 @@ pub enum CovergroupItem {
 pub struct Coverpoint {
     pub name: Option<Identifier>,
     pub expr: Expression,
+    /// IEEE 1800-2023 §19.5 `coverpoint real <expr>` — the sampled expression
+    /// is real-valued, so bins are ranges over reals rather than over integral
+    /// values. False for an ordinary integral coverpoint.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_real: bool,
     /// LRM §19.5 `coverpoint x iff (guard)` — sample is skipped when the
     /// guard evaluates false. `None` means "always sample".
     #[cfg_attr(feature = "serde", serde(default))]
