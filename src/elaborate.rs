@@ -1112,6 +1112,16 @@ pub struct ElaboratedModule {
     /// governs both edges.
     #[serde(default)]
     pub gate_fall_delays: HashMap<String, u64>,
+    /// Nets driven by a lowered GATE PRIMITIVE (`buf`, `and`, …), by name.
+    ///
+    /// A gate lowers to an ordinary `ContinuousAssignment`, which makes it
+    /// indistinguishable from a user `assign` by the time the simulator fuses
+    /// one-bit copies into a buffer op. The two differ on `z`: §28.4's `buf`
+    /// truth table maps a `z` input to an `x` output, but §10.3 continuous
+    /// assignment passes the value through unchanged. Applying the gate rule
+    /// to both silently turned every `assign y = x;` into a z-eater.
+    #[serde(default)]
+    pub gate_driven_nets: std::collections::HashSet<String>,
     /// Associative array default values.
     pub assoc_defaults: HashMap<String, Expression>,
     /// Dynamic arrays / queues (size starts at 0, not pre-allocated range).
@@ -1379,6 +1389,15 @@ pub struct ElaboratedModule {
     /// so cache-hit runs keep multi-file `file:line` diagnostics.
     #[serde(default)]
     pub src_file_of_module: HashMap<String, u32>,
+    /// Line count of each source file BEFORE preprocessing, parallel to
+    /// `source_texts`. A `Span` indexes the PREPROCESSED text, where an
+    /// `\`include` has been spliced in whole, so a reported line can land far
+    /// past the end of the file it names — a 10-line file that includes 3000
+    /// lines reports line 3005. Keeping the original count lets a diagnostic
+    /// SAY that the number is post-expansion instead of quoting a line that
+    /// cannot exist.
+    #[serde(default)]
+    pub source_orig_lines: Vec<u32>,
 }
 
 /// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
@@ -1519,6 +1538,7 @@ impl ElaboratedModule {
             specify_delays: HashMap::default(),
             resolved_net_kinds: HashMap::default(),
             gate_fall_delays: HashMap::default(),
+            gate_driven_nets: std::collections::HashSet::default(),
             assoc_defaults: HashMap::default(),
             dynamic_arrays: HashSet::default(),
             net_strengths: HashMap::default(),
@@ -1569,6 +1589,7 @@ impl ElaboratedModule {
             source_texts: Vec::new(),
             source_files: Vec::new(),
             src_file_of_module: HashMap::default(),
+            source_orig_lines: Vec::new(),
         }
     }
 
@@ -3430,6 +3451,48 @@ pub fn elaborate_module_with_defs(
                                 }
                             }
                         }
+                        // A member that is itself a multi-dimensional PACKED
+                        // array (`logic [1:0][63:0] wdata;`) needs its element
+                        // width recorded so `arr[i].wdata[j]` selects a whole
+                        // lane. The non-array declarator path does this, but an
+                        // ARRAY of structs reaches `continue` before it, so the
+                        // select silently degraded to a 1-BIT read — a 64-bit
+                        // lane compared against one bit. Registered under the
+                        // DECLARATION name; the runtime aliases each element to
+                        // it. Applies whether or not the element is packed:
+                        // an unpacked struct still stores `wdata` as one signal.
+                        {
+                            let mut pending: Vec<(String, u32)> = Vec::new();
+                            let mut pending_dims: Vec<(String, Vec<(i64, i64)>)> = Vec::new();
+                            if let DataType::Struct(su) =
+                                resolve_typedef_chain(elem_resolved, &elab.typedef_types)
+                            {
+                                for m in &su.members {
+                                    let ew = packed_inner_elem_width(
+                                        &m.data_type,
+                                        &elab.parameters,
+                                        &elab.typedefs,
+                                    );
+                                    let fd = packed_full_dims_of(&m.data_type, &elab.parameters);
+                                    for mdecl in &m.declarators {
+                                        let key =
+                                            format!("{}.{}", decl.name.name, mdecl.name.name);
+                                        if let Some(ew) = ew {
+                                            pending.push((key.clone(), ew));
+                                        }
+                                        if let Some(fd) = &fd {
+                                            pending_dims.push((key, fd.clone()));
+                                        }
+                                    }
+                                }
+                            }
+                            for (k, ew) in pending {
+                                elab.packed_signal_elem_widths.insert(k, ew);
+                            }
+                            for (k, fd) in pending_dims {
+                                elab.packed_full_dims.insert(k, fd);
+                            }
+                        }
                     };
                     // IEEE 1800-2017 §7.4.5: a DYNAMIC outer dimension with
                     // FIXED trailing dimensions — `mailbox mbx[][16]`,
@@ -3972,6 +4035,8 @@ pub fn elaborate_module_with_defs(
                                 if let Some(ew) = packed_inner_elem_width(&m.data_type, &elab.parameters, &elab.typedefs) {
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
+                                        if std::env::var_os("XEZIM_PEW_DBG").is_some() {
+                                        }
                                         elab.packed_signal_elem_widths.insert(key, ew);
                                     }
                                 }
@@ -15020,6 +15085,11 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
         .map(|d| eval_const_expr(d, &elab.parameters));
     let pairs = gate_inst_to_assign_pairs(gi);
     for (lhs, rhs) in pairs {
+        // Mark the driven net as gate-driven so the runtime keeps §28.4 truth-
+        // table semantics for it and only for it.
+        if let Some(n) = ident_flat_name(&lhs) {
+            elab.gate_driven_nets.insert(n);
+        }
         if let Some(f) = fall {
             if f != delay {
                 if let Some(n) = ident_flat_name(&lhs) {

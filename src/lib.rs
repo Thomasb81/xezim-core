@@ -562,6 +562,12 @@ pub fn parse_and_elaborate_multi(
     elab.source_texts = texts;
     elab.source_files = files;
     elab.src_file_of_module = src_file_of_module;
+    // Captured from the RAW sources — the only place the pre-preprocessing
+    // line counts are still known.
+    elab.source_orig_lines = sources
+        .iter()
+        .map(|s| s.lines().count() as u32)
+        .collect();
     Ok((defs, elab))
 }
 
