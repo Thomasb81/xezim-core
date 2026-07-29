@@ -4157,9 +4157,19 @@ pub fn elaborate_module_with_defs(
                         signed = true;
                     }
                     for assign in assignments {
+                        // The pre-seed exemption only vouches for the
+                        // parameter's OWN fixpoint-seeded value. If the name
+                        // has a recorded declaration site by now, something
+                        // else (an enum member, an imported symbol) declared
+                        // it first — the pre-seed merely overwrote it, and
+                        // consuming the exemption silently accepted e.g.
+                        // `typedef enum {BUSY} …; parameter int BUSY = 5;`,
+                        // which every other simulator rejects.
+                        let self_seeded = preseed_dup_exempt.remove(&assign.name.name)
+                            && !elab.decl_sites.contains_key(&assign.name.name);
                         if (elab.signals.contains_key(&assign.name.name)
                             || elab.parameters.contains_key(&assign.name.name))
-                            && !preseed_dup_exempt.remove(&assign.name.name)
+                            && !self_seeded
                         {
                             if elab.claim_local_decl_displacement(&assign.name.name, assign.name.span, "parameter/localparam") {
                                 elab.parameters.remove(&assign.name.name);
@@ -15945,6 +15955,61 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             if &td.name.name == sym_name => {
                                 process_typedef(td, elab);
                                 found = true;
+                            }
+                        // §26.2.2: an enum MEMBER can be imported by name —
+                        // `import ep::BUSY;` makes just that member visible.
+                        // Only typedef NAMES matched here before, so a member
+                        // import died with "Symbol not found in package".
+                        // Register the one member (bare-name constant+signal,
+                        // exactly as a wildcard import would) plus the
+                        // typedef's ordered member list, which `.name()` /
+                        // `.next()` resolve through.
+                        PackageItem::Typedef(td)
+                            if matches!(&td.data_type, DataType::Enum(_)) => {
+                                if let DataType::Enum(et) = &td.data_type {
+                                    let base_width = et.base_type.as_ref()
+                                        .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
+                                        .unwrap_or(32);
+                                    let mut next_val: u64 = 0;
+                                    let mut members_ordered: Vec<(String, u64)> = Vec::new();
+                                    for member in &et.members {
+                                        let (entries, nv) =
+                                            expand_enum_member(member, next_val, &elab.parameters);
+                                        next_val = nv;
+                                        for (nm, val) in entries {
+                                            if &nm == sym_name {
+                                                let v = Value::from_u64(val, base_width);
+                                                elab.note_decl_site(
+                                                    &nm,
+                                                    member.name.span,
+                                                    &format!("imported from package '{}'", pkg_name),
+                                                    false,
+                                                );
+                                                elab.parameters.insert(nm.clone(), v.clone());
+                                                elab.signals.insert(nm.clone(), Signal {
+                                                    is_const: false,
+                                                    name: nm.clone(),
+                                                    width: base_width,
+                                                    is_signed: false,
+                                                    is_real: false,
+                                                    direction: None,
+                                                    value: v,
+                                                    type_name: Some(td.name.name.clone()),
+                                                });
+                                                found = true;
+                                            }
+                                            members_ordered.push((nm, val));
+                                        }
+                                    }
+                                    if found {
+                                        elab.typedefs
+                                            .entry(td.name.name.clone())
+                                            .or_insert(base_width);
+                                        elab.enum_members
+                                            .entry(td.name.name.clone())
+                                            .or_insert(members_ordered);
+                                    }
+                                }
                             }
                         PackageItem::Function(fd)
                             if &fd.name.name.name == sym_name && fd.name.scope.is_none() => {
