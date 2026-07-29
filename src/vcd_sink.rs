@@ -49,9 +49,22 @@ pub struct VcdTimestep {
     pub changes: Vec<(Arc<str>, Value)>,
 }
 
+/// One XTrace time slot's records, still in VALUE form. The worker renders the
+/// `T,` / `D,` / `P,` / `X,` records — the ASCII conversion is the expensive
+/// part of an XTrace dump and does not belong on the simulation thread.
+pub struct XtraceTimestep {
+    /// `Some(d)` → emit a `T,+d` time-advance record before the changes.
+    pub time_delta: Option<u64>,
+    /// (XTrace dictionary id, value, is_real, is_string).
+    pub changes: Vec<(Arc<str>, Value, bool, bool)>,
+    /// Dictionary ids of §19.5 events that fired in this slot (`X,event,sig=`).
+    pub events: Vec<Arc<str>>,
+}
+
 enum WorkerMsg {
     Chunk(Vec<u8>),
     VcdBatch(Vec<VcdTimestep>),
+    XtraceBatch(Vec<XtraceTimestep>),
     /// Force the worker's `BufWriter` (and any streaming zstd encoder) to
     /// flush accumulated bytes to the OS file, so a later crash/SIGKILL of
     /// the main process leaves a readable partial dump.
@@ -64,6 +77,7 @@ enum Mode {
     Threaded {
         buf: Vec<u8>,
         pending: Vec<VcdTimestep>,
+        pending_xt: Vec<XtraceTimestep>,
         tx: Option<Sender<WorkerMsg>>,
         handle: Option<JoinHandle<()>>,
     },
@@ -97,6 +111,11 @@ impl VcdSink {
                                 }
                             }
                         }
+                        WorkerMsg::XtraceBatch(batch) => {
+                            for ts in &batch {
+                                write_xtrace_timestep(&mut bw, ts);
+                            }
+                        }
                         WorkerMsg::Flush => { let _ = bw.flush(); }
                         WorkerMsg::Shutdown => break,
                     }
@@ -110,6 +129,7 @@ impl VcdSink {
             mode: Mode::Threaded {
                 buf: Vec::with_capacity(CHUNK_CAPACITY),
                 pending: Vec::with_capacity(VCD_BATCH_FLUSH),
+                pending_xt: Vec::new(),
                 tx: Some(tx),
                 handle: Some(handle),
             },
@@ -157,11 +177,37 @@ impl VcdSink {
         }
     }
 
+    /// XTrace counterpart of `post_vcd_changes`: hand one time slot's records to
+    /// the worker in VALUE form so the `D`/`P`/`X` record rendering — which
+    /// walks every bit of every changed value — happens off the simulation
+    /// thread. In inline mode it is rendered here, as before.
+    ///
+    /// A `VcdSink` instance carries either VCD batches or XTrace batches (the
+    /// simulator holds separate sinks for the two dumps), so only the byte
+    /// buffer has to be ordered against this one.
+    pub fn post_xtrace_changes(&mut self, ts: XtraceTimestep) {
+        match &mut self.mode {
+            Mode::Inline(w) => write_xtrace_timestep(w, &ts),
+            Mode::Threaded { buf, pending_xt, tx: Some(tx), .. } => {
+                if !buf.is_empty() {
+                    let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
+                    let _ = tx.send(WorkerMsg::Chunk(chunk));
+                }
+                pending_xt.push(ts);
+                if pending_xt.len() >= VCD_BATCH_FLUSH {
+                    let batch = std::mem::take(pending_xt);
+                    let _ = tx.send(WorkerMsg::XtraceBatch(batch));
+                }
+            }
+            _ => {}
+        }
+    }
+
     /// Hand any pending bytes and VCD batches to the worker. In inline
     /// mode this is a no-op; `BufWriter` handles batching. Called at
     /// natural boundaries; `Drop` flushes whatever is left.
     pub fn commit(&mut self) {
-        if let Mode::Threaded { buf, pending, tx: Some(tx), .. } = &mut self.mode {
+        if let Mode::Threaded { buf, pending, pending_xt, tx: Some(tx), .. } = &mut self.mode {
             if buf.len() >= COMMIT_THRESHOLD {
                 let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
                 let _ = tx.send(WorkerMsg::Chunk(chunk));
@@ -170,7 +216,171 @@ impl VcdSink {
                 let batch = std::mem::replace(pending, Vec::with_capacity(VCD_BATCH_FLUSH));
                 let _ = tx.send(WorkerMsg::VcdBatch(batch));
             }
+            if pending_xt.len() >= VCD_BATCH_FLUSH {
+                let batch = std::mem::take(pending_xt);
+                let _ = tx.send(WorkerMsg::XtraceBatch(batch));
+            }
         }
+    }
+}
+
+/// Render an XTrace value token (§15).
+///
+/// * `string` (`is_string`): a §15.4 quoted, escaped literal, not a bit blob.
+/// * `real` (`is_real`): a DECIMAL number — the same spelling the VCD path uses.
+///   §9.3's type list is *recommended*, not exhaustive, so a `real` signal
+///   carrying a decimal value is a legitimate producer choice; §15.1 explicitly
+///   allows decimal "where semantically better".
+/// * fully-known: `0x<hex>`.
+/// * all-x / all-z: the compact `X` / `Z` forms of §15.3. A 128-bit all-z net
+///   then costs 1 byte on the line instead of 130; 4-state designs sit at x/z
+///   for most of reset, and full-width binary made XTrace several times LARGER
+///   than the equivalent VCD.
+/// * mixed x/z: FULL-WIDTH `0b<bits>`, every bit spelled out. VCD's leading-run
+///   suppression is deliberately NOT copied: it is legal there only because
+///   §21.7.2.1 defines a left-EXTENSION rule for a value shorter than its `$var`
+///   width. XTrace defines no such rule, so a partially collapsed vector would
+///   be unparseable.
+///
+/// Lives here, next to `write_xtrace_timestep`, because the writer thread calls
+/// it: value→ASCII conversion is the bulk of an XTrace dump's cost and is what
+/// the background writer exists to absorb.
+pub fn xtrace_format_value(val: &Value, is_real: bool, is_string: bool) -> String {
+    if is_string {
+        // §9.3 `str` type + §15.4: a string signal is emitted as a quoted,
+        // escaped literal, not a 1024-bit hex blob. §8.5 escapes only.
+        let mut s = String::with_capacity(val.width as usize / 8 + 2);
+        s.push('"');
+        for b in val.sv_string_bytes() {
+            match b {
+                b'\\' => s.push_str("\\\\"),
+                b'"' => s.push_str("\\\""),
+                b'\n' => s.push_str("\\n"),
+                b'\t' => s.push_str("\\t"),
+                // A raw comma inside a quoted value is spec-legal (a parser that
+                // honours quotes handles it), but XTrace records are
+                // comma-delimited and design goal #1 is "easy to parse", so
+                // escape it via §8.5 `\xHH` to stay safe for naive splitters.
+                b',' => s.push_str("\\x2c"),
+                0x20..=0x7e => s.push(b as char),
+                other => s.push_str(&format!("\\x{:02x}", other)),
+            }
+        }
+        s.push('"');
+        return s;
+    }
+    if is_real || val.is_real {
+        return vcd_real_string(val.to_f64());
+    }
+    if val.has_xz() {
+        let w = val.width as usize;
+        // §15.3 compact unknowns: `X` iff EVERY bit is x, `Z` iff every bit is
+        // z. A mixed vector (or one with known bits) keeps full width.
+        let (mut all_x, mut all_z) = (true, true);
+        for i in 0..w {
+            match val.get_bit(i) {
+                LogicBit::X => all_z = false,
+                LogicBit::Z => all_x = false,
+                _ => {
+                    all_x = false;
+                    all_z = false;
+                    break;
+                }
+            }
+        }
+        if w > 0 && all_x {
+            return "X".to_string();
+        }
+        if w > 0 && all_z {
+            return "Z".to_string();
+        }
+        // Per-bit binary representation preserves X/Z exactly.
+        let mut s = String::with_capacity(w + 2);
+        s.push_str("0b");
+        for i in (0..w).rev() {
+            s.push(match val.get_bit(i) {
+                LogicBit::Zero => '0',
+                LogicBit::One => '1',
+                LogicBit::X => 'X',
+                LogicBit::Z => 'Z',
+            });
+        }
+        s
+    } else if val.width <= 64 {
+        format!("0x{:x}", val.to_u64().unwrap_or(0))
+    } else {
+        // Wide all-known: emit as hex, MSB first.
+        let mut s = String::with_capacity((val.width as usize).div_ceil(4) + 2);
+        s.push_str("0x");
+        let mut started = false;
+        let nibble_count = (val.width as usize).div_ceil(4);
+        for n in (0..nibble_count).rev() {
+            let mut nib: u32 = 0;
+            for b in 0..4 {
+                let bit_idx = n * 4 + b;
+                if bit_idx < val.width as usize {
+                    if let LogicBit::One = val.get_bit(bit_idx) {
+                        nib |= 1 << b;
+                    }
+                }
+            }
+            if nib != 0 || started || n == 0 {
+                s.push(char::from_digit(nib, 16).unwrap());
+                started = true;
+            }
+        }
+        s
+    }
+}
+
+/// Render one XTrace time slot (§18 trace records). Shared by the inline path
+/// and the writer thread so the two can never diverge.
+///
+/// `T,+delta` advances time; a single change is a `D,<id>,<val>` record, several
+/// are packed 16-per-`P` record, and each fired event adds `X,event,sig=<id>`.
+fn write_xtrace_timestep<W: Write>(w: &mut W, ts: &XtraceTimestep) {
+    if let Some(delta) = ts.time_delta {
+        let _ = writeln!(w, "T,+{}", delta);
+    }
+    if ts.changes.len() == 1 {
+        let (id, val, is_real, is_string) = &ts.changes[0];
+        let _ = writeln!(w, "D,{},{}", id, xtrace_format_value(val, *is_real, *is_string));
+    } else if !ts.changes.is_empty() {
+        for chunk in ts.changes.chunks(16) {
+            let _ = write!(w, "P");
+            for (id, val, is_real, is_string) in chunk {
+                let _ = write!(w, ",{}={}", id, xtrace_format_value(val, *is_real, *is_string));
+            }
+            let _ = writeln!(w);
+        }
+    }
+    // §10.4 `X,<event_type>[,k=v]*`. The event_type names the record family
+    // (`event` — an SV event object fired); the `sig=` attribute points at the
+    // object's own dictionary id, which is why an event keeps an `S` record even
+    // though it carries no value. `X` inherits the current time from the T
+    // record above (§19.3), so no timestamp is repeated.
+    for id in &ts.events {
+        let _ = writeln!(w, "X,event,sig={}", id);
+    }
+}
+
+/// Hand every buffered RECORD batch (VCD and XTrace) to the worker. Must run
+/// before any raw byte chunk is enqueued, or a header/footer written through
+/// `std::io::Write` would overtake records that were produced earlier — which
+/// silently truncates the tail of a dump when the closing `@section end` is
+/// written while a partial batch is still buffered here.
+fn dispatch_batches(
+    pending: &mut Vec<VcdTimestep>,
+    pending_xt: &mut Vec<XtraceTimestep>,
+    tx: &Sender<WorkerMsg>,
+) {
+    if !pending.is_empty() {
+        let batch = std::mem::replace(pending, Vec::with_capacity(VCD_BATCH_FLUSH));
+        let _ = tx.send(WorkerMsg::VcdBatch(batch));
+    }
+    if !pending_xt.is_empty() {
+        let batch = std::mem::take(pending_xt);
+        let _ = tx.send(WorkerMsg::XtraceBatch(batch));
     }
 }
 
@@ -178,11 +388,8 @@ impl Write for VcdSink {
     fn write(&mut self, data: &[u8]) -> io::Result<usize> {
         match &mut self.mode {
             Mode::Inline(w) => w.write(data),
-            Mode::Threaded { buf, pending, tx: Some(tx), .. } => {
-                if !pending.is_empty() {
-                    let batch = std::mem::replace(pending, Vec::with_capacity(VCD_BATCH_FLUSH));
-                    let _ = tx.send(WorkerMsg::VcdBatch(batch));
-                }
+            Mode::Threaded { buf, pending, pending_xt, tx: Some(tx), .. } => {
+                dispatch_batches(pending, pending_xt, tx);
                 buf.extend_from_slice(data);
                 Ok(data.len())
             }
@@ -199,15 +406,12 @@ impl Write for VcdSink {
             // Unlike `commit()` (threshold-gated), a flush must force ALL
             // buffered work to the worker AND have the worker flush its own
             // BufWriter to disk — otherwise a crash loses the tail of the dump.
-            Mode::Threaded { buf, pending, tx: Some(tx), .. } => {
+            Mode::Threaded { buf, pending, pending_xt, tx: Some(tx), .. } => {
                 if !buf.is_empty() {
                     let chunk = std::mem::replace(buf, Vec::with_capacity(CHUNK_CAPACITY));
                     let _ = tx.send(WorkerMsg::Chunk(chunk));
                 }
-                if !pending.is_empty() {
-                    let batch = std::mem::replace(pending, Vec::with_capacity(VCD_BATCH_FLUSH));
-                    let _ = tx.send(WorkerMsg::VcdBatch(batch));
-                }
+                dispatch_batches(pending, pending_xt, tx);
                 let _ = tx.send(WorkerMsg::Flush);
                 Ok(())
             }
@@ -218,16 +422,13 @@ impl Write for VcdSink {
 
 impl Drop for VcdSink {
     fn drop(&mut self) {
-        if let Mode::Threaded { buf, pending, tx, handle, .. } = &mut self.mode {
+        if let Mode::Threaded { buf, pending, pending_xt, tx, handle } = &mut self.mode {
             if let Some(tx_ref) = tx.as_ref() {
                 if !buf.is_empty() {
                     let chunk = std::mem::take(buf);
                     let _ = tx_ref.send(WorkerMsg::Chunk(chunk));
                 }
-                if !pending.is_empty() {
-                    let batch = std::mem::take(pending);
-                    let _ = tx_ref.send(WorkerMsg::VcdBatch(batch));
-                }
+                dispatch_batches(pending, pending_xt, tx_ref);
             }
             if let Some(tx) = tx.take() {
                 let _ = tx.send(WorkerMsg::Shutdown);

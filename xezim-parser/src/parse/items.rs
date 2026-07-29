@@ -1234,12 +1234,18 @@ impl Parser {
             self.expect(TokenKind::RParen);
         }
         // Optional `#(delay)` or `#delay` spec between the gate keyword and
-        // the first instance: `buf #(D) name (...)`. Capture the FIRST delay
-        // expression (rise/fall/turn-off lists collapse to it); skip the rest.
+        // the first instance: `buf #(D) name (...)`. §28.11: the list is
+        // `(rise, fall, turn-off)` — capture rise AND fall (the turn-off value
+        // is still skipped). Collapsing fall onto rise made every 1->0 edge
+        // use the rise delay.
         let mut delay: Option<Expression> = None;
+        let mut delay_fall: Option<Expression> = None;
         if self.eat(TokenKind::Hash).is_some() {
             if self.eat(TokenKind::LParen).is_some() {
                 delay = Some(self.parse_expression());
+                if self.eat(TokenKind::Comma).is_some() {
+                    delay_fall = Some(self.parse_expression());
+                }
                 let mut depth = 1;
                 while depth > 0 && !self.at(TokenKind::Eof) {
                     match self.current_kind() {
@@ -1268,7 +1274,7 @@ impl Parser {
             if self.eat(TokenKind::Comma).is_none() { break; }
         }
         self.expect(TokenKind::Semicolon);
-        GateInstantiation { gate_type, delay, instances, span: self.span_from(start) }
+        GateInstantiation { gate_type, delay, delay_fall, instances, span: self.span_from(start) }
     }
 
     fn parse_generate_if(&mut self, start: usize) -> ModuleItem {
