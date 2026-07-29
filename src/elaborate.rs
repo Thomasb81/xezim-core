@@ -1819,6 +1819,26 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             next_val = nv;
             for (nm, val) in entries {
                 let v = Value::from_u64(val, base_width);
+                // §6.19: an enum member name belongs to its ENCLOSING scope,
+                // but these are registered in one flat namespace, so a later
+                // enum with a same-named member silently overwrote an earlier
+                // one — `class ca; enum {DUP=5} …` and `class cb; enum
+                // {DUP=11} …` both resolved to 11. Scoping the namespace is a
+                // deeper change; until then, never let the clobber be silent.
+                // Only a CONFLICTING value is reported: re-registering the same
+                // name with the same value is harmless (e.g. a package enum
+                // imported into several scopes).
+                if let Some(prev) = elab.parameters.get(&nm) {
+                    if prev.to_u64() != Some(val) {
+                        let prev_s = prev
+                            .to_u64()
+                            .map(|x| x.to_string())
+                            .unwrap_or_else(|| "x".into());
+                        crate::elab_diag(format!(
+                            "[xezim][warning] enum member '{nm}' redefined with a different value ({prev_s} -> {val}); the later definition wins for unqualified references. Enum member names share one namespace here, so qualify the reference (`pkg::{nm}` / `Class::{nm}`) or rename one member (IEEE 1800-2017 \u{00a7}6.19)."
+                        ));
+                    }
+                }
                 elab.parameters.insert(nm.clone(), v.clone());
                 elab.signals.insert(nm.clone(), Signal { is_const: false,
                     name: nm.clone(),
