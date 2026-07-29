@@ -1268,6 +1268,36 @@ pub struct ElaboratedModule {
     /// Used to resolve `.name()` / `.next()` / `.first()` etc.
     #[serde(default)]
     pub enum_members: HashMap<String, Vec<(String, u64)>>,
+    /// IEEE 1800-2017 §26.3: enum members grouped by their declaring PACKAGE,
+    /// as `package -> member -> (value, width)`.
+    ///
+    /// Members are otherwise reachable only through the flat design-wide
+    /// name maps, so `pkg::NAME` was answered by stripping the scope and
+    /// looking `NAME` up bare. That works right up until a local declaration
+    /// legally shadows `NAME`, at which point the qualified form — the one
+    /// way §26.3 leaves the member reachable — silently read the LOCAL
+    /// instead. This map keeps the package's own view addressable.
+    #[serde(default)]
+    pub package_enum_members: HashMap<String, HashMap<String, (u64, u32)>>,
+    /// Where each name was FIRST declared, as `name -> (span, what it was)`.
+    /// Only the first declaration is kept — that is the one a duplicate-
+    /// declaration error needs to point at, and it is the one a later
+    /// declaration cannot see. `what it was` is a short human phrase
+    /// ("parameter", "enum member of state_e", "imported from pkg p") because
+    /// the surprise in these errors is usually not WHERE the first declaration
+    /// is but WHAT it is.
+    #[serde(default)]
+    pub decl_sites: HashMap<String, (Span, String, bool)>,
+    /// §26.3: names declared in packages this module does NOT import (see
+    /// `compute_foreign_package_names`). A local declaration of one of these
+    /// is legal and must win — they are only visible at all because package
+    /// contents are registered in one flat design-wide namespace.
+    #[serde(default)]
+    pub foreign_package_names: std::collections::HashSet<String>,
+    /// Foreign-package names a local declaration has already displaced. A
+    /// module gets ONE such declaration per name; a second is a real duplicate.
+    #[serde(default)]
+    pub foreign_displaced: std::collections::HashSet<String>,
     /// IEEE 1800-2017 §6.2: names of 2-state-typed signals (bit, byte,
     /// shortint, int, longint). Assignments to these coerce X/Z
     /// source bits to 0.
@@ -1369,6 +1399,62 @@ impl ElaboratedModule {
     /// `output [31:0] x; T x;`). Implicit types (a bare `output x;` direction
     /// line, or `wire x;`) are ignored, so the legal non-ANSI split where only
     /// one declaration carries a type still elaborates.
+
+    /// True when a local declaration of `name` legally displaces whatever the
+    /// design-wide maps already hold for it, rather than conflicting with it:
+    /// either §26.3 shadowing of a wildcard-imported name, or a name that only
+    /// appeared because some package this module never imported declares it.
+    /// Both mean "the local wins"; neither is an error.
+    ///
+    /// Non-consuming — this is also what suppresses the repeated design-wide
+    /// re-registration of the displaced name, which has to keep applying for
+    /// the whole elaboration. Use `claim_local_decl_displacement` for the
+    /// once-per-name decision at a declaration.
+    pub fn local_decl_displaces(&self, name: &str) -> bool {
+        self.wildcard_shadowed.contains(name) || self.foreign_package_names.contains(name)
+    }
+
+    /// `local_decl_displaces`, but true only the FIRST time it is asked about a
+    /// foreign-package name. A module is entitled to one declaration that
+    /// displaces the package's; a SECOND declaration of the same name is an
+    /// ordinary duplicate and must still be reported as one.
+    pub fn claim_local_decl_displacement(&mut self, name: &str, span: Span, kind: &str) -> bool {
+        let claimed = self.wildcard_shadowed.contains(name)
+            || (self.foreign_package_names.contains(name)
+                && self.foreign_displaced.insert(name.to_string()));
+        if claimed && !(span.start == 0 && span.end == 0) {
+            // The displaced declaration is no longer what `name` refers to
+            // here, so it must stop being the "first declaration" a later
+            // duplicate is blamed on — a second local declaration would
+            // otherwise be pointed at a package member it has nothing to do
+            // with. This one supersedes it, so overwrite rather than remove:
+            // callers record their site at inconsistent points relative to
+            // this check, and some never do.
+            self.decl_sites
+                .insert(name.to_string(), (span, kind.to_string(), true));
+        }
+        claimed
+    }
+
+    /// Remember where `name` was first declared, and as what. Later calls for
+    /// the same name are ignored: a duplicate-declaration error has to point at
+    /// the ORIGINAL, and overwriting would make it point at the duplicate.
+    /// A synthesized (dummy) span records nothing — an entry with no location
+    /// would only suppress the fallback description in the error text.
+    /// `own_scope` says the span is in the source of the module being
+    /// elaborated. That decides whether the span may be resolved with the
+    /// "prefer this module's file" hint: for a declaration that came from
+    /// somewhere else (a package's enum member, an imported parameter) the
+    /// hint would confidently name the wrong file.
+    pub fn note_decl_site(&mut self, name: &str, span: Span, kind: &str, own_scope: bool) {
+        if span.start == 0 && span.end == 0 {
+            return;
+        }
+        self.decl_sites
+            .entry(name.to_string())
+            .or_insert_with(|| (span, kind.to_string(), own_scope));
+    }
+
     fn note_explicit_type(&mut self, name: &str, dt: &DataType, span: Span) -> Result<(), String> {
         // A *bare* implicit type — `output x;` / `wire x;` (no range, no
         // signing) — carries no type; it is the legal half of a non-ANSI split
@@ -1388,12 +1474,13 @@ impl ElaboratedModule {
             | DataType::Simple { .. } | DataType::Struct(_) | DataType::Enum(_));
         if let Some(&prev_incompat) = self.typed_decls.get(name) {
             if incompat || prev_incompat {
-                return Err(duplicate_decl_error(self, name, span, "this"));
+                return Err(duplicate_decl_error(self, name, span, "variable/net"));
             }
         }
         self.typed_decls.entry(name.to_string())
             .and_modify(|v| *v = *v || incompat)
             .or_insert(incompat);
+        self.note_decl_site(name, span, "variable/net", true);
         Ok(())
     }
 
@@ -1466,6 +1553,10 @@ impl ElaboratedModule {
             timeprecision_exp: default_timeunit_exp(),
             module_timescale_exp: HashMap::default(),
             enum_members: HashMap::default(),
+            package_enum_members: HashMap::default(),
+            decl_sites: HashMap::default(),
+            foreign_package_names: std::collections::HashSet::default(),
+            foreign_displaced: std::collections::HashSet::default(),
             two_state_signals: HashSet::default(),
             z_init_signals: HashSet::default(),
             pending_always: Vec::new(),
@@ -1819,6 +1910,24 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             next_val = nv;
             for (nm, val) in entries {
                 let v = Value::from_u64(val, base_width);
+                // §26.3: a local declaration shadows a wildcard-imported name,
+                // and the enum members of an imported package are registered
+                // under their BARE name. The declaration walk removes the
+                // shadowed member when it reaches the local decl, but
+                // `process_typedef` runs several more times for the same
+                // package afterwards (once per import site and per re-export
+                // hop), and each of those re-inserted the member — silently
+                // undoing the shadow. The local then read the enum's value and
+                // carried the enum's WIDTH, so `int INIT_STATE = 500;` sitting
+                // under `import p::*` became a 2-bit signal reading 0.
+                //
+                // The member still joins `members_ordered`, so it stays
+                // reachable the only way §26.3 allows once shadowed: qualified
+                // as `pkg::NAME`.
+                if elab.local_decl_displaces(&nm) {
+                    members_ordered.push((nm.clone(), val));
+                    continue;
+                }
                 // §6.19: an enum member name belongs to its ENCLOSING scope,
                 // but these are registered in one flat namespace, so a later
                 // enum with a same-named member silently overwrote an earlier
@@ -1839,6 +1948,12 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                         ));
                     }
                 }
+                elab.note_decl_site(
+                    &nm,
+                    member.name.span,
+                    &format!("enum member of '{}'", td.name.name),
+                    false,
+                );
                 elab.parameters.insert(nm.clone(), v.clone());
                 elab.signals.insert(nm.clone(), Signal { is_const: false,
                     name: nm.clone(),
@@ -2640,6 +2755,7 @@ pub fn elaborate_module_with_defs(
     // — the local declaration shadows the imported one (no duplicate error).
     if let Some(defs) = all_defs {
         elab.wildcard_shadowed = compute_wildcard_shadowed(module.items(), defs);
+        elab.foreign_package_names = compute_foreign_package_names(module.items(), defs);
     }
     // §6.20 — resolve the module's own parameters to a FIXPOINT before walking
     // the items, so a declaration whose width depends on one of them is sized
@@ -2756,7 +2872,7 @@ pub fn elaborate_module_with_defs(
                 let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
-                        if elab.wildcard_shadowed.contains(&decl.name.name) {
+                        if elab.claim_local_decl_displacement(&decl.name.name, decl.name.span, "variable/net") {
                             elab.parameters.remove(&decl.name.name);
                             elab.signals.remove(&decl.name.name);
                         } else {
@@ -2827,7 +2943,7 @@ pub fn elaborate_module_with_defs(
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
-                        if elab.wildcard_shadowed.contains(&decl.name.name) {
+                        if elab.claim_local_decl_displacement(&decl.name.name, decl.name.span, "variable/net") {
                             elab.parameters.remove(&decl.name.name);
                             elab.signals.remove(&decl.name.name);
                         } else {
@@ -3118,7 +3234,7 @@ pub fn elaborate_module_with_defs(
                         continue;
                     }
                     if (elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name))
-                        && elab.wildcard_shadowed.contains(&decl.name.name) {
+                        && elab.claim_local_decl_displacement(&decl.name.name, decl.name.span, "variable/net") {
                         // §26.3: local decl shadows the wildcard-imported name.
                         elab.signals.remove(&decl.name.name);
                         elab.parameters.remove(&decl.name.name);
@@ -3980,13 +4096,14 @@ pub fn elaborate_module_with_defs(
                             || elab.parameters.contains_key(&assign.name.name))
                             && !preseed_dup_exempt.remove(&assign.name.name)
                         {
-                            if elab.wildcard_shadowed.contains(&assign.name.name) {
+                            if elab.claim_local_decl_displacement(&assign.name.name, assign.name.span, "parameter/localparam") {
                                 elab.parameters.remove(&assign.name.name);
                                 elab.signals.remove(&assign.name.name);
                             } else {
                                 return Err(duplicate_decl_error(&elab, &assign.name.name, assign.name.span, "parameter"));
                             }
                         }
+                        elab.note_decl_site(&assign.name.name, assign.name.span, "parameter/localparam", true);
                         // IEEE 1800-2023: keyed assignment-pattern init for
                         // associative-array typed parameters. Materialize
                         // `'{ "K": V, ... }` as `<param>["K"]` signals so
@@ -6964,7 +7081,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 let is_real = is_type_real(&pd.data_type);
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
-                        if elab.wildcard_shadowed.contains(&decl.name.name) {
+                        if elab.claim_local_decl_displacement(&decl.name.name, decl.name.span, "variable/net") {
                             elab.parameters.remove(&decl.name.name);
                             elab.signals.remove(&decl.name.name);
                         } else {
@@ -7178,13 +7295,14 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) { width = 32; }
                     for assign in assignments {
                         if elab.signals.contains_key(&assign.name.name) || elab.parameters.contains_key(&assign.name.name) {
-                            if elab.wildcard_shadowed.contains(&assign.name.name) {
+                            if elab.claim_local_decl_displacement(&assign.name.name, assign.name.span, "parameter/localparam") {
                                 elab.parameters.remove(&assign.name.name);
                                 elab.signals.remove(&assign.name.name);
                             } else {
                                 return Err(duplicate_decl_error(&elab, &assign.name.name, assign.name.span, "parameter"));
                             }
                         }
+                        elab.note_decl_site(&assign.name.name, assign.name.span, "parameter/localparam", true);
                         if !elab.parameters.contains_key(&assign.name.name) {
                             let val = if let Some(init) = &assign.init {
                                 // §6.20.2 + §5.7.1: an implicit-type parameter
@@ -10008,6 +10126,23 @@ pub fn inline_instantiations(
                             crate::ast::decl::PackageItem::Typedef(td) => { process_typedef(td, elab); }
                             _ => {}
                         }
+                    }
+                }
+                // §26.3: record this package's enum members under the package
+                // name so `pkg::NAME` stays resolvable when a local
+                // declaration shadows the bare `NAME`. Read back out of
+                // `enum_members`, which `process_typedef` has just filled with
+                // the fully-resolved values (ranges expanded, widths settled).
+                for item in &p.items {
+                    let crate::ast::decl::PackageItem::Typedef(td) = item else { continue };
+                    if !matches!(td.data_type, DataType::Enum(_)) {
+                        continue;
+                    }
+                    let Some(members) = elab.enum_members.get(&td.name.name).cloned() else { continue };
+                    let w = elab.typedefs.get(&td.name.name).copied().unwrap_or(32).max(1);
+                    let slot = elab.package_enum_members.entry(name.clone()).or_default();
+                    for (m, v) in members {
+                        slot.insert(m, (v, w));
                     }
                 }
                 for item in &p.items {
@@ -14423,6 +14558,13 @@ thread_local! {
     /// Moved in and back out (never cloned) so this costs no extra memory.
     static ELAB_SOURCES_TLS: std::cell::RefCell<(Vec<String>, Vec<String>)> =
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    /// Which source file defined each module/interface/program, by name.
+    /// Published alongside the sources for the same reason: a `Span` is a byte
+    /// offset into ITS OWN file, so with several files retained the offset
+    /// alone cannot say which one it belongs to. Knowing the file of the
+    /// module being elaborated resolves that.
+    static ELAB_MODULE_FILES_TLS: std::cell::RefCell<HashMap<String, u32>> =
+        std::cell::RefCell::new(HashMap::default());
 }
 
 /// Publish the preprocessed sources for elaboration-time diagnostics. Takes
@@ -14432,8 +14574,16 @@ pub fn set_elab_sources(texts: Vec<String>, files: Vec<String>) {
     ELAB_SOURCES_TLS.with(|c| *c.borrow_mut() = (texts, files));
 }
 
+/// Publish the module→source-file index map for elaboration-time diagnostics.
+/// Cloned rather than moved: unlike the source texts this map is small, and
+/// the caller still needs it for `ElaboratedModule::src_file_of_module`.
+pub fn set_elab_module_files(map: HashMap<String, u32>) {
+    ELAB_MODULE_FILES_TLS.with(|c| *c.borrow_mut() = map);
+}
+
 /// Move the published sources back out (leaving the slot empty).
 pub fn take_elab_sources() -> (Vec<String>, Vec<String>) {
+    ELAB_MODULE_FILES_TLS.with(|c| c.borrow_mut().clear());
     ELAB_SOURCES_TLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
@@ -14443,19 +14593,55 @@ pub fn take_elab_sources() -> (Vec<String>, Vec<String>) {
 /// offset the location is ambiguous, and printing a wrong file is worse than
 /// printing none.
 pub fn span_location(elab: &ElaboratedModule, span: Span) -> Option<String> {
+    span_location_impl(elab, span, true)
+}
+
+/// As `span_location`, but WITHOUT preferring the file of the module being
+/// elaborated. For a span that may belong to another file — a package's enum
+/// member, an imported parameter — the hint would name the wrong file with
+/// full confidence, which is worse than saying nothing.
+pub fn span_location_unhinted(elab: &ElaboratedModule, span: Span) -> Option<String> {
+    span_location_impl(elab, span, false)
+}
+
+fn span_location_impl(elab: &ElaboratedModule, span: Span, hint: bool) -> Option<String> {
     if span.start == 0 && span.end == 0 {
         return None; // Span::dummy() — synthesized, no source
     }
+    // Which file the module being elaborated came from. A `Span` is an offset
+    // into its OWN file, so with several files retained almost every offset
+    // fits inside more than one of them — the old "unique fit wins, otherwise
+    // give up" scan therefore reported NOTHING for any multi-file design,
+    // which is every real one. Prefer the file that actually defines this
+    // module and fall back to the scan only when it is unknown.
+    let preferred: Option<usize> = if !hint || elab.name.is_empty() {
+        None
+    } else {
+        elab.src_file_of_module
+            .get(&elab.name)
+            .copied()
+            .or_else(|| {
+                ELAB_MODULE_FILES_TLS.with(|c| c.borrow().get(&elab.name).copied())
+            })
+            .map(|i| i as usize)
+    };
     // During elaboration the module's own copy is still empty; the sources
     // live in the TLS published by `set_elab_sources`.
     let resolve = |texts: &[String], files: &[String]| -> Option<String> {
         let mut hit: Option<usize> = None;
-        for (i, t) in texts.iter().enumerate() {
-            if span.start < t.len() {
-                if hit.is_some() {
-                    return None; // ambiguous across files
+        if let Some(p) = preferred {
+            if texts.get(p).is_some_and(|t| span.start < t.len()) {
+                hit = Some(p);
+            }
+        }
+        if hit.is_none() {
+            for (i, t) in texts.iter().enumerate() {
+                if span.start < t.len() {
+                    if hit.is_some() {
+                        return None; // ambiguous across files
+                    }
+                    hit = Some(i);
                 }
-                hit = Some(i);
             }
         }
         let i = hit?;
@@ -14490,8 +14676,31 @@ pub fn duplicate_decl_error(
     kind: &str,
 ) -> String {
     let mut m = format!("duplicate declaration of '{}' in the same scope", name);
+
+    // The FIRST declaration — the one the user usually cannot find, because
+    // the error is raised at the second. Its recorded kind ("enum member of
+    // 'state_e'", "imported from package 'p'") is often the whole answer.
+    let first = elab.decl_sites.get(name);
+    // Resolved WITHOUT the "prefer this module's file" hint: the first
+    // declaration is often in another file entirely (an enum member of a
+    // package, say), and preferring the module's file would confidently
+    // print a line number from the wrong file. Fall back to naming only
+    // WHAT it is, which is the more useful half anyway.
+    let first_loc = first.and_then(|(sp, _, own)| {
+        if *own { span_location(elab, *sp) } else { span_location_unhinted(elab, *sp) }
+    });
+    match (first, &first_loc) {
+        (Some((_, what, _)), Some(loc)) => {
+            m.push_str(&format!("\n  first declaration ({}) is at {}", what, loc));
+        }
+        (Some((_, what, _)), None) => {
+            m.push_str(&format!("\n  first declaration: {}", what));
+        }
+        (None, _) => {}
+    }
+
     if let Some(loc) = span_location(elab, span) {
-        m.push_str(&format!("\n  {} declaration is at {}", kind, loc));
+        m.push_str(&format!("\n  duplicate {} declaration is at {}", kind, loc));
     }
     let prior = if elab.parameters.contains_key(name) {
         Some("a parameter/localparam")
@@ -15422,6 +15631,62 @@ fn stmt_contains_nonblocking(s: &Statement) -> bool {
     }
 }
 
+/// §26.3: names declared in packages this module does NOT import.
+///
+/// A package's contents — enum members especially — are registered design-wide
+/// under their BARE name, so they are visible to every module whether or not it
+/// imported the package. That is only ever too permissive for a REFERENCE, but
+/// it is actively wrong for a DECLARATION: a module that never imported the
+/// package would get "duplicate declaration" for a perfectly ordinary local
+/// variable whose name happens to match a member of some unrelated package
+/// elsewhere in the design. No other simulator rejects that, because without an
+/// import the package's name is simply not in scope.
+///
+/// Names collected here let the local declaration win. This can only change
+/// behaviour where elaboration previously FAILED, so no working design moves.
+fn compute_foreign_package_names(
+    items: &[ModuleItem],
+    defs: &HashMap<String, Definition>,
+) -> std::collections::HashSet<String> {
+    // Any mention of a package in an import — wildcard or explicit — makes its
+    // names legitimately visible here, and a collision with one of those is a
+    // real conflict (or, for a wildcard, a legal shadow handled separately).
+    let mut imported: std::collections::HashSet<&str> = std::collections::HashSet::default();
+    for item in items {
+        if let ModuleItem::ImportDeclaration(imp) = item {
+            for ii in &imp.items {
+                imported.insert(ii.package.name.as_str());
+            }
+        }
+    }
+    // Intersected with the module's OWN declarations, exactly as
+    // `compute_wildcard_shadowed` is. Keeping only names that are actually
+    // declared here matters: the set also suppresses the design-wide
+    // registration of these members, and suppressing every unimported
+    // package name would break the (over-permissive but relied upon) bare
+    // reference to a package member from a module that never imported it.
+    // Unlike the wildcard case there is no §26.3 ordering rule to honour —
+    // the name was never in scope, so a local declaration wins wherever it
+    // appears.
+    let local = collect_local_scope_names(items);
+    let mut out = std::collections::HashSet::default();
+    for (pkg_name, def) in defs {
+        if imported.contains(pkg_name.as_str()) {
+            continue;
+        }
+        if let Definition::Package(pkg) = def {
+            for pi in &pkg.items {
+                for n in package_item_names(pi) {
+                    if local.contains(&n) {
+                        out.insert(n);
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 fn package_item_names(pi: &PackageItem) -> Vec<String> {
     match pi {
         PackageItem::Parameter(pd) => match &pd.kind {
@@ -15584,6 +15849,16 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             if is_real { v = Value::from_f64(v.to_f64()); }
                                             v
                                         } else { Value::zero(width) };
+                                        // A name that arrived by import is the
+                                        // most confusing thing to collide with —
+                                        // it is declared nowhere the reader is
+                                        // looking. Name the package.
+                                        elab.note_decl_site(
+                                            &assign.name.name,
+                                            assign.name.span,
+                                            &format!("imported from package '{}'", pkg_name),
+                                            false,
+                                        );
                                         elab.parameters.insert(assign.name.name.clone(), v.clone());
                                         elab.signals.insert(assign.name.name.clone(), Signal {
                                             is_const: false, name: assign.name.name.clone(),
@@ -15743,6 +16018,16 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                         if signed { v.is_signed = true; }
                                         if is_real { v = Value::from_f64(v.to_f64()); }
+                                        // A name that arrived by import is the
+                                        // most confusing thing to collide with —
+                                        // it is declared nowhere the reader is
+                                        // looking. Name the package.
+                                        elab.note_decl_site(
+                                            &assign.name.name,
+                                            assign.name.span,
+                                            &format!("imported from package '{}'", pkg_name),
+                                            false,
+                                        );
                                         elab.parameters.insert(assign.name.name.clone(), v.clone());
                                         elab.signals.insert(assign.name.name.clone(), Signal {
                                             is_const: false, name: assign.name.name.clone(),

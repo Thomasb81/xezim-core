@@ -554,6 +554,7 @@ pub fn parse_and_elaborate_multi(
     // `elab.source_texts` below is assigned too late for that. Moved, not
     // cloned, then moved back out.
     elaborate::set_elab_sources(preprocessed_texts, source_files.to_vec());
+    elaborate::set_elab_module_files(src_file_of_module.clone());
     let elaborated =
         parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales, &module_ts_own_file);
     let (texts, files) = elaborate::take_elab_sources();
