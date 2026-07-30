@@ -300,7 +300,9 @@ impl Parser {
         let return_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) ||
                             (self.at(TokenKind::Identifier) && (
                                 self.peek_kind() == TokenKind::Identifier ||
-                                (self.peek_kind() == TokenKind::DoubleColon && self.peek_kind_n(2) != TokenKind::KwNew) ||
+                                (self.peek_kind() == TokenKind::DoubleColon
+                                    && self.peek_kind_n(2) != TokenKind::KwNew
+                                    && !self.scoped_name_is_the_method_name()) ||
                                 self.peek_kind() == TokenKind::Hash ||
                                 // `function automatic typedef_t [7:0] name(...)` — packed
                                 // dimension on a typedef-named return type.
@@ -446,6 +448,26 @@ impl Parser {
     }
 
     /// Parse a method name: handles 'new', regular identifiers, and class_scope::name.
+    /// At `function`'s type-or-name position, sitting on `ident :: ident`: is
+    /// that scoped name the METHOD NAME rather than a scoped return type?
+    ///
+    /// §13.4 lets an out-of-class definition omit the return type
+    /// (`function my_class::set_default();` returns a 1-bit logic). The caller
+    /// otherwise sees the `::`, assumes `pkg::type_t name(...)`, and consumes
+    /// the whole thing as a return type — then finds `(` where the name should
+    /// be and reports "expected identifier, found LParen".
+    ///
+    /// A port list or `;` right after the second identifier means nothing is
+    /// left to be the name, so the scoped name IS the name. When a real return
+    /// type is present the next token is that name instead
+    /// (`function pkg::t_e cls::m();`), and this stays false.
+    fn scoped_name_is_the_method_name(&self) -> bool {
+        matches!(
+            self.peek_kind_n(3),
+            TokenKind::LParen | TokenKind::Semicolon
+        )
+    }
+
     pub(super) fn parse_method_name(&mut self) -> TypeName {
         let start = self.current().span.start;
         let first = if self.at(TokenKind::KwNew) {
@@ -480,7 +502,9 @@ impl Parser {
         let return_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) ||
                             (self.at(TokenKind::Identifier) && (
                                 self.peek_kind() == TokenKind::Identifier ||
-                                (self.peek_kind() == TokenKind::DoubleColon && self.peek_kind_n(2) != TokenKind::KwNew) ||
+                                (self.peek_kind() == TokenKind::DoubleColon
+                                    && self.peek_kind_n(2) != TokenKind::KwNew
+                                    && !self.scoped_name_is_the_method_name()) ||
                                 self.peek_kind() == TokenKind::Hash
                             )) {
             self.parse_data_type()
