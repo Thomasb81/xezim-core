@@ -2869,8 +2869,19 @@ pub fn elaborate_module_with_defs(
                     continue;
                 }
                 let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
-                if is_type_signed(data_type) {
-                    v.is_signed = true;
+                // §6.20.2: the DECLARED signedness is authoritative. Setting it
+                // only when true let a signed INITIALIZER leak its signedness
+                // into an unsigned parameter: `parameter [7:0] UP = -3` kept
+                // `is_signed` from the `-3`, so `UP` behaved as -3 in every
+                // signed-sensitive operation — `UP >>> 1` gave -2 instead of
+                // 126, `UP < 0` was 1, `UP / 2` was -1. An implicit type with
+                // no range is signed 32-bit per §6.20.2; a real keeps its own.
+                let declared_signed = is_type_signed(data_type)
+                    || matches!(data_type,
+                        DataType::Implicit { dimensions, signing: None, .. }
+                            if dimensions.is_empty());
+                if !v.is_real {
+                    v.is_signed = declared_signed;
                 }
                 if v.is_real {
                     continue; // real parameters keep the walk's own handling
@@ -4360,12 +4371,17 @@ pub fn elaborate_module_with_defs(
                                         .filter(|e| !expr_has_call(e))
                                 {
                                     let mut v = eval_init_for_width(&subbed, &elab.parameters, current_width);
-                                    if current_signed { v.is_signed = true; }
+                                    // §6.20.2: the DECLARED signedness is authoritative. Assigning
+                                    // only when true let a signed INIT LITERAL leak its
+                                    // signedness into an unsigned parameter — `parameter
+                                    // [7:0] UP = -3` kept is_signed, so `UP + 1` sign-
+                                    // extended to -2 instead of 254. A real keeps its own.
+                                    if !v.is_real { v.is_signed = current_signed; }
                                     v
                                 } else {
                                 elab.deferred_param_exprs.push((assign.name.name.clone(), init.clone()));
                                 let mut v = Value::zero(current_width);
-                                if current_signed { v.is_signed = true; }
+                                if !v.is_real { v.is_signed = current_signed; }
                                 v
                                 }
                             } else {
@@ -4378,12 +4394,12 @@ pub fn elaborate_module_with_defs(
                                 let mut v = eval_param_value(
                                     data_type, init, &elab.parameters,
                                     &elab.typedefs, &elab.typedef_types, current_width);
-                                if current_signed { v.is_signed = true; }
+                                if !v.is_real { v.is_signed = current_signed; }
                                 v
                             }
                         } else {
                             let mut v = Value::zero(current_width);
-                            if current_signed { v.is_signed = true; }
+                            if !v.is_real { v.is_signed = current_signed; }
                             v
                         };
 
@@ -4847,6 +4863,15 @@ pub fn elaborate_module_with_defs(
     create_implicit_nets(&mut elab, &port_conn_nets)?;
 
     // Validate that all identifiers in procedural blocks are declared.
+    // §27.6: make every labelled generate block a known SCOPE name before the
+    // undeclared-identifier pass. `collect_generate_labels` walks nested
+    // regions, so one call over the module's items covers every depth —
+    // per-arm registration in the item loop would miss the ones that
+    // `elaborate_items` handles on its own recursion.
+    {
+        let items: Vec<ModuleItem> = module.items().to_vec();
+        register_generate_labels(&items, &mut elab);
+    }
     for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::default())?; }
     for ab in &elab.always_blocks { validate_stmt_idents(&ab.stmt, &elab, &mut HashSet::default())?; }
     for ca in &elab.continuous_assigns {
@@ -6446,6 +6471,71 @@ fn collect_pattern_bindings(p: &crate::ast::stmt::Pattern, out: &mut Vec<String>
     }
 }
 
+/// §27.6: every `begin : label` name introduced by a generate construct, at
+/// any nesting depth. These are SCOPES in the hierarchical namespace
+/// (`gblk.u.ID`, `g[0].u.ID`), not values, and validation runs before generate
+/// inlining creates the flattened keys — so they are registered up front as
+/// placeholder names, exactly as instance names already are.
+/// §27.6: register every labelled generate block as a placeholder name so the
+/// undeclared-identifier validator accepts it as a SCOPE root. `gblk.u.ID` and
+/// `g[0].u.ID` are legal hierarchical references, but validation runs before
+/// generate inlining creates the flattened keys, so the bare root (`gblk`, `g`)
+/// was rejected and the whole enclosing block failed to elaborate — even though
+/// the generate itself was correct, and a non-generate `u1.ID` worked because
+/// instance names are registered the same way.
+fn register_generate_labels(items: &[ModuleItem], elab: &mut ElaboratedModule) {
+    let mut labels = Vec::new();
+    collect_generate_labels(items, &mut labels);
+    for l in labels {
+        if !elab.signals.contains_key(&l) {
+            elab.signals.insert(
+                l.clone(),
+                Signal {
+                    is_const: false,
+                    name: l,
+                    width: 1,
+                    is_signed: false,
+                    is_real: false,
+                    direction: None,
+                    value: Value::new(1),
+                    type_name: Some("$genblock".to_string()),
+                },
+            );
+        }
+    }
+}
+
+fn collect_generate_labels(items: &[ModuleItem], out: &mut Vec<String>) {
+    for item in items {
+        match item {
+            ModuleItem::GenerateRegion(gr) => collect_generate_labels(&gr.items, out),
+            ModuleItem::GenerateFor(gf) => {
+                if let Some(n) = &gf.name {
+                    out.push(n.clone());
+                }
+                collect_generate_labels(&gf.items, out);
+            }
+            ModuleItem::GenerateIf(gi) => {
+                for l in gi.branch_labels.iter().flatten() {
+                    out.push(l.clone());
+                }
+                for (_, items) in &gi.branches {
+                    collect_generate_labels(items, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    if let Some(l) = &arm.label {
+                        out.push(l.clone());
+                    }
+                    collect_generate_labels(&arm.items, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut HashSet<String>) -> Result<(), String> {
     match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
@@ -7511,7 +7601,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                     init_eval
                                 };
                                 let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
-                                if signed { v.is_signed = true; }
+                                if !v.is_real { v.is_signed = signed; }
                                 v
                             } else { Value::zero(width) };
                             elab.parameters.insert(assign.name.name.clone(), val.clone());

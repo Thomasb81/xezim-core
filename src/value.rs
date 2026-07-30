@@ -735,6 +735,35 @@ impl Value {
     }
 
     #[inline]
+    /// IEEE 1800-2017 §11.8.2 step 2: in a SIGNED expression every operand is
+    /// converted to the expression's width by **sign** extension before the
+    /// operation. `to_u64` zero-extends, which turns a narrow signed `-3` into
+    /// 253 — so an 8-bit `parameter signed [7:0]` met a 32-bit literal as a
+    /// positive number and `SP * 2` evaluated to 506 instead of -6 (likewise
+    /// `SP - 1` → 252, `SP + 1` → 254). `div`/`mod` already sign-extended via
+    /// `to_i64`, which is why only `+`/`-`/`*` were wrong.
+    ///
+    /// Equal-width operands are untouched: two's-complement add/sub/mul are
+    /// sign-agnostic at a fixed width, so this changes only the mixed-width
+    /// signed case.
+    #[inline]
+    fn operand_bits_u64(&self, signed_expr: bool, w: u32) -> u64 {
+        if signed_expr && self.width < w && self.width < 64 {
+            self.to_i64().unwrap_or(0) as u64
+        } else {
+            self.to_u64().unwrap_or(0)
+        }
+    }
+
+    #[inline]
+    fn operand_bits_u128(&self, signed_expr: bool, w: u32) -> u128 {
+        if signed_expr && self.width < w && self.width < 64 {
+            self.to_i64().unwrap_or(0) as i128 as u128
+        } else {
+            self.to_u128()
+        }
+    }
+
     pub fn add(&self, other: &Value) -> Value {
         if let Some((a, b)) = self.fill_pair(other) {
             return a.add(&b);
@@ -748,12 +777,12 @@ impl Value {
         let w = self.width.max(other.width);
         let result_signed = self.is_signed && other.is_signed;
         let mut v = if w <= 64 {
-            let a = self.to_u64().unwrap_or(0);
-            let b = other.to_u64().unwrap_or(0);
+            let a = self.operand_bits_u64(result_signed, w);
+            let b = other.operand_bits_u64(result_signed, w);
             Value::from_u64(a.wrapping_add(b), w)
         } else {
-            let a = self.to_u128();
-            let b = other.to_u128();
+            let a = self.operand_bits_u128(result_signed, w);
+            let b = other.operand_bits_u128(result_signed, w);
             Value::from_u128(a.wrapping_add(b), w)
         };
         v.is_signed = result_signed;
@@ -774,12 +803,12 @@ impl Value {
         let w = self.width.max(other.width);
         let result_signed = self.is_signed && other.is_signed;
         let mut v = if w <= 64 {
-            let a = self.to_u64().unwrap_or(0);
-            let b = other.to_u64().unwrap_or(0);
+            let a = self.operand_bits_u64(result_signed, w);
+            let b = other.operand_bits_u64(result_signed, w);
             Value::from_u64(a.wrapping_sub(b), w)
         } else {
-            let a = self.to_u128();
-            let b = other.to_u128();
+            let a = self.operand_bits_u128(result_signed, w);
+            let b = other.operand_bits_u128(result_signed, w);
             Value::from_u128(a.wrapping_sub(b), w)
         };
         v.is_signed = result_signed;
@@ -797,12 +826,12 @@ impl Value {
         let w = self.width.max(other.width);
         let result_signed = self.is_signed && other.is_signed;
         let mut v = if w <= 64 {
-            let a = self.to_u64().unwrap_or(0);
-            let b = other.to_u64().unwrap_or(0);
+            let a = self.operand_bits_u64(result_signed, w);
+            let b = other.operand_bits_u64(result_signed, w);
             Value::from_u64(a.wrapping_mul(b), w)
         } else {
-            let a = self.to_u128();
-            let b = other.to_u128();
+            let a = self.operand_bits_u128(result_signed, w);
+            let b = other.operand_bits_u128(result_signed, w);
             Value::from_u128(a.wrapping_mul(b), w)
         };
         v.is_signed = result_signed;
