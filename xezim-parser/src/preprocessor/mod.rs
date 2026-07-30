@@ -3,7 +3,7 @@
 //! Handles `define, `ifdef/`ifndef/`else/`endif, `include, `undef, etc.
 //! This is a simplified preprocessor suitable for parsing purposes.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 #[derive(Debug, Clone)]
@@ -65,6 +65,10 @@ pub struct Preprocessor {
     /// mutability because `expand_macros*` run behind `&self`; drained into
     /// `errors` after each line is expanded.
     expansion_errors: std::cell::RefCell<Vec<String>>,
+    /// Names already reported by `note_undefined_macro`, so a macro used in a
+    /// loop or an `include pulled in many times warns once rather than once
+    /// per use.
+    reported_undefined: std::cell::RefCell<HashSet<String>>,
 }
 
 const MAX_INCLUDE_DEPTH: usize = 32;
@@ -123,11 +127,50 @@ impl Preprocessor {
             errors: Vec::new(),
             design_element_depth: 0,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
+            reported_undefined: std::cell::RefCell::new(HashSet::new()),
         }
     }
 
     /// Strict-mode directive errors collected during preprocessing (empty
     /// unless `strict_checks()` is on and an illegal directive was seen).
+    /// Report a `\`name` that no `\`define` (and no compiler directive) covers,
+    /// once per name, naming the file and line of the first use.
+    ///
+    /// Standard compiler directives reach this path too when they appear in a
+    /// position `resolve_directives` does not handle, and an unrecognised
+    /// tool-specific pragma is legitimate input, so this warns rather than
+    /// failing the build. It is written straight to stderr because the
+    /// preprocessor's own error list only surfaces on the `--preprocess` path,
+    /// and this is most useful precisely when compiling.
+    fn note_undefined_macro(&self, name: &str) {
+        const DIRECTIVES: &[&str] = &[
+            "define", "undef", "undefineall", "ifdef", "ifndef", "elsif",
+            "else", "endif", "include", "line", "pragma", "resetall",
+            "timescale", "begin_keywords", "end_keywords",
+            "default_nettype", "celldefine", "endcelldefine",
+            "unconnected_drive", "nounconnected_drive", "protect",
+            "endprotect", "protected", "endprotected", "uselib", "default_decay_time",
+            "default_trireg_strength", "delay_mode_distributed", "delay_mode_path",
+            "delay_mode_unit", "delay_mode_zero", "accelerate", "noaccelerate",
+            "autoexpand_vectornets", "expand_vectornets", "noexpand_vectornets",
+            "remove_gatenames", "noremove_gatenames", "remove_netnames",
+            "noremove_netnames", "suppress_faults", "nosuppress_faults",
+            "enable_portfaults", "disable_portfaults", "signed", "unsigned",
+        ];
+        if name.is_empty() || DIRECTIVES.contains(&name) {
+            return;
+        }
+        if !self.reported_undefined.borrow_mut().insert(name.to_string()) {
+            return;
+        }
+        eprintln!(
+            "[{}] {}: warning: macro `{} is undefined (IEEE 1800-2017 §22.5.1) \
+             — it is left as literal text, which usually causes a syntax error \
+             at the point of use",
+            self.current_file, self.current_line, name
+        );
+    }
+
     pub fn errors(&self) -> &[String] {
         &self.errors
     }
@@ -582,6 +625,15 @@ impl Preprocessor {
                                 current = next.to_string();
                                 continue;
                             }
+                            // The source ended while the body was still
+                            // continued — a `\` on the very last line, with
+                            // nothing left to splice onto it. The text before
+                            // the backslash was already taken above, so the
+                            // body ends here. Falling through instead appended
+                            // the same text a SECOND time, backslash and all,
+                            // so `\`define FOO(arg) \ / {1, arg} \` (EOF)
+                            // expanded to `{1, arg} {1, arg} \`.
+                            break;
                         }
                     }
                     clean_line.push_str(text);
@@ -1259,6 +1311,17 @@ impl Preprocessor {
                                                 if body_bytes[i] == b'"' { i += 1; break; }
                                                 i += 1;
                                             }
+                                            // A `` inside these quotes does NOT
+                                            // reopen the region to substitution:
+                                            // §22.5.1 says argument substitution
+                                            // shall not occur within a string
+                                            // literal, and `\`"` is the construct
+                                            // for building a string from an
+                                            // argument. `"``x``"` therefore stays
+                                            // literal (GitHub #62 asked for it to
+                                            // expand; a reference simulator
+                                            // leaves it alone too, so expanding
+                                            // would be a divergence).
                                             string_ranges.push((start, i));
                                         } else {
                                             i += 1;
@@ -1299,6 +1362,16 @@ impl Preprocessor {
                         result.push_str(&def.body);
                     }
                 } else {
+                    // §22.5.1: referencing an undefined text macro is an error.
+                    // We still pass the text through — an unrecognised compiler
+                    // directive or tool pragma has to survive to the lexer — but
+                    // the user gets told WHICH name was undefined and where.
+                    // Without this, `\`uvm_do_with(req, {req.wr_en==1;})` (a
+                    // macro that only exists under UVM_ENABLE_DEPRECATED_API)
+                    // reached the parser as literal text and produced ten
+                    // "expected RParen, found Comma" errors that named neither
+                    // the macro nor the reason.
+                    self.note_undefined_macro(macro_name);
                     result.push('`');
                     result.push_str(macro_name);
                 }

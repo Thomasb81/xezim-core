@@ -346,6 +346,47 @@ impl Parser {
                             span: self.span_from(start),
                         })
                     }
+                    // §15.5 an event that is a CLASS PROPERTY reached through
+                    // a handle (`-> h.ce`, `-> this.ce`) parses as a
+                    // MemberAccess. This arm used to fall through to the
+                    // "event" placeholder below, so the trigger named a
+                    // nonexistent event and the real one never fired. Flatten
+                    // the chain to a dotted name; the simulator resolves the
+                    // receiver to a heap handle.
+                    ExprKind::MemberAccess { .. } => {
+                        fn flatten(e: &Expression, out: &mut Vec<String>) -> bool {
+                            match &e.kind {
+                                ExprKind::MemberAccess { expr, member } => {
+                                    if !flatten(expr, out) {
+                                        return false;
+                                    }
+                                    out.push(member.name.clone());
+                                    true
+                                }
+                                ExprKind::Ident(h) if h.path.len() == 1 => {
+                                    out.push(h.path[0].name.name.clone());
+                                    true
+                                }
+                                ExprKind::This => {
+                                    out.push("this".to_string());
+                                    true
+                                }
+                                _ => false,
+                            }
+                        }
+                        let mut parts = Vec::new();
+                        if flatten(&target, &mut parts) && parts.len() >= 2 {
+                            crate::ast::Identifier {
+                                name: parts.join("."),
+                                span: self.span_from(start),
+                            }
+                        } else {
+                            crate::ast::Identifier {
+                                name: "event".to_string(),
+                                span: self.span_from(start),
+                            }
+                        }
+                    }
                     _ => crate::ast::Identifier {
                         name: "event".to_string(),
                         span: self.span_from(start),

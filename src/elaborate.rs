@@ -1065,6 +1065,14 @@ pub struct ElaboratedModule {
     pub arrays: HashMap<String, (i64, i64, u32)>,
     /// Associative arrays: name -> true if string-keyed
     pub associative_arrays: HashMap<String, bool>,
+    /// Associative-array ELEMENT width: `logic [3:0] aa [string]` -> 4.
+    /// Only `associative_arrays` (a keyed-ness flag) was recorded, so a write
+    /// stored the RHS at its own width — `aa["k"] = 8'hEF` kept all 8 bits in
+    /// a 4-bit element, and `$bits` reported the stored width rather than the
+    /// declared one. Elements live in the runtime `signals` map with no
+    /// declared width attached, so the width has to be carried here.
+    #[serde(default)]
+    pub assoc_elem_widths: HashMap<String, u32>,
     /// Class definitions: name -> elaborated class.
     pub classes: HashMap<String, ElaboratedClass>,
     /// Covergroup definitions: name -> AST declaration.
@@ -1522,6 +1530,7 @@ impl ElaboratedModule {
             typedef_types: HashMap::default(),
             arrays: HashMap::default(),
             associative_arrays: HashMap::default(),
+            assoc_elem_widths: HashMap::default(),
             classes: HashMap::default(),
             covergroups: HashMap::default(),
             functions: HashMap::default(),
@@ -1607,7 +1616,15 @@ impl ElaboratedModule {
         }
         let pending_ca = std::mem::take(&mut self.pending_cont_assign);
         for p in pending_ca {
-            self.continuous_assigns.push(p.materialize());
+            let ca = p.materialize();
+            // A sub-module's `assign dst = src;` between unpacked arrays
+            // arrives here (inlined bodies bypass the ModuleItem path), so it
+            // needs the same per-element expansion — otherwise an array OUTPUT
+            // PORT driven that way never propagates and the parent's array
+            // stays x for the whole run.
+            if !expand_whole_array_assign(&ca.lhs, &ca.rhs, ca.delay, self) {
+                self.continuous_assigns.push(ca);
+            }
         }
     }
 
@@ -1629,7 +1646,16 @@ impl ElaboratedModule {
     /// Streaming drain for pending continuous-assigns.
     pub fn drain_pending_cont_assign_for_each<F: FnMut(ContinuousAssignment)>(&mut self, mut f: F) {
         let pending = std::mem::take(&mut self.pending_cont_assign);
-        for p in pending { f(p.materialize()); }
+        for p in pending {
+            let ca = p.materialize();
+            // Same unpacked-array expansion the eager drain does; this is the
+            // path the bytecode compiler takes, and a sub-module's
+            // `assign dst = src;` between arrays reaches only one of the two.
+            match whole_array_assign_parts(&ca.lhs, &ca.rhs, ca.delay, &self.arrays) {
+                Some(parts) => { for e in parts { f(e); } }
+                None => f(ca),
+            }
+        }
     }
 }
 
@@ -2858,8 +2884,19 @@ pub fn elaborate_module_with_defs(
                     continue;
                 }
                 let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
-                if is_type_signed(data_type) {
-                    v.is_signed = true;
+                // §6.20.2: the DECLARED signedness is authoritative. Setting it
+                // only when true let a signed INITIALIZER leak its signedness
+                // into an unsigned parameter: `parameter [7:0] UP = -3` kept
+                // `is_signed` from the `-3`, so `UP` behaved as -3 in every
+                // signed-sensitive operation — `UP >>> 1` gave -2 instead of
+                // 126, `UP < 0` was 1, `UP / 2` was -1. An implicit type with
+                // no range is signed 32-bit per §6.20.2; a real keeps its own.
+                let declared_signed = is_type_signed(data_type)
+                    || matches!(data_type,
+                        DataType::Implicit { dimensions, signing: None, .. }
+                            if dimensions.is_empty());
+                if !v.is_real {
+                    v.is_signed = declared_signed;
                 }
                 if v.is_real {
                     continue; // real parameters keep the walk's own handling
@@ -3300,6 +3337,9 @@ pub fn elaborate_module_with_defs(
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = effective_dims.first() {
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
+                        if width > 0 {
+                            elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
+                        }
                         if let Some(init_expr) = &decl.init {
                             if let ExprKind::AssignmentPattern(items) = &init_expr.kind {
                                 for item in items {
@@ -3643,6 +3683,41 @@ pub fn elaborate_module_with_defs(
                         // when it builds the element storage).
                         if is_type_two_state(&dd.data_type) {
                             elab.two_state_signals.insert(decl.name.name.clone());
+                        }
+                        // §15.5 an ARRAY of named events. Only the scalar
+                        // declarator path registers `events` + a 1-bit backing
+                        // signal, so an element had neither: `-> ev[1]` found
+                        // no signal to toggle, and `@ev[1]` found none to arm
+                        // on — the waiter then fell into the simulator's
+                        // "not a real signal" delta-yield and woke instantly at
+                        // t=0 instead of blocking. Give each element the same
+                        // identity a scalar event gets, so the existing
+                        // name-keyed machinery (trigger / `@` / `.triggered`)
+                        // works on elements unchanged.
+                        if matches!(
+                            &dd.data_type,
+                            DataType::Simple { kind: SimpleType::Event, .. }
+                        ) {
+                            elab.events.insert(decl.name.name.clone());
+                            if hi >= lo && (hi - lo) < 4096 {
+                                for i in lo..=hi {
+                                    let en = format!("{}[{}]", decl.name.name, i);
+                                    elab.events.insert(en.clone());
+                                    elab.signals.insert(
+                                        en.clone(),
+                                        Signal {
+                                            is_const: false,
+                                            name: en,
+                                            width: 1,
+                                            is_signed: false,
+                                            is_real: false,
+                                            direction: None,
+                                            value: Value::zero(1),
+                                            type_name: Some("event".to_string()),
+                                        },
+                                    );
+                                }
+                            }
                         }
                         // Element type, for the type-directed `%p` renderer.
                         elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
@@ -4155,9 +4230,19 @@ pub fn elaborate_module_with_defs(
                         signed = true;
                     }
                     for assign in assignments {
+                        // The pre-seed exemption only vouches for the
+                        // parameter's OWN fixpoint-seeded value. If the name
+                        // has a recorded declaration site by now, something
+                        // else (an enum member, an imported symbol) declared
+                        // it first — the pre-seed merely overwrote it, and
+                        // consuming the exemption silently accepted e.g.
+                        // `typedef enum {BUSY} …; parameter int BUSY = 5;`,
+                        // which every other simulator rejects.
+                        let self_seeded = preseed_dup_exempt.remove(&assign.name.name)
+                            && !elab.decl_sites.contains_key(&assign.name.name);
                         if (elab.signals.contains_key(&assign.name.name)
                             || elab.parameters.contains_key(&assign.name.name))
-                            && !preseed_dup_exempt.remove(&assign.name.name)
+                            && !self_seeded
                         {
                             if elab.claim_local_decl_displacement(&assign.name.name, assign.name.span, "parameter/localparam") {
                                 elab.parameters.remove(&assign.name.name);
@@ -4255,6 +4340,40 @@ pub fn elaborate_module_with_defs(
                         {
                             elab.parameters.get(&assign.name.name).cloned().unwrap_or(Value::zero(current_width))
                         } else if let Some(init) = &assign.init {
+                            // §20.7 `$bits(<signal>)` — const-eval has no
+                            // signal table, so `$bits` of a variable, a port,
+                            // or `port.member` silently evaluated to 0 and
+                            // sized everything downstream to nothing. Bind
+                            // those to literals before any eval below.
+                            let prebound_init;
+                            let init: &Expression = if expr_mentions_bits(init) {
+                                let via_signals = prebind_bits_of_signals(
+                                    init, &elab.signals, &elab.parameters, "",
+                                    &elab.typedefs, &elab.typedef_types,
+                                    &elab.packed_struct_fields, &elab.arrays,
+                                );
+                                // Anything the signal table could not size —
+                                // an UNPACKED array element, whose declaration
+                                // name is not itself a signal — is resolved
+                                // from the declared type instead.
+                                prebound_init = if expr_mentions_bits(&via_signals) {
+                                    let mut decls = HashMap::default();
+                                    let mut elem_decls = HashMap::default();
+                                    collect_declared_types(
+                                        module.ports(), module.items(),
+                                        &mut decls, &mut elem_decls,
+                                    );
+                                    prebind_bits_from_declared_types(
+                                        &via_signals, &decls, &elem_decls, &elab.parameters,
+                                        &elab.typedefs, &elab.typedef_types,
+                                    )
+                                } else {
+                                    via_signals
+                                };
+                                &prebound_init
+                            } else {
+                                init
+                            };
                             if expr_has_call(init) {
                                 // §13.4.3: try to CONST-EVALUATE the calls
                                 // (LOG2-style sizing helpers) right now —
@@ -4267,12 +4386,17 @@ pub fn elaborate_module_with_defs(
                                         .filter(|e| !expr_has_call(e))
                                 {
                                     let mut v = eval_init_for_width(&subbed, &elab.parameters, current_width);
-                                    if current_signed { v.is_signed = true; }
+                                    // §6.20.2: the DECLARED signedness is authoritative. Assigning
+                                    // only when true let a signed INIT LITERAL leak its
+                                    // signedness into an unsigned parameter — `parameter
+                                    // [7:0] UP = -3` kept is_signed, so `UP + 1` sign-
+                                    // extended to -2 instead of 254. A real keeps its own.
+                                    if !v.is_real { v.is_signed = current_signed; }
                                     v
                                 } else {
                                 elab.deferred_param_exprs.push((assign.name.name.clone(), init.clone()));
                                 let mut v = Value::zero(current_width);
-                                if current_signed { v.is_signed = true; }
+                                if !v.is_real { v.is_signed = current_signed; }
                                 v
                                 }
                             } else {
@@ -4285,12 +4409,12 @@ pub fn elaborate_module_with_defs(
                                 let mut v = eval_param_value(
                                     data_type, init, &elab.parameters,
                                     &elab.typedefs, &elab.typedef_types, current_width);
-                                if current_signed { v.is_signed = true; }
+                                if !v.is_real { v.is_signed = current_signed; }
                                 v
                             }
                         } else {
                             let mut v = Value::zero(current_width);
-                            if current_signed { v.is_signed = true; }
+                            if !v.is_real { v.is_signed = current_signed; }
                             v
                         };
 
@@ -4490,7 +4614,9 @@ pub fn elaborate_module_with_defs(
                     } else {
                         rhs.clone()
                     };
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                    }
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -4754,6 +4880,15 @@ pub fn elaborate_module_with_defs(
     create_implicit_nets(&mut elab, &port_conn_nets)?;
 
     // Validate that all identifiers in procedural blocks are declared.
+    // §27.6: make every labelled generate block a known SCOPE name before the
+    // undeclared-identifier pass. `collect_generate_labels` walks nested
+    // regions, so one call over the module's items covers every depth —
+    // per-arm registration in the item loop would miss the ones that
+    // `elaborate_items` handles on its own recursion.
+    {
+        let items: Vec<ModuleItem> = module.items().to_vec();
+        register_generate_labels(&items, &mut elab);
+    }
     for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::default())?; }
     for ab in &elab.always_blocks { validate_stmt_idents(&ab.stmt, &elab, &mut HashSet::default())?; }
     for ca in &elab.continuous_assigns {
@@ -6353,6 +6488,71 @@ fn collect_pattern_bindings(p: &crate::ast::stmt::Pattern, out: &mut Vec<String>
     }
 }
 
+/// §27.6: every `begin : label` name introduced by a generate construct, at
+/// any nesting depth. These are SCOPES in the hierarchical namespace
+/// (`gblk.u.ID`, `g[0].u.ID`), not values, and validation runs before generate
+/// inlining creates the flattened keys — so they are registered up front as
+/// placeholder names, exactly as instance names already are.
+/// §27.6: register every labelled generate block as a placeholder name so the
+/// undeclared-identifier validator accepts it as a SCOPE root. `gblk.u.ID` and
+/// `g[0].u.ID` are legal hierarchical references, but validation runs before
+/// generate inlining creates the flattened keys, so the bare root (`gblk`, `g`)
+/// was rejected and the whole enclosing block failed to elaborate — even though
+/// the generate itself was correct, and a non-generate `u1.ID` worked because
+/// instance names are registered the same way.
+fn register_generate_labels(items: &[ModuleItem], elab: &mut ElaboratedModule) {
+    let mut labels = Vec::new();
+    collect_generate_labels(items, &mut labels);
+    for l in labels {
+        if !elab.signals.contains_key(&l) {
+            elab.signals.insert(
+                l.clone(),
+                Signal {
+                    is_const: false,
+                    name: l,
+                    width: 1,
+                    is_signed: false,
+                    is_real: false,
+                    direction: None,
+                    value: Value::new(1),
+                    type_name: Some("$genblock".to_string()),
+                },
+            );
+        }
+    }
+}
+
+fn collect_generate_labels(items: &[ModuleItem], out: &mut Vec<String>) {
+    for item in items {
+        match item {
+            ModuleItem::GenerateRegion(gr) => collect_generate_labels(&gr.items, out),
+            ModuleItem::GenerateFor(gf) => {
+                if let Some(n) = &gf.name {
+                    out.push(n.clone());
+                }
+                collect_generate_labels(&gf.items, out);
+            }
+            ModuleItem::GenerateIf(gi) => {
+                for l in gi.branch_labels.iter().flatten() {
+                    out.push(l.clone());
+                }
+                for (_, items) in &gi.branches {
+                    collect_generate_labels(items, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    if let Some(l) = &arm.label {
+                        out.push(l.clone());
+                    }
+                    collect_generate_labels(&arm.items, out);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut HashSet<String>) -> Result<(), String> {
     match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } | StatementKind::NonblockingAssign { lvalue, rvalue, .. } => {
@@ -6754,6 +6954,22 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             // The bare name is a sub-module-local identifier; after rewrite
             // it becomes `<prefix>name`.
             let prefixed = format!("{}{}", prefix, name);
+            // An unpacked ARRAY has no signal under its own name — its
+            // ELEMENTS are the signals — so `assign dst = src;` between two
+            // arrays inside a sub-module looked like two undeclared
+            // identifiers here and got 1-BIT implicit nets. The assignment
+            // then drove a phantom scalar and the real elements stayed x for
+            // the whole run. An array is declared; never synthesize a net for
+            // it.
+            let is_declared_array = |n: &String| {
+                elab.arrays.contains_key(n)
+                    || elab.arrays_2d.contains_key(n)
+                    || elab.arrays_nd.contains_key(n)
+                    || elab.associative_arrays.contains_key(n)
+            };
+            if is_declared_array(&prefixed) || is_declared_array(&name) {
+                continue;
+            }
             if !elab.signals.contains_key(&prefixed)
                 && !elab.parameters.contains_key(&prefixed)
                 && !elab.nets.contains(&prefixed)
@@ -7283,6 +7499,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = decl.dimensions.first() {
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
+                        if width > 0 {
+                            elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
+                        }
                     }
                     let is_dynamic_dim = decl.dimensions.first().is_some_and(|d| matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }));
                     if is_dynamic_dim {
@@ -7398,8 +7617,24 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                 } else {
                                     init
                                 };
+                                // §20.7 `$bits(<signal>)` / `$bits(port.member)`
+                                // in a body localparam: const-eval has no
+                                // signal table and would yield 0, silently
+                                // sizing whatever the localparam feeds to
+                                // nothing. Bind those to literals first.
+                                let prebound;
+                                let init_eval: &Expression = if expr_mentions_bits(init_eval) {
+                                    prebound = prebind_bits_of_signals(
+                                        init_eval, &elab.signals, &elab.parameters, "",
+                                        &elab.typedefs, &elab.typedef_types,
+                                        &elab.packed_struct_fields, &elab.arrays,
+                                    );
+                                    &prebound
+                                } else {
+                                    init_eval
+                                };
                                 let mut v = eval_init_for_width(init_eval, &elab.parameters, width);
-                                if signed { v.is_signed = true; }
+                                if !v.is_real { v.is_signed = signed; }
                                 v
                             } else { Value::zero(width) };
                             elab.parameters.insert(assign.name.name.clone(), val.clone());
@@ -7440,7 +7675,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     } else {
                         rhs.clone()
                     };
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                    if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                    }
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -8704,64 +8941,371 @@ fn register_packed_array_elem_w(name: &str, dt: &DataType, typedefs: &HashMap<St
     }
 }
 
-/// Rewrite `$bits(<ident>)` to a literal when `<ident>` names a SIGNAL in the
-/// enclosing scope. Instance parameter overrides are const-evaluated against
-/// the parameter map only, so `#(.W($bits(some_signal)))` found nothing and
-/// evaluated to 0 — a port declared `[W-1:0]` then elaborated as `[-1:0]`,
-/// i.e. 2 bits, which surfaced as a bogus "port is 2 bit(s)" width-mismatch
-/// warning. Parameters and typedefs already resolve inside `$bits` itself and
-/// are left untouched here.
-fn prebind_bits_of_signals(
-    e: &Expression,
-    signals: &HashMap<String, Signal>,
+/// Collect `name → declared DataType` for a module's ANSI ports and its
+/// body variable/net declarations. Used to size `$bits(<port>.<member>)` in a
+/// SUB-module's own body localparam, where the elaborated signal table does not
+/// yet hold the sub-module's names — the width has to come from the
+/// declarations themselves.
+/// `elem_out` receives declarators that carry UNPACKED dimensions, mapped to
+/// their ELEMENT type — `logic [3:0] arr [4]` gives `arr → logic [3:0]`, which
+/// is what `$bits(arr[1])` needs. Those are kept apart from `out` because
+/// `$bits(arr)` is the whole array, not one element.
+fn collect_declared_types(
+    ports: &PortList,
+    items: &[ModuleItem],
+    out: &mut HashMap<String, DataType>,
+    elem_out: &mut HashMap<String, DataType>,
+) {
+    if let PortList::Ansi(ps) = ports {
+        for p in ps {
+            if let Some(dt) = &p.data_type {
+                let target = if p.dimensions.is_empty() { &mut *out } else { &mut *elem_out };
+                target.entry(p.name.name.clone()).or_insert_with(|| dt.clone());
+            }
+        }
+    }
+    for item in items {
+        if let ModuleItem::DataDeclaration(vd) = item {
+            for d in &vd.declarators {
+                let target = if d.dimensions.is_empty() { &mut *out } else { &mut *elem_out };
+                target.entry(d.name.name.clone())
+                    .or_insert_with(|| vd.data_type.clone());
+            }
+        }
+    }
+}
+
+/// `$bits(<expr>)` sized purely from DECLARED types (no signal table). Mirrors
+/// `bits_of_signal_expr` for the sub-module-body case.
+fn bits_from_declared_types(
+    arg: &Expression,
+    decls: &HashMap<String, DataType>,
+    elem_decls: &HashMap<String, DataType>,
     params: &HashMap<String, Value>,
-    prefix: &str,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<u32> {
+    if let ExprKind::SystemCall { name, args } = &arg.kind {
+        if (name == "$unsigned" || name == "$signed") && args.len() == 1 {
+            return bits_from_declared_types(
+                &args[0], decls, elem_decls, params, typedefs, typedef_types,
+            );
+        }
+        return None;
+    }
+    // `arr[i]` / `arr[i].member` on an unpacked array — size from the ELEMENT
+    // type. A bit-select of a packed vector is handled by the signal-table
+    // path, which knows the declaration is not an array.
+    if let ExprKind::Index { expr, .. } = &arg.kind {
+        let (base, path) = flatten_member_chain(expr)?;
+        if params.contains_key(&base) {
+            return None;
+        }
+        let dt = elem_decls.get(&base)?;
+        return member_path_width(dt, &path, params, typedefs, typedef_types, 0);
+    }
+    let (base, path) = flatten_member_chain(arg)?;
+    if params.contains_key(&base) || typedefs.contains_key(&base) {
+        return None;
+    }
+    let dt = decls.get(&base)?;
+    member_path_width(dt, &path, params, typedefs, typedef_types, 0)
+}
+
+/// Rewrite every `$bits(<decl-rooted expr>)` in `e` to a literal, using
+/// declared types only.
+fn prebind_bits_from_declared_types(
+    e: &Expression,
+    decls: &HashMap<String, DataType>,
+    elem_decls: &HashMap<String, DataType>,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
 ) -> Expression {
     let mut out = e.clone();
     if let ExprKind::SystemCall { name, args } = &e.kind {
         if name == "$bits" && args.len() == 1 {
-            if let ExprKind::Ident(h) = &args[0].kind {
-                let leaf = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-                if !leaf.is_empty() && !params.contains_key(leaf) {
-                    let w = signals
-                        .get(&format!("{}{}", prefix, leaf))
-                        .or_else(|| signals.get(leaf))
-                        .map(|sig| sig.width);
-                    if let Some(w) = w.filter(|w| *w > 0) {
-                        out.kind = ExprKind::Number(NumberLiteral::Integer {
-                            size: None,
-                            signed: false,
-                            base: crate::ast::expr::NumberBase::Decimal,
-                            value: w.to_string(),
-                            cached_val: std::cell::Cell::new(None),
-                        });
-                        return out;
-                    }
-                }
+            if let Some(w) = bits_from_declared_types(
+                &args[0], decls, elem_decls, params, typedefs, typedef_types,
+            ) {
+                out.kind = ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: w.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                });
             }
             return out;
         }
     }
-    // Recurse into the common composite forms so `$bits(sig)-1` works.
+    macro_rules! rb {
+        ($x:expr) => {
+            prebind_bits_from_declared_types(
+                $x, decls, elem_decls, params, typedefs, typedef_types,
+            )
+        };
+    }
     match &mut out.kind {
         ExprKind::Binary { left, right, .. } => {
-            **left = prebind_bits_of_signals(left, signals, params, prefix);
-            **right = prebind_bits_of_signals(right, signals, params, prefix);
+            **left = rb!(left);
+            **right = rb!(right);
         }
         ExprKind::Unary { operand, .. } => {
-            **operand = prebind_bits_of_signals(operand, signals, params, prefix);
+            **operand = rb!(operand);
         }
         ExprKind::Paren(inner) => {
-            **inner = prebind_bits_of_signals(inner, signals, params, prefix);
+            **inner = rb!(inner);
         }
         ExprKind::SystemCall { args, .. } => {
             for a in args.iter_mut() {
-                *a = prebind_bits_of_signals(a, signals, params, prefix);
+                *a = rb!(a);
             }
         }
         _ => {}
     }
     out
+}
+
+/// Does this expression mention `$bits` anywhere? Cheap guard so the prebind
+/// walk (which clones) only runs for the expressions that need it.
+fn expr_mentions_bits(e: &Expression) -> bool {
+    match &e.kind {
+        ExprKind::SystemCall { name, args } => {
+            name == "$bits" || args.iter().any(expr_mentions_bits)
+        }
+        ExprKind::Binary { left, right, .. } => {
+            expr_mentions_bits(left) || expr_mentions_bits(right)
+        }
+        ExprKind::Unary { operand, .. } => expr_mentions_bits(operand),
+        ExprKind::Paren(inner) => expr_mentions_bits(inner),
+        _ => false,
+    }
+}
+
+/// Bit width of a struct/union member PATH (`.w0`, `.w0.a`) starting from the
+/// declared type `dt`. A named type is resolved through `typedef_types` so a
+/// nested `hidden_field_t` inside a `prebuf_sync_t` can be walked; anonymous
+/// inline structs and unions work directly. Returns None the moment the walk
+/// cannot be completed, so callers keep whatever behaviour they had.
+fn member_path_width(
+    dt: &DataType,
+    path: &[String],
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+    depth: u32,
+) -> Option<u32> {
+    if path.is_empty() {
+        // §7.4.2: a packed dimension on the member multiplies its width, which
+        // `resolve_type_width` already accounts for.
+        return Some(resolve_type_width(dt, Some(params), Some(typedefs))).filter(|w| *w > 0);
+    }
+    if depth > 8 {
+        return None;
+    }
+    let resolved: DataType;
+    let su = match dt {
+        DataType::Struct(su) => su,
+        DataType::TypeReference { name, .. } => {
+            resolved = typedef_types.get(&name.name.name)?.clone();
+            match &resolved {
+                DataType::Struct(su) => su,
+                _ => return None,
+            }
+        }
+        _ => return None,
+    };
+    for m in &su.members {
+        for d in &m.declarators {
+            if d.name.name == path[0] {
+                // An unpacked dimension on the declarator would make `$bits`
+                // the whole array; not modelled here, so decline rather than
+                // report the element width.
+                if !d.dimensions.is_empty() {
+                    return None;
+                }
+                return member_path_width(
+                    &m.data_type, &path[1..], params, typedefs, typedef_types, depth + 1,
+                );
+            }
+        }
+    }
+    None
+}
+
+/// Flatten `a.b.c` into its base identifier and the member names after it.
+/// A `::` scope resolution lowers to the same `MemberAccess` node, so callers
+/// must confirm the base actually names a signal before trusting the result.
+fn flatten_member_chain(e: &Expression) -> Option<(String, Vec<String>)> {
+    match &e.kind {
+        ExprKind::Ident(h) => Some((h.path.last()?.name.name.clone(), Vec::new())),
+        ExprKind::MemberAccess { expr, member } => {
+            let (base, mut path) = flatten_member_chain(expr)?;
+            path.push(member.name.clone());
+            Some((base, path))
+        }
+        _ => None,
+    }
+}
+
+/// Rewrite `$bits(<expr>)` to a literal when `<expr>` is rooted at a SIGNAL in
+/// the enclosing scope. Const-eval resolves `$bits` of a parameter or a type
+/// NAME, but has no signal table, so `$bits` of a plain variable, a port, a
+/// struct-member select, a part-select or an element select all fell through to
+/// 0 — silently. `#(.W($bits(some_signal)))` then elaborated a port declared
+/// `[W-1:0]` as `[-1:0]`, and `localparam L = $bits(port.member)` came back 0,
+/// which sized a whole synchronizer bus to nothing and left its output x.
+///
+/// Parameters and type names are left untouched: `$bits` resolves those itself,
+/// and a `pkg::type_t` lowers to the same `MemberAccess` node as a member
+/// select, so only a base that really names a signal is rewritten here.
+fn prebind_bits_of_signals(
+    e: &Expression,
+    signals: &HashMap<String, Signal>,
+    params: &HashMap<String, Value>,
+    prefix: &str,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+    struct_fields: &HashMap<String, Vec<(String, u32, u32)>>,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+) -> Expression {
+    let mut out = e.clone();
+    if let ExprKind::SystemCall { name, args } = &e.kind {
+        if name == "$bits" && args.len() == 1 {
+            if let Some(w) = bits_of_signal_expr(
+                &args[0], signals, params, prefix, typedefs, typedef_types, struct_fields, arrays,
+            ) {
+                out.kind = ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: w.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                });
+            }
+            return out;
+        }
+    }
+    // Recurse into the common composite forms so `$bits(sig)-1` works.
+    macro_rules! rb {
+        ($x:expr) => {
+            prebind_bits_of_signals(
+                $x, signals, params, prefix, typedefs, typedef_types, struct_fields, arrays,
+            )
+        };
+    }
+    match &mut out.kind {
+        ExprKind::Binary { left, right, .. } => {
+            **left = rb!(left);
+            **right = rb!(right);
+        }
+        ExprKind::Unary { operand, .. } => {
+            **operand = rb!(operand);
+        }
+        ExprKind::Paren(inner) => {
+            **inner = rb!(inner);
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args.iter_mut() {
+                *a = rb!(a);
+            }
+        }
+        _ => {}
+    }
+    out
+}
+
+/// `$bits(arg)` where `arg` is rooted at a declared signal, or None when it is
+/// not (a parameter, a type name, or anything this cannot size confidently).
+#[allow(clippy::too_many_arguments)]
+fn bits_of_signal_expr(
+    arg: &Expression,
+    signals: &HashMap<String, Signal>,
+    params: &HashMap<String, Value>,
+    prefix: &str,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+    struct_fields: &HashMap<String, Vec<(String, u32, u32)>>,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+) -> Option<u32> {
+    // `$signed`/`$unsigned` are width-preserving wrappers.
+    if let ExprKind::SystemCall { name, args } = &arg.kind {
+        if (name == "$unsigned" || name == "$signed") && args.len() == 1 {
+            return bits_of_signal_expr(
+                &args[0], signals, params, prefix, typedefs, typedef_types, struct_fields, arrays,
+            );
+        }
+        return None;
+    }
+    // A part-select is sized by its own bounds, whatever the base is.
+    if let ExprKind::RangeSelect { kind, left, right, .. } = &arg.kind {
+        let l = const_eval_i64_with_params(left, Some(params))?;
+        let r = const_eval_i64_with_params(right, Some(params))?;
+        let w = match kind {
+            RangeKind::Constant => (l - r).abs() + 1,
+            // §7.4.6 `[base +: n]` / `[base -: n]` — the width is the operand.
+            RangeKind::IndexedUp | RangeKind::IndexedDown => r,
+        };
+        return u32::try_from(w).ok().filter(|w| *w > 0);
+    }
+    // An element select: an unpacked-array element keeps the declared width, a
+    // bit-select of a packed vector is one bit.
+    if let ExprKind::Index { expr, .. } = &arg.kind {
+        let (base, path) = flatten_member_chain(expr)?;
+        if params.contains_key(&base) || !path.is_empty() {
+            return None;
+        }
+        let scoped = format!("{}{}", prefix, base);
+        let is_unpacked = arrays.contains_key(&scoped) || arrays.contains_key(&base);
+        if is_unpacked {
+            // An unpacked array's ELEMENTS are the signals; the declaration
+            // name may not be one at all, so take the width from an element.
+            let w = signals
+                .get(&scoped)
+                .or_else(|| signals.get(&base))
+                .map(|s| s.width)
+                .or_else(|| {
+                    let (lo, hi, _) = *arrays.get(&scoped).or_else(|| arrays.get(&base))?;
+                    signals
+                        .get(&format!("{}[{}]", scoped, lo))
+                        .or_else(|| signals.get(&format!("{}[{}]", base, lo)))
+                        .or_else(|| signals.get(&format!("{}[{}]", scoped, hi)))
+                        .or_else(|| signals.get(&format!("{}[{}]", base, hi)))
+                        .map(|s| s.width)
+                })?;
+            return Some(w).filter(|w| *w > 0);
+        }
+        let sig = signals.get(&scoped).or_else(|| signals.get(&base))?;
+        return Some(1).filter(|_| sig.width > 0);
+    }
+
+    let (base, path) = flatten_member_chain(arg)?;
+    // A parameter or type name resolves inside `$bits` itself — leave it.
+    if params.contains_key(&base) || typedefs.contains_key(&base) {
+        return None;
+    }
+    let scoped = format!("{}{}", prefix, base);
+    let sig = signals.get(&scoped).or_else(|| signals.get(&base))?;
+    if path.is_empty() {
+        return Some(sig.width).filter(|w| *w > 0);
+    }
+    // One level of member select also works for an ANONYMOUS inline struct,
+    // which has no type name to walk — the packed field layout is recorded
+    // under the signal's own name.
+    if path.len() == 1 {
+        if let Some(fields) = struct_fields.get(&scoped).or_else(|| struct_fields.get(&base)) {
+            if let Some((_, _, w)) = fields.iter().find(|(f, _, _)| *f == path[0]) {
+                if *w > 0 {
+                    return Some(*w);
+                }
+            }
+        }
+    }
+    // Otherwise walk the declared type, which handles nesting.
+    let tn = sig.type_name.as_deref()?;
+    let dt = typedef_types.get(tn)?;
+    member_path_width(dt, &path, params, typedefs, typedef_types, 0)
 }
 
 /// Run `f` with `typedefs` installed as the thread-local typedef table
@@ -12496,6 +13040,8 @@ fn inline_module_items(
                                 if let Some(ParamValue::Expr(v)) = value {
                                     let v = &prebind_bits_of_signals(
                                         v, &elab.signals, scoped_eval_params, prefix,
+                                        &elab.typedefs, &elab.typedef_types,
+                                        &elab.packed_struct_fields, &elab.arrays,
                                     );
                                     let mut val = eval_const_expr_val(v, scoped_eval_params);
                                     // Check if target parameter is real or implicit real
@@ -12683,6 +13229,14 @@ fn inline_module_items(
                 // registered and read X, collapsing every `assign vec[Idx0]` to
                 // bit 0 (floo_router forwarding loss). Re-running after NumLevels
                 // is bound lets the loop expand and its body localparams resolve.
+                // Declared types of the sub-module's own ports and variables,
+                // so a body localparam can size `$bits` of them (§20.7).
+                let (sub_decl_types, sub_decl_elem_types) = {
+                    let mut m = HashMap::default();
+                    let mut e = HashMap::default();
+                    collect_declared_types(sub_mod.ports(), sub_mod.items(), &mut m, &mut e);
+                    (m, e)
+                };
                 let add_params_from_items = |items: &[ModuleItem], local_map: &mut HashMap<String, Value>, elab_ro: &ElaboratedModule| {
                     for _ in 0..64 {
                         let before = local_map.len();
@@ -12702,6 +13256,26 @@ fn inline_module_items(
                                                         Some(e) => { subbed_init = e; &subbed_init }
                                                         None => init,
                                                     }
+                                                } else {
+                                                    init
+                                                };
+                                                // §20.7 `$bits(<port>)` /
+                                                // `$bits(port.member)` in a
+                                                // SUB-module body localparam.
+                                                // `local_map` holds parameters
+                                                // only, so these evaluated to 0
+                                                // and sized dependent widths to
+                                                // nothing. The sub-module's own
+                                                // declarations are the authority
+                                                // here.
+                                                let prebound;
+                                                let init: &Expression = if expr_mentions_bits(init) {
+                                                    prebound = prebind_bits_from_declared_types(
+                                                        init, &sub_decl_types,
+                                                        &sub_decl_elem_types, local_map,
+                                                        &elab_ro.typedefs, &elab_ro.typedef_types,
+                                                    );
+                                                    &prebound
                                                 } else {
                                                     init
                                                 };
@@ -13453,6 +14027,12 @@ fn inline_module_items(
                                             matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
                                         });
                                         elab.associative_arrays.insert(sig_name.clone(), is_str);
+                                        // §10.7: the element width, under the SCOPED name — the runtime
+                                        // looks it up by resolved signal name, and a bare leaf would
+                                        // collide with a same-named array in another module.
+                                        if width > 0 {
+                                            elab.assoc_elem_widths.insert(sig_name.clone(), width);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -15258,6 +15838,94 @@ fn make_udp_int_expr(v: i64) -> Expression {
     )
 }
 
+/// `name[idx]` as an expression.
+fn make_index_expr(name: &str, idx: i64) -> Expression {
+    Expression::new(
+        ExprKind::Index {
+            expr: Box::new(make_ident_expr(name)),
+            index: Box::new(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: true,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: idx.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                Span::dummy(),
+            )),
+        },
+        Span::dummy(),
+    )
+}
+
+/// §10.6.2: a WHOLE-ARRAY continuous assignment between two UNPACKED arrays
+/// (`assign dst = src;`). An unpacked array has no single backing signal — its
+/// ELEMENTS are the signals — so this was pushed as one scalar assignment that
+/// matched no target and silently did nothing: `dst` stayed x for the entire
+/// run and never responded to a change in `src`. The per-element spelling
+/// (`assign dst[i] = src[i];`) always worked, so expand into that.
+///
+/// Returns true when it consumed the assignment. Only the plain
+/// `<ident> = <ident>` shape between two same-sized unpacked arrays is
+/// expanded; anything else keeps its existing path.
+/// The per-element assignments a whole-array continuous assign expands to, or
+/// None when this is not that shape. Pure so both the eager and the streaming
+/// pending-drain can share it.
+pub fn whole_array_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+) -> Option<Vec<ContinuousAssignment>> {
+    let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
+        return None;
+    };
+    if lh.path.len() != 1 || rh.path.len() != 1 {
+        return None;
+    }
+    if !lh.path[0].selects.is_empty() || !rh.path[0].selects.is_empty() {
+        return None;
+    }
+    let ln = &lh.path[0].name.name;
+    let rn = &rh.path[0].name.name;
+    let &(llo, lhi, _) = arrays.get(ln)?;
+    let &(rlo, rhi, _) = arrays.get(rn)?;
+    // Same element COUNT is what matters; the index ranges may differ.
+    if lhi < llo || rhi < rlo || (lhi - llo) != (rhi - rlo) {
+        return None;
+    }
+    let n = lhi - llo;
+    if n > 4096 {
+        return None; // pathological; leave it alone
+    }
+    Some(
+        (0..=n)
+            .map(|k| ContinuousAssignment {
+                lhs: make_index_expr(ln, llo + k),
+                rhs: make_index_expr(rn, rlo + k),
+                delay,
+            })
+            .collect(),
+    )
+}
+
+/// Push the expansion of a whole-array continuous assign, returning true when
+/// it consumed the assignment.
+fn expand_whole_array_assign(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    elab: &mut ElaboratedModule,
+) -> bool {
+    match whole_array_assign_parts(lhs, rhs, delay, &elab.arrays) {
+        Some(parts) => {
+            elab.continuous_assigns.extend(parts);
+            true
+        }
+        None => false,
+    }
+}
+
 fn make_ident_expr(name: &str) -> Expression {
     Expression::new(ExprKind::Ident(HierarchicalIdentifier {
         root: None,
@@ -15943,6 +16611,61 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             if &td.name.name == sym_name => {
                                 process_typedef(td, elab);
                                 found = true;
+                            }
+                        // §26.2.2: an enum MEMBER can be imported by name —
+                        // `import ep::BUSY;` makes just that member visible.
+                        // Only typedef NAMES matched here before, so a member
+                        // import died with "Symbol not found in package".
+                        // Register the one member (bare-name constant+signal,
+                        // exactly as a wildcard import would) plus the
+                        // typedef's ordered member list, which `.name()` /
+                        // `.next()` resolve through.
+                        PackageItem::Typedef(td)
+                            if matches!(&td.data_type, DataType::Enum(_)) => {
+                                if let DataType::Enum(et) = &td.data_type {
+                                    let base_width = et.base_type.as_ref()
+                                        .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
+                                        .unwrap_or(32);
+                                    let mut next_val: u64 = 0;
+                                    let mut members_ordered: Vec<(String, u64)> = Vec::new();
+                                    for member in &et.members {
+                                        let (entries, nv) =
+                                            expand_enum_member(member, next_val, &elab.parameters);
+                                        next_val = nv;
+                                        for (nm, val) in entries {
+                                            if &nm == sym_name {
+                                                let v = Value::from_u64(val, base_width);
+                                                elab.note_decl_site(
+                                                    &nm,
+                                                    member.name.span,
+                                                    &format!("imported from package '{}'", pkg_name),
+                                                    false,
+                                                );
+                                                elab.parameters.insert(nm.clone(), v.clone());
+                                                elab.signals.insert(nm.clone(), Signal {
+                                                    is_const: false,
+                                                    name: nm.clone(),
+                                                    width: base_width,
+                                                    is_signed: false,
+                                                    is_real: false,
+                                                    direction: None,
+                                                    value: v,
+                                                    type_name: Some(td.name.name.clone()),
+                                                });
+                                                found = true;
+                                            }
+                                            members_ordered.push((nm, val));
+                                        }
+                                    }
+                                    if found {
+                                        elab.typedefs
+                                            .entry(td.name.name.clone())
+                                            .or_insert(base_width);
+                                        elab.enum_members
+                                            .entry(td.name.name.clone())
+                                            .or_insert(members_ordered);
+                                    }
+                                }
                             }
                         PackageItem::Function(fd)
                             if &fd.name.name.name == sym_name && fd.name.scope.is_none() => {
