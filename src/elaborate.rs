@@ -1618,7 +1618,15 @@ impl ElaboratedModule {
         }
         let pending_ca = std::mem::take(&mut self.pending_cont_assign);
         for p in pending_ca {
-            self.continuous_assigns.push(p.materialize());
+            let ca = p.materialize();
+            // A sub-module's `assign dst = src;` between unpacked arrays
+            // arrives here (inlined bodies bypass the ModuleItem path), so it
+            // needs the same per-element expansion — otherwise an array OUTPUT
+            // PORT driven that way never propagates and the parent's array
+            // stays x for the whole run.
+            if !expand_whole_array_assign(&ca.lhs, &ca.rhs, ca.delay, self) {
+                self.continuous_assigns.push(ca);
+            }
         }
     }
 
@@ -1640,7 +1648,16 @@ impl ElaboratedModule {
     /// Streaming drain for pending continuous-assigns.
     pub fn drain_pending_cont_assign_for_each<F: FnMut(ContinuousAssignment)>(&mut self, mut f: F) {
         let pending = std::mem::take(&mut self.pending_cont_assign);
-        for p in pending { f(p.materialize()); }
+        for p in pending {
+            let ca = p.materialize();
+            // Same unpacked-array expansion the eager drain does; this is the
+            // path the bytecode compiler takes, and a sub-module's
+            // `assign dst = src;` between arrays reaches only one of the two.
+            match whole_array_assign_parts(&ca.lhs, &ca.rhs, ca.delay, &self.arrays) {
+                Some(parts) => { for e in parts { f(e); } }
+                None => f(ca),
+            }
+        }
     }
 }
 
@@ -4599,7 +4616,9 @@ pub fn elaborate_module_with_defs(
                     } else {
                         rhs.clone()
                     };
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                    if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                    }
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -7642,7 +7661,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     } else {
                         rhs.clone()
                     };
-                    elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                    if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                    }
                 }
             }
             ModuleItem::GateInstantiation(gi) => {
@@ -15801,6 +15822,94 @@ fn make_udp_int_expr(v: i64) -> Expression {
         }),
         Span::dummy(),
     )
+}
+
+/// `name[idx]` as an expression.
+fn make_index_expr(name: &str, idx: i64) -> Expression {
+    Expression::new(
+        ExprKind::Index {
+            expr: Box::new(make_ident_expr(name)),
+            index: Box::new(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: true,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: idx.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                Span::dummy(),
+            )),
+        },
+        Span::dummy(),
+    )
+}
+
+/// §10.6.2: a WHOLE-ARRAY continuous assignment between two UNPACKED arrays
+/// (`assign dst = src;`). An unpacked array has no single backing signal — its
+/// ELEMENTS are the signals — so this was pushed as one scalar assignment that
+/// matched no target and silently did nothing: `dst` stayed x for the entire
+/// run and never responded to a change in `src`. The per-element spelling
+/// (`assign dst[i] = src[i];`) always worked, so expand into that.
+///
+/// Returns true when it consumed the assignment. Only the plain
+/// `<ident> = <ident>` shape between two same-sized unpacked arrays is
+/// expanded; anything else keeps its existing path.
+/// The per-element assignments a whole-array continuous assign expands to, or
+/// None when this is not that shape. Pure so both the eager and the streaming
+/// pending-drain can share it.
+fn whole_array_assign_parts(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    arrays: &HashMap<String, (i64, i64, u32)>,
+) -> Option<Vec<ContinuousAssignment>> {
+    let (ExprKind::Ident(lh), ExprKind::Ident(rh)) = (&lhs.kind, &rhs.kind) else {
+        return None;
+    };
+    if lh.path.len() != 1 || rh.path.len() != 1 {
+        return None;
+    }
+    if !lh.path[0].selects.is_empty() || !rh.path[0].selects.is_empty() {
+        return None;
+    }
+    let ln = &lh.path[0].name.name;
+    let rn = &rh.path[0].name.name;
+    let &(llo, lhi, _) = arrays.get(ln)?;
+    let &(rlo, rhi, _) = arrays.get(rn)?;
+    // Same element COUNT is what matters; the index ranges may differ.
+    if lhi < llo || rhi < rlo || (lhi - llo) != (rhi - rlo) {
+        return None;
+    }
+    let n = lhi - llo;
+    if n > 4096 {
+        return None; // pathological; leave it alone
+    }
+    Some(
+        (0..=n)
+            .map(|k| ContinuousAssignment {
+                lhs: make_index_expr(ln, llo + k),
+                rhs: make_index_expr(rn, rlo + k),
+                delay,
+            })
+            .collect(),
+    )
+}
+
+/// Push the expansion of a whole-array continuous assign, returning true when
+/// it consumed the assignment.
+fn expand_whole_array_assign(
+    lhs: &Expression,
+    rhs: &Expression,
+    delay: u64,
+    elab: &mut ElaboratedModule,
+) -> bool {
+    match whole_array_assign_parts(lhs, rhs, delay, &elab.arrays) {
+        Some(parts) => {
+            elab.continuous_assigns.extend(parts);
+            true
+        }
+        None => false,
+    }
 }
 
 fn make_ident_expr(name: &str) -> Expression {
