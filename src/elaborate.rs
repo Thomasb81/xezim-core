@@ -7307,6 +7307,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = decl.dimensions.first() {
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
+                        if width > 0 {
+                            elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
+                        }
                     }
                     let is_dynamic_dim = decl.dimensions.first().is_some_and(|d| matches!(d, UnpackedDimension::Unsized(_) | UnpackedDimension::Queue { .. }));
                     if is_dynamic_dim {
@@ -13477,6 +13480,12 @@ fn inline_module_items(
                                             matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. })
                                         });
                                         elab.associative_arrays.insert(sig_name.clone(), is_str);
+                                        // §10.7: the element width, under the SCOPED name — the runtime
+                                        // looks it up by resolved signal name, and a bare leaf would
+                                        // collide with a same-named array in another module.
+                                        if width > 0 {
+                                            elab.assoc_elem_widths.insert(sig_name.clone(), width);
+                                        }
                                     }
                                     _ => {}
                                 }
