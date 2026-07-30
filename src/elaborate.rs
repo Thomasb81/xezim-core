@@ -6956,6 +6956,22 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             // The bare name is a sub-module-local identifier; after rewrite
             // it becomes `<prefix>name`.
             let prefixed = format!("{}{}", prefix, name);
+            // An unpacked ARRAY has no signal under its own name — its
+            // ELEMENTS are the signals — so `assign dst = src;` between two
+            // arrays inside a sub-module looked like two undeclared
+            // identifiers here and got 1-BIT implicit nets. The assignment
+            // then drove a phantom scalar and the real elements stayed x for
+            // the whole run. An array is declared; never synthesize a net for
+            // it.
+            let is_declared_array = |n: &String| {
+                elab.arrays.contains_key(n)
+                    || elab.arrays_2d.contains_key(n)
+                    || elab.arrays_nd.contains_key(n)
+                    || elab.associative_arrays.contains_key(n)
+            };
+            if is_declared_array(&prefixed) || is_declared_array(&name) {
+                continue;
+            }
             if !elab.signals.contains_key(&prefixed)
                 && !elab.parameters.contains_key(&prefixed)
                 && !elab.nets.contains(&prefixed)
@@ -15857,7 +15873,7 @@ fn make_index_expr(name: &str, idx: i64) -> Expression {
 /// The per-element assignments a whole-array continuous assign expands to, or
 /// None when this is not that shape. Pure so both the eager and the streaming
 /// pending-drain can share it.
-fn whole_array_assign_parts(
+pub fn whole_array_assign_parts(
     lhs: &Expression,
     rhs: &Expression,
     delay: u64,
