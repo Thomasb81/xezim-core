@@ -1067,6 +1067,14 @@ pub struct ElaboratedModule {
     pub arrays: HashMap<String, (i64, i64, u32)>,
     /// Associative arrays: name -> true if string-keyed
     pub associative_arrays: HashMap<String, bool>,
+    /// Associative-array ELEMENT width: `logic [3:0] aa [string]` -> 4.
+    /// Only `associative_arrays` (a keyed-ness flag) was recorded, so a write
+    /// stored the RHS at its own width — `aa["k"] = 8'hEF` kept all 8 bits in
+    /// a 4-bit element, and `$bits` reported the stored width rather than the
+    /// declared one. Elements live in the runtime `signals` map with no
+    /// declared width attached, so the width has to be carried here.
+    #[serde(default)]
+    pub assoc_elem_widths: HashMap<String, u32>,
     /// Class definitions: name -> elaborated class.
     pub classes: HashMap<String, ElaboratedClass>,
     /// Covergroup definitions: name -> AST declaration.
@@ -1524,6 +1532,7 @@ impl ElaboratedModule {
             typedef_types: HashMap::default(),
             arrays: HashMap::default(),
             associative_arrays: HashMap::default(),
+            assoc_elem_widths: HashMap::default(),
             classes: HashMap::default(),
             covergroups: HashMap::default(),
             functions: HashMap::default(),
@@ -3302,6 +3311,9 @@ pub fn elaborate_module_with_defs(
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = effective_dims.first() {
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
+                        if width > 0 {
+                            elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
+                        }
                         if let Some(init_expr) = &decl.init {
                             if let ExprKind::AssignmentPattern(items) = &init_expr.kind {
                                 for item in items {
