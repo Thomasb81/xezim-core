@@ -3658,6 +3658,41 @@ pub fn elaborate_module_with_defs(
                         if is_type_two_state(&dd.data_type) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
+                        // §15.5 an ARRAY of named events. Only the scalar
+                        // declarator path registers `events` + a 1-bit backing
+                        // signal, so an element had neither: `-> ev[1]` found
+                        // no signal to toggle, and `@ev[1]` found none to arm
+                        // on — the waiter then fell into the simulator's
+                        // "not a real signal" delta-yield and woke instantly at
+                        // t=0 instead of blocking. Give each element the same
+                        // identity a scalar event gets, so the existing
+                        // name-keyed machinery (trigger / `@` / `.triggered`)
+                        // works on elements unchanged.
+                        if matches!(
+                            &dd.data_type,
+                            DataType::Simple { kind: SimpleType::Event, .. }
+                        ) {
+                            elab.events.insert(decl.name.name.clone());
+                            if hi >= lo && (hi - lo) < 4096 {
+                                for i in lo..=hi {
+                                    let en = format!("{}[{}]", decl.name.name, i);
+                                    elab.events.insert(en.clone());
+                                    elab.signals.insert(
+                                        en.clone(),
+                                        Signal {
+                                            is_const: false,
+                                            name: en,
+                                            width: 1,
+                                            is_signed: false,
+                                            is_real: false,
+                                            direction: None,
+                                            value: Value::zero(1),
+                                            type_name: Some("event".to_string()),
+                                        },
+                                    );
+                                }
+                            }
+                        }
                         // Element type, for the type-directed `%p` renderer.
                         elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
                         // An UNPACKED struct element keeps each member in its own
