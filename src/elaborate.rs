@@ -3814,7 +3814,26 @@ pub fn elaborate_module_with_defs(
                         let w = width;
                         let (init_val, procedural_init) = if let Some(init_expr) = &decl.init {
                             if is_const_expr(init_expr, &elab.parameters) {
-                                let mut rv = eval_init_for_width(init_expr, &elab.parameters, w);
+                                // §6.16: a `string` has no declared length — `w`
+                                // is the 1024-bit PLACEHOLDER, and fitting the
+                                // initializer to it truncates the FRONT of any
+                                // text past 128 characters (a packed string
+                                // keeps its text in the low bits). The runtime
+                                // stores were already exempt (issues #63/#64);
+                                // this DECLARATION-initializer path was the
+                                // last one still fitting (issue #65:
+                                // `string cmd = "<144 chars>";` lost its
+                                // "echo_SAFE_" prefix while the identical
+                                // procedural assignment was correct).
+                                let is_string_decl = matches!(
+                                    &dd.data_type,
+                                    DataType::Simple { kind: SimpleType::String, .. }
+                                );
+                                let mut rv = if is_string_decl {
+                                    eval_const_expr_val(init_expr, &elab.parameters)
+                                } else {
+                                    eval_init_for_width(init_expr, &elab.parameters, w)
+                                };
                                 if is_signed { rv.is_signed = true; }
                                 if is_real { rv = Value::from_f64(rv.to_f64()); }
                                 (rv, None)
