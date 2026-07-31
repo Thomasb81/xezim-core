@@ -796,7 +796,15 @@ pub fn elaborate_class_with_params(
                     } else {
                         default_value_for_type(&p.data_type, width)
                     };
-                    if is_signed { v.is_signed = true; }
+                    // §11.8.1: the DECLARED type decides signedness, and an
+                    // initializer's sign must not leak into it. This only ever
+                    // SET the flag, so `bit [15:0] u = -1` kept the literal's
+                    // signedness and `c.u > 0` compared as -1 instead of
+                    // 65535 — the same shape as the parameter bug, one level
+                    // in. A real keeps its own representation.
+                    if !is_real {
+                        v.is_signed = is_signed;
+                    }
                     // Track source order for `%p` (§21.2.1.7).
                     if !property_order.contains(&decl.name.name) {
                         property_order.push(decl.name.name.clone());
@@ -3834,7 +3842,14 @@ pub fn elaborate_module_with_defs(
                                 } else {
                                     eval_init_for_width(init_expr, &elab.parameters, w)
                                 };
-                                if is_signed { rv.is_signed = true; }
+// §11.8.1: the DECLARED type decides signedness — an
+                                // initializer's sign must never leak into it.
+                                // Only SETTING the flag left `int unsigned x = -1`
+                                // and `bit [15:0] u = -1` behaving as signed, so
+                                // `x > 0` was false and `u + 10` was 9 instead of
+                                // 65545. (Parameters had the same bug; this is the
+                                // variable-declaration twin.)
+                                if !is_real { rv.is_signed = is_signed; }
                                 if is_real { rv = Value::from_f64(rv.to_f64()); }
                                 (rv, None)
                             } else {
@@ -7591,7 +7606,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     } else {
                         let init_val = if let Some(init_expr) = &decl.init {
                             let mut rv = eval_init_for_width(init_expr, &elab.parameters, width);
-                            if is_signed { rv.is_signed = true; }
+                            if !is_real { rv.is_signed = is_signed; }
                             if is_real { rv = Value::from_f64(rv.to_f64()); }
                             rv
                         } else {
@@ -9858,7 +9873,12 @@ pub(crate) fn pack_packed_vector_pattern(
         DataType::Implicit { dimensions, .. } => dimensions,
         _ => return None,
     };
-    if dims.len() < 2 {
+    // A SINGLE packed dim is a vector of bits — `'{1'b1, 2.0, 2+1}` on
+    // `bit [2:0]` converts each item to ONE bit (§10.9.2 element-by-element),
+    // exactly like the multi-D case with 1-bit elements. The old `< 2` guard
+    // sent it to the raw-concat fallback, which kept every item at its own
+    // width and scrambled the result.
+    if dims.is_empty() {
         return None;
     }
     pack_vector_pattern_dims(dims, expr, params)
@@ -9893,8 +9913,16 @@ fn pack_vector_pattern_dims(
         elem_w = elem_w.checked_mul(((il - ir).unsigned_abs() + 1) as u32)?;
     }
     let eval_elem = |e: &Expression| -> Option<Value> {
-        if inner.len() >= 2 && matches!(e.kind, ExprKind::AssignmentPattern(_)) {
+        if !inner.is_empty() && matches!(e.kind, ExprKind::AssignmentPattern(_)) {
             return pack_vector_pattern_dims(inner, e, params);
+        }
+        // §6.12.2: a real item CONVERTS (rounds) to the element type — the
+        // width-fit path would reinterpret its IEEE-754 bits.
+        let raw = eval_const_expr_val(e, params);
+        if raw.is_real {
+            let r = raw.to_f64().round() as i64;
+            let m = if elem_w >= 64 { u64::MAX } else { (1u64 << elem_w) - 1 };
+            return Some(Value::from_u64(r as u64 & m, elem_w));
         }
         Some(eval_init_for_width(e, params, elem_w))
     };
@@ -10330,8 +10358,22 @@ fn pack_struct_const_value(
             Some(e) => {
                 if let Some(sub) = pack_struct_const_value(mdt, e, params, typedefs, typedef_types) {
                     sub.resize(*mw)
+                } else if let Some(sub) = pack_packed_vector_pattern(mdt, e, params, typedef_types)
+                {
+                    // A nested pattern on a packed-VECTOR member
+                    // (`bit [2:0][3:0] y` given `'{4,5,6}`).
+                    sub.resize(*mw)
                 } else {
-                    eval_init_for_width(e, params, *mw)
+                    // §6.12.2: a real item CONVERTS (rounds) to the member
+                    // type; the width-fit would reinterpret its IEEE-754 bits.
+                    let raw = eval_const_expr_val(e, params);
+                    if raw.is_real {
+                        let r = raw.to_f64().round() as i64;
+                        let m = if *mw >= 64 { u64::MAX } else { (1u64 << *mw) - 1 };
+                        Value::from_u64(r as u64 & m, *mw)
+                    } else {
+                        eval_init_for_width(e, params, *mw)
+                    }
                 }
             }
             None => Value::zero(*mw),

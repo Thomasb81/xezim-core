@@ -965,7 +965,24 @@ impl Parser {
                                 self.span_from(start),
                             )));
                         } else {
-                            items.push(AssignmentPatternItem::Ordered(count_expr));
+                            // An explicit-brace concat/replication ITEM —
+                            // `'{{3{y}}}` is ONE element whose value is the
+                            // 24-bit concat — parses to the same Replication
+                            // node as the multiplier form `'{3{y}}` (three
+                            // elements). Wrap the explicit form in Paren so
+                            // the expansion sites can tell them apart: a bare
+                            // Ordered(Replication) always means the
+                            // §10.10.1 multiplier.
+                            let item_expr = if matches!(count_expr.kind, ExprKind::Replication { .. })
+                            {
+                                Expression::new(
+                                    ExprKind::Paren(Box::new(count_expr)),
+                                    self.span_from(start),
+                                )
+                            } else {
+                                count_expr
+                            };
+                            items.push(AssignmentPatternItem::Ordered(item_expr));
                         }
                     }
                     first = false;
