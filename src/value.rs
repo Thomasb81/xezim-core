@@ -451,7 +451,12 @@ impl Value {
     /// shifts and a small match in the caller's frame.
     #[inline(always)]
     pub fn get_bit(&self, i: usize) -> LogicBit {
-        if i as u32 >= self.width {
+        // Compare in `usize`: `i as u32` TRUNCATES, so a 64-bit index whose low
+        // 32 bits happen to be small (what a negative part-select base becomes
+        // after wrapping — `w[-4 +: 8]`) slipped past the range guard and
+        // panicked on the shift below. Widening `self.width` instead of
+        // narrowing `i` costs nothing on this hot path.
+        if i >= self.width as usize {
             // §5.7.1: a fill value replicates its bit into any wider context.
             if self.is_fill {
                 return self.get_bit(0);
@@ -478,7 +483,7 @@ impl Value {
     /// in fused gate simulation.
     #[inline(always)]
     pub fn get_bit_code(&self, i: usize) -> u8 {
-        if i as u32 >= self.width {
+        if i >= self.width as usize {
             if self.is_fill {
                 return self.get_bit_code(0);
             }
@@ -500,7 +505,7 @@ impl Value {
     /// Set one bit from compact 4-state code. Returns true when the bit changed.
     #[inline(always)]
     pub fn set_bit_code(&mut self, i: usize, code: u8) -> bool {
-        if i as u32 >= self.width { return false; }
+        if i >= self.width as usize { return false; }
         match &mut self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 let mask = 1u64 << i;
@@ -532,7 +537,7 @@ impl Value {
     /// rationale for `#[inline(always)]`.
     #[inline(always)]
     pub fn set_bit(&mut self, i: usize, bit: LogicBit) {
-        if i as u32 >= self.width { return; }
+        if i >= self.width as usize { return; }
         match &mut self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => {
                 let mask = 1u64 << i;

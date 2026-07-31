@@ -6803,9 +6803,23 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
         ExprKind::Index { expr, index } => {
             if let ExprKind::Ident(hier) = &expr.kind {
                 if hier.path.len() == 1 {
-                    if let Some(sig) = elab.signals.get(&hier.path[0].name.name) {
-                        if sig.is_real {
-                            return Err(format!("Bit-select of real variable '{}' is not allowed", sig.name));
+                    let nm = &hier.path[0].name.name;
+                    // §6.12.2 forbids a bit-select OF a real, but `r[i]` on an
+                    // ARRAY of reals is an ELEMENT select, not a bit-select.
+                    // The check keyed only on "the signal is real", so
+                    // `real r_aa[int]; r_aa[7]` was rejected outright and any
+                    // module holding a real associative/unpacked array failed
+                    // to elaborate.
+                    let is_indexable_collection = elab.arrays.contains_key(nm)
+                        || elab.associative_arrays.contains_key(nm)
+                        || elab.arrays_2d.contains_key(nm)
+                        || elab.arrays_nd.contains_key(nm)
+                        || elab.dynamic_arrays.contains(nm);
+                    if !is_indexable_collection {
+                        if let Some(sig) = elab.signals.get(nm) {
+                            if sig.is_real {
+                                return Err(format!("Bit-select of real variable '{}' is not allowed", sig.name));
+                            }
                         }
                     }
                 }
