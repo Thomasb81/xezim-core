@@ -325,7 +325,12 @@ impl Parser {
         self.expect(TokenKind::KwFunction);
         let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
-        let return_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) ||
+        // §25.9: `virtual` at the RETURN-TYPE position can only start a
+        // virtual-interface type (`function automatic virtual bus_if #(4).drv
+        // get(...)`) — a virtual METHOD's keyword sits BEFORE `function` and
+        // was consumed above.
+        let return_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid)
+            || self.at(TokenKind::KwVirtual) ||
                             (self.at(TokenKind::Identifier) && (
                                 self.peek_kind() == TokenKind::Identifier ||
                                 (self.peek_kind() == TokenKind::DoubleColon
@@ -363,6 +368,7 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
+        Self::merge_nonansi_port_types(&mut ports, &mut items);
         FunctionDeclaration { lifetime, specifier, return_type, name, ports, items, endlabel, strict_body_ports, span: self.span_from(start) }
     }
 
@@ -472,7 +478,44 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
+        Self::merge_nonansi_port_types(&mut ports, &mut items);
         TaskDeclaration { lifetime, specifier, name, ports, items, endlabel, strict_body_ports, span: self.span_from(start) }
+    }
+
+    /// §13.3: the non-ANSI style may declare a port's DIRECTION and its DATA
+    /// TYPE as two separate body items (`input x;  int x;`). The second line
+    /// parses as an ordinary variable declaration; left there it became a
+    /// LOCAL that shadowed the 1-bit implicit port. Merge such a declaration's
+    /// type into the matching implicit-typed port and drop the statement.
+    /// Only single-declarator, no-initializer declarations whose name matches
+    /// an IMPLICIT-typed port are merged — anything else really is a local.
+    pub(super) fn merge_nonansi_port_types(
+        ports: &mut [FunctionPort],
+        items: &mut Vec<super::super::ast::stmt::Statement>,
+    ) {
+        use super::super::ast::stmt::StatementKind;
+        items.retain(|it| {
+            let StatementKind::VarDecl { data_type, lifetime: None, declarators } = &it.kind
+            else {
+                return true;
+            };
+            if declarators.len() != 1 {
+                return true;
+            }
+            let d = &declarators[0];
+            if d.init.is_some() || !d.dimensions.is_empty() {
+                return true;
+            }
+            let Some(port) = ports.iter_mut().find(|p| {
+                p.name.name == d.name.name
+                    && matches!(&p.data_type, DataType::Implicit { dimensions, .. }
+                        if dimensions.is_empty())
+            }) else {
+                return true;
+            };
+            port.data_type = data_type.clone();
+            false
+        });
     }
 
     /// Parse a method name: handles 'new', regular identifiers, and class_scope::name.

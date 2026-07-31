@@ -533,6 +533,16 @@ impl Parser {
             }
             TokenKind::KwVirtual => {
                 if self.peek_kind() == TokenKind::KwInterface { Some(self.parse_identifier_starting_item()) }
+                else if self.peek_kind() == TokenKind::Identifier {
+                    // §25.9: a MODULE-scope virtual-interface variable —
+                    // `virtual req_if #(4).driver rd;`. Bumping past `virtual`
+                    // and re-parsing (the old behavior) made `req_if #(4)`
+                    // look like a parameterized INSTANTIATION, which then
+                    // choked on `.driver`. parse_data_declaration starts at
+                    // the `virtual` keyword and handles `#(...)` and
+                    // `.modport` through parse_data_type.
+                    Some(ModuleItem::DataDeclaration(self.parse_data_declaration()))
+                }
                 else { self.bump(); self.parse_module_item() }
             }
             // IEEE 1800-2023 §23.11: `bind` inside a module body. Parsed into a

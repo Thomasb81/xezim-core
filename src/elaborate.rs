@@ -2978,6 +2978,30 @@ pub fn elaborate_module_with_defs(
                             return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
                         }
                     }
+                    // §7.4.1: a non-ANSI PORT of a packed multi-D (or packed
+                    // struct) type needs the same element/field registrations
+                    // a variable declaration gets — the DataDeclaration arm
+                    // has always done this, the port arm never did, so
+                    // `output logic [3:0][9:0] o; assign o[1] = v;` degraded
+                    // to a bit-window write (only the low bits landed) and
+                    // struct-port member writes missed the layout.
+                    if let Some(ew) = packed_inner_elem_width(&pd.data_type, &elab.parameters, &elab.typedefs) {
+                        elab.packed_signal_elem_widths.entry(decl.name.name.clone()).or_insert(ew);
+                    }
+                    if let Some(fd) = packed_full_dims_of(&pd.data_type, &elab.parameters) {
+                        elab.packed_full_dims.entry(decl.name.name.clone()).or_insert(fd);
+                    }
+                    if let Some(fields) = packed_struct_field_layout(
+                        &pd.data_type,
+                        &elab.parameters,
+                        &elab.typedefs,
+                        &elab.typedef_types,
+                    ) {
+                        if !fields.is_empty() {
+                            tls_register_struct_layout(&decl.name.name, &fields);
+                            elab.packed_struct_fields.entry(decl.name.name.clone()).or_insert(fields);
+                        }
+                    }
                     elab.note_explicit_type(&decl.name.name, &pd.data_type, decl.name.span)?;
                     // §23.2.2.1 non-ANSI ports: the data type and the direction
                     // may be declared in separate statements (`byte x; output x;`).
@@ -10999,6 +11023,98 @@ pub fn inline_instantiations(
                                         if l > r { elab.descending_arrays.insert(decl.name.name.clone()); }
                                     }
                                 }
+                                // SCALAR package variable (`enum integer {A,B} e = A;`,
+                                // `integer n = 42;`): nothing below handles it — the
+                                // arm only registered arrays, so the signal never
+                                // existed, its initializer never applied (`P::e`
+                                // read x), and an anonymous enum's members/methods
+                                // had no registration (`P::e.first` was empty).
+                                // Mirror the module-scope declaration path.
+                                if decl.dimensions.is_empty() {
+                                    register_anonymous_enum_members(&dd.data_type, elab);
+                                    let is_anon_enum =
+                                        anon_enum_members_ordered(&dd.data_type, &elab.parameters);
+                                    if let Some(members) = &is_anon_enum {
+                                        elab.enum_members
+                                            .insert(decl.name.name.clone(), members.clone());
+                                    }
+                                    let w = width.max(1);
+                                    let is_real = is_type_real(&dd.data_type);
+                                    // `C c = new;` cannot const-evaluate — run
+                                    // it as a static init (same machinery the
+                                    // array initializers use) so `P::c.f1()`
+                                    // has a live handle. NOTE: no-parens `new`
+                                    // parses as a bare IDENT, not a Call, so
+                                    // expr_has_call alone misses it.
+                                    let init_has_call = decl.init.as_ref().is_some_and(|e| {
+                                        expr_has_call(e)
+                                            || matches!(&e.kind, ExprKind::Ident(h)
+                                                if h.path.len() == 1
+                                                    && h.path[0].name.name == "new")
+                                    });
+                                    if init_has_call {
+                                        if let Some(init_expr) = &decl.init {
+                                            elab.static_init_blocks.push(InitialBlock {
+                                                stmt: Statement::new(
+                                                    StatementKind::BlockingAssign {
+                                                        lvalue: make_ident_expr(&decl.name.name),
+                                                        rvalue: init_expr.clone(),
+                                                    },
+                                                    Span::dummy(),
+                                                ),
+                                                scope: String::new(),
+                                            });
+                                        }
+                                    }
+                                    let v = match &decl.init {
+                                        Some(e) if !init_has_call => {
+                                            let mut v =
+                                                eval_init_for_width(e, &elab.parameters, w);
+                                            if is_real {
+                                                v = Value::from_f64(v.to_f64());
+                                            } else if is_signed {
+                                                v.is_signed = true;
+                                            }
+                                            v
+                                        }
+                                        _ => default_value_for_type(&dd.data_type, w),
+                                    };
+                                    let tn = if is_anon_enum.is_some() {
+                                        Some(decl.name.name.clone())
+                                    } else {
+                                        get_type_name(&dd.data_type)
+                                    };
+                                    // A packed-STRUCT package variable needs its
+                                    // field layout registered, or `P::s.x`
+                                    // (and any member select) reads x.
+                                    if let Some(fields) = packed_struct_field_layout(
+                                        &dd.data_type,
+                                        &elab.parameters,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            tls_register_struct_layout(&decl.name.name, &fields);
+                                            elab.packed_struct_fields
+                                                .entry(decl.name.name.clone())
+                                                .or_insert(fields);
+                                        }
+                                    }
+                                    elab.var_decl_types
+                                        .entry(decl.name.name.clone())
+                                        .or_insert_with(|| dd.data_type.clone());
+                                    elab.signals.entry(decl.name.name.clone()).or_insert(Signal {
+                                        is_const: false,
+                                        name: decl.name.name.clone(),
+                                        width: w,
+                                        is_signed,
+                                        is_real,
+                                        direction: None,
+                                        value: v,
+                                        type_name: tn,
+                                    });
+                                    continue;
+                                }
                                 let Some(init_expr) = &decl.init else { continue };
                                 let init_items: Vec<&Expression> = match &init_expr.kind {
                                     ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
@@ -13814,6 +13930,32 @@ fn inline_module_items(
                                 let is_signed = is_type_signed(&pd.data_type);
                                 for decl in &pd.declarators {
                                     let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                    // §7.4.1: a non-ANSI PORT of a packed
+                                    // multi-D / packed-struct type needs the
+                                    // same shape registrations a variable
+                                    // declaration gets. Without them
+                                    // `assign o[1] = v;` on a
+                                    // `output logic [3:0][9:0] o;` inlined
+                                    // port degraded to a bit-window write, and
+                                    // struct-port member assigns lost the
+                                    // layout.
+                                    if let Some(ew) = packed_inner_elem_width(&pd.data_type, &sub_local_params, &elab.typedefs) {
+                                        elab.packed_signal_elem_widths.entry(sig_name.clone()).or_insert(ew);
+                                    }
+                                    if let Some(fd) = packed_full_dims_of(&pd.data_type, &sub_local_params) {
+                                        elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
+                                    }
+                                    if let Some(fields) = packed_struct_field_layout(
+                                        &pd.data_type,
+                                        &sub_local_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            tls_register_struct_layout(&sig_name, &fields);
+                                            elab.packed_struct_fields.entry(sig_name.clone()).or_insert(fields);
+                                        }
+                                    }
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                         name: sig_name, width, is_signed,
                                         direction: Some(pd.direction),
@@ -17053,14 +17195,32 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             let struct_fields = flatten_struct_fields(
                                 &dd.data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types,
                             ).filter(|f| !f.is_empty());
+                            // An ANONYMOUS enum's members must be registered
+                            // BEFORE the initializer evaluates — `enum { A, B }
+                            // e = B;` otherwise read B as an unknown (0). Also
+                            // key the member list by the VARIABLE name so
+                            // `e.first/next` resolve (§6.19.6).
+                            register_anonymous_enum_members(&dd.data_type, elab);
+                            let anon_members =
+                                anon_enum_members_ordered(&dd.data_type, &elab.parameters);
                             for decl in &dd.declarators {
+                                if let Some(members) = &anon_members {
+                                    elab.enum_members
+                                        .entry(decl.name.name.clone())
+                                        .or_insert_with(|| members.clone());
+                                }
                                 let v = if let Some(init) = &decl.init {
                                     eval_init_for_width(init, &elab.parameters, width)
                                 } else { Value::zero(width) };
+                                let tn = if anon_members.is_some() {
+                                    Some(decl.name.name.clone())
+                                } else {
+                                    get_type_name(&dd.data_type)
+                                };
                                 elab.signals.insert(decl.name.name.clone(), Signal {
                                     is_const: dd.const_kw, name: decl.name.name.clone(),
                                     width, is_signed, is_real, direction: None,
-                                    value: v, type_name: get_type_name(&dd.data_type),
+                                    value: v, type_name: tn,
                                 });
                                 if let Some(fields) = &struct_fields {
                                     tls_register_struct_layout(&decl.name.name, fields);
