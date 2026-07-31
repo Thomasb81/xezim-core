@@ -1938,6 +1938,20 @@ pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedMo
     }
 }
 
+/// §26.3: mirror a package typedef under its qualified `pkg::name` key so a
+/// SCOPED reference resolves even when a module-local typedef shadows the bare
+/// name (`typedef int T;` in the module vs `P::T`). The bare registration is
+/// unchanged — imports keep working exactly as before.
+pub fn register_scoped_typedef_alias(pkg: &str, td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
+    let key = format!("{}::{}", pkg, td.name.name);
+    if let Some(w) = elab.typedefs.get(&td.name.name).copied() {
+        elab.typedefs.insert(key.clone(), w);
+    }
+    if let Some(dt) = elab.typedef_types.get(&td.name.name).cloned() {
+        elab.typedef_types.insert(key, dt);
+    }
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // §6.18: a bare forward type declaration `typedef name;`. Record it for the
     // resolution check and register a placeholder, but never clobber a name that
@@ -2430,6 +2444,7 @@ pub fn elaborate_module_with_defs(
                             // inline_instantiations, after the top body.
                             crate::ast::decl::PackageItem::Typedef(td) => {
                                 process_typedef(td, &mut elab);
+                                register_scoped_typedef_alias(&p.name.name, td, &mut elab);
                             }
                             // Hoist package DPI imports so calls to
                             // `uvm_re_compexecfree` etc. resolve via
@@ -2924,6 +2939,24 @@ pub fn elaborate_module_with_defs(
         }
     }
 
+    // §6.18: a FORWARD typedef (`typedef T;`) may be completed LATER in the
+    // module, with declarations using the name in between (`typedef T; T x;
+    // typedef int T;`). The main walk below processes items in source order,
+    // so `T x` sized against the Void placeholder (width 0). Pre-register
+    // every REAL module typedef here — after the parameter pre-seed, so their
+    // dims resolve — exactly as packages pre-register theirs; the main walk's
+    // re-processing is idempotent.
+    for item in module.items() {
+        if let ModuleItem::TypedefDeclaration(td) = item {
+            if !td.forward
+                && struct_typedef_self_reference(&td.name.name, &td.data_type, &elab.typedef_types)
+                    .is_none()
+            {
+                process_typedef(td, &mut elab);
+            }
+        }
+    }
+
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -3241,7 +3274,16 @@ pub fn elaborate_module_with_defs(
                     // applies both, so only take the shortcut when there are
                     // no such dims.
                     DataType::TypeReference { name, dimensions, .. } if dimensions.is_empty() => {
-                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                        {
+                        // §26.3: a SCOPED `P::T` prefers the qualified key so
+                        // a module-local `typedef ... T` cannot capture it.
+                        let scoped_w = name.scope.as_ref().and_then(|sc| {
+                            elab.typedefs.get(&format!("{}::{}", sc.name, name.name.name)).copied()
+                        });
+                        scoped_w
+                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                            .unwrap_or_else(|| resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                    }
                     }
                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                 };
@@ -4347,6 +4389,20 @@ pub fn elaborate_module_with_defs(
                         let mut current_width = width;
                         let mut current_is_real = is_real;
                         let mut current_signed = signed;
+
+                        // §6.20.2: a parameter with NO type and NO range takes
+                        // the SIZE of its final value when that value is a
+                        // sized literal — `localparam P = 16'b...` is 16 bits,
+                        // so `$left(P)` is 15 and `$bits(P)` 16. Only the
+                        // sized-literal case is narrowed; unsized values keep
+                        // the 32-bit default. (The package path already did
+                        // this; the module path pinned 32.)
+                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                        {
+                            if let Some(w) = assign.init.as_ref().and_then(sized_literal_width) {
+                                current_width = w;
+                            }
+                        }
 
                         if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
                             let init_is_real = if elab.parameters.contains_key(&assign.name.name)
@@ -7529,7 +7585,16 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     // applies both, so only take the shortcut when there are
                     // no such dims.
                     DataType::TypeReference { name, dimensions, .. } if dimensions.is_empty() => {
-                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                        {
+                        // §26.3: a SCOPED `P::T` prefers the qualified key so
+                        // a module-local `typedef ... T` cannot capture it.
+                        let scoped_w = name.scope.as_ref().and_then(|sc| {
+                            elab.typedefs.get(&format!("{}::{}", sc.name, name.name.name)).copied()
+                        });
+                        scoped_w
+                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                            .unwrap_or_else(|| resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                    }
                     }
                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                 };
@@ -8364,7 +8429,14 @@ pub fn resolve_typedef_chain<'a>(
     let mut cur = dt;
     for _ in 0..64 {
         let DataType::TypeReference { name, .. } = cur else { break };
-        match typedef_types.get(&name.name.name) {
+        // §26.3: a SCOPED reference (`P::T`) names the package's typedef and
+        // must not be captured by a same-named local — try the qualified key
+        // first (package walks register both spellings).
+        let scoped = name
+            .scope
+            .as_ref()
+            .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, name.name.name)));
+        match scoped.or_else(|| typedef_types.get(&name.name.name)) {
             Some(next) => cur = next,
             None => break,
         }
@@ -8424,7 +8496,16 @@ pub fn resolve_type_width(
         }
         DataType::TypeReference { name, dimensions, .. } => {
             let mut base_width = if let Some(td) = typedefs {
-                td.get(&name.name.name).copied().unwrap_or(32)
+                // §26.3: prefer the package-qualified key for `P::T` so a
+                // module-local `typedef ... T` cannot capture it.
+                let scoped = name
+                    .scope
+                    .as_ref()
+                    .and_then(|sc| td.get(&format!("{}::{}", sc.name, name.name.name)))
+                    .copied();
+                scoped
+                    .or_else(|| td.get(&name.name.name).copied())
+                    .unwrap_or(32)
             } else {
                 32
             };
@@ -8522,7 +8603,13 @@ pub fn is_type_signed_resolved(
 ) -> bool {
     if let DataType::TypeReference { name, .. } = dt {
         let key = &name.name.name;
-        if let Some(inner) = typedef_types.get(key) {
+        // §26.3: scoped `P::T` prefers the qualified registration.
+        let inner = name
+            .scope
+            .as_ref()
+            .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, key)))
+            .or_else(|| typedef_types.get(key));
+        if let Some(inner) = inner {
             // Guard against a self-referential name.
             if !matches!(inner, DataType::TypeReference { name: n, .. } if &n.name.name == key) {
                 return is_type_signed_resolved(inner, typedef_types);
@@ -10807,7 +10894,10 @@ pub fn inline_instantiations(
                                     }
                                 }
                             }
-                            crate::ast::decl::PackageItem::Typedef(td) => { process_typedef(td, elab); }
+                            crate::ast::decl::PackageItem::Typedef(td) => {
+                                process_typedef(td, elab);
+                                register_scoped_typedef_alias(name, td, elab);
+                            }
                             _ => {}
                         }
                     }
@@ -10840,6 +10930,7 @@ pub fn inline_instantiations(
                         }
                         crate::ast::decl::PackageItem::Typedef(td) => {
                             process_typedef(td, elab);
+                            register_scoped_typedef_alias(name, td, elab);
                         }
                         crate::ast::decl::PackageItem::Parameter(pd) => {
                             if let ParameterKind::Data { data_type, assignments } = &pd.kind {
@@ -16774,7 +16865,16 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             if dd.declarators.iter().any(|decl| &decl.name.name == sym_name) => {
                                 let width = match &dd.data_type {
                                     DataType::TypeReference { name, .. } => {
-                                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                                        {
+                        // §26.3: a SCOPED `P::T` prefers the qualified key so
+                        // a module-local `typedef ... T` cannot capture it.
+                        let scoped_w = name.scope.as_ref().and_then(|sc| {
+                            elab.typedefs.get(&format!("{}::{}", sc.name, name.name.name)).copied()
+                        });
+                        scoped_w
+                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                            .unwrap_or_else(|| resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                    }
                                     }
                                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                                 };
@@ -16930,7 +17030,16 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         PackageItem::Data(dd) => {
                             let width = match &dd.data_type {
                                 DataType::TypeReference { name, .. } => {
-                                    elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                                    {
+                        // §26.3: a SCOPED `P::T` prefers the qualified key so
+                        // a module-local `typedef ... T` cannot capture it.
+                        let scoped_w = name.scope.as_ref().and_then(|sc| {
+                            elab.typedefs.get(&format!("{}::{}", sc.name, name.name.name)).copied()
+                        });
+                        scoped_w
+                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                            .unwrap_or_else(|| resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                    }
                                 }
                                 _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                             };

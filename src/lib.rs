@@ -941,6 +941,166 @@ fn parse_and_elaborate(
         }
     }
 
+    // §6.18 + §3.12.1: a $unit typedef's DIMENSIONS are evaluated in the
+    // scope where the typedef is DECLARED — the compilation unit — not where
+    // the type is later used. The $unit localparams themselves are injected
+    // into each module body (and skipped entirely when the module shadows the
+    // name), so by elaboration time the typedef would resolve its dims against
+    // the MODULE's table: `localparam A=8; typedef logic [A-1:0] T[1:0];` in
+    // a module declaring `localparam A=4` produced 4-bit (or, shadowed, 1-bit)
+    // elements. Fold the dims to literals here, against the $unit environment,
+    // while both are still in hand. Anything that doesn't const-evaluate in
+    // that environment (e.g. `pkg::W`) is left untouched for the existing
+    // late resolution.
+    {
+        let mut unit_params: std::collections::HashMap<String, Value, crate::hasher::DeterministicState> = Default::default();
+        for pd in &top_level_params {
+            if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                for a in assignments {
+                    if let Some(init) = &a.init {
+                        if let Some(v) = elaborate::const_eval_i64_with_params(init, Some(&unit_params)) {
+                            let mut val = Value::from_u64(v as u64, 32);
+                            val.is_signed = true;
+                            unit_params.insert(a.name.name.clone(), val);
+                        }
+                    }
+                }
+            }
+        }
+        {
+            type PTable = std::collections::HashMap<String, Value, crate::hasher::DeterministicState>;
+            fn fold_expr(e: &mut ast::expr::Expression, table: &PTable) {
+                if table.is_empty() || matches!(e.kind, ast::expr::ExprKind::Number(_)) {
+                    return;
+                }
+                if let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table)) {
+                    if v >= 0 {
+                        *e = ast::expr::Expression::new(
+                            // UNSIZED literal — a sized one would trip the
+                            // §6.19 enum-member width check against narrow
+                            // base types.
+                            ast::expr::ExprKind::Number(ast::expr::NumberLiteral::Integer {
+                                size: None,
+                                signed: true,
+                                base: ast::expr::NumberBase::Decimal,
+                                value: v.to_string(),
+                                cached_val: std::cell::Cell::new(None),
+                            }),
+                            e.span,
+                        );
+                    }
+                }
+            }
+            fn fold_packed(dims: &mut [ast::types::PackedDimension], table: &PTable) {
+                for d in dims.iter_mut() {
+                    if let ast::types::PackedDimension::Range { left, right, .. } = d {
+                        fold_expr(left, table);
+                        fold_expr(right, table);
+                    }
+                }
+            }
+            fn fold_unpacked(d: &mut ast::types::UnpackedDimension, table: &PTable) {
+                match d {
+                    ast::types::UnpackedDimension::Range { left, right, .. } => {
+                        fold_expr(left, table);
+                        fold_expr(right, table);
+                    }
+                    ast::types::UnpackedDimension::Expression { expr, .. } => fold_expr(expr, table),
+                    _ => {}
+                }
+            }
+            fn fold_dt(dt: &mut ast::types::DataType, table: &PTable, depth: usize) {
+                if depth > 8 {
+                    return;
+                }
+                match dt {
+                    ast::types::DataType::IntegerVector { dimensions, .. }
+                    | ast::types::DataType::Implicit { dimensions, .. }
+                    // `typedef l [A-1:0] T[$];` — packed dims ON a type
+                    // reference base.
+                    | ast::types::DataType::TypeReference { dimensions, .. } => {
+                        fold_packed(dimensions, table)
+                    }
+                    ast::types::DataType::Enum(et) => {
+                        if let Some(bt) = et.base_type.as_mut() {
+                            fold_dt(bt.as_mut(), table, depth + 1);
+                        }
+                        // Member initializers (`B = X`) evaluate in the
+                        // DECLARING scope too.
+                        for m in et.members.iter_mut() {
+                            if let Some(init) = m.init.as_mut() {
+                                fold_expr(init, table);
+                            }
+                        }
+                    }
+                    // A struct/union base (`typedef struct packed { logic
+                    // [A-1:0] x; } T[1:0];`) carries the scope references in
+                    // its MEMBER types — recurse.
+                    ast::types::DataType::Struct(su) => {
+                        for m in su.members.iter_mut() {
+                            fold_dt(&mut m.data_type, table, depth + 1);
+                            for mdecl in m.declarators.iter_mut() {
+                                for d in mdecl.dimensions.iter_mut() {
+                                    fold_unpacked(d, table);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            fn eval_params_into(pd: &ast::decl::ParameterDeclaration, table: &mut PTable) {
+                if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for a in assignments {
+                        if let Some(init) = &a.init {
+                            if let Some(v) =
+                                elaborate::const_eval_i64_with_params(init, Some(table))
+                            {
+                                let mut val = Value::from_u64(v as u64, 32);
+                                val.is_signed = true;
+                                table.insert(a.name.name.clone(), val);
+                            }
+                        }
+                    }
+                }
+            }
+            // $unit typedefs fold against the $unit params.
+            for def in definitions.values_mut() {
+                let SourceDefinition::Typedef(t) = def else { continue };
+                let td = Rc::make_mut(t);
+                fold_dt(&mut td.data_type, &unit_params, 0);
+                for d in td.dimensions.iter_mut() {
+                    fold_unpacked(d, &unit_params);
+                }
+            }
+            // PACKAGE typedefs fold against ($unit params + that package's own
+            // params, in item order) — each package is its own scope, so
+            // same-named localparams in different packages (`P1.A=8`,
+            // `P2.A=4`) must not bleed into each other the way the flat
+            // elaboration table lets them. With the dims already literal, the
+            // later flat-table walk stores the right width no matter which
+            // package's `A` currently occupies the slot — and a QUALIFIED
+            // `P1::T` reference works without any import.
+            for def in definitions.values_mut() {
+                let SourceDefinition::Package(pkg) = def else { continue };
+                let pkg = Rc::make_mut(pkg);
+                let mut table = unit_params.clone();
+                for item in pkg.items.iter_mut() {
+                    match item {
+                        ast::decl::PackageItem::Parameter(pd) => eval_params_into(pd, &mut table),
+                        ast::decl::PackageItem::Typedef(td) => {
+                            fold_dt(&mut td.data_type, &table, 0);
+                            for d in td.dimensions.iter_mut() {
+                                fold_unpacked(d, &table);
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+        }
+    }
+
     let named_top_found = top_module_name.is_some_and(|n| definitions.contains_key(n));
     if let (Some(name), true) = (top_module_name, named_top_found) {
         top_module = Some(name.to_string());

@@ -166,6 +166,34 @@ impl Parser {
                 forward: false, // forward CLASS — resolved via a class decl, not checked here
             };
         }
+        // §6.18: KEYWORD-qualified forward form — `typedef struct T;`,
+        // `typedef union T;`, `typedef enum T;`. Falling through to
+        // parse_data_type read `struct` and found no body, registering a
+        // bodyless width-0 type under T that CLOBBERED the real definition
+        // when the item was re-processed. Only the exact keyword-ident-semi
+        // shape is taken; `typedef struct {...} T;` still parses normally.
+        if matches!(
+            self.current_kind(),
+            TokenKind::KwStruct | TokenKind::KwUnion | TokenKind::KwEnum
+        ) && matches!(
+            self.peek_kind(),
+            TokenKind::Identifier | TokenKind::EscapedIdentifier
+        ) && self
+            .tokens
+            .get(self.pos + 2)
+            .is_some_and(|t| t.kind == TokenKind::Semicolon)
+        {
+            self.bump(); // the struct/union/enum keyword
+            let name = self.parse_identifier();
+            self.expect(TokenKind::Semicolon);
+            return TypedefDeclaration {
+                data_type: DataType::Void(self.span_from(start)),
+                name,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+                forward: true,
+            };
+        }
         // IEEE 1800-2017 §6.18: bare forward type declaration `typedef name;`
         // (no type body) — promises a later full typedef. Multiple are legal.
         if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
