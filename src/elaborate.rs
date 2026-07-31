@@ -10571,6 +10571,13 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 BinaryOp::Power => l.power(&r),
                 BinaryOp::Eq => l.is_equal(&r),
                 BinaryOp::Neq => l.is_not_equal(&r),
+                // §11.4.6: wildcard equality in a CONSTANT expression —
+                // `parameter W = 2'b01 ==? 2'b0x;` evaluated to 0 because
+                // these ops had no const-eval arm at all.
+                BinaryOp::CaseEq => l.case_eq(&r),
+                BinaryOp::CaseNeq => l.case_eq(&r).logic_not(),
+                BinaryOp::WildcardEq => l.wildcard_eq(&r),
+                BinaryOp::WildcardNeq => l.wildcard_ne(&r),
                 BinaryOp::Lt => l.less_than(&r),
                 BinaryOp::Leq => l.less_equal(&r),
                 BinaryOp::Gt => l.greater_than(&r),

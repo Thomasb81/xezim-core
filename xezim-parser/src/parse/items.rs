@@ -232,8 +232,39 @@ impl Parser {
             self.expect(TokenKind::Dot);
             let mp_name = self.parse_identifier();
             Some(DataType::Interface { name: if_name, modport: Some(mp_name), span: self.span_from(start) })
-        } else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash | TokenKind::LBracket) {
+        } else if self.at(TokenKind::Identifier)
+            && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)
+        {
             Some(self.parse_data_type())
+        } else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket {
+            // AMBIGUOUS: `typedef_t [7:0] name` (a type with packed dims)
+            // vs `name[t-1:0]` (an implicit-typed port whose NAME carries an
+            // unpacked dimension — `output v0vJ[t-1:0],`). Look past the
+            // balanced bracket groups: an IDENTIFIER there means the first
+            // token was a type; a comma/`)`/`=` means it was the port name.
+            let mut p = self.pos + 1;
+            while self.tokens.get(p).is_some_and(|t| t.kind == TokenKind::LBracket) {
+                let mut depth = 1;
+                p += 1;
+                while depth > 0 {
+                    match self.tokens.get(p).map(|t| t.kind) {
+                        Some(TokenKind::LBracket) => depth += 1,
+                        Some(TokenKind::RBracket) => depth -= 1,
+                        Some(_) => {}
+                        None => break,
+                    }
+                    p += 1;
+                }
+            }
+            if self
+                .tokens
+                .get(p)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Identifier | TokenKind::EscapedIdentifier))
+            {
+                Some(self.parse_data_type())
+            } else {
+                None
+            }
         } else { None };
         let mut dimensions = if data_type.is_some() {
             self.parse_unpacked_dimensions()
