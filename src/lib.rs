@@ -1006,6 +1006,33 @@ fn parse_and_elaborate(
                         fold_expr(right, table);
                     }
                     ast::types::UnpackedDimension::Expression { expr, .. } => fold_expr(expr, table),
+                    // `[B]` with B a parameter parses as an ASSOCIATIVE dim
+                    // keyed by "type B" — rewrite to a literal size in the
+                    // declaring scope, exactly like normalize_unpacked_dims
+                    // does later with the (wrong-scope) module table.
+                    ast::types::UnpackedDimension::Associative { data_type: Some(dt), span } => {
+                        if let ast::types::DataType::TypeReference { name, .. } = dt.as_ref() {
+                            if let Some(v) = table.get(&name.name.name) {
+                                if let Some(n) = v.to_u64() {
+                                    *d = ast::types::UnpackedDimension::Expression {
+                                        expr: Box::new(ast::expr::Expression::new(
+                                            ast::expr::ExprKind::Number(
+                                                ast::expr::NumberLiteral::Integer {
+                                                    size: None,
+                                                    signed: true,
+                                                    base: ast::expr::NumberBase::Decimal,
+                                                    value: n.to_string(),
+                                                    cached_val: std::cell::Cell::new(None),
+                                                },
+                                            ),
+                                            *span,
+                                        )),
+                                        span: *span,
+                                    };
+                                }
+                            }
+                        }
+                    }
                     _ => {}
                 }
             }
