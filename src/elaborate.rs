@@ -2512,6 +2512,19 @@ pub fn elaborate_module_with_defs(
         }
     }
     set_funcs_tls(&elab.functions);
+    // §23.2.2 / A.1.2: module-HEADER imports (`module m import P::*;
+    // #(parameter X = FOO) (...)`) precede the parameter list in the grammar
+    // and are usable in it. The items walk processes imports in source order
+    // — long after this header-parameter pass had evaluated defaults, so
+    // `parameter X = FOO` read 0. Process every module import first; later
+    // re-processing is idempotent (inserts).
+    for item in module.items() {
+        if let ModuleItem::ImportDeclaration(imp) = item {
+            if let Some(defs) = all_defs {
+                process_import(imp, &mut elab, defs)?;
+            }
+        }
+    }
     // Process parameters
     for param in module.params() {
         if let ParameterKind::Data { data_type, assignments } = &param.kind {
