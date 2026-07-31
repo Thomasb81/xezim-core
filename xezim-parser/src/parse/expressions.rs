@@ -799,6 +799,23 @@ impl Parser {
             TokenKind::LParen => {
                 self.bump();
                 let inner = self.parse_expression();
+                // §18.5.4 tolerated nonstandard form `( expr dist { ... } )`
+                // inside a constraint (a reference simulator warns and
+                // accepts). Capture the body for `parse_constraint_item`;
+                // outside constraint context `dist` here stays an error.
+                if self.in_constraint && self.at(TokenKind::KwDist) {
+                    let dspan = self.current().span;
+                    self.diagnostics.push(crate::diagnostics::Diagnostic::warning(
+                        "parenthesized 'dist' constraint is nonstandard (accepted for \
+                         compatibility)",
+                        dspan,
+                    ));
+                    self.bump();
+                    let body = self.parse_dist_body();
+                    self.pending_paren_dist.push(body);
+                    self.expect(TokenKind::RParen);
+                    return inner;
+                }
                 let inner = if self.at_any(&[
                     TokenKind::Assign, TokenKind::PlusAssign, TokenKind::MinusAssign,
                     TokenKind::StarAssign, TokenKind::SlashAssign, TokenKind::PercentAssign,

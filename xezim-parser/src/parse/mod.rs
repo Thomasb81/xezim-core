@@ -27,13 +27,24 @@ pub struct Parser {
     /// operators. Outside this context `or` stays an event-list separator
     /// (`@(a or b)`) and `and` a gate primitive, so the flag is essential.
     in_sva_seq: bool,
+    /// True while parsing the expression of a CONSTRAINT item, so the
+    /// parenthesized-primary parser accepts the nonstandard-but-tolerated
+    /// `( expr dist { ... } )` form (§18.5.4; a reference simulator warns
+    /// `Illegal use of parenthesis around 'dist' constraint` and accepts it).
+    pub(super) in_constraint: bool,
+    /// The dist body captured by that paren form, handed back to
+    /// `parse_constraint_item` once the enclosing expression finishes.
+    pub(super) pending_paren_dist:
+        Vec<(Vec<crate::ast::decl::ConstraintRange>, Vec<Option<crate::ast::decl::DistWeight>>)>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
         Self { tokens, pos: 0, diagnostics: Vec::new(),
                pending_pattern_bindings: Vec::new(),
-               in_sva_seq: false }
+               in_sva_seq: false,
+               in_constraint: false,
+               pending_paren_dist: Vec::new() }
     }
 
     pub fn diagnostics(&self) -> &[Diagnostic] { &self.diagnostics }
