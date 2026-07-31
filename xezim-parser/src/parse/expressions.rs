@@ -1729,7 +1729,11 @@ impl Parser {
             TokenKind::Star => Some((BinaryOp::Mul, 21, 22)),
             TokenKind::Slash => Some((BinaryOp::Div, 21, 22)),
             TokenKind::Percent => Some((BinaryOp::Mod, 21, 22)),
-            TokenKind::DoubleStar => Some((BinaryOp::Power, 24, 23)), // right-assoc
+            // §11.3.2: ALL binary operators associate left to right — only
+            // the conditional operator is right-associative. `2 ** 3 ** 2`
+            // is (2**3)**2 = 64, unlike the right-associative `**` of most
+            // general-purpose languages (which gave 512 here).
+            TokenKind::DoubleStar => Some((BinaryOp::Power, 23, 24)), // left-assoc
             _ => None,
         }
     }

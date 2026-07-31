@@ -872,7 +872,34 @@ impl Value {
             let a = self.to_u128();
             let b = other.to_u128();
             if b == 0 { return Value::new(w); }
+            // §11.6.1: signed only when BOTH operands are signed — the WIDE
+            // path ignored signedness entirely, so a 128-bit `-5 / 3` divided
+            // the raw two's-complement pattern and returned a huge positive
+            // number.
+            if self.is_signed && other.is_signed {
+                let sa = Self::i128_at_width(a, self.width);
+                let sb = Self::i128_at_width(b, other.width);
+                if sb == 0 { return Value::new(w); }
+                let q = sa.wrapping_div(sb);
+                let mut r = Value::from_u128(q as u128, w);
+                r.is_signed = true;
+                return r;
+            }
             Value::from_u128(a / b, w)
+        }
+    }
+
+    /// Sign-extend a `width`-bit pattern to i128 (width capped at 128).
+    #[inline]
+    fn i128_at_width(raw: u128, width: u32) -> i128 {
+        if width == 0 || width >= 128 {
+            return raw as i128;
+        }
+        let sign = 1u128 << (width - 1);
+        if raw & sign != 0 {
+            (raw | (!0u128 << width)) as i128
+        } else {
+            raw as i128
         }
     }
 
@@ -904,6 +931,17 @@ impl Value {
             let a = self.to_u128();
             let b = other.to_u128();
             if b == 0 { return Value::new(w); }
+            // §11.6.1: signed remainder in the wide path too (sign follows
+            // the FIRST operand, as in the 64-bit arm).
+            if self.is_signed && other.is_signed {
+                let sa = Self::i128_at_width(a, self.width);
+                let sb = Self::i128_at_width(b, other.width);
+                if sb == 0 { return Value::new(w); }
+                let q = sa.wrapping_rem(sb);
+                let mut r = Value::from_u128(q as u128, w);
+                r.is_signed = true;
+                return r;
+            }
             Value::from_u128(a % b, w)
         }
     }
@@ -929,11 +967,23 @@ impl Value {
                 _ => 0,
             }
         } else {
-            let base = self.to_u64().unwrap_or(0);
+            // Accumulate in u128 so a WIDE result survives — `2**100` on a
+            // 128-bit operand computed in u64 wrapped to 0. The iteration cap
+            // grows with the width (an even base saturates to 0 well before
+            // it; an odd base cycles, and real designs don't raise to
+            // astronomic exponents).
+            let base = self.to_u128();
             let exp = other.to_u64().unwrap_or(0);
-            let mut r: u64 = 1;
-            for _ in 0..exp.min(64) { r = r.wrapping_mul(base); }
-            r
+            let mut r: u128 = 1;
+            for _ in 0..exp.min(4096) {
+                r = r.wrapping_mul(base);
+                if r == 0 {
+                    break;
+                }
+            }
+            let mut v = Value::from_u128(r, self.width);
+            v.is_signed = result_signed;
+            return v;
         };
         let mut v = Value::from_u64(result, self.width);
         v.is_signed = result_signed;
