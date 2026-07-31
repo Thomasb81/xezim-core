@@ -417,7 +417,7 @@ fn parse_enum_type(&mut self) -> DataType {
     if self.at(TokenKind::Identifier)
         && matches!(self.peek_kind(), TokenKind::Semicolon | TokenKind::Comma) {
         return DataType::Enum(crate::ast::types::EnumType {
-            base_type: None, members: Vec::new(), span: self.span_from(start),
+            base_type: None, members: Vec::new(), dimensions: Vec::new(), span: self.span_from(start),
         });
     }
     let base_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
@@ -439,7 +439,7 @@ fn parse_enum_type(&mut self) -> DataType {
     // started on a non-`{` token and could spin without progress.
     if !self.at(TokenKind::LBrace) {
         return DataType::Enum(crate::ast::types::EnumType {
-            base_type, members: Vec::new(), span: self.span_from(start),
+            base_type, members: Vec::new(), dimensions: Vec::new(), span: self.span_from(start),
         });
     }
     self.expect(TokenKind::LBrace);
@@ -524,8 +524,11 @@ fn parse_enum_type(&mut self) -> DataType {
             }
         }
 
+        // §7.4.2: packed dims AFTER the body — `enum {...} [1:0] x;` is a
+        // packed array of the enum (same as the struct body-suffix form).
+        let dimensions = self.parse_packed_dimensions();
         DataType::Enum(crate::ast::types::EnumType {
-            base_type, members, span: self.span_from(start),
+            base_type, members, dimensions, span: self.span_from(start),
         })
     }
 

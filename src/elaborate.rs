@@ -8656,11 +8656,25 @@ pub fn resolve_type_width(
             SimpleType::Event => 1,
         },
         DataType::Enum(e) => {
-            if let Some(bt) = &e.base_type {
+            let base = if let Some(bt) = &e.base_type {
                 resolve_type_width(bt, params, typedefs)
             } else {
                 32
+            };
+            // §7.4.2: body-suffix packed dims (`enum {...} [1:0] x;`) make a
+            // packed ARRAY of the enum — multiply like the struct arm does.
+            let mut total = base as u64;
+            for d in &e.dimensions {
+                if let PackedDimension::Range { left, right, .. } = d {
+                    if let (Some(l), Some(r)) = (
+                        const_eval_i64_with_params(left, params),
+                        const_eval_i64_with_params(right, params),
+                    ) {
+                        total = total.saturating_mul((l - r).unsigned_abs() + 1);
+                    }
+                }
             }
+            clamp_packed_width(total, "Enum", "")
         }
         DataType::Struct(s) => {
             let is_union = matches!(s.kind, StructUnionKind::Union);
