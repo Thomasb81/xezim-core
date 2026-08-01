@@ -826,6 +826,13 @@ fn parse_and_elaborate(
     }
     let mut definitions: crate::hasher::HashMap<String, SourceDefinition> = crate::hasher::HashMap::default();
     let mut top_module = None;
+    /// When the design has multiple uninstantiated top-level modules, this
+    /// holds their names so that — after elaboration of the synthetic
+    /// `__xezim_multi_top` wrapper — each one's module-local static
+    /// declarations (classes/typedefs) can be hoisted into the global table
+    /// exactly as they would be if that module alone were the root. Empty for
+    /// single-top designs (no hoisting needed, no behaviour change).
+    let mut multi_top_modules: Vec<String> = Vec::new();
     let mut top_level_imports = Vec::new();
     let mut top_level_lets = Vec::new();
     let mut top_level_functions: Vec<ast::decl::FunctionDeclaration> = Vec::new();
@@ -1305,7 +1312,33 @@ fn parse_and_elaborate(
         // and rely on `candidates.sort()` for determinism.
         let parse_pick_valid = top_module.as_ref()
             .is_some_and(|n| candidates.iter().any(|c| c == n));
-        if parse_pick_valid {
+        // IEEE 1800-2017 §23.3.3: every uninstantiated
+        // module/interface/program is a top-level instance and its
+        // initial/always/continuous-assign blocks ALL execute concurrently.
+        // xezim elaborates a single root, so when MORE than one module-like
+        // candidate is uninstantiated, wrap them all in a synthetic module and
+        // let `inline_instantiations` flatten each as a namespaced child
+        // instance (signal/block names are prefixed per instance, avoiding
+        // collisions). Packages/classes/typedefs/UDPs are excluded: packages
+        // are consumed globally regardless of root choice, and the rest are
+        // not hierarchy roots. This fixes multi-top testbenches (e.g. UVM's
+        // 35objections/03basic/04module) where the previous heuristic ran only
+        // one module's initial blocks.
+        let module_candidates: Vec<String> = candidates.iter()
+            .filter(|c| matches!(
+                definitions.get(c.as_str()),
+                Some(SourceDefinition::Module(_)) | Some(SourceDefinition::Interface(_)) | Some(SourceDefinition::Program(_))
+            ))
+            .cloned().collect();
+        if module_candidates.len() > 1 {
+            // Multi-top design: synthesize `__xezim_multi_top` instantiating
+            // every top-level module and elaborate that as the root.
+            let wrapper = make_multi_top_wrapper(&module_candidates);
+            let wrapper_name = wrapper.name.name.clone();
+            definitions.insert(wrapper_name.clone(), SourceDefinition::Module(std::rc::Rc::new(wrapper)));
+            top_module = Some(wrapper_name);
+            multi_top_modules = module_candidates.clone();
+        } else if parse_pick_valid {
             // Keep top_module as-is — deterministic via source order.
         } else if candidates.len() == 1 {
             top_module = Some(candidates[0].clone());
@@ -1377,6 +1410,35 @@ fn parse_and_elaborate(
     // Link `function ClassName::m(); ...` out-of-class bodies into their
     // classes — must run after inline_instantiations repopulates classes.
     elaborate::link_extern_methods(&mut elab, &def_refs);
+    // Multi-top hoist: a synthetic `__xezim_multi_top` wrapper flattens each
+    // top-level module as a child instance (so its signals/initials are
+    // namespaced and run), but the child-inline path drops module-LOCAL static
+    // declarations (classes/typedefs). When a module is the sole root these
+    // are registered globally; to keep multi-top behaviour identical, hoist
+    // each top module's classes and typedefs here, exactly as root
+    // elaboration does. This is what lets UVM's `class test` + factory
+    // (`uvm_component_utils`) resolve when the testbench module is one of
+    // several tops.
+    if !multi_top_modules.is_empty() {
+        for mname in &multi_top_modules {
+            let Some(elaborate::Definition::Module(mdef)) = def_refs.get(mname) else { continue };
+            for item in &mdef.items {
+                match item {
+                    ast::decl::ModuleItem::ClassDeclaration(cd) => {
+                        elaborate::register_class_enum_members(cd, &mut elab);
+                        elab.classes.insert(
+                            cd.name.name.clone(),
+                            elaborate::elaborate_class_with_params(cd, Some(&elab.parameters)),
+                        );
+                    }
+                    ast::decl::ModuleItem::TypedefDeclaration(td) => {
+                        elaborate::process_typedef(td, &mut elab);
+                    }
+                    _ => {}
+                }
+            }
+        }
+    }
     if std::env::var("XEZIM_ELAB_STATS").is_ok() {
         eprintln!("[elab-stats] always_blocks={} initial_blocks={} cont_assigns={} pending_always={} pending_initial={} pending_cont_assign={} signals={} parameters={} arrays={} arrays_2d={} arrays_nd={} packed_struct_fields={}",
             elab.always_blocks.len(),
@@ -1443,6 +1505,40 @@ fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::
             }
             _ => {}
         }
+    }
+}
+
+/// Build a synthetic wrapper module that instantiates each uninstantiated
+/// top-level module once, with no port connections (top-level ports are left
+/// unconnected, matching how simulators elaborate a module with unused ports).
+/// Used as the single elaboration root for multi-top designs
+/// (IEEE 1800-2017 §23.3.3). Each instance is named after its module so `%m`
+/// reads `__xezim_multi_top.<module>`.
+fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration {
+    use ast::decl::{HierarchicalInstance, ModuleInstantiation};
+    let items: Vec<ast::decl::ModuleItem> = modules.iter().map(|name| {
+        ast::decl::ModuleItem::ModuleInstantiation(ModuleInstantiation {
+            module_name: ast::Identifier { name: name.clone(), span: ast::Span::dummy() },
+            params: None,
+            instances: vec![HierarchicalInstance {
+                name: ast::Identifier { name: name.clone(), span: ast::Span::dummy() },
+                dimensions: vec![],
+                connections: vec![],
+                span: ast::Span::dummy(),
+            }],
+            span: ast::Span::dummy(),
+        })
+    }).collect();
+    ast::module::ModuleDeclaration {
+        attrs: vec![],
+        kind: ast::module::ModuleKind::Module,
+        lifetime: None,
+        name: ast::Identifier { name: "__xezim_multi_top".to_string(), span: ast::Span::dummy() },
+        params: vec![],
+        ports: ast::module::PortList::Empty,
+        items,
+        endlabel: None,
+        span: ast::Span::dummy(),
     }
 }
 

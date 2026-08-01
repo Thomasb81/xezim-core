@@ -780,10 +780,8 @@ pub fn elaborate_class_with_params(
                     } // end `if !is_static`
                     // Remember scalar initializers so instantiation can re-eval
                     // them with the live parameter table (e.g. `= NUM_HARTS`).
-                    if decl.dimensions.is_empty() {
-                        if let Some(init) = &decl.init {
-                            property_inits.insert(decl.name.name.clone(), init.clone());
-                        }
+                    if let Some(init) = &decl.init {
+                        property_inits.insert(decl.name.name.clone(), init.clone());
                     }
                     let mut v = if let Some(init) = &decl.init {
                         let mut val = eval_init_for_width(init, &HashMap::default(), width);
