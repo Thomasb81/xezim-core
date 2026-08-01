@@ -332,6 +332,41 @@ pub fn compile_verbose() -> bool {
     COMPILE_VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Single-line build progress on stderr: rewrites itself with `\r` so a long
+/// parse/elaboration shows a live indicator instead of silence. Active only
+/// when stderr is a terminal — piped output and `-l` logs never see control
+/// characters — and callers skip it under `--verbose`, which already prints a
+/// full line per file.
+pub fn progress_status(msg: &str) {
+    use std::io::{IsTerminal, Write};
+    let err = std::io::stderr();
+    if !err.is_terminal() {
+        return;
+    }
+    // Truncate to one line: a long path must not wrap, or the \r rewrite
+    // leaves stale fragments behind.
+    let msg: String = if msg.len() > 100 {
+        format!("...{}", &msg[msg.len() - 97..])
+    } else {
+        msg.to_string()
+    };
+    let mut h = err.lock();
+    let _ = write!(h, "\r\x1b[K{}", msg);
+    let _ = h.flush();
+}
+
+/// Erase the progress line (call before printing normal output).
+pub fn progress_clear() {
+    use std::io::{IsTerminal, Write};
+    let err = std::io::stderr();
+    if !err.is_terminal() {
+        return;
+    }
+    let mut h = err.lock();
+    let _ = write!(h, "\r\x1b[K");
+    let _ = h.flush();
+}
+
 pub(crate) fn implicit_net_warn() -> bool {
     IMPLICIT_NET_WARN.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -560,6 +595,13 @@ pub fn parse_and_elaborate_multi(
         let label = source_files.get(i).map(|s| s.as_str()).unwrap_or("<unnamed>");
         if compile_verbose() {
             eprintln!("[compile] ({}/{}) parsing {}", i + 1, sources.len(), label);
+        } else {
+            progress_status(&format!(
+                "[compile] parsing {}/{}: {}",
+                i + 1,
+                sources.len(),
+                label.rsplit('/').next().unwrap_or(label)
+            ));
         }
         // Mark a new compilation file so a `timescale that stuck across from a
         // prior file is treated as inherited (overridable by --module-timescale)
@@ -573,6 +615,7 @@ pub fn parse_and_elaborate_multi(
         let diags = parser.diagnostics().to_vec();
 
         if diags.iter().any(|d| d.severity == diagnostics::Severity::Error) {
+            progress_clear();
             let errs: Vec<_> = diags.iter()
                 .filter(|d| d.severity == diagnostics::Severity::Error)
                 .map(|d| d.to_string()).collect();
@@ -587,6 +630,7 @@ pub fn parse_and_elaborate_multi(
         // parser accepts. See sv_parser::strict_check.
         let strict_viol = sv_parser::strict_check::strict_violations(&source_ast.descriptions);
         if !strict_viol.is_empty() {
+            progress_clear();
             return Err(format!("Strict check failed in '{}' (file {} of {}):\n{}",
                 label, i + 1, sources.len(), strict_viol.join("\n")));
         }
@@ -617,8 +661,16 @@ pub fn parse_and_elaborate_multi(
     // cloned, then moved back out.
     elaborate::set_elab_sources(preprocessed_texts, source_files.to_vec());
     elaborate::set_elab_module_files(src_file_of_module.clone());
+    if !compile_verbose() {
+        progress_status(&format!(
+            "[compile] elaborating design ({} files parsed, {} definitions)...",
+            sources.len(),
+            all_descriptions.len()
+        ));
+    }
     let elaborated =
         parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales, &module_ts_own_file);
+    progress_clear();
     let (texts, files) = elaborate::take_elab_sources();
     let (defs, mut elab) = elaborated?;
     elab.source_texts = texts;
