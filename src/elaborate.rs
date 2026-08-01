@@ -7027,7 +7027,10 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
                    !elab.sequences.contains(name) &&
                    !locals.contains(name) {
-                   return Err(format!("Undeclared identifier '{}'", name));
+                   let loc = span_location(elab, expr.span)
+                       .map(|l| format!(" at {}", l))
+                       .unwrap_or_default();
+                   return Err(format!("Undeclared identifier '{}'{}", name, loc));
                 }            }
         ExprKind::Unary { operand, .. } => validate_expr_idents(operand, elab, locals)?,
         ExprKind::Binary { left, right, .. } => { validate_expr_idents(left, elab, locals)?; validate_expr_idents(right, elab, locals)?; }
@@ -7126,6 +7129,14 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                     | "$probe" | "$probe_close" | "$probe_off" | "$probe_on"
                     // §20.16: second argument is an instance scope.
                     | "$sdf_annotate"
+                    // §20.12 assertion controls: `$assertoff(0, testbench)`
+                    // during reset is a staple of vendor testbenches — the
+                    // trailing args are scopes/hierarchical refs, not values.
+                    | "$assertoff" | "$asserton" | "$assertkill" | "$assertcontrol"
+                    | "$assertpasson" | "$assertpassoff" | "$assertfailon"
+                    | "$assertfailoff" | "$assertnonvacuouson" | "$assertvacuousoff"
+                    // Legacy scope/listing tasks (§21 of 1364): scope args too.
+                    | "$scope" | "$list" | "$showvars" | "$showscopes"
             )
             // Vendor debug/waveform families take scope args throughout and
             // are runtime-ignored anyway; match by PREFIX so each vendor's
@@ -7211,7 +7222,10 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
                 && !elab.clocking_blocks.contains_key(&id.name)
                 && id.name != "__xz_default_clocking"
             => {
-                return Err(format!("Undeclared identifier '{}'", id.name));
+                let loc = span_location(elab, id.span)
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                return Err(format!("Undeclared identifier '{}'{}", id.name, loc));
             }
         EventControl::HierIdentifier(e) => validate_expr_idents(e, elab, locals)?,
         _ => {}
