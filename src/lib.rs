@@ -455,6 +455,39 @@ pub fn set_library_cli(cfg: LibraryCli) {
     *library_cli_cell().lock().unwrap() = cfg;
 }
 
+/// Library files whose definitions were ADOPTED during elaboration (module
+/// name list per file, insertion-ordered). Consumed by `--dump-merged-sv` to
+/// append the needed `-v`/`-y` sources so the merged artifact rebuilds
+/// standalone.
+static ADOPTED_LIB_FILES: std::sync::OnceLock<
+    std::sync::Mutex<Vec<(std::path::PathBuf, Vec<String>)>>,
+> = std::sync::OnceLock::new();
+
+fn adopted_lib_files_cell() -> &'static std::sync::Mutex<Vec<(std::path::PathBuf, Vec<String>)>> {
+    ADOPTED_LIB_FILES.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+pub(crate) fn record_adopted_lib_file(path: std::path::PathBuf, module: &str) {
+    if let Ok(mut v) = adopted_lib_files_cell().lock() {
+        if let Some((_, mods)) = v.iter_mut().find(|(p, _)| *p == path) {
+            if !mods.iter().any(|m| m == module) {
+                mods.push(module.to_string());
+            }
+        } else {
+            v.push((path, vec![module.to_string()]));
+        }
+    }
+}
+
+/// The adopted-library record, in adoption order. Does not clear — a single
+/// CLI run elaborates once.
+pub fn adopted_lib_files() -> Vec<(std::path::PathBuf, Vec<String>)> {
+    adopted_lib_files_cell()
+        .lock()
+        .map(|v| v.clone())
+        .unwrap_or_default()
+}
+
 static MODULE_TIMESCALE_CLI: std::sync::OnceLock<std::sync::Mutex<ModuleTimescaleCli>> =
     std::sync::OnceLock::new();
 
@@ -1821,15 +1854,21 @@ fn resolve_library_modules(
             continue;
         }
         if let Some(def) = lib.get(&name) {
-            if let Some((path, true, kind)) = lib_origins.get(&name) {
-                adopted_from_v += 1;
-                if lib_cli.primitive_verbose {
-                    eprintln!(
-                        "[primitive-verbose] adopting {} '{}' from -v '{}' to resolve an instantiation",
-                        kind,
-                        name,
-                        path.display()
-                    );
+            if let Some((path, from_v, kind)) = lib_origins.get(&name) {
+                // Record every adoption (both -v and -y) so `--dump-merged-sv`
+                // can append the library files the design actually needed and
+                // produce a standalone-rebuildable artifact.
+                record_adopted_lib_file(path.clone(), &name);
+                if *from_v {
+                    adopted_from_v += 1;
+                    if lib_cli.primitive_verbose {
+                        eprintln!(
+                            "[primitive-verbose] adopting {} '{}' from -v '{}' to resolve an instantiation",
+                            kind,
+                            name,
+                            path.display()
+                        );
+                    }
                 }
             }
             let mut more = std::collections::HashSet::new();
