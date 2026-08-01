@@ -1155,7 +1155,60 @@ impl Preprocessor {
         result
     }
 
+fn apply_token_pasting(text: &str) -> String {
+    if !text.contains("``") {
+        return text.to_string();
+    }
+    let mut result = String::with_capacity(text.len());
+    let bytes = text.as_bytes();
+    let mut i = 0;
+    let mut in_string = false;
+    while i < bytes.len() {
+        if in_string {
+            let ch = text[i..].chars().next().unwrap();
+            if ch == '\\' {
+                result.push(ch);
+                i += ch.len_utf8();
+                if i < bytes.len() {
+                    let n = text[i..].chars().next().unwrap();
+                    result.push(n);
+                    i += n.len_utf8();
+                }
+                continue;
+            }
+            if ch == '"' {
+                in_string = false;
+            }
+            result.push(ch);
+            i += ch.len_utf8();
+            continue;
+        }
+
+        if bytes[i] == b'`' && i + 1 < bytes.len() && bytes[i + 1] == b'`' {
+            i += 2;
+            while result.ends_with(' ') || result.ends_with('\t') {
+                result.pop();
+            }
+            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
+                i += 1;
+            }
+            continue;
+        }
+
+        if bytes[i] == b'"' && !(i > 0 && bytes[i - 1] == b'`') {
+            in_string = true;
+        }
+
+        let ch = text[i..].chars().next().unwrap();
+        result.push(ch);
+        i += ch.len_utf8();
+    }
+    result
+}
+
     fn expand_macros_once(&self, line: &str) -> String {
+        let line_pasted = Self::apply_token_pasting(line);
+        let line = &line_pasted;
         let mut result = String::with_capacity(line.len());
         let bytes = line.as_bytes();
         let mut i = 0;
@@ -1350,7 +1403,8 @@ impl Preprocessor {
                             }
                             }
                         }
-                        result.push_str(&body);
+                        let body_pasted = Self::apply_token_pasting(&body);
+                        result.push_str(&body_pasted);
                     } else {
                         // §22.5.1: a macro defined with a formal list must be
                         // invoked with parentheses, even when empty.
@@ -1359,7 +1413,8 @@ impl Preprocessor {
                                 "macro `{}` requires parentheses (it is defined with \
                                  arguments) (IEEE 1800-2017 §22.5.1)", macro_name));
                         }
-                        result.push_str(&def.body);
+                        let body_pasted = Self::apply_token_pasting(&def.body);
+                        result.push_str(&body_pasted);
                     }
                 } else {
                     // §22.5.1: referencing an undefined text macro is an error.
