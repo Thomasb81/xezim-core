@@ -2594,7 +2594,23 @@ pub fn elaborate_module_with_defs(
                     let init_is_real = if let Some(override_val) = param_overrides.get(&assign.name.name) {
                         override_val.is_real
                     } else if let Some(init) = &assign.init {
-                        eval_const_expr_val(init, &elab.parameters).is_real
+                        // A const-FUNCTION call in the initializer must be
+                        // substituted first, or a real-returning function reads
+                        // as non-real (§6.20.2: an implicit parameter takes
+                        // the type of its final value).
+                        let subst;
+                        let e: &Expression = if expr_has_call(init) {
+                            match substitute_const_fn_calls(init, &elab.parameters, &elab, 0) {
+                                Some(x) => {
+                                    subst = x;
+                                    &subst
+                                }
+                                None => init,
+                            }
+                        } else {
+                            init
+                        };
+                        eval_const_expr_val(e, &elab.parameters).is_real
                     } else { false };
 
                     if init_is_real {
@@ -4550,7 +4566,21 @@ pub fn elaborate_module_with_defs(
                             {
                                 elab.parameters.get(&assign.name.name).map(|v| v.is_real).unwrap_or(false)
                             } else if let Some(init) = &assign.init {
-                                eval_const_expr_val(init, &elab.parameters).is_real
+                                // Substitute const-function calls first (see
+                                // the header-param twin above).
+                                let subst;
+                                let e: &Expression = if expr_has_call(init) {
+                                    match substitute_const_fn_calls(init, &elab.parameters, &elab, 0) {
+                                        Some(x) => {
+                                            subst = x;
+                                            &subst
+                                        }
+                                        None => init,
+                                    }
+                                } else {
+                                    init
+                                };
+                                eval_const_expr_val(e, &elab.parameters).is_real
                             } else { false };
 
                             if init_is_real {
@@ -15229,13 +15259,22 @@ fn eval_const_user_function(
     let fname = fd.name.name.name.clone();
     let mut locals: HashMap<String, Value> = elab.parameters.clone();
     for (i, port) in fd.ports.iter().enumerate() {
-        locals.insert(
-            port.name.name.clone(),
-            arg_vals.get(i).cloned().unwrap_or_else(|| Value::zero(32)),
-        );
+        let mut v = arg_vals.get(i).cloned().unwrap_or_else(|| Value::zero(32));
+        // §13.3: the actual CONVERTS to the formal's declared type — a REAL
+        // formal bound to the integer literal `5` otherwise did integer
+        // arithmetic throughout (`x /= 2` gave 2, not 2.5).
+        if is_type_real(&port.data_type) && !v.is_real {
+            v = Value::from_f64(v.to_f64());
+        }
+        locals.insert(port.name.name.clone(), v);
     }
-    // The implicit return variable.
-    locals.insert(fname.clone(), Value::zero(32));
+    // The implicit return variable (typed per the declared return type).
+    let ret_init = if is_type_real(&fd.return_type) {
+        Value::from_f64(0.0)
+    } else {
+        Value::zero(32)
+    };
+    locals.insert(fname.clone(), ret_init);
 
     enum Flow {
         Normal,
@@ -15401,7 +15440,17 @@ fn eval_const_user_function(
                         if let ExprKind::Ident(h) = &operand.kind {
                             if h.path.len() == 1 && h.path[0].selects.is_empty() {
                                 let n = h.path[0].name.name.clone();
-                                let cur = locals.get(&n)?.to_i64().unwrap_or(0);
+                                let cur_v = locals.get(&n)?.clone();
+                                // Real-aware: `++x` on a real formal stepped
+                                // through to_i64 (None on a real) and reset to
+                                // 0.
+                                if cur_v.is_real {
+                                    let f = cur_v.to_f64();
+                                    let nf = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { f + 1.0 } else { f - 1.0 };
+                                    locals.insert(n, Value::from_f64(nf));
+                                    return Some(Flow::Normal);
+                                }
+                                let cur = cur_v.to_i64().unwrap_or(0);
                                 let nv = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { cur + 1 } else { cur - 1 };
                                 locals.insert(n, Value::from_u64(nv as u64, 32));
                                 return Some(Flow::Normal);
@@ -15433,7 +15482,14 @@ fn eval_const_user_function(
                 if let ExprKind::Ident(h) = &operand.kind {
                     if h.path.len() == 1 && h.path[0].selects.is_empty() {
                         let n = h.path[0].name.name.clone();
-                        let cur = locals.get(&n)?.to_i64().unwrap_or(0);
+                        let cur_v = locals.get(&n)?.clone();
+                        if cur_v.is_real {
+                            let f = cur_v.to_f64();
+                            let nf = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { f + 1.0 } else { f - 1.0 };
+                            locals.insert(n, Value::from_f64(nf));
+                            return Some(());
+                        }
+                        let cur = cur_v.to_i64().unwrap_or(0);
                         let nv = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { cur + 1 } else { cur - 1 };
                         locals.insert(n, Value::from_u64(nv as u64, 32));
                         return Some(());
@@ -15482,6 +15538,15 @@ fn eval_const_user_function(
         }
     }
     let v = locals.remove(&fname)?;
+    // A REAL return keeps its representation — resize() reinterprets the
+    // IEEE-754 bits (f_id(5) came back 0.0).
+    if is_type_real(&fd.return_type) {
+        return Some(if v.is_real {
+            v
+        } else {
+            Value::from_f64(v.to_f64())
+        });
+    }
     // §13.4.1: the result takes the DECLARED return type — a
     // `function [3:0]` returning 20 yields 4, not 20. Unresolvable return
     // widths bail (deferral) rather than guessing.
@@ -15563,8 +15628,18 @@ fn substitute_const_fn_calls(
                 argv.push(eval_const_expr_val(&sa, params));
             }
             let v = eval_const_user_function(&fd, &argv, elab, depth)?;
-            let iv = v.to_i64()?;
-            make_i64_literal(iv, expr.span)
+            // A REAL result substitutes as a REAL literal — `to_i64` dropped
+            // the fraction and the realness (`localparam D = f_div(5)` with a
+            // real function read 0/2 instead of 2.5).
+            if v.is_real {
+                Expression::new(
+                    ExprKind::Number(NumberLiteral::Real(v.to_f64())),
+                    expr.span,
+                )
+            } else {
+                let iv = v.to_i64()?;
+                make_i64_literal(iv, expr.span)
+            }
         }
         ExprKind::Binary { op, left, right } => rebuild(ExprKind::Binary {
             op: *op,
