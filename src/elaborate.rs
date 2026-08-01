@@ -7115,6 +7115,15 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                     | "$set_coverage_db_name" | "$load_coverage_db"
                     // Verdi/VCS waveform tasks: scope args like $dumpvars.
                     | "$fsdbDumpvars" | "$fsdbDumpfile" | "$vcdpluson" | "$vcdplusoff"
+                    // Cadence/Xcelium SHM + SST2 waveform tasks: the first
+                    // argument of $shm_probe/$recordvars/$probe is a SCOPE
+                    // (`$shm_probe(testbench, "AC")`), so validating it as a
+                    // value lookup failed whole-testbench elaboration with
+                    // "Undeclared identifier '<top>'".
+                    | "$shm_open" | "$shm_probe" | "$shm_close" | "$shm_save"
+                    | "$recordfile" | "$recordvars" | "$recordon" | "$recordoff"
+                    | "$recordsetup" | "$recordclose"
+                    | "$probe" | "$probe_close" | "$probe_off" | "$probe_on"
                     // §20.16: second argument is an instance scope.
                     | "$sdf_annotate"
             );
