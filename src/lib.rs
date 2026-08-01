@@ -76,6 +76,20 @@ static COMPRESSION_STATS: std::sync::OnceLock<std::sync::atomic::AtomicBool> = s
 
 /// Set the zstd compression level (1-22). Must be called before `write_compiled`.
 /// Higher levels = better compression but slower. Level 3 is the default.
+/// `--artifact-compression none`: write `-o` artifacts as raw bincode (no
+/// zstd). The read side sniffs the zstd frame magic after the XEZIM header,
+/// so both kinds load transparently.
+static ARTIFACT_UNCOMPRESSED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_artifact_uncompressed(on: bool) {
+    ARTIFACT_UNCOMPRESSED.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn artifact_uncompressed() -> bool {
+    ARTIFACT_UNCOMPRESSED.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub fn set_zstd_level(level: i32) {
     let cell = ZSTD_LEVEL.get_or_init(|| std::sync::RwLock::new(XEZIM_ZSTD_LEVEL_DEFAULT));
     if let Ok(mut guard) = cell.write() {
@@ -139,7 +153,17 @@ fn artifact_version_error(file_magic: &[u8; 8]) -> Option<String> {
 pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<(), String> {
     use bincode::Options;
     use std::io::Write;
-    
+
+    if artifact_uncompressed() {
+        let f = std::fs::File::create(path).map_err(|e| format!("create '{}': {}", path, e))?;
+        let mut w = std::io::BufWriter::with_capacity(1 << 20, f);
+        w.write_all(XEZIM_BYTECODE_MAGIC).map_err(|e| format!("write '{}': {}", path, e))?;
+        xez_bincode_options()
+            .serialize_into(&mut w, elab)
+            .map_err(|e| format!("serialize: {}", e))?;
+        return w.flush().map_err(|e| format!("flush '{}': {}", path, e));
+    }
+
     let level = get_zstd_level();
     let stats_enabled = compression_stats_enabled();
     
@@ -238,10 +262,22 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
         }
         return Ok(None);
     }
-    let dec = zstd::stream::Decoder::new(r).map_err(|e| format!("zstd init: {}", e))?;
-    let elab = xez_bincode_options()
-        .deserialize_from(dec)
-        .map_err(|e| format!("deserialize: {}", e))?;
+    // Sniff: a zstd frame starts 28 B5 2F FD; an uncompressed artifact's
+    // first payload bytes are a bincode string length (low bytes small), so
+    // the two cannot collide. Chain the peeked bytes back in front.
+    let mut head = [0u8; 4];
+    let got = r.read(&mut head).map_err(|e| format!("read '{}': {}", path, e))?;
+    let chained = std::io::Read::chain(std::io::Cursor::new(head[..got].to_vec()), r);
+    let elab = if got == 4 && head == [0x28, 0xB5, 0x2F, 0xFD] {
+        let dec = zstd::stream::Decoder::new(chained).map_err(|e| format!("zstd init: {}", e))?;
+        xez_bincode_options()
+            .deserialize_from(dec)
+            .map_err(|e| format!("deserialize: {}", e))?
+    } else {
+        xez_bincode_options()
+            .deserialize_from(chained)
+            .map_err(|e| format!("deserialize: {}", e))?
+    };
     Ok(Some(elab))
 }
 
@@ -261,10 +297,17 @@ pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, 
         }
         return Err("xezim artifact: missing magic header".to_string());
     }
-    let dec = zstd::stream::Decoder::new(body).map_err(|e| format!("zstd init: {}", e))?;
-    xez_bincode_options()
-        .deserialize_from(dec)
-        .map_err(|e| format!("deserialize: {}", e))
+    // Same compressed/uncompressed sniff as `read_compiled`.
+    if body.len() >= 4 && body[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
+        let dec = zstd::stream::Decoder::new(body).map_err(|e| format!("zstd init: {}", e))?;
+        xez_bincode_options()
+            .deserialize_from(dec)
+            .map_err(|e| format!("deserialize: {}", e))
+    } else {
+        xez_bincode_options()
+            .deserialize(body)
+            .map_err(|e| format!("deserialize: {}", e))
+    }
 }
 
 use std::rc::Rc;
