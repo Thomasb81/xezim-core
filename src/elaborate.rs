@@ -9113,6 +9113,64 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                     ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => Some(*s as i64),
                     ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => Some(32),
                     ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
+                    // §20.6.2 over an EXPRESSION operand: compute the
+                    // self-determined width structurally. A port declared
+                    // `[$bits({{A{1'b0}}, {(A*B){1'b0}}})-1:0]` elaborated to
+                    // ONE BIT without this and silently truncated the bus.
+                    ExprKind::Concatenation(_) | ExprKind::Replication { .. } | ExprKind::Paren(_) => {
+                        fn expr_bits(
+                            e: &Expression,
+                            params: Option<&HashMap<String, Value>>,
+                        ) -> Option<i64> {
+                            match &e.kind {
+                                ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => {
+                                    Some(*s as i64)
+                                }
+                                ExprKind::Number(NumberLiteral::Integer { size: None, .. }) => {
+                                    Some(32)
+                                }
+                                ExprKind::Number(NumberLiteral::UnbasedUnsized(_)) => Some(1),
+                                ExprKind::Paren(i) => expr_bits(i, params),
+                                ExprKind::Concatenation(parts) => {
+                                    let mut t = 0i64;
+                                    for p in parts {
+                                        t = t.checked_add(expr_bits(p, params)?)?;
+                                    }
+                                    Some(t)
+                                }
+                                ExprKind::Replication { count, exprs } => {
+                                    let c = const_eval_i64_with_params(count, params)?;
+                                    if c < 0 {
+                                        return None;
+                                    }
+                                    let mut t = 0i64;
+                                    for p in exprs {
+                                        t = t.checked_add(expr_bits(p, params)?)?;
+                                    }
+                                    t.checked_mul(c)
+                                }
+                                ExprKind::Ident(hier) => {
+                                    let n = hier
+                                        .path
+                                        .last()
+                                        .map(|s| s.name.name.as_str())
+                                        .unwrap_or("");
+                                    params
+                                        .and_then(|m| m.get(n).map(|v| v.width as i64))
+                                        .or_else(|| {
+                                            TYPEDEFS_TLS.with(|td| {
+                                                td.borrow()
+                                                    .as_ref()
+                                                    .and_then(|m| m.get(n).copied())
+                                                    .map(|w| w as i64)
+                                            })
+                                        })
+                                }
+                                _ => None,
+                            }
+                        }
+                        expr_bits(inner, params)
+                    }
                     _ => None,
                 }
             }
@@ -13726,15 +13784,25 @@ fn inline_module_items(
                     collect_declared_types(sub_mod.ports(), sub_mod.items(), &mut m, &mut e);
                     (m, e)
                 };
-                let add_params_from_items = |items: &[ModuleItem], local_map: &mut HashMap<String, Value>, elab_ro: &ElaboratedModule| {
+                let add_params_from_items = |items: &[ModuleItem], local_map: &mut HashMap<String, Value>, elab_ro: &ElaboratedModule, frozen: &HashSet<String>| {
                     for _ in 0..64 {
+                        let mut changed = false;
                         let before = local_map.len();
                         let effective_items = collect_effective_items(items, local_map);
                         for item in &effective_items {
                             if let ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) = item {
                                 if let ParameterKind::Data { data_type, assignments } = &pd.kind {
                                     for assign in assignments {
-                                        if !local_map.contains_key(&assign.name.name) {
+                                        // A body localparam may have been
+                                        // computed in an earlier round against
+                                        // a STALE local-typedef width (its
+                                        // fields size by other localparams) —
+                                        // recompute non-frozen entries each
+                                        // round until stable. Header params /
+                                        // overrides stay frozen.
+                                        if !local_map.contains_key(&assign.name.name)
+                                            || !frozen.contains(&assign.name.name)
+                                        {
                                             if let Some(init) = &assign.init {
                                                 // §13.4.3 const-function calls.
                                                 let subbed_init;
@@ -13776,14 +13844,17 @@ fn inline_module_items(
                                                         val = Value::from_f64(val.to_f64());
                                                     }
                                                 }
-                                                local_map.insert(assign.name.name.clone(), val);
+                                                if local_map.get(&assign.name.name) != Some(&val) {
+                                                    changed = true;
+                                                    local_map.insert(assign.name.name.clone(), val);
+                                                }
                                             }
                                         }
                                     }
                                 }
                             }
                         }
-                        if local_map.len() == before { break; }
+                        if local_map.len() == before && !changed { break; }
                     }
                 };
 
@@ -13948,7 +14019,18 @@ fn inline_module_items(
                 // - …` saw $bits = 0 and the subtraction wrapped to ~u32::MAX,
                 // producing a multi-GB phantom width. A few passes converge
                 // typedefs whose width depends on an earlier-resolved typedef.
-                {
+                // Header params + overrides are authoritative; body
+                // localparams computed below may be revised as local typedef
+                // widths converge.
+                let frozen_params: HashSet<String> = sub_local_params.keys().cloned().collect();
+                // 1b+2 fixed point: a local typedef's field widths can use
+                // body LOCALPARAMS (LP1 = A*B; logic [LP1-1:0] f2;) and a
+                // localparam can use $bits(<local typedef>) — registering the
+                // typedefs once against header params only froze the wrong
+                // width into everything downstream (a parameterized struct
+                // read $bits = 15 instead of 53). Alternate the two passes
+                // until neither changes.
+                for _ in 0..4 {
                     let body_items = collect_effective_items(sub_mod.items(), &sub_local_params);
                     let mut local_tds = elab.typedefs.clone();
                     for _ in 0..3 {
@@ -13960,10 +14042,14 @@ fn inline_module_items(
                         }
                     }
                     TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(local_tds));
-                }
 
-                // 2. Parameters from module items
-                add_params_from_items(sub_mod.items(), &mut sub_local_params, elab);
+                    // 2. Parameters from module items
+                    let snapshot = sub_local_params.clone();
+                    add_params_from_items(sub_mod.items(), &mut sub_local_params, elab, &frozen_params);
+                    if sub_local_params == snapshot {
+                        break;
+                    }
+                }
 
                 let prepared_sub = prepare_module_items(sub_mod, definitions, &sub_local_params, &elab.typedefs, cache);
 
