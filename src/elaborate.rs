@@ -7126,7 +7126,15 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                     | "$probe" | "$probe_close" | "$probe_off" | "$probe_on"
                     // §20.16: second argument is an instance scope.
                     | "$sdf_annotate"
-            );
+            )
+            // Vendor debug/waveform families take scope args throughout and
+            // are runtime-ignored anyway; match by PREFIX so each vendor's
+            // next task name ($xm* Verisium/vwdb dumping, $indago*, ...)
+            // doesn't re-break elaboration one name at a time. None collide
+            // with an LRM-defined task name.
+            || ["$shm", "$xm", "$fsdb", "$vcdplus", "$vwdb", "$indago", "$record", "$probe"]
+                .iter()
+                .any(|p| name.starts_with(p));
             if !skip {
                 for a in args { validate_expr_idents(a, elab, locals)?; }
             }
