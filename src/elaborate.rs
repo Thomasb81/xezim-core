@@ -14774,28 +14774,45 @@ fn inline_module_items(
                         new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
                         // Return-type width can also use a module parameter.
                         new_fd.return_type = rewrite_data_type_genvar(&new_fd.return_type, &param_expr_map, &no_local, &no_iface);
+                        // A FORMAL shadows any same-named module-scope object
+                        // inside the body (§13.4): `local_names` is the set of
+                        // module-scope names that GET the instance prefix, so
+                        // the formals must be REMOVED from it — otherwise
+                        // `function z(input x, input y)` in a module that ALSO
+                        // has a function `y` rewrote the formal reference to
+                        // "<inst>.y", a nonexistent signal that read x
+                        // (br_gh277b).
+                        let mut fn_locals = (*prepared_sub.local_names).clone();
+                        for p in &fd.ports {
+                            fn_locals.remove(&p.name.name);
+                        }
                         for p in &mut new_fd.ports {
                             bake_formal_type(p);
                             if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
+                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &fn_locals, &sub_interface_map));
                             }
                         }
                         new_fd.items = fd.items.iter()
-                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map))
+                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &fn_locals, &sub_interface_map))
                             .collect();
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
                     if let ModuleItem::TaskDeclaration(td) = sub_item {
                         let mut new_td = td.clone();
                         new_td.name.name.name = format!("{}{}", inst_prefix, td.name.name.name);
+                        // Same formal-shadowing rule as functions above.
+                        let mut task_locals = (*prepared_sub.local_names).clone();
+                        for p in &td.ports {
+                            task_locals.remove(&p.name.name);
+                        }
                         for p in &mut new_td.ports {
                             bake_formal_type(p);
                             if let Some(def) = &p.default {
-                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map));
+                                p.default = Some(rewrite_expr(def, &inst_prefix, &rewrite_port_map, &task_locals, &sub_interface_map));
                             }
                         }
                         new_td.items = td.items.iter()
-                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &prepared_sub.local_names, &sub_interface_map))
+                            .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &task_locals, &sub_interface_map))
                             .collect();
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
                     }
