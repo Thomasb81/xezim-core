@@ -317,6 +317,21 @@ pub fn set_implicit_net_warn(on: bool) {
     IMPLICIT_NET_WARN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `--verbose`: per-file compile progress — which file is being parsed and
+/// which definitions it contributed to the working library. The point is
+/// debuggability of big `-f` builds ("did my testbench actually get compiled,
+/// and what came out of it?"), so the output names every module/interface/
+/// package/program/class rather than just counting them.
+static COMPILE_VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compile_verbose(on: bool) {
+    COMPILE_VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn compile_verbose() -> bool {
+    COMPILE_VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
 pub(crate) fn implicit_net_warn() -> bool {
     IMPLICIT_NET_WARN.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -474,6 +489,44 @@ pub fn parse_str(source: &str) -> Result<ParseResult, Vec<diagnostics::Diagnosti
     }
 }
 
+/// `--verbose` compile reporting: what a source file contributed to the
+/// working library, by name. An empty result is called out explicitly — a
+/// file whose entire body sits behind a false `ifdef` is the classic
+/// "my testbench never compiled" failure and deserves a loud line.
+fn report_file_definitions(label: &str, descriptions: &[ast::Description]) {
+    let mut named: Vec<(&'static str, &str)> = Vec::new();
+    let mut other = 0usize;
+    for d in descriptions {
+        match d {
+            ast::Description::Module(m) => named.push(("module", &m.name.name)),
+            ast::Description::Interface(x) => named.push(("interface", &x.name.name)),
+            ast::Description::Program(p) => named.push(("program", &p.name.name)),
+            ast::Description::Package(p) => named.push(("package", &p.name.name)),
+            ast::Description::Class(c) => named.push(("class", &c.name.name)),
+            ast::Description::Udp(u) => named.push(("primitive", &u.name.name)),
+            ast::Description::TypedefDecl(t) => named.push(("typedef", &t.name.name)),
+            _ => other += 1,
+        }
+    }
+    if named.is_empty() && other == 0 {
+        eprintln!(
+            "[compile]   {}: NO definitions — if unexpected, check `ifdef guards and defines",
+            label
+        );
+        return;
+    }
+    let list = named
+        .iter()
+        .map(|(k, n)| format!("{} {}", k, n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if other > 0 {
+        eprintln!("[compile]   {}: {} (+{} other item(s))", label, list, other);
+    } else {
+        eprintln!("[compile]   {}: {}", label, list);
+    }
+}
+
 pub fn parse_and_elaborate_multi(
     sources: &[String],
     top_module_name: Option<&str>,
@@ -504,6 +557,10 @@ pub fn parse_and_elaborate_multi(
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
+        let label = source_files.get(i).map(|s| s.as_str()).unwrap_or("<unnamed>");
+        if compile_verbose() {
+            eprintln!("[compile] ({}/{}) parsing {}", i + 1, sources.len(), label);
+        }
         // Mark a new compilation file so a `timescale that stuck across from a
         // prior file is treated as inherited (overridable by --module-timescale)
         // rather than declared here.
@@ -519,14 +576,19 @@ pub fn parse_and_elaborate_multi(
             let errs: Vec<_> = diags.iter()
                 .filter(|d| d.severity == diagnostics::Severity::Error)
                 .map(|d| d.to_string()).collect();
-            return Err(format!("Parse errors in source {}:\n{}", i, errs.join("\n")));
+            return Err(format!("Parse errors in '{}' (file {} of {}):\n{}",
+                label, i + 1, sources.len(), errs.join("\n")));
+        }
+        if compile_verbose() {
+            report_file_definitions(label, &source_ast.descriptions);
         }
         // Second, AST-level strict pass (runs alongside the permissive parser;
         // gated by --strict, on by default). Rejects LRM violations the main
         // parser accepts. See sv_parser::strict_check.
         let strict_viol = sv_parser::strict_check::strict_violations(&source_ast.descriptions);
         if !strict_viol.is_empty() {
-            return Err(format!("Strict check failed in source {}:\n{}", i, strict_viol.join("\n")));
+            return Err(format!("Strict check failed in '{}' (file {} of {}):\n{}",
+                label, i + 1, sources.len(), strict_viol.join("\n")));
         }
         for d in &source_ast.descriptions {
             let name = match d {
