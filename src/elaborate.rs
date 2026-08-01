@@ -13,6 +13,38 @@ use crate::ast::expr::*;
 use crate::ast::stmt::*;
 use super::value::Value;
 
+struct ScopeGuardLite<F: FnMut()>(F);
+impl<F: FnMut()> Drop for ScopeGuardLite<F> {
+    fn drop(&mut self) {
+        (self.0)();
+    }
+}
+fn scopeguard_lite<F: FnMut()>(f: F) -> ScopeGuardLite<F> {
+    ScopeGuardLite(f)
+}
+
+thread_local! {
+    static IPROF_SECT: std::cell::RefCell<std::collections::BTreeMap<&'static str, f64>> =
+        std::cell::RefCell::new(std::collections::BTreeMap::new());
+}
+fn iprof_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XZ_INST_PROF").is_ok())
+}
+fn iprof_add(k: &'static str, d: std::time::Duration) {
+    if !iprof_enabled() {
+        return;
+    }
+    IPROF_SECT.with(|m| *m.borrow_mut().entry(k).or_insert(0.0) += d.as_secs_f64());
+}
+pub fn iprof_dump() {
+    IPROF_SECT.with(|m| {
+        for (k, v) in m.borrow().iter() {
+            eprintln!("[IPROF-SECT] {:<28} {:>10.3}s", k, v);
+        }
+    });
+}
+
 fn elab_trace_enabled() -> bool {
     std::env::var("XEZIM_TRACE_ELAB").map(|v| {
         let v = v.trim();
@@ -7256,6 +7288,12 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             if pending.ctx.port_map.contains_key(&name) { continue; }
             // If it's a parameter, no implicit net needed.
             if elab.parameters.contains_key(&name) { continue; }
+            // A pending wrapped through NESTED inlining carries ALREADY-
+            // PREFIXED identifiers in its source expressions; re-prefixing
+            // fabricated doubled names (`u0.l0.u0.l0.w0`) and phantom 1-bit
+            // nets for signals that exist. If the candidate as-is is a known
+            // signal or net, it needs nothing.
+            if elab.signals.contains_key(&name) || elab.nets.contains(&name) { continue; }
             // The bare name is a sub-module-local identifier; after rewrite
             // it becomes `<prefix>name`.
             let prefixed = format!("{}{}", prefix, name);
@@ -9268,6 +9306,32 @@ thread_local! {
 fn set_funcs_tls(funcs: &HashMap<String, FunctionDeclaration>) {
     FUNCS_TLS.with(|cell| {
         *cell.borrow_mut() = Some(std::rc::Rc::new(funcs.clone()));
+    });
+}
+
+/// Incremental FUNCS_TLS refresh for the per-instance inlining path. The full
+/// `set_funcs_tls` deep-clones the ENTIRE accumulated function map — which
+/// grows with every inlined instance — so calling it per instantiation was
+/// O(instances²) in AST clones and dominated big-design elaboration (a 2200-
+/// instance design spent ~95% of its 23s compile there). The const-eval
+/// consumer only ever looks up BARE names (`h.path.last()`), so it needs just
+/// the sub-module's own function declarations merged in, first-wins like the
+/// `entry().or_insert` registration it mirrors.
+fn funcs_tls_add<'a>(
+    funcs: &HashMap<String, FunctionDeclaration>,
+    names: impl Iterator<Item = &'a String>,
+) {
+    FUNCS_TLS.with(|cell| {
+        let mut b = cell.borrow_mut();
+        let rc = b.get_or_insert_with(|| std::rc::Rc::new(HashMap::default()));
+        let map = std::rc::Rc::make_mut(rc);
+        for n in names {
+            if !map.contains_key(n) {
+                if let Some(fd) = funcs.get(n) {
+                    map.insert(n.clone(), fd.clone());
+                }
+            }
+        }
     });
 }
 
@@ -13167,6 +13231,7 @@ fn inline_module_items(
     for item in &prepared_source.effective_items {
         if let ModuleItem::ModuleInstantiation(inst) = item {
             let sub_mod_name = &inst.module_name.name;
+            let __inst_t0 = std::time::Instant::now();
             if elab_trace_enabled() {
                 eprintln!(
                     "[xezim][elab] visiting prefix='{}' module='{}' instances={}",
@@ -13175,6 +13240,12 @@ fn inline_module_items(
                     inst.instances.len()
                 );
             }
+            let __inst_prof = iprof_enabled();
+            let _guard = scopeguard_lite(move || {
+                if __inst_prof {
+                    eprintln!("[IPROF] {} {:?}", std::process::id(), __inst_t0.elapsed());
+                }
+            });
             // IEEE 1800-2017 §29: a UDP instance looks exactly like a module
             // instantiation. Lower it into a flattened `UdpInstance` (truth
             // table + resolved terminal nets) instead of inlining module items.
@@ -13265,6 +13336,7 @@ fn inline_module_items(
             };
 
             for hi in &inst.instances {
+                let __th = std::time::Instant::now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
                 if elab_trace_enabled() {
@@ -13290,6 +13362,7 @@ fn inline_module_items(
                 // dropping most transitions on a fast clock. Register it here,
                 // under this instance's prefix, exactly as a declared net.
                 {
+                    let __ta = std::time::Instant::now();
                     let sub_mod_port_names: std::collections::HashSet<String> = match sub_mod.ports() {
                         PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
                         PortList::NonAnsi(ps) => ps.iter().map(|p| p.name.clone()).collect(),
@@ -13344,8 +13417,10 @@ fn inline_module_items(
                         elab.implicit_nets.insert(scoped.clone());
                         elab.nets.insert(scoped);
                     }
+                    iprof_add("implicit_net_scan", __ta.elapsed());
                 }
 
+                iprof_add("ck1_after_implnet", __th.elapsed());
                 // Build port map and interface map
                 let mut port_map = HashMap::default();
                 let mut sub_interface_map = HashMap::default();
@@ -13490,6 +13565,7 @@ fn inline_module_items(
                     }
                 }
 
+                iprof_add("ck2_after_portmap", __th.elapsed());
                 // Short-circuit: gated_clk_cell is a passthrough whose body is
                 // `assign clk_out = clk_in;` plus dead enable logic. Inlining
                 // it produces a 3-hop cont-assign chain (parent_clk_in →
@@ -13868,7 +13944,15 @@ fn inline_module_items(
                             .or_insert_with(|| fd.clone());
                     }
                 }
-                set_funcs_tls(&elab.functions);
+                // Incremental — the full-snapshot refresh here was O(N²), see
+                // funcs_tls_add.
+                funcs_tls_add(
+                    &elab.functions,
+                    sub_mod.items().iter().filter_map(|it| match it {
+                        ModuleItem::FunctionDeclaration(fd) => Some(&fd.name.name.name),
+                        _ => None,
+                    }),
+                );
                 // 1. Parameters from port list
                 for p_decl in sub_mod.params() {
                     if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
@@ -14030,6 +14114,7 @@ fn inline_module_items(
                 // width into everything downstream (a parameterized struct
                 // read $bits = 15 instead of 53). Alternate the two passes
                 // until neither changes.
+                let __tb = std::time::Instant::now();
                 for _ in 0..4 {
                     let body_items = collect_effective_items(sub_mod.items(), &sub_local_params);
                     let mut local_tds = elab.typedefs.clone();
@@ -14050,8 +14135,11 @@ fn inline_module_items(
                         break;
                     }
                 }
+                iprof_add("param_typedef_fixpoint", __tb.elapsed());
 
+                let __tp = std::time::Instant::now();
                 let prepared_sub = prepare_module_items(sub_mod, definitions, &sub_local_params, &elab.typedefs, cache);
+                iprof_add("prepare_module_items", __tp.elapsed());
 
                 // Inline all resolved parameters into global map with prefix
                 for (name, val) in &sub_local_params {
@@ -14265,7 +14353,9 @@ fn inline_module_items(
                     PortList::Empty => {}
                 }
 
+                iprof_add("ck3_after_hdrparams", __th.elapsed());
                 // sub_merged_params already built above for port declarations.
+                iprof_add("ck4_before_loopB", __th.elapsed());
                 for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::TypedefDeclaration(td) = sub_item {
                         if let DataType::Enum(et) = &td.data_type {
@@ -14333,6 +14423,7 @@ fn inline_module_items(
                         }
                     }
                 }
+                iprof_add("ck5_before_loopC", __th.elapsed());
                 for sub_item in &prepared_sub.effective_items {
                     match sub_item {
                         ModuleItem::NetDeclaration(nd) => {
@@ -14854,6 +14945,8 @@ fn inline_module_items(
                     p.dimensions = rewrite_unpacked_dims_genvar(&p.dimensions, &param_expr_map, &no_local, &no_iface);
                 };
                 // Inline the sub-module's continuous assigns
+                iprof_add("ck6_before_fntask", __th.elapsed());
+                let __td = std::time::Instant::now();
                 for (sub_item, body_src) in prepared_sub.effective_items.iter().zip(prepared_sub.body_sources.iter()) {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
                         let mut new_fd = fd.clone();
@@ -15090,7 +15183,11 @@ fn inline_module_items(
                 });
 
                 // Recurse into sub-module instantiations
+                iprof_add("subitem_loop", __td.elapsed());
+                iprof_add("per_hi_prelude", __th.elapsed());
+                let __te = std::time::Instant::now();
                 inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache, &sub_defparams)?;
+                iprof_add("recursion", __te.elapsed());
 
                 // Restore typedef entries shadowed by this instance's TYPE
                 // parameter overrides.
