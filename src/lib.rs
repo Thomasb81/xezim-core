@@ -596,7 +596,22 @@ fn parse_and_elaborate(
     // modules timed, some not) can be warned about after the pass.
     let mut any_explicit_ts = false;
     let mut modules_without_ts: Vec<String> = Vec::new();
+    // §3.14.2.3: `timeunit`/`timeprecision` at COMPILATION-UNIT scope — parsed
+    // as Description::TimeunitsDecl but previously dropped entirely, so
+    // `timeunit 1ns; timeprecision 10ps;` before a module left the design on
+    // the 1 ns default tick and `#78.1ps` collapsed to 0. Track it sticky, in
+    // source order, as the fallback for modules with no timescale of their
+    // own.
+    let mut unit_scope_ts: (Option<i32>, Option<i32>) = (None, None);
     for desc in &all_descriptions {
+        if let ast::Description::TimeunitsDecl(td) = desc {
+            if let Some(u) = &td.unit {
+                unit_scope_ts.0 = Some(elaborate::time_literal_to_exp(u));
+            }
+            if let Some(p) = &td.precision {
+                unit_scope_ts.1 = Some(elaborate::time_literal_to_exp(p));
+            }
+        }
         if let ast::Description::Module(m) = desc {
             let name = &m.name.name;
             // Explicit source-level declarations.
@@ -646,6 +661,13 @@ fn parse_and_elaborate(
                         name
                     );
                 }
+                Some((u, p))
+            } else if unit_scope_ts.0.is_some() || unit_scope_ts.1.is_some() {
+                // §3.14.2.3 compilation-unit-scope decl: source-explicit, so
+                // it outranks the CLI and inherited directives.
+                let u = unit_scope_ts.0.unwrap_or(-9);
+                let p = unit_scope_ts.1.unwrap_or(unit_scope_ts.0.unwrap_or(-9));
+                any_explicit_ts = true;
                 Some((u, p))
             } else if let Some(ts) = cli_ts {
                 // --module-timescale supplies the timescale, OVERRIDING any
