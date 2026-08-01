@@ -8813,6 +8813,9 @@ pub fn is_type_two_state(dt: &DataType) -> bool {
         DataType::IntegerAtom { kind, .. } => matches!(kind,
             IntegerAtomType::Byte | IntegerAtomType::ShortInt | IntegerAtomType::Int | IntegerAtomType::LongInt),
         DataType::Real { .. } => true,
+        // §6.19.2: an enum's state-ness follows its BASE type — `enum bit
+        // [3:0] {...} e;` default-initializes to 0, `enum reg [3:0]` to x.
+        DataType::Enum(e) => e.base_type.as_deref().map(is_type_two_state).unwrap_or(false),
         _ => false,
     }
 }
