@@ -799,6 +799,23 @@ impl Parser {
             TokenKind::LParen => {
                 self.bump();
                 let inner = self.parse_expression();
+                // §18.5.4 tolerated nonstandard form `( expr dist { ... } )`
+                // inside a constraint (a reference simulator warns and
+                // accepts). Capture the body for `parse_constraint_item`;
+                // outside constraint context `dist` here stays an error.
+                if self.in_constraint && self.at(TokenKind::KwDist) {
+                    let dspan = self.current().span;
+                    self.diagnostics.push(crate::diagnostics::Diagnostic::warning(
+                        "parenthesized 'dist' constraint is nonstandard (accepted for \
+                         compatibility)",
+                        dspan,
+                    ));
+                    self.bump();
+                    let body = self.parse_dist_body();
+                    self.pending_paren_dist.push(body);
+                    self.expect(TokenKind::RParen);
+                    return inner;
+                }
                 let inner = if self.at_any(&[
                     TokenKind::Assign, TokenKind::PlusAssign, TokenKind::MinusAssign,
                     TokenKind::StarAssign, TokenKind::SlashAssign, TokenKind::PercentAssign,
@@ -948,7 +965,24 @@ impl Parser {
                                 self.span_from(start),
                             )));
                         } else {
-                            items.push(AssignmentPatternItem::Ordered(count_expr));
+                            // An explicit-brace concat/replication ITEM —
+                            // `'{{3{y}}}` is ONE element whose value is the
+                            // 24-bit concat — parses to the same Replication
+                            // node as the multiplier form `'{3{y}}` (three
+                            // elements). Wrap the explicit form in Paren so
+                            // the expansion sites can tell them apart: a bare
+                            // Ordered(Replication) always means the
+                            // §10.10.1 multiplier.
+                            let item_expr = if matches!(count_expr.kind, ExprKind::Replication { .. })
+                            {
+                                Expression::new(
+                                    ExprKind::Paren(Box::new(count_expr)),
+                                    self.span_from(start),
+                                )
+                            } else {
+                                count_expr
+                            };
+                            items.push(AssignmentPatternItem::Ordered(item_expr));
                         }
                     }
                     first = false;
@@ -1695,7 +1729,11 @@ impl Parser {
             TokenKind::Star => Some((BinaryOp::Mul, 21, 22)),
             TokenKind::Slash => Some((BinaryOp::Div, 21, 22)),
             TokenKind::Percent => Some((BinaryOp::Mod, 21, 22)),
-            TokenKind::DoubleStar => Some((BinaryOp::Power, 24, 23)), // right-assoc
+            // §11.3.2: ALL binary operators associate left to right — only
+            // the conditional operator is right-associative. `2 ** 3 ** 2`
+            // is (2**3)**2 = 64, unlike the right-associative `**` of most
+            // general-purpose languages (which gave 512 here).
+            TokenKind::DoubleStar => Some((BinaryOp::Power, 23, 24)), // left-assoc
             _ => None,
         }
     }

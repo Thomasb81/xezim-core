@@ -232,8 +232,39 @@ impl Parser {
             self.expect(TokenKind::Dot);
             let mp_name = self.parse_identifier();
             Some(DataType::Interface { name: if_name, modport: Some(mp_name), span: self.span_from(start) })
-        } else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash | TokenKind::LBracket) {
+        } else if self.at(TokenKind::Identifier)
+            && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)
+        {
             Some(self.parse_data_type())
+        } else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket {
+            // AMBIGUOUS: `typedef_t [7:0] name` (a type with packed dims)
+            // vs `name[t-1:0]` (an implicit-typed port whose NAME carries an
+            // unpacked dimension — `output v0vJ[t-1:0],`). Look past the
+            // balanced bracket groups: an IDENTIFIER there means the first
+            // token was a type; a comma/`)`/`=` means it was the port name.
+            let mut p = self.pos + 1;
+            while self.tokens.get(p).is_some_and(|t| t.kind == TokenKind::LBracket) {
+                let mut depth = 1;
+                p += 1;
+                while depth > 0 {
+                    match self.tokens.get(p).map(|t| t.kind) {
+                        Some(TokenKind::LBracket) => depth += 1,
+                        Some(TokenKind::RBracket) => depth -= 1,
+                        Some(_) => {}
+                        None => break,
+                    }
+                    p += 1;
+                }
+            }
+            if self
+                .tokens
+                .get(p)
+                .is_some_and(|t| matches!(t.kind, TokenKind::Identifier | TokenKind::EscapedIdentifier))
+            {
+                Some(self.parse_data_type())
+            } else {
+                None
+            }
         } else { None };
         let mut dimensions = if data_type.is_some() {
             self.parse_unpacked_dimensions()
@@ -533,6 +564,16 @@ impl Parser {
             }
             TokenKind::KwVirtual => {
                 if self.peek_kind() == TokenKind::KwInterface { Some(self.parse_identifier_starting_item()) }
+                else if self.peek_kind() == TokenKind::Identifier {
+                    // §25.9: a MODULE-scope virtual-interface variable —
+                    // `virtual req_if #(4).driver rd;`. Bumping past `virtual`
+                    // and re-parsing (the old behavior) made `req_if #(4)`
+                    // look like a parameterized INSTANTIATION, which then
+                    // choked on `.driver`. parse_data_declaration starts at
+                    // the `virtual` keyword and handles `#(...)` and
+                    // `.modport` through parse_data_type.
+                    Some(ModuleItem::DataDeclaration(self.parse_data_declaration()))
+                }
                 else { self.bump(); self.parse_module_item() }
             }
             // IEEE 1800-2023 §23.11: `bind` inside a module body. Parsed into a
@@ -2361,35 +2402,39 @@ impl Parser {
                 ConstraintItem::Block(items)
             }
             _ => {
+                // The paren-primary parser needs to accept `( expr dist {...} )`
+                // only in constraint context.
+                let saved_in_constraint = self.in_constraint;
+                self.in_constraint = true;
                 let expr = self.parse_expression();
+                self.in_constraint = saved_in_constraint;
+                // Nonstandard `-> ( expr dist {...} )`: the dist body was
+                // captured inside the parentheses; the LogImplies chain that
+                // `parse_expression` built around it becomes real constraint
+                // implications so the solver applies the WEIGHTS only when the
+                // guard holds (a reference simulator warns about the parens
+                // and accepts exactly this reading).
+                if let Some((range, dist_weights)) = self.pending_paren_dist.pop() {
+                    let span = self.span_from(start);
+                    self.expect(TokenKind::Semicolon);
+                    return Self::dist_item_peeling_implications(expr, range, dist_weights, span);
+                }
                 if self.at(TokenKind::KwDist) {
                     // `expr dist { value (:= | :/ ) weight, ... };` — LRM
                     // §18.5.4. Weights are captured into a parallel vector
                     // so the runtime distribution picker can honor them.
+                    // `expr` may be a LogImplies chain (`en -> kind dist {…}`):
+                    // the expression parser binds `->` before we ever see
+                    // `dist`, so peel those into constraint implications —
+                    // otherwise the dist attached to the whole implication
+                    // EXPRESSION, whose value nothing targets, and the weights
+                    // were silently dropped (only membership survived, via the
+                    // resample-until-satisfied loop).
                     self.bump();
-                    self.expect(TokenKind::LBrace);
-                    let mut range = Vec::new();
-                    let mut dist_weights: Vec<Option<crate::ast::decl::DistWeight>> = Vec::new();
-                    loop {
-                        range.push(self.parse_constraint_range());
-                        if self.at(TokenKind::ColonAssign) {
-                            self.bump();
-                            let w = self.parse_expression();
-                            dist_weights.push(Some(crate::ast::decl::DistWeight::Each(w)));
-                        } else if self.at(TokenKind::ColonSlash) {
-                            self.bump();
-                            let w = self.parse_expression();
-                            dist_weights.push(Some(crate::ast::decl::DistWeight::Total(w)));
-                        } else {
-                            dist_weights.push(None);
-                        }
-                        if !self.at(TokenKind::Comma) { break; }
-                        self.bump();
-                    }
-                    self.expect(TokenKind::RBrace);
+                    let (range, dist_weights) = self.parse_dist_body();
                     let span = self.span_from(start);
                     self.expect(TokenKind::Semicolon);
-                    return ConstraintItem::Inside { expr, range, is_dist: true, dist_weights, span };
+                    return Self::dist_item_peeling_implications(expr, range, dist_weights, span);
                 }
                 if self.at(TokenKind::KwInside) {
                     self.bump(); self.expect(TokenKind::LBrace);
@@ -2412,6 +2457,76 @@ impl Parser {
                     ConstraintItem::Expr(expr)
                 }
             }
+        }
+    }
+
+    /// The `{ value (:= | :/) weight, ... }` body of a `dist` constraint,
+    /// cursor on the LBrace. Shared by the plain form, the implication-chain
+    /// form, and the parenthesized form the paren-primary captures.
+    pub(super) fn parse_dist_body(
+        &mut self,
+    ) -> (Vec<ConstraintRange>, Vec<Option<crate::ast::decl::DistWeight>>) {
+        self.expect(TokenKind::LBrace);
+        let mut range = Vec::new();
+        let mut dist_weights: Vec<Option<crate::ast::decl::DistWeight>> = Vec::new();
+        loop {
+            range.push(self.parse_constraint_range());
+            if self.at(TokenKind::ColonAssign) {
+                self.bump();
+                let w = self.parse_expression();
+                dist_weights.push(Some(crate::ast::decl::DistWeight::Each(w)));
+            } else if self.at(TokenKind::ColonSlash) {
+                self.bump();
+                let w = self.parse_expression();
+                dist_weights.push(Some(crate::ast::decl::DistWeight::Total(w)));
+            } else {
+                dist_weights.push(None);
+            }
+            if !self.at(TokenKind::Comma) {
+                break;
+            }
+            self.bump();
+        }
+        self.expect(TokenKind::RBrace);
+        (range, dist_weights)
+    }
+
+    /// Wrap a dist body around `expr`, peeling any top-level `->` (which the
+    /// EXPRESSION parser bound as LogImplies before the `dist` keyword was
+    /// visible) back into constraint implications: `a -> b dist {…}` is
+    /// `Implication{a, Inside{b, dist}}` per §18.5.6, not a dist over the
+    /// 1-bit implication result.
+    fn dist_item_peeling_implications(
+        expr: crate::ast::expr::Expression,
+        range: Vec<ConstraintRange>,
+        dist_weights: Vec<Option<crate::ast::decl::DistWeight>>,
+        span: crate::ast::Span,
+    ) -> ConstraintItem {
+        match expr.kind {
+            crate::ast::expr::ExprKind::Binary {
+                op: crate::ast::expr::BinaryOp::LogImplies,
+                left,
+                right,
+            } => ConstraintItem::Implication {
+                condition: *left,
+                constraint: Box::new(Self::dist_item_peeling_implications(
+                    *right,
+                    range,
+                    dist_weights,
+                    span,
+                )),
+                span,
+            },
+            crate::ast::expr::ExprKind::Paren(inner) => {
+                Self::dist_item_peeling_implications(*inner, range, dist_weights, span)
+            }
+            _ => ConstraintItem::Inside {
+                expr,
+                range,
+                is_dist: true,
+                dist_weights,
+                span,
+            },
         }
     }
 

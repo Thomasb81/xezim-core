@@ -317,6 +317,56 @@ pub fn set_implicit_net_warn(on: bool) {
     IMPLICIT_NET_WARN.store(on, std::sync::atomic::Ordering::Relaxed);
 }
 
+/// `--verbose`: per-file compile progress — which file is being parsed and
+/// which definitions it contributed to the working library. The point is
+/// debuggability of big `-f` builds ("did my testbench actually get compiled,
+/// and what came out of it?"), so the output names every module/interface/
+/// package/program/class rather than just counting them.
+static COMPILE_VERBOSE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_compile_verbose(on: bool) {
+    COMPILE_VERBOSE.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+pub fn compile_verbose() -> bool {
+    COMPILE_VERBOSE.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Single-line build progress on stderr: rewrites itself with `\r` so a long
+/// parse/elaboration shows a live indicator instead of silence. Active only
+/// when stderr is a terminal — piped output and `-l` logs never see control
+/// characters — and callers skip it under `--verbose`, which already prints a
+/// full line per file.
+pub fn progress_status(msg: &str) {
+    use std::io::{IsTerminal, Write};
+    let err = std::io::stderr();
+    if !err.is_terminal() {
+        return;
+    }
+    // Truncate to one line: a long path must not wrap, or the \r rewrite
+    // leaves stale fragments behind.
+    let msg: String = if msg.len() > 100 {
+        format!("...{}", &msg[msg.len() - 97..])
+    } else {
+        msg.to_string()
+    };
+    let mut h = err.lock();
+    let _ = write!(h, "\r\x1b[K{}", msg);
+    let _ = h.flush();
+}
+
+/// Erase the progress line (call before printing normal output).
+pub fn progress_clear() {
+    use std::io::{IsTerminal, Write};
+    let err = std::io::stderr();
+    if !err.is_terminal() {
+        return;
+    }
+    let mut h = err.lock();
+    let _ = write!(h, "\r\x1b[K");
+    let _ = h.flush();
+}
+
 pub(crate) fn implicit_net_warn() -> bool {
     IMPLICIT_NET_WARN.load(std::sync::atomic::Ordering::Relaxed)
 }
@@ -474,6 +524,44 @@ pub fn parse_str(source: &str) -> Result<ParseResult, Vec<diagnostics::Diagnosti
     }
 }
 
+/// `--verbose` compile reporting: what a source file contributed to the
+/// working library, by name. An empty result is called out explicitly — a
+/// file whose entire body sits behind a false `ifdef` is the classic
+/// "my testbench never compiled" failure and deserves a loud line.
+fn report_file_definitions(label: &str, descriptions: &[ast::Description]) {
+    let mut named: Vec<(&'static str, &str)> = Vec::new();
+    let mut other = 0usize;
+    for d in descriptions {
+        match d {
+            ast::Description::Module(m) => named.push(("module", &m.name.name)),
+            ast::Description::Interface(x) => named.push(("interface", &x.name.name)),
+            ast::Description::Program(p) => named.push(("program", &p.name.name)),
+            ast::Description::Package(p) => named.push(("package", &p.name.name)),
+            ast::Description::Class(c) => named.push(("class", &c.name.name)),
+            ast::Description::Udp(u) => named.push(("primitive", &u.name.name)),
+            ast::Description::TypedefDecl(t) => named.push(("typedef", &t.name.name)),
+            _ => other += 1,
+        }
+    }
+    if named.is_empty() && other == 0 {
+        eprintln!(
+            "[compile]   {}: NO definitions — if unexpected, check `ifdef guards and defines",
+            label
+        );
+        return;
+    }
+    let list = named
+        .iter()
+        .map(|(k, n)| format!("{} {}", k, n))
+        .collect::<Vec<_>>()
+        .join(", ");
+    if other > 0 {
+        eprintln!("[compile]   {}: {} (+{} other item(s))", label, list, other);
+    } else {
+        eprintln!("[compile]   {}: {}", label, list);
+    }
+}
+
 pub fn parse_and_elaborate_multi(
     sources: &[String],
     top_module_name: Option<&str>,
@@ -504,6 +592,17 @@ pub fn parse_and_elaborate_multi(
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
+        let label = source_files.get(i).map(|s| s.as_str()).unwrap_or("<unnamed>");
+        if compile_verbose() {
+            eprintln!("[compile] ({}/{}) parsing {}", i + 1, sources.len(), label);
+        } else {
+            progress_status(&format!(
+                "[compile] parsing {}/{}: {}",
+                i + 1,
+                sources.len(),
+                label.rsplit('/').next().unwrap_or(label)
+            ));
+        }
         // Mark a new compilation file so a `timescale that stuck across from a
         // prior file is treated as inherited (overridable by --module-timescale)
         // rather than declared here.
@@ -516,17 +615,24 @@ pub fn parse_and_elaborate_multi(
         let diags = parser.diagnostics().to_vec();
 
         if diags.iter().any(|d| d.severity == diagnostics::Severity::Error) {
+            progress_clear();
             let errs: Vec<_> = diags.iter()
                 .filter(|d| d.severity == diagnostics::Severity::Error)
                 .map(|d| d.to_string()).collect();
-            return Err(format!("Parse errors in source {}:\n{}", i, errs.join("\n")));
+            return Err(format!("Parse errors in '{}' (file {} of {}):\n{}",
+                label, i + 1, sources.len(), errs.join("\n")));
+        }
+        if compile_verbose() {
+            report_file_definitions(label, &source_ast.descriptions);
         }
         // Second, AST-level strict pass (runs alongside the permissive parser;
         // gated by --strict, on by default). Rejects LRM violations the main
         // parser accepts. See sv_parser::strict_check.
         let strict_viol = sv_parser::strict_check::strict_violations(&source_ast.descriptions);
         if !strict_viol.is_empty() {
-            return Err(format!("Strict check failed in source {}:\n{}", i, strict_viol.join("\n")));
+            progress_clear();
+            return Err(format!("Strict check failed in '{}' (file {} of {}):\n{}",
+                label, i + 1, sources.len(), strict_viol.join("\n")));
         }
         for d in &source_ast.descriptions {
             let name = match d {
@@ -555,8 +661,16 @@ pub fn parse_and_elaborate_multi(
     // cloned, then moved back out.
     elaborate::set_elab_sources(preprocessed_texts, source_files.to_vec());
     elaborate::set_elab_module_files(src_file_of_module.clone());
+    if !compile_verbose() {
+        progress_status(&format!(
+            "[compile] elaborating design ({} files parsed, {} definitions)...",
+            sources.len(),
+            all_descriptions.len()
+        ));
+    }
     let elaborated =
         parse_and_elaborate(all_descriptions, top_module_name, include_dirs, &lib_defines, &module_timescales, &module_ts_own_file);
+    progress_clear();
     let (texts, files) = elaborate::take_elab_sources();
     let (defs, mut elab) = elaborated?;
     elab.source_texts = texts;
@@ -596,7 +710,22 @@ fn parse_and_elaborate(
     // modules timed, some not) can be warned about after the pass.
     let mut any_explicit_ts = false;
     let mut modules_without_ts: Vec<String> = Vec::new();
+    // §3.14.2.3: `timeunit`/`timeprecision` at COMPILATION-UNIT scope — parsed
+    // as Description::TimeunitsDecl but previously dropped entirely, so
+    // `timeunit 1ns; timeprecision 10ps;` before a module left the design on
+    // the 1 ns default tick and `#78.1ps` collapsed to 0. Track it sticky, in
+    // source order, as the fallback for modules with no timescale of their
+    // own.
+    let mut unit_scope_ts: (Option<i32>, Option<i32>) = (None, None);
     for desc in &all_descriptions {
+        if let ast::Description::TimeunitsDecl(td) = desc {
+            if let Some(u) = &td.unit {
+                unit_scope_ts.0 = Some(elaborate::time_literal_to_exp(u));
+            }
+            if let Some(p) = &td.precision {
+                unit_scope_ts.1 = Some(elaborate::time_literal_to_exp(p));
+            }
+        }
         if let ast::Description::Module(m) = desc {
             let name = &m.name.name;
             // Explicit source-level declarations.
@@ -646,6 +775,13 @@ fn parse_and_elaborate(
                         name
                     );
                 }
+                Some((u, p))
+            } else if unit_scope_ts.0.is_some() || unit_scope_ts.1.is_some() {
+                // §3.14.2.3 compilation-unit-scope decl: source-explicit, so
+                // it outranks the CLI and inherited directives.
+                let u = unit_scope_ts.0.unwrap_or(-9);
+                let p = unit_scope_ts.1.unwrap_or(unit_scope_ts.0.unwrap_or(-9));
+                any_explicit_ts = true;
                 Some((u, p))
             } else if let Some(ts) = cli_ts {
                 // --module-timescale supplies the timescale, OVERRIDING any
@@ -943,6 +1079,193 @@ fn parse_and_elaborate(
                     elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
                     module_timescale_exp
                         .insert(name.clone(), (elaborate::secs_to_exp(unit_s), elaborate::secs_to_exp(elaborate::exp_to_secs(p))));
+                }
+            }
+        }
+    }
+
+    // §6.18 + §3.12.1: a $unit typedef's DIMENSIONS are evaluated in the
+    // scope where the typedef is DECLARED — the compilation unit — not where
+    // the type is later used. The $unit localparams themselves are injected
+    // into each module body (and skipped entirely when the module shadows the
+    // name), so by elaboration time the typedef would resolve its dims against
+    // the MODULE's table: `localparam A=8; typedef logic [A-1:0] T[1:0];` in
+    // a module declaring `localparam A=4` produced 4-bit (or, shadowed, 1-bit)
+    // elements. Fold the dims to literals here, against the $unit environment,
+    // while both are still in hand. Anything that doesn't const-evaluate in
+    // that environment (e.g. `pkg::W`) is left untouched for the existing
+    // late resolution.
+    {
+        let mut unit_params: std::collections::HashMap<String, Value, crate::hasher::DeterministicState> = Default::default();
+        for pd in &top_level_params {
+            if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                for a in assignments {
+                    if let Some(init) = &a.init {
+                        if let Some(v) = elaborate::const_eval_i64_with_params(init, Some(&unit_params)) {
+                            let mut val = Value::from_u64(v as u64, 32);
+                            val.is_signed = true;
+                            unit_params.insert(a.name.name.clone(), val);
+                        }
+                    }
+                }
+            }
+        }
+        {
+            type PTable = std::collections::HashMap<String, Value, crate::hasher::DeterministicState>;
+            fn fold_expr(e: &mut ast::expr::Expression, table: &PTable) {
+                if table.is_empty() || matches!(e.kind, ast::expr::ExprKind::Number(_)) {
+                    return;
+                }
+                if let Some(v) = elaborate::const_eval_i64_with_params(e, Some(table)) {
+                    if v >= 0 {
+                        *e = ast::expr::Expression::new(
+                            // UNSIZED literal — a sized one would trip the
+                            // §6.19 enum-member width check against narrow
+                            // base types.
+                            ast::expr::ExprKind::Number(ast::expr::NumberLiteral::Integer {
+                                size: None,
+                                signed: true,
+                                base: ast::expr::NumberBase::Decimal,
+                                value: v.to_string(),
+                                cached_val: std::cell::Cell::new(None),
+                            }),
+                            e.span,
+                        );
+                    }
+                }
+            }
+            fn fold_packed(dims: &mut [ast::types::PackedDimension], table: &PTable) {
+                for d in dims.iter_mut() {
+                    if let ast::types::PackedDimension::Range { left, right, .. } = d {
+                        fold_expr(left, table);
+                        fold_expr(right, table);
+                    }
+                }
+            }
+            fn fold_unpacked(d: &mut ast::types::UnpackedDimension, table: &PTable) {
+                match d {
+                    ast::types::UnpackedDimension::Range { left, right, .. } => {
+                        fold_expr(left, table);
+                        fold_expr(right, table);
+                    }
+                    ast::types::UnpackedDimension::Expression { expr, .. } => fold_expr(expr, table),
+                    // `[B]` with B a parameter parses as an ASSOCIATIVE dim
+                    // keyed by "type B" — rewrite to a literal size in the
+                    // declaring scope, exactly like normalize_unpacked_dims
+                    // does later with the (wrong-scope) module table.
+                    ast::types::UnpackedDimension::Associative { data_type: Some(dt), span } => {
+                        if let ast::types::DataType::TypeReference { name, .. } = dt.as_ref() {
+                            if let Some(v) = table.get(&name.name.name) {
+                                if let Some(n) = v.to_u64() {
+                                    *d = ast::types::UnpackedDimension::Expression {
+                                        expr: Box::new(ast::expr::Expression::new(
+                                            ast::expr::ExprKind::Number(
+                                                ast::expr::NumberLiteral::Integer {
+                                                    size: None,
+                                                    signed: true,
+                                                    base: ast::expr::NumberBase::Decimal,
+                                                    value: n.to_string(),
+                                                    cached_val: std::cell::Cell::new(None),
+                                                },
+                                            ),
+                                            *span,
+                                        )),
+                                        span: *span,
+                                    };
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            fn fold_dt(dt: &mut ast::types::DataType, table: &PTable, depth: usize) {
+                if depth > 8 {
+                    return;
+                }
+                match dt {
+                    ast::types::DataType::IntegerVector { dimensions, .. }
+                    | ast::types::DataType::Implicit { dimensions, .. }
+                    // `typedef l [A-1:0] T[$];` — packed dims ON a type
+                    // reference base.
+                    | ast::types::DataType::TypeReference { dimensions, .. } => {
+                        fold_packed(dimensions, table)
+                    }
+                    ast::types::DataType::Enum(et) => {
+                        if let Some(bt) = et.base_type.as_mut() {
+                            fold_dt(bt.as_mut(), table, depth + 1);
+                        }
+                        // Member initializers (`B = X`) evaluate in the
+                        // DECLARING scope too.
+                        for m in et.members.iter_mut() {
+                            if let Some(init) = m.init.as_mut() {
+                                fold_expr(init, table);
+                            }
+                        }
+                    }
+                    // A struct/union base (`typedef struct packed { logic
+                    // [A-1:0] x; } T[1:0];`) carries the scope references in
+                    // its MEMBER types — recurse.
+                    ast::types::DataType::Struct(su) => {
+                        for m in su.members.iter_mut() {
+                            fold_dt(&mut m.data_type, table, depth + 1);
+                            for mdecl in m.declarators.iter_mut() {
+                                for d in mdecl.dimensions.iter_mut() {
+                                    fold_unpacked(d, table);
+                                }
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            fn eval_params_into(pd: &ast::decl::ParameterDeclaration, table: &mut PTable) {
+                if let ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for a in assignments {
+                        if let Some(init) = &a.init {
+                            if let Some(v) =
+                                elaborate::const_eval_i64_with_params(init, Some(table))
+                            {
+                                let mut val = Value::from_u64(v as u64, 32);
+                                val.is_signed = true;
+                                table.insert(a.name.name.clone(), val);
+                            }
+                        }
+                    }
+                }
+            }
+            // $unit typedefs fold against the $unit params.
+            for def in definitions.values_mut() {
+                let SourceDefinition::Typedef(t) = def else { continue };
+                let td = Rc::make_mut(t);
+                fold_dt(&mut td.data_type, &unit_params, 0);
+                for d in td.dimensions.iter_mut() {
+                    fold_unpacked(d, &unit_params);
+                }
+            }
+            // PACKAGE typedefs fold against ($unit params + that package's own
+            // params, in item order) — each package is its own scope, so
+            // same-named localparams in different packages (`P1.A=8`,
+            // `P2.A=4`) must not bleed into each other the way the flat
+            // elaboration table lets them. With the dims already literal, the
+            // later flat-table walk stores the right width no matter which
+            // package's `A` currently occupies the slot — and a QUALIFIED
+            // `P1::T` reference works without any import.
+            for def in definitions.values_mut() {
+                let SourceDefinition::Package(pkg) = def else { continue };
+                let pkg = Rc::make_mut(pkg);
+                let mut table = unit_params.clone();
+                for item in pkg.items.iter_mut() {
+                    match item {
+                        ast::decl::PackageItem::Parameter(pd) => eval_params_into(pd, &mut table),
+                        ast::decl::PackageItem::Typedef(td) => {
+                            fold_dt(&mut td.data_type, &table, 0);
+                            for d in td.dimensions.iter_mut() {
+                                fold_unpacked(d, &table);
+                            }
+                        }
+                        _ => {}
+                    }
                 }
             }
         }

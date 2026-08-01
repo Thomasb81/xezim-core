@@ -119,6 +119,11 @@ pub struct StructDeclarator {
 pub struct EnumType {
     pub base_type: Option<Box<DataType>>,
     pub members: Vec<EnumMember>,
+    /// Packed array dimensions written AFTER the enum body
+    /// (`enum {...} [1:0] x;` — a packed array of the enum, §7.4.2).
+    /// Mirrors `StructUnionType::dimensions`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub dimensions: Vec<PackedDimension>,
     pub span: Span,
 }
 

@@ -794,7 +794,15 @@ pub fn elaborate_class_with_params(
                     } else {
                         default_value_for_type(&p.data_type, width)
                     };
-                    if is_signed { v.is_signed = true; }
+                    // §11.8.1: the DECLARED type decides signedness, and an
+                    // initializer's sign must not leak into it. This only ever
+                    // SET the flag, so `bit [15:0] u = -1` kept the literal's
+                    // signedness and `c.u > 0` compared as -1 instead of
+                    // 65535 — the same shape as the parameter bug, one level
+                    // in. A real keeps its own representation.
+                    if !is_real {
+                        v.is_signed = is_signed;
+                    }
                     // Track source order for `%p` (§21.2.1.7).
                     if !property_order.contains(&decl.name.name) {
                         property_order.push(decl.name.name.clone());
@@ -1830,6 +1838,27 @@ pub fn elaborate_module(
 /// honoring a `[lo:hi]` element range (already normalized from the `[N]` count
 /// form by the parser). An `init` seeds the FIRST expanded name; the rest
 /// auto-increment. Returns the expanded entries and the next auto value.
+/// §6.19: an enum member may carry an X/Z-bearing value (`XX = 'bx`,
+/// `XZ = 32'h1x2z3xxz`). The u64 pipeline masks those bits away, so the
+/// registered CONSTANT must be rebuilt as a 4-state Value from the raw
+/// initializer. Only single (non-ranged) members can carry one legally.
+fn enum_member_4state(
+    member: &crate::ast::types::EnumMember,
+    fallback: u64,
+    width: u32,
+    params: &crate::hasher::HashMap<String, Value>,
+) -> Value {
+    if member.range.is_none() {
+        if let Some(init) = &member.init {
+            let v = eval_const_expr_val(init, params);
+            if v.has_xz() && !v.is_real {
+                return v.resize(width.max(1));
+            }
+        }
+    }
+    Value::from_u64(fallback, width)
+}
+
 fn expand_enum_member(
     member: &crate::ast::types::EnumMember,
     next_val: u64,
@@ -1881,6 +1910,15 @@ pub fn anon_enum_members_ordered(
 }
 
 pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModule) {
+    // §6.19: an enum declared INSIDE a struct member's type installs its
+    // members in the scope enclosing the STRUCT — `struct packed { enum
+    // integer { A } e; } s;` makes `A` visible in the module. Recurse.
+    if let DataType::Struct(su) = dt {
+        for m in &su.members {
+            register_anonymous_enum_members(&m.data_type, elab);
+        }
+        return;
+    }
     if let DataType::Enum(et) = dt {
         let base_width = et.base_type.as_ref()
             .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
@@ -1890,7 +1928,7 @@ pub fn register_anonymous_enum_members(dt: &DataType, elab: &mut ElaboratedModul
             let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
             next_val = nv;
             for (nm, val) in entries {
-                let v = Value::from_u64(val, base_width);
+                let v = enum_member_4state(member, val, base_width, &elab.parameters);
                 elab.parameters.entry(nm.clone()).or_insert_with(|| v.clone());
                 elab.signals.entry(nm.clone()).or_insert_with(|| Signal {
                     is_const: false,
@@ -1928,6 +1966,20 @@ pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedMo
     }
 }
 
+/// §26.3: mirror a package typedef under its qualified `pkg::name` key so a
+/// SCOPED reference resolves even when a module-local typedef shadows the bare
+/// name (`typedef int T;` in the module vs `P::T`). The bare registration is
+/// unchanged — imports keep working exactly as before.
+pub fn register_scoped_typedef_alias(pkg: &str, td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
+    let key = format!("{}::{}", pkg, td.name.name);
+    if let Some(w) = elab.typedefs.get(&td.name.name).copied() {
+        elab.typedefs.insert(key.clone(), w);
+    }
+    if let Some(dt) = elab.typedef_types.get(&td.name.name).cloned() {
+        elab.typedef_types.insert(key, dt);
+    }
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // §6.18: a bare forward type declaration `typedef name;`. Record it for the
     // resolution check and register a placeholder, but never clobber a name that
@@ -1954,7 +2006,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
             next_val = nv;
             for (nm, val) in entries {
-                let v = Value::from_u64(val, base_width);
+                let v = enum_member_4state(member, val, base_width, &elab.parameters);
                 // §26.3: a local declaration shadows a wildcard-imported name,
                 // and the enum members of an imported package are registered
                 // under their BARE name. The declaration walk removes the
@@ -2420,6 +2472,7 @@ pub fn elaborate_module_with_defs(
                             // inline_instantiations, after the top body.
                             crate::ast::decl::PackageItem::Typedef(td) => {
                                 process_typedef(td, &mut elab);
+                                register_scoped_typedef_alias(&p.name.name, td, &mut elab);
                             }
                             // Hoist package DPI imports so calls to
                             // `uvm_re_compexecfree` etc. resolve via
@@ -2457,6 +2510,19 @@ pub fn elaborate_module_with_defs(
         }
     }
     set_funcs_tls(&elab.functions);
+    // §23.2.2 / A.1.2: module-HEADER imports (`module m import P::*;
+    // #(parameter X = FOO) (...)`) precede the parameter list in the grammar
+    // and are usable in it. The items walk processes imports in source order
+    // — long after this header-parameter pass had evaluated defaults, so
+    // `parameter X = FOO` read 0. Process every module import first; later
+    // re-processing is idempotent (inserts).
+    for item in module.items() {
+        if let ModuleItem::ImportDeclaration(imp) = item {
+            if let Some(defs) = all_defs {
+                process_import(imp, &mut elab, defs)?;
+            }
+        }
+    }
     // Process parameters
     for param in module.params() {
         if let ParameterKind::Data { data_type, assignments } = &param.kind {
@@ -2526,7 +2592,23 @@ pub fn elaborate_module_with_defs(
                     let init_is_real = if let Some(override_val) = param_overrides.get(&assign.name.name) {
                         override_val.is_real
                     } else if let Some(init) = &assign.init {
-                        eval_const_expr_val(init, &elab.parameters).is_real
+                        // A const-FUNCTION call in the initializer must be
+                        // substituted first, or a real-returning function reads
+                        // as non-real (§6.20.2: an implicit parameter takes
+                        // the type of its final value).
+                        let subst;
+                        let e: &Expression = if expr_has_call(init) {
+                            match substitute_const_fn_calls(init, &elab.parameters, &elab, 0) {
+                                Some(x) => {
+                                    subst = x;
+                                    &subst
+                                }
+                                None => init,
+                            }
+                        } else {
+                            init
+                        };
+                        eval_const_expr_val(e, &elab.parameters).is_real
                     } else { false };
 
                     if init_is_real {
@@ -2639,7 +2721,35 @@ pub fn elaborate_module_with_defs(
                     .map(is_type_signed)
                     .unwrap_or(false);
                 let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
-                let port_shape = fixed_unpacked_shape(&port.dimensions, &elab.parameters)
+                // §6.18/§7.4: a port declared with an ARRAY typedef
+                // (`typedef logic [A-1:0] T[B]; input T x;`) inherits the
+                // typedef's UNPACKED dims — mirroring the variable path's
+                // `effective_dims`. Without this the port registered as a
+                // scalar of the ELEMENT width, so `$size(x,1)` was the packed
+                // width and element indexing was wrong.
+                let effective_port_dims: Vec<UnpackedDimension> = if port.dimensions.is_empty() {
+                    match port.data_type.as_ref() {
+                        Some(DataType::TypeReference { name, .. }) => name
+                            .scope
+                            .as_ref()
+                            .and_then(|sc| {
+                                elab.typedef_unpacked_dims
+                                    .get(&format!("{}::{}", sc.name, name.name.name))
+                            })
+                            .or_else(|| elab.typedef_unpacked_dims.get(&name.name.name))
+                            .cloned()
+                            .unwrap_or_default(),
+                        _ => Vec::new(),
+                    }
+                } else {
+                    port.dimensions.clone()
+                };
+                let effective_port_dims = normalize_unpacked_dims(
+                    &effective_port_dims,
+                    &elab.parameters,
+                    &elab.typedef_types,
+                );
+                let port_shape = fixed_unpacked_shape(&effective_port_dims, &elab.parameters)
                     .unwrap_or_default();
                 // §23.2.2.4: `output logic clk = 0` — the default on an
                 // OUTPUT (variable) port is the variable's initializer.
@@ -2914,6 +3024,24 @@ pub fn elaborate_module_with_defs(
         }
     }
 
+    // §6.18: a FORWARD typedef (`typedef T;`) may be completed LATER in the
+    // module, with declarations using the name in between (`typedef T; T x;
+    // typedef int T;`). The main walk below processes items in source order,
+    // so `T x` sized against the Void placeholder (width 0). Pre-register
+    // every REAL module typedef here — after the parameter pre-seed, so their
+    // dims resolve — exactly as packages pre-register theirs; the main walk's
+    // re-processing is idempotent.
+    for item in module.items() {
+        if let ModuleItem::TypedefDeclaration(td) = item {
+            if !td.forward
+                && struct_typedef_self_reference(&td.name.name, &td.data_type, &elab.typedef_types)
+                    .is_none()
+            {
+                process_typedef(td, &mut elab);
+            }
+        }
+    }
+
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -2933,6 +3061,75 @@ pub fn elaborate_module_with_defs(
                             elab.signals.remove(&decl.name.name);
                         } else {
                             return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
+                        }
+                    }
+                    // §7.4.1: a non-ANSI PORT of a packed multi-D (or packed
+                    // struct) type needs the same element/field registrations
+                    // a variable declaration gets — the DataDeclaration arm
+                    // has always done this, the port arm never did, so
+                    // `output logic [3:0][9:0] o; assign o[1] = v;` degraded
+                    // to a bit-window write (only the low bits landed) and
+                    // struct-port member writes missed the layout.
+                    if let Some(ew) = packed_inner_elem_width(&pd.data_type, &elab.parameters, &elab.typedefs) {
+                        elab.packed_signal_elem_widths.entry(decl.name.name.clone()).or_insert(ew);
+                    }
+                    if let Some(fd) = packed_full_dims_of(&pd.data_type, &elab.parameters) {
+                        elab.packed_full_dims.entry(decl.name.name.clone()).or_insert(fd);
+                    }
+                    if let Some(fields) = packed_struct_field_layout(
+                        &pd.data_type,
+                        &elab.parameters,
+                        &elab.typedefs,
+                        &elab.typedef_types,
+                    ) {
+                        if !fields.is_empty() {
+                            tls_register_struct_layout(&decl.name.name, &fields);
+                            elab.packed_struct_fields.entry(decl.name.name.clone()).or_insert(fields);
+                        }
+                    }
+                    // §6.18/§7.4: a PORT declared with an ARRAY typedef
+                    // (`typedef logic [A-1:0] T[B]; input T x;`) inherits the
+                    // typedef's UNPACKED dimensions — the Data path has always
+                    // done this via `effective_dims`; the port path registered
+                    // a scalar of the ELEMENT width, so `$size(x,1)` reported
+                    // the packed width and element indexing was wrong.
+                    {
+                        let tdims: Vec<UnpackedDimension> = match &pd.data_type {
+                            DataType::TypeReference { name, .. }
+                                if decl.dimensions.is_empty() =>
+                            {
+                                name.scope
+                                    .as_ref()
+                                    .and_then(|sc| {
+                                        elab.typedef_unpacked_dims
+                                            .get(&format!("{}::{}", sc.name, name.name.name))
+                                    })
+                                    .or_else(|| elab.typedef_unpacked_dims.get(&name.name.name))
+                                    .cloned()
+                                    .unwrap_or_default()
+                            }
+                            _ => Vec::new(),
+                        };
+                        if !tdims.is_empty() {
+                            let tdims = normalize_unpacked_dims(
+                                &tdims,
+                                &elab.parameters,
+                                &elab.typedef_types,
+                            );
+                            if let Some(shape) = fixed_unpacked_shape(&tdims, &elab.parameters)
+                                .filter(|sh| !sh.is_empty())
+                            {
+                                register_fixed_unpacked_array(
+                                    &mut elab,
+                                    &decl.name.name,
+                                    &shape,
+                                    width,
+                                    false,
+                                );
+                                elab.var_decl_types
+                                    .entry(decl.name.name.clone())
+                                    .or_insert_with(|| pd.data_type.clone());
+                            }
                         }
                     }
                     elab.note_explicit_type(&decl.name.name, &pd.data_type, decl.name.span)?;
@@ -3231,7 +3428,16 @@ pub fn elaborate_module_with_defs(
                     // applies both, so only take the shortcut when there are
                     // no such dims.
                     DataType::TypeReference { name, dimensions, .. } if dimensions.is_empty() => {
-                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                        {
+                        // §26.3: a SCOPED `P::T` prefers the qualified key so
+                        // a module-local `typedef ... T` cannot capture it.
+                        let scoped_w = name.scope.as_ref().and_then(|sc| {
+                            elab.typedefs.get(&format!("{}::{}", sc.name, name.name.name)).copied()
+                        });
+                        scoped_w
+                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                            .unwrap_or_else(|| resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                    }
                     }
                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                 };
@@ -3812,8 +4018,34 @@ pub fn elaborate_module_with_defs(
                         let w = width;
                         let (init_val, procedural_init) = if let Some(init_expr) = &decl.init {
                             if is_const_expr(init_expr, &elab.parameters) {
-                                let mut rv = eval_init_for_width(init_expr, &elab.parameters, w);
-                                if is_signed { rv.is_signed = true; }
+                                // §6.16: a `string` has no declared length — `w`
+                                // is the 1024-bit PLACEHOLDER, and fitting the
+                                // initializer to it truncates the FRONT of any
+                                // text past 128 characters (a packed string
+                                // keeps its text in the low bits). The runtime
+                                // stores were already exempt (issues #63/#64);
+                                // this DECLARATION-initializer path was the
+                                // last one still fitting (issue #65:
+                                // `string cmd = "<144 chars>";` lost its
+                                // "echo_SAFE_" prefix while the identical
+                                // procedural assignment was correct).
+                                let is_string_decl = matches!(
+                                    &dd.data_type,
+                                    DataType::Simple { kind: SimpleType::String, .. }
+                                );
+                                let mut rv = if is_string_decl {
+                                    eval_const_expr_val(init_expr, &elab.parameters)
+                                } else {
+                                    eval_init_for_width(init_expr, &elab.parameters, w)
+                                };
+// §11.8.1: the DECLARED type decides signedness — an
+                                // initializer's sign must never leak into it.
+                                // Only SETTING the flag left `int unsigned x = -1`
+                                // and `bit [15:0] u = -1` behaving as signed, so
+                                // `x > 0` was false and `u + 10` was 9 instead of
+                                // 65545. (Parameters had the same bug; this is the
+                                // variable-declaration twin.)
+                                if !is_real { rv.is_signed = is_signed; }
                                 if is_real { rv = Value::from_f64(rv.to_f64()); }
                                 (rv, None)
                             } else {
@@ -4312,13 +4544,41 @@ pub fn elaborate_module_with_defs(
                         let mut current_is_real = is_real;
                         let mut current_signed = signed;
 
+                        // §6.20.2: a parameter with NO type and NO range takes
+                        // the SIZE of its final value when that value is a
+                        // sized literal — `localparam P = 16'b...` is 16 bits,
+                        // so `$left(P)` is 15 and `$bits(P)` 16. Only the
+                        // sized-literal case is narrowed; unsized values keep
+                        // the 32-bit default. (The package path already did
+                        // this; the module path pinned 32.)
+                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                        {
+                            if let Some(w) = assign.init.as_ref().and_then(sized_literal_width) {
+                                current_width = w;
+                            }
+                        }
+
                         if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
                             let init_is_real = if elab.parameters.contains_key(&assign.name.name)
                                 && !preseeded_params.contains(&assign.name.name)
                             {
                                 elab.parameters.get(&assign.name.name).map(|v| v.is_real).unwrap_or(false)
                             } else if let Some(init) = &assign.init {
-                                eval_const_expr_val(init, &elab.parameters).is_real
+                                // Substitute const-function calls first (see
+                                // the header-param twin above).
+                                let subst;
+                                let e: &Expression = if expr_has_call(init) {
+                                    match substitute_const_fn_calls(init, &elab.parameters, &elab, 0) {
+                                        Some(x) => {
+                                            subst = x;
+                                            &subst
+                                        }
+                                        None => init,
+                                    }
+                                } else {
+                                    init
+                                };
+                                eval_const_expr_val(e, &elab.parameters).is_real
                             } else { false };
 
                             if init_is_real {
@@ -6765,7 +7025,10 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                    !elab.clocking_blocks.contains_key(name) && !elab.lets.contains_key(name) &&
                    !elab.sequences.contains(name) &&
                    !locals.contains(name) {
-                   return Err(format!("Undeclared identifier '{}'", name));
+                   let loc = span_location(elab, expr.span)
+                       .map(|l| format!(" at {}", l))
+                       .unwrap_or_default();
+                   return Err(format!("Undeclared identifier '{}'{}", name, loc));
                 }            }
         ExprKind::Unary { operand, .. } => validate_expr_idents(operand, elab, locals)?,
         ExprKind::Binary { left, right, .. } => { validate_expr_idents(left, elab, locals)?; validate_expr_idents(right, elab, locals)?; }
@@ -6782,9 +7045,23 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
         ExprKind::Index { expr, index } => {
             if let ExprKind::Ident(hier) = &expr.kind {
                 if hier.path.len() == 1 {
-                    if let Some(sig) = elab.signals.get(&hier.path[0].name.name) {
-                        if sig.is_real {
-                            return Err(format!("Bit-select of real variable '{}' is not allowed", sig.name));
+                    let nm = &hier.path[0].name.name;
+                    // §6.12.2 forbids a bit-select OF a real, but `r[i]` on an
+                    // ARRAY of reals is an ELEMENT select, not a bit-select.
+                    // The check keyed only on "the signal is real", so
+                    // `real r_aa[int]; r_aa[7]` was rejected outright and any
+                    // module holding a real associative/unpacked array failed
+                    // to elaborate.
+                    let is_indexable_collection = elab.arrays.contains_key(nm)
+                        || elab.associative_arrays.contains_key(nm)
+                        || elab.arrays_2d.contains_key(nm)
+                        || elab.arrays_nd.contains_key(nm)
+                        || elab.dynamic_arrays.contains(nm);
+                    if !is_indexable_collection {
+                        if let Some(sig) = elab.signals.get(nm) {
+                            if sig.is_real {
+                                return Err(format!("Bit-select of real variable '{}' is not allowed", sig.name));
+                            }
                         }
                     }
                 }
@@ -6839,9 +7116,34 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                     | "$set_coverage_db_name" | "$load_coverage_db"
                     // Verdi/VCS waveform tasks: scope args like $dumpvars.
                     | "$fsdbDumpvars" | "$fsdbDumpfile" | "$vcdpluson" | "$vcdplusoff"
+                    // Cadence/Xcelium SHM + SST2 waveform tasks: the first
+                    // argument of $shm_probe/$recordvars/$probe is a SCOPE
+                    // (`$shm_probe(testbench, "AC")`), so validating it as a
+                    // value lookup failed whole-testbench elaboration with
+                    // "Undeclared identifier '<top>'".
+                    | "$shm_open" | "$shm_probe" | "$shm_close" | "$shm_save"
+                    | "$recordfile" | "$recordvars" | "$recordon" | "$recordoff"
+                    | "$recordsetup" | "$recordclose"
+                    | "$probe" | "$probe_close" | "$probe_off" | "$probe_on"
                     // §20.16: second argument is an instance scope.
                     | "$sdf_annotate"
-            );
+                    // §20.12 assertion controls: `$assertoff(0, testbench)`
+                    // during reset is a staple of vendor testbenches — the
+                    // trailing args are scopes/hierarchical refs, not values.
+                    | "$assertoff" | "$asserton" | "$assertkill" | "$assertcontrol"
+                    | "$assertpasson" | "$assertpassoff" | "$assertfailon"
+                    | "$assertfailoff" | "$assertnonvacuouson" | "$assertvacuousoff"
+                    // Legacy scope/listing tasks (§21 of 1364): scope args too.
+                    | "$scope" | "$list" | "$showvars" | "$showscopes"
+            )
+            // Vendor debug/waveform families take scope args throughout and
+            // are runtime-ignored anyway; match by PREFIX so each vendor's
+            // next task name ($xm* Verisium/vwdb dumping, $indago*, ...)
+            // doesn't re-break elaboration one name at a time. None collide
+            // with an LRM-defined task name.
+            || ["$shm", "$xm", "$fsdb", "$vcdplus", "$vwdb", "$indago", "$record", "$probe"]
+                .iter()
+                .any(|p| name.starts_with(p));
             if !skip {
                 for a in args { validate_expr_idents(a, elab, locals)?; }
             }
@@ -6918,7 +7220,10 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
                 && !elab.clocking_blocks.contains_key(&id.name)
                 && id.name != "__xz_default_clocking"
             => {
-                return Err(format!("Undeclared identifier '{}'", id.name));
+                let loc = span_location(elab, id.span)
+                    .map(|l| format!(" at {}", l))
+                    .unwrap_or_default();
+                return Err(format!("Undeclared identifier '{}'{}", id.name, loc));
             }
         EventControl::HierIdentifier(e) => validate_expr_idents(e, elab, locals)?,
         _ => {}
@@ -7479,7 +7784,16 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     // applies both, so only take the shortcut when there are
                     // no such dims.
                     DataType::TypeReference { name, dimensions, .. } if dimensions.is_empty() => {
-                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                        {
+                        // §26.3: a SCOPED `P::T` prefers the qualified key so
+                        // a module-local `typedef ... T` cannot capture it.
+                        let scoped_w = name.scope.as_ref().and_then(|sc| {
+                            elab.typedefs.get(&format!("{}::{}", sc.name, name.name.name)).copied()
+                        });
+                        scoped_w
+                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                            .unwrap_or_else(|| resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                    }
                     }
                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                 };
@@ -7556,7 +7870,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     } else {
                         let init_val = if let Some(init_expr) = &decl.init {
                             let mut rv = eval_init_for_width(init_expr, &elab.parameters, width);
-                            if is_signed { rv.is_signed = true; }
+                            if !is_real { rv.is_signed = is_signed; }
                             if is_real { rv = Value::from_f64(rv.to_f64()); }
                             rv
                         } else {
@@ -8314,7 +8628,14 @@ pub fn resolve_typedef_chain<'a>(
     let mut cur = dt;
     for _ in 0..64 {
         let DataType::TypeReference { name, .. } = cur else { break };
-        match typedef_types.get(&name.name.name) {
+        // §26.3: a SCOPED reference (`P::T`) names the package's typedef and
+        // must not be captured by a same-named local — try the qualified key
+        // first (package walks register both spellings).
+        let scoped = name
+            .scope
+            .as_ref()
+            .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, name.name.name)));
+        match scoped.or_else(|| typedef_types.get(&name.name.name)) {
             Some(next) => cur = next,
             None => break,
         }
@@ -8374,7 +8695,16 @@ pub fn resolve_type_width(
         }
         DataType::TypeReference { name, dimensions, .. } => {
             let mut base_width = if let Some(td) = typedefs {
-                td.get(&name.name.name).copied().unwrap_or(32)
+                // §26.3: prefer the package-qualified key for `P::T` so a
+                // module-local `typedef ... T` cannot capture it.
+                let scoped = name
+                    .scope
+                    .as_ref()
+                    .and_then(|sc| td.get(&format!("{}::{}", sc.name, name.name.name)))
+                    .copied();
+                scoped
+                    .or_else(|| td.get(&name.name.name).copied())
+                    .unwrap_or(32)
             } else {
                 32
             };
@@ -8398,11 +8728,25 @@ pub fn resolve_type_width(
             SimpleType::Event => 1,
         },
         DataType::Enum(e) => {
-            if let Some(bt) = &e.base_type {
+            let base = if let Some(bt) = &e.base_type {
                 resolve_type_width(bt, params, typedefs)
             } else {
                 32
+            };
+            // §7.4.2: body-suffix packed dims (`enum {...} [1:0] x;`) make a
+            // packed ARRAY of the enum — multiply like the struct arm does.
+            let mut total = base as u64;
+            for d in &e.dimensions {
+                if let PackedDimension::Range { left, right, .. } = d {
+                    if let (Some(l), Some(r)) = (
+                        const_eval_i64_with_params(left, params),
+                        const_eval_i64_with_params(right, params),
+                    ) {
+                        total = total.saturating_mul((l - r).unsigned_abs() + 1);
+                    }
+                }
             }
+            clamp_packed_width(total, "Enum", "")
         }
         DataType::Struct(s) => {
             let is_union = matches!(s.kind, StructUnionKind::Union);
@@ -8472,7 +8816,13 @@ pub fn is_type_signed_resolved(
 ) -> bool {
     if let DataType::TypeReference { name, .. } = dt {
         let key = &name.name.name;
-        if let Some(inner) = typedef_types.get(key) {
+        // §26.3: scoped `P::T` prefers the qualified registration.
+        let inner = name
+            .scope
+            .as_ref()
+            .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, key)))
+            .or_else(|| typedef_types.get(key));
+        if let Some(inner) = inner {
             // Guard against a self-referential name.
             if !matches!(inner, DataType::TypeReference { name: n, .. } if &n.name.name == key) {
                 return is_type_signed_resolved(inner, typedef_types);
@@ -8522,6 +8872,9 @@ pub fn is_type_two_state(dt: &DataType) -> bool {
         DataType::IntegerAtom { kind, .. } => matches!(kind,
             IntegerAtomType::Byte | IntegerAtomType::ShortInt | IntegerAtomType::Int | IntegerAtomType::LongInt),
         DataType::Real { .. } => true,
+        // §6.19.2: an enum's state-ness follows its BASE type — `enum bit
+        // [3:0] {...} e;` default-initializes to 0, `enum reg [3:0]` to x.
+        DataType::Enum(e) => e.base_type.as_deref().map(is_type_two_state).unwrap_or(false),
         _ => false,
     }
 }
@@ -9823,7 +10176,12 @@ pub(crate) fn pack_packed_vector_pattern(
         DataType::Implicit { dimensions, .. } => dimensions,
         _ => return None,
     };
-    if dims.len() < 2 {
+    // A SINGLE packed dim is a vector of bits — `'{1'b1, 2.0, 2+1}` on
+    // `bit [2:0]` converts each item to ONE bit (§10.9.2 element-by-element),
+    // exactly like the multi-D case with 1-bit elements. The old `< 2` guard
+    // sent it to the raw-concat fallback, which kept every item at its own
+    // width and scrambled the result.
+    if dims.is_empty() {
         return None;
     }
     pack_vector_pattern_dims(dims, expr, params)
@@ -9858,8 +10216,16 @@ fn pack_vector_pattern_dims(
         elem_w = elem_w.checked_mul(((il - ir).unsigned_abs() + 1) as u32)?;
     }
     let eval_elem = |e: &Expression| -> Option<Value> {
-        if inner.len() >= 2 && matches!(e.kind, ExprKind::AssignmentPattern(_)) {
+        if !inner.is_empty() && matches!(e.kind, ExprKind::AssignmentPattern(_)) {
             return pack_vector_pattern_dims(inner, e, params);
+        }
+        // §6.12.2: a real item CONVERTS (rounds) to the element type — the
+        // width-fit path would reinterpret its IEEE-754 bits.
+        let raw = eval_const_expr_val(e, params);
+        if raw.is_real {
+            let r = raw.to_f64().round() as i64;
+            let m = if elem_w >= 64 { u64::MAX } else { (1u64 << elem_w) - 1 };
+            return Some(Value::from_u64(r as u64 & m, elem_w));
         }
         Some(eval_init_for_width(e, params, elem_w))
     };
@@ -10295,8 +10661,22 @@ fn pack_struct_const_value(
             Some(e) => {
                 if let Some(sub) = pack_struct_const_value(mdt, e, params, typedefs, typedef_types) {
                     sub.resize(*mw)
+                } else if let Some(sub) = pack_packed_vector_pattern(mdt, e, params, typedef_types)
+                {
+                    // A nested pattern on a packed-VECTOR member
+                    // (`bit [2:0][3:0] y` given `'{4,5,6}`).
+                    sub.resize(*mw)
                 } else {
-                    eval_init_for_width(e, params, *mw)
+                    // §6.12.2: a real item CONVERTS (rounds) to the member
+                    // type; the width-fit would reinterpret its IEEE-754 bits.
+                    let raw = eval_const_expr_val(e, params);
+                    if raw.is_real {
+                        let r = raw.to_f64().round() as i64;
+                        let m = if *mw >= 64 { u64::MAX } else { (1u64 << *mw) - 1 };
+                        Value::from_u64(r as u64 & m, *mw)
+                    } else {
+                        eval_init_for_width(e, params, *mw)
+                    }
                 }
             }
             None => Value::zero(*mw),
@@ -10383,6 +10763,13 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 BinaryOp::Power => l.power(&r),
                 BinaryOp::Eq => l.is_equal(&r),
                 BinaryOp::Neq => l.is_not_equal(&r),
+                // §11.4.6: wildcard equality in a CONSTANT expression —
+                // `parameter W = 2'b01 ==? 2'b0x;` evaluated to 0 because
+                // these ops had no const-eval arm at all.
+                BinaryOp::CaseEq => l.case_eq(&r),
+                BinaryOp::CaseNeq => l.case_eq(&r).logic_not(),
+                BinaryOp::WildcardEq => l.wildcard_eq(&r),
+                BinaryOp::WildcardNeq => l.wildcard_ne(&r),
                 BinaryOp::Lt => l.less_than(&r),
                 BinaryOp::Leq => l.less_equal(&r),
                 BinaryOp::Gt => l.greater_than(&r),
@@ -10730,7 +11117,10 @@ pub fn inline_instantiations(
                                     }
                                 }
                             }
-                            crate::ast::decl::PackageItem::Typedef(td) => { process_typedef(td, elab); }
+                            crate::ast::decl::PackageItem::Typedef(td) => {
+                                process_typedef(td, elab);
+                                register_scoped_typedef_alias(name, td, elab);
+                            }
                             _ => {}
                         }
                     }
@@ -10763,6 +11153,7 @@ pub fn inline_instantiations(
                         }
                         crate::ast::decl::PackageItem::Typedef(td) => {
                             process_typedef(td, elab);
+                            register_scoped_typedef_alias(name, td, elab);
                         }
                         crate::ast::decl::PackageItem::Parameter(pd) => {
                             if let ParameterKind::Data { data_type, assignments } = &pd.kind {
@@ -10830,6 +11221,104 @@ pub fn inline_instantiations(
                                         let r = const_eval_i64_with_params(right, Some(&elab.parameters)).unwrap_or(0);
                                         if l > r { elab.descending_arrays.insert(decl.name.name.clone()); }
                                     }
+                                }
+                                // SCALAR package variable (`enum integer {A,B} e = A;`,
+                                // `integer n = 42;`): nothing below handles it — the
+                                // arm only registered arrays, so the signal never
+                                // existed, its initializer never applied (`P::e`
+                                // read x), and an anonymous enum's members/methods
+                                // had no registration (`P::e.first` was empty).
+                                // Mirror the module-scope declaration path.
+                                if decl.dimensions.is_empty() {
+                                    register_anonymous_enum_members(&dd.data_type, elab);
+                                    let is_anon_enum =
+                                        anon_enum_members_ordered(&dd.data_type, &elab.parameters);
+                                    if let Some(members) = &is_anon_enum {
+                                        elab.enum_members
+                                            .insert(decl.name.name.clone(), members.clone());
+                                    }
+                                    if let Some(ew) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs) {
+                                        elab.packed_signal_elem_widths.entry(decl.name.name.clone()).or_insert(ew);
+                                    }
+                                    if let Some(fd) = packed_full_dims_of(&dd.data_type, &elab.parameters) {
+                                        elab.packed_full_dims.entry(decl.name.name.clone()).or_insert(fd);
+                                    }
+                                    let w = width.max(1);
+                                    let is_real = is_type_real(&dd.data_type);
+                                    // `C c = new;` cannot const-evaluate — run
+                                    // it as a static init (same machinery the
+                                    // array initializers use) so `P::c.f1()`
+                                    // has a live handle. NOTE: no-parens `new`
+                                    // parses as a bare IDENT, not a Call, so
+                                    // expr_has_call alone misses it.
+                                    let init_has_call = decl.init.as_ref().is_some_and(|e| {
+                                        expr_has_call(e)
+                                            || matches!(&e.kind, ExprKind::Ident(h)
+                                                if h.path.len() == 1
+                                                    && h.path[0].name.name == "new")
+                                    });
+                                    if init_has_call {
+                                        if let Some(init_expr) = &decl.init {
+                                            elab.static_init_blocks.push(InitialBlock {
+                                                stmt: Statement::new(
+                                                    StatementKind::BlockingAssign {
+                                                        lvalue: make_ident_expr(&decl.name.name),
+                                                        rvalue: init_expr.clone(),
+                                                    },
+                                                    Span::dummy(),
+                                                ),
+                                                scope: String::new(),
+                                            });
+                                        }
+                                    }
+                                    let v = match &decl.init {
+                                        Some(e) if !init_has_call => {
+                                            let mut v =
+                                                eval_init_for_width(e, &elab.parameters, w);
+                                            if is_real {
+                                                v = Value::from_f64(v.to_f64());
+                                            } else if is_signed {
+                                                v.is_signed = true;
+                                            }
+                                            v
+                                        }
+                                        _ => default_value_for_type(&dd.data_type, w),
+                                    };
+                                    let tn = if is_anon_enum.is_some() {
+                                        Some(decl.name.name.clone())
+                                    } else {
+                                        get_type_name(&dd.data_type)
+                                    };
+                                    // A packed-STRUCT package variable needs its
+                                    // field layout registered, or `P::s.x`
+                                    // (and any member select) reads x.
+                                    if let Some(fields) = packed_struct_field_layout(
+                                        &dd.data_type,
+                                        &elab.parameters,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            tls_register_struct_layout(&decl.name.name, &fields);
+                                            elab.packed_struct_fields
+                                                .entry(decl.name.name.clone())
+                                                .or_insert(fields);
+                                        }
+                                    }
+                                    elab.var_decl_types
+                                        .entry(decl.name.name.clone())
+                                        .or_insert_with(|| dd.data_type.clone());
+                                    elab.signals.entry(decl.name.name.clone()).or_insert(Signal {
+                                        is_const: false,
+                                        name: decl.name.name.clone(),
+                                        width: w,
+                                        is_signed,
+                                        is_real,
+                                        direction: None,
+                                        value: v,
+                                        type_name: tn,
+                                    });
+                                    continue;
                                 }
                                 let Some(init_expr) = &decl.init else { continue };
                                 let init_items: Vec<&Expression> = match &init_expr.kind {
@@ -13646,6 +14135,32 @@ fn inline_module_items(
                                 let is_signed = is_type_signed(&pd.data_type);
                                 for decl in &pd.declarators {
                                     let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                    // §7.4.1: a non-ANSI PORT of a packed
+                                    // multi-D / packed-struct type needs the
+                                    // same shape registrations a variable
+                                    // declaration gets. Without them
+                                    // `assign o[1] = v;` on a
+                                    // `output logic [3:0][9:0] o;` inlined
+                                    // port degraded to a bit-window write, and
+                                    // struct-port member assigns lost the
+                                    // layout.
+                                    if let Some(ew) = packed_inner_elem_width(&pd.data_type, &sub_local_params, &elab.typedefs) {
+                                        elab.packed_signal_elem_widths.entry(sig_name.clone()).or_insert(ew);
+                                    }
+                                    if let Some(fd) = packed_full_dims_of(&pd.data_type, &sub_local_params) {
+                                        elab.packed_full_dims.entry(sig_name.clone()).or_insert(fd);
+                                    }
+                                    if let Some(fields) = packed_struct_field_layout(
+                                        &pd.data_type,
+                                        &sub_local_params,
+                                        &elab.typedefs,
+                                        &elab.typedef_types,
+                                    ) {
+                                        if !fields.is_empty() {
+                                            tls_register_struct_layout(&sig_name, &fields);
+                                            elab.packed_struct_fields.entry(sig_name.clone()).or_insert(fields);
+                                        }
+                                    }
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: false,
                                         name: sig_name, width, is_signed,
                                         direction: Some(pd.direction),
@@ -14773,13 +15288,22 @@ fn eval_const_user_function(
     let fname = fd.name.name.name.clone();
     let mut locals: HashMap<String, Value> = elab.parameters.clone();
     for (i, port) in fd.ports.iter().enumerate() {
-        locals.insert(
-            port.name.name.clone(),
-            arg_vals.get(i).cloned().unwrap_or_else(|| Value::zero(32)),
-        );
+        let mut v = arg_vals.get(i).cloned().unwrap_or_else(|| Value::zero(32));
+        // §13.3: the actual CONVERTS to the formal's declared type — a REAL
+        // formal bound to the integer literal `5` otherwise did integer
+        // arithmetic throughout (`x /= 2` gave 2, not 2.5).
+        if is_type_real(&port.data_type) && !v.is_real {
+            v = Value::from_f64(v.to_f64());
+        }
+        locals.insert(port.name.name.clone(), v);
     }
-    // The implicit return variable.
-    locals.insert(fname.clone(), Value::zero(32));
+    // The implicit return variable (typed per the declared return type).
+    let ret_init = if is_type_real(&fd.return_type) {
+        Value::from_f64(0.0)
+    } else {
+        Value::zero(32)
+    };
+    locals.insert(fname.clone(), ret_init);
 
     enum Flow {
         Normal,
@@ -14945,7 +15469,17 @@ fn eval_const_user_function(
                         if let ExprKind::Ident(h) = &operand.kind {
                             if h.path.len() == 1 && h.path[0].selects.is_empty() {
                                 let n = h.path[0].name.name.clone();
-                                let cur = locals.get(&n)?.to_i64().unwrap_or(0);
+                                let cur_v = locals.get(&n)?.clone();
+                                // Real-aware: `++x` on a real formal stepped
+                                // through to_i64 (None on a real) and reset to
+                                // 0.
+                                if cur_v.is_real {
+                                    let f = cur_v.to_f64();
+                                    let nf = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { f + 1.0 } else { f - 1.0 };
+                                    locals.insert(n, Value::from_f64(nf));
+                                    return Some(Flow::Normal);
+                                }
+                                let cur = cur_v.to_i64().unwrap_or(0);
                                 let nv = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { cur + 1 } else { cur - 1 };
                                 locals.insert(n, Value::from_u64(nv as u64, 32));
                                 return Some(Flow::Normal);
@@ -14977,7 +15511,14 @@ fn eval_const_user_function(
                 if let ExprKind::Ident(h) = &operand.kind {
                     if h.path.len() == 1 && h.path[0].selects.is_empty() {
                         let n = h.path[0].name.name.clone();
-                        let cur = locals.get(&n)?.to_i64().unwrap_or(0);
+                        let cur_v = locals.get(&n)?.clone();
+                        if cur_v.is_real {
+                            let f = cur_v.to_f64();
+                            let nf = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { f + 1.0 } else { f - 1.0 };
+                            locals.insert(n, Value::from_f64(nf));
+                            return Some(());
+                        }
+                        let cur = cur_v.to_i64().unwrap_or(0);
                         let nv = if matches!(op, UnaryOp::PostIncr | UnaryOp::PreIncr) { cur + 1 } else { cur - 1 };
                         locals.insert(n, Value::from_u64(nv as u64, 32));
                         return Some(());
@@ -15026,6 +15567,15 @@ fn eval_const_user_function(
         }
     }
     let v = locals.remove(&fname)?;
+    // A REAL return keeps its representation — resize() reinterprets the
+    // IEEE-754 bits (f_id(5) came back 0.0).
+    if is_type_real(&fd.return_type) {
+        return Some(if v.is_real {
+            v
+        } else {
+            Value::from_f64(v.to_f64())
+        });
+    }
     // §13.4.1: the result takes the DECLARED return type — a
     // `function [3:0]` returning 20 yields 4, not 20. Unresolvable return
     // widths bail (deferral) rather than guessing.
@@ -15107,8 +15657,18 @@ fn substitute_const_fn_calls(
                 argv.push(eval_const_expr_val(&sa, params));
             }
             let v = eval_const_user_function(&fd, &argv, elab, depth)?;
-            let iv = v.to_i64()?;
-            make_i64_literal(iv, expr.span)
+            // A REAL result substitutes as a REAL literal — `to_i64` dropped
+            // the fraction and the realness (`localparam D = f_div(5)` with a
+            // real function read 0/2 instead of 2.5).
+            if v.is_real {
+                Expression::new(
+                    ExprKind::Number(NumberLiteral::Real(v.to_f64())),
+                    expr.span,
+                )
+            } else {
+                let iv = v.to_i64()?;
+                make_i64_literal(iv, expr.span)
+            }
         }
         ExprKind::Binary { op, left, right } => rebuild(ExprKind::Binary {
             op: *op,
@@ -16697,7 +17257,16 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             if dd.declarators.iter().any(|decl| &decl.name.name == sym_name) => {
                                 let width = match &dd.data_type {
                                     DataType::TypeReference { name, .. } => {
-                                        elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                                        {
+                        // §26.3: a SCOPED `P::T` prefers the qualified key so
+                        // a module-local `typedef ... T` cannot capture it.
+                        let scoped_w = name.scope.as_ref().and_then(|sc| {
+                            elab.typedefs.get(&format!("{}::{}", sc.name, name.name.name)).copied()
+                        });
+                        scoped_w
+                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                            .unwrap_or_else(|| resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                    }
                                     }
                                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                                 };
@@ -16853,7 +17422,16 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         PackageItem::Data(dd) => {
                             let width = match &dd.data_type {
                                 DataType::TypeReference { name, .. } => {
-                                    elab.typedefs.get(&name.name.name).copied().unwrap_or(resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                                    {
+                        // §26.3: a SCOPED `P::T` prefers the qualified key so
+                        // a module-local `typedef ... T` cannot capture it.
+                        let scoped_w = name.scope.as_ref().and_then(|sc| {
+                            elab.typedefs.get(&format!("{}::{}", sc.name, name.name.name)).copied()
+                        });
+                        scoped_w
+                            .or_else(|| elab.typedefs.get(&name.name.name).copied())
+                            .unwrap_or_else(|| resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)))
+                    }
                                 }
                                 _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                             };
@@ -16867,14 +17445,40 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             let struct_fields = flatten_struct_fields(
                                 &dd.data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types,
                             ).filter(|f| !f.is_empty());
+                            // An ANONYMOUS enum's members must be registered
+                            // BEFORE the initializer evaluates — `enum { A, B }
+                            // e = B;` otherwise read B as an unknown (0). Also
+                            // key the member list by the VARIABLE name so
+                            // `e.first/next` resolve (§6.19.6).
+                            register_anonymous_enum_members(&dd.data_type, elab);
+                            let anon_members =
+                                anon_enum_members_ordered(&dd.data_type, &elab.parameters);
                             for decl in &dd.declarators {
+                                if let Some(members) = &anon_members {
+                                    elab.enum_members
+                                        .entry(decl.name.name.clone())
+                                        .or_insert_with(|| members.clone());
+                                }
+                                // Packed multi-D shape (`reg [1:0][7:0] y`):
+                                // element selects `P::y[i]` need these maps.
+                                if let Some(ew) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs) {
+                                    elab.packed_signal_elem_widths.entry(decl.name.name.clone()).or_insert(ew);
+                                }
+                                if let Some(fd) = packed_full_dims_of(&dd.data_type, &elab.parameters) {
+                                    elab.packed_full_dims.entry(decl.name.name.clone()).or_insert(fd);
+                                }
                                 let v = if let Some(init) = &decl.init {
                                     eval_init_for_width(init, &elab.parameters, width)
                                 } else { Value::zero(width) };
+                                let tn = if anon_members.is_some() {
+                                    Some(decl.name.name.clone())
+                                } else {
+                                    get_type_name(&dd.data_type)
+                                };
                                 elab.signals.insert(decl.name.name.clone(), Signal {
                                     is_const: dd.const_kw, name: decl.name.name.clone(),
                                     width, is_signed, is_real, direction: None,
-                                    value: v, type_name: get_type_name(&dd.data_type),
+                                    value: v, type_name: tn,
                                 });
                                 if let Some(fields) = &struct_fields {
                                     tls_register_struct_layout(&decl.name.name, fields);
