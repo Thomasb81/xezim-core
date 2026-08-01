@@ -1185,13 +1185,12 @@ fn apply_token_pasting(text: &str) -> String {
         }
 
         if bytes[i] == b'`' && i + 1 < bytes.len() && bytes[i + 1] == b'`' {
+            // §22.5.1: `` DELIMITS lexical tokens "without introducing white
+            // space" — it is deleted, nothing more. It must NOT eat existing
+            // whitespace around it: `localparam `` i``a``b``j` keeps the gap
+            // after `localparam` (br979), while `i``a` glues because there
+            // was no whitespace between the tokens to begin with.
             i += 2;
-            while result.ends_with(' ') || result.ends_with('\t') {
-                result.pop();
-            }
-            while i < bytes.len() && (bytes[i] == b' ' || bytes[i] == b'\t') {
-                i += 1;
-            }
             continue;
         }
 
