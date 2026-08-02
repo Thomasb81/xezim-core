@@ -359,6 +359,13 @@ pub struct ElaboratedClass {
     /// `m_derived_types` stayed empty.
     #[serde(default)]
     pub type_param_defaults: Vec<(String, String)>,
+    /// §6.20.2: the DEFAULT type of each type parameter, kept as AST so a
+    /// width that references a VALUE parameter (`parameter type T = logic
+    /// [W-1:0]`) can be resolved against the active specialization at
+    /// runtime. `type_param_defaults` only keeps a textual fragment, which
+    /// cannot be re-sized per specialization.
+    #[serde(default)]
+    pub type_param_default_types: Vec<(String, crate::ast::types::DataType)>,
     /// IEEE 1800-2017 §8.7: value arguments in the `extends Base(args)` clause,
     /// passed to the implicit `super.new(args)` when the derived constructor
     /// does not call `super.new` explicitly.
@@ -921,18 +928,22 @@ pub fn elaborate_class_with_params(
                 for a in assignments {
                     param_defaults.push((a.name.name.clone(), a.init.clone()));
                     static_properties.insert(a.name.name.clone());
-                    // Evaluate the initial value for the property.
-                    let width = resolve_type_width(data_type, None, None);
+                    // Evaluate the initial value for the property against the
+                    // class's CONSTANT SCOPE (header parameter defaults plus
+                    // earlier body localparams). An empty map was used, so
+                    // `localparam int MYW = W;` in `class C #(parameter int
+                    // W = 8)` baked in 0 for every specialization.
+                    let width = resolve_type_width(data_type, Some(&const_scope), None);
                     let is_string = matches!(data_type, crate::ast::types::DataType::Simple { kind: crate::ast::types::SimpleType::String, .. });
                     let v = if is_string {
                         // String localparams: evaluate using the const-eval path.
                         if let Some(init) = &a.init {
-                            eval_const_expr_val(init, &HashMap::default())
+                            eval_const_expr_val(init, &const_scope)
                         } else {
                             Value::from_string("")
                         }
                     } else if let Some(init) = &a.init {
-                        eval_init_for_width(init, &HashMap::default(), width)
+                        eval_init_for_width(init, &const_scope, width)
                     } else {
                         Value::zero(width)
                     };
@@ -954,6 +965,7 @@ pub fn elaborate_class_with_params(
         matches!(it, ClassItem::Method(m) if matches!(m.kind, ClassMethodKind::PureVirtual(_))));
     let mut type_param_names = Vec::new();
     let mut type_param_defaults: Vec<(String, String)> = Vec::new();
+    let mut type_param_default_types: Vec<(String, crate::ast::types::DataType)> = Vec::new();
     let mut param_order: Vec<String> = Vec::new();
     for p in &c.params {
         match &p.kind {
@@ -961,11 +973,13 @@ pub fn elaborate_class_with_params(
                 for a in assignments {
                     type_param_names.push(a.name.name.clone());
                     param_order.push(a.name.name.clone());
-                    // Capture the default type as a textual fragment.
+                    // Capture the default type as a textual fragment, and
+                    // the AST itself for per-specialization width resolution.
                     if let Some(dt) = &a.init {
                         if let Some(frag) = data_type_to_spec_fragment(dt) {
                             type_param_defaults.push((a.name.name.clone(), frag));
                         }
+                        type_param_default_types.push((a.name.name.clone(), dt.clone()));
                     }
                 }
             }
@@ -1005,6 +1019,7 @@ pub fn elaborate_class_with_params(
         implements: c.implements.iter().map(|i| i.name.clone()).collect(),
         type_param_names,
         type_param_defaults,
+        type_param_default_types,
         param_order,
         property_type_args,
         typedef_names: c.items.iter().filter_map(|it| match it {
@@ -8380,6 +8395,31 @@ fn scope_generated_subroutines(items: &mut [ModuleItem], scope: &str) {
     }
 }
 
+/// Collect `(renamed_name, "<scope>.<base>")` for every parameter/localparam
+/// declared directly in a generate-for iteration body.
+fn collect_param_decl_names(
+    items: &[ModuleItem],
+    out: &mut Vec<(String, String)>,
+    suffix: &str,
+    scope: &str,
+) {
+    for it in items {
+        match it {
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for a in assignments {
+                        if let Some(base) = a.name.name.strip_suffix(suffix) {
+                            out.push((a.name.name.clone(), format!("{}.{}", scope, base)));
+                        }
+                    }
+                }
+            }
+            ModuleItem::GenerateRegion(gr) => collect_param_decl_names(&gr.items, out, suffix, scope),
+            _ => {}
+        }
+    }
+}
+
 fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
     let var = &gf.var;
     let mut i = gf.init_val;
@@ -8406,6 +8446,32 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
             scope_generated_subroutines(&mut renamed, &format!("{}[{}]", label, i));
         }
         elaborate_items(&renamed, elab, all_defs)?;
+        // §27.6: a generate-block localparam is also visible hierarchically
+        // as `<label>[i].<name>`. The per-iteration rename above stores it
+        // under `<name><suffix>`, so a hierarchical read (`gb[2].MYIDX`)
+        // found nothing and returned 0. Alias the resolved values under the
+        // LRM-visible scoped name. Named blocks only — an unnamed block's
+        // `genblk<n>` ordinal is not known here.
+        if let Some(label) = &gf.name {
+            let scope = format!("{}[{}]", label, i);
+            let mut alias_names: Vec<(String, String)> = Vec::new();
+            collect_param_decl_names(&renamed, &mut alias_names, &suffix, &scope);
+            for (renamed_name, scoped_name) in alias_names {
+                if let Some(v) = elab.parameters.get(&renamed_name).cloned() {
+                    elab.parameters.entry(scoped_name.clone()).or_insert(v.clone());
+                    elab.signals.entry(scoped_name.clone()).or_insert(Signal {
+                        is_const: true,
+                        name: scoped_name,
+                        width: v.width,
+                        is_signed: v.is_signed,
+                        is_real: v.is_real,
+                        direction: None,
+                        value: v,
+                        type_name: None,
+                    });
+                }
+            }
+        }
         if trace && (iter_count % 8) == 0 {
             let rss = std::fs::read_to_string("/proc/self/statm")
                 .ok()
@@ -11892,6 +11958,23 @@ fn rename_item_decls(
         }
         ModuleItem::ModuleInstantiation(mi) => {
             let mut new_mi = mi.clone();
+            // §27.4: a PARAMETER OVERRIDE expression may reference a
+            // generate-scope localparam (`#(.W(MYW))` next to
+            // `localparam int MYW = ...`). Those declarations are renamed
+            // per-iteration, so the override kept the stale bare name,
+            // resolved to nothing, and the child elaborated with 0-width
+            // parameters. Only port connections were rewritten here.
+            if let Some(params) = &mut new_mi.params {
+                for pc in params.iter_mut() {
+                    let value = match pc {
+                        ParamConnection::Ordered(v) => v,
+                        ParamConnection::Named { value, .. } => value,
+                    };
+                    if let Some(ParamValue::Expr(e)) = value {
+                        *e = rewrite_expr(e, "", port_map, local_names, interface_map);
+                    }
+                }
+            }
             for hi in &mut new_mi.instances {
                 // Instance names are NOT suffixed: each generate-for iteration
                 // gets a distinct `scope[i].` prefix (§27.6), which both keeps
