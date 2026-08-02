@@ -2883,6 +2883,9 @@ pub fn elaborate_module_with_defs(
                         let is_signed = is_type_signed(data_type);
                         for assign in assignments {
                             register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
+                            if matches!(data_type, DataType::Simple { kind: SimpleType::String, .. }) {
+                                tls_register_string_param(&assign.name.name);
+                            }
                             if let Some(init) = &assign.init {
                                 // For implicit-typed parameters, infer width
                                 // from a sized literal initializer so
@@ -4546,6 +4549,11 @@ pub fn elaborate_module_with_defs(
                         }
                         elab.note_decl_site(&assign.name.name, assign.name.span, "parameter/localparam", true);
                         // IEEE 1800-2023: keyed assignment-pattern init for
+                        // §6.16: remember STRING-typed parameters so const-eval
+                        // treats `{A, B}` over them as text concatenation.
+                        if matches!(data_type, DataType::Simple { kind: SimpleType::String, .. }) {
+                            tls_register_string_param(&assign.name.name);
+                        }
                         // §6.20.2 unpacked-array parameter in a module BODY
                         // (`localparam int A [0:2] = '{7,8,9};`) — only the
                         // header pass called register_array_param, so a body
@@ -4610,6 +4618,12 @@ pub fn elaborate_module_with_defs(
                         // parameter must element-select, not bit-select.
                         if let Some(elem_w) = packed_inner_elem_width(data_type, &elab.parameters, &elab.typedefs) {
                             elab.packed_signal_elem_widths.insert(assign.name.name.clone(), elem_w);
+                            // The CONST-eval index arm reads its own TLS table
+                            // (only `register_packed_array_elem_w` fed it, which
+                            // handles a typedef'd element type). Without this a
+                            // `localparam logic [1:0][7:0] MP` element select
+                            // `MP[0]` in another localparam bit-selected instead.
+                            tls_register_elem_w(&assign.name.name, elem_w);
                         }
                         if let Some(fdims) = packed_full_dims_of(data_type, &elab.parameters) {
                             elab.packed_full_dims.insert(assign.name.name.clone(), fdims);
@@ -9474,6 +9488,12 @@ thread_local! {
     /// packed-array parameter Value (black-parrot's `all_cfgs_gp[bp_params_p]`).
     static PACKED_ELEM_W_TLS: std::cell::RefCell<HashMap<String, u32>>
         = std::cell::RefCell::new(HashMap::default());
+    /// Names of STRING-typed parameters, so const-eval knows a concatenation
+    /// involving them is TEXT concatenation (§6.16) rather than a bit-vector
+    /// concatenation — `localparam string CAT = {PFX, NAME}` produced only the
+    /// last operand's text otherwise.
+    static STRING_PARAMS_TLS: std::cell::RefCell<HashSet<String>>
+        = std::cell::RefCell::new(HashSet::default());
     /// Globally-visible parameter fallback for const-eval: package/$unit params
     /// (snapshot taken after package elaboration, before module inlining). When a
     /// const-eval `Ident` misses the scoped param map — e.g. a sub-module
@@ -9506,6 +9526,16 @@ fn tls_register_struct_layout(name: &str, fields: &[(String, u32, u32)]) {
 
 /// Record a packed-array parameter's element width for const-eval index selects
 /// (`a[i]`).
+fn tls_register_string_param(name: &str) {
+    STRING_PARAMS_TLS.with(|c| {
+        c.borrow_mut().insert(name.to_string());
+    });
+}
+
+fn tls_is_string_param(name: &str) -> bool {
+    STRING_PARAMS_TLS.with(|c| c.borrow().contains(name))
+}
+
 fn tls_register_elem_w(name: &str, elem_w: u32) {
     if elem_w == 0 { return; }
     PACKED_ELEM_W_TLS.with(|c| {
@@ -10673,6 +10703,44 @@ fn register_array_param(
     params: &HashMap<String, Value>,
 ) -> bool {
     let dims = normalize_unpacked_dims(dims, params, &elab.typedef_types);
+    // §6.20.2 MULTI-DIMENSIONAL unpacked parameter array
+    // (`localparam int UA [0:1][0:1] = '{'{1,2},'{3,4}}`). Only the FIRST
+    // dimension was consulted, so the inner dimension vanished and every
+    // element read 0. Recurse per outer index over the matching sub-pattern.
+    if dims.len() > 1 {
+        let Some(outer) = const_dim_indices(&dims[..1], params) else { return false };
+        let Some(init) = init else { return false };
+        let items: Vec<&Expression> = match &init.kind {
+            ExprKind::Concatenation(v) => v.iter().collect(),
+            ExprKind::AssignmentPattern(items) => items.iter().map(|i| i.expr()).collect(),
+            _ => return false,
+        };
+        if items.len() != outer.len() {
+            return false;
+        }
+        for (i, it) in outer.iter().zip(items) {
+            let sub = format!("{}[{}]", name, i);
+            if !register_array_param(
+                elab, prefix, &sub, &dims[1..], Some(it), None, data_type, params,
+            ) {
+                return false;
+            }
+        }
+        // Register the 2-D shape too: name validation and the runtime
+        // element-select path both key off it. (Simulator::new rebuilds this
+        // storage, so its elaboration-value restore must run AFTER the 2-D
+        // loop — see the ordering note there.)
+        if dims.len() == 2 {
+            if let Some(inner) = const_dim_indices(&dims[1..2], params) {
+                let ew = resolve_type_width(data_type, Some(params), Some(&elab.typedefs)).max(1);
+                let (o0, o1) = (outer[0], outer[outer.len() - 1]);
+                let (i0, i1) = (inner[0], inner[inner.len() - 1]);
+                elab.arrays_2d
+                    .insert(format!("{}{}", prefix, name), ((o0, o1), (i0, i1), ew));
+            }
+        }
+        return true;
+    }
     let Some(idxs) = const_dim_indices(&dims, params) else { return false };
     let n = idxs.len();
     if n == 0 {
@@ -11121,6 +11189,25 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         // §6.24.1 casts in CONSTANT context — the parser lowers `5'(x)`,
         // `int'(x)` and `T'(x)` to intrinsics that had no const-eval arms, so
         // `localparam int RI = int'(RP * 4.0)` silently became 0.
+        // §20.5 real↔integer conversions and rounding in CONSTANT context.
+        // None had const-eval arms, so `localparam int PI_I = $rtoi(PI*100.0)`
+        // evaluated to 0.
+        ExprKind::SystemCall { name, args }
+            if matches!(name.as_str(), "$rtoi" | "$itor" | "$ceil" | "$floor" | "$sqrt")
+                && args.len() == 1 =>
+        {
+            let v = eval_const_expr_val(&args[0], params);
+            let f = v.to_f64();
+            match name.as_str() {
+                // $rtoi TRUNCATES toward zero (unlike an assignment to int,
+                // which rounds).
+                "$rtoi" => Value::from_u64((f.trunc() as i64) as u64, 32),
+                "$itor" => Value::from_f64(f),
+                "$ceil" => Value::from_f64(f.ceil()),
+                "$floor" => Value::from_f64(f.floor()),
+                _ => Value::from_f64(f.sqrt()),
+            }
+        }
         ExprKind::SystemCall { name, args } if name == "$__xz_size_cast" && args.len() == 2 => {
             let n = eval_const_expr_val(&args[0], params).to_u64().unwrap_or(32).max(1) as u32;
             // §6.24.1: the cast width is the operand's evaluation CONTEXT —
@@ -11245,6 +11332,25 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             else { eval_const_expr_val(else_expr, params) }
         }
         ExprKind::Concatenation(parts) => {
+            // §6.16: a concatenation involving a STRING operand is TEXT
+            // concatenation. Bit-concatenating instead produced only the last
+            // operand's text (`localparam string CAT = {PFX, NAME}` = "widget"),
+            // because a string Value is padded to its placeholder width.
+            let is_text = parts.iter().any(|p| match &p.kind {
+                ExprKind::StringLiteral(_) => true,
+                ExprKind::Ident(h) => h
+                    .path
+                    .last()
+                    .is_some_and(|seg| tls_is_string_param(&seg.name.name)),
+                _ => false,
+            });
+            if is_text {
+                let mut text: Vec<u8> = Vec::new();
+                for p in parts {
+                    text.extend_from_slice(&eval_const_expr_val(p, params).sv_string_bytes());
+                }
+                return Value::from_string(&String::from_utf8_lossy(&text));
+            }
             let mut r = Value::zero(0);
             for p in parts.iter().rev() {
                 r = eval_const_expr_val(p, params).concat_with(&r);
@@ -14193,6 +14299,7 @@ fn inline_module_items(
                             if let Some(elem_w) = packed_inner_elem_width(data_type, &sub_local_params, &elab.typedefs) {
                                 elab.packed_signal_elem_widths
                                     .insert(format!("{}{}", inst_prefix, assign.name.name), elem_w);
+                                tls_register_elem_w(&assign.name.name, elem_w);
                             }
                             if let Some(fdims) = packed_full_dims_of(data_type, &sub_local_params) {
                                 elab.packed_full_dims
