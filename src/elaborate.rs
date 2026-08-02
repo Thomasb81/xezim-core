@@ -14938,6 +14938,26 @@ fn inline_module_items(
                             // submodule like cv32e40p_fifo silently degrades to
                             // a single-bit write at bit `i`, corrupting all
                             // prefetch data.
+                            // §6.16: a `string` declared in an INSTANTIATED
+                            // module. Only the top module's walk recorded
+                            // these, so a submodule string was width-fit to
+                            // the 1024-bit placeholder on every write —
+                            // silently dropping the FRONT of any text past 128
+                            // characters (string bytes pack LSB-first, so the
+                            // tail is what survived). Registered under both the
+                            // bare and instance-scoped names, like the packed
+                            // widths below.
+                            if matches!(
+                                &dd.data_type,
+                                DataType::Simple { kind: SimpleType::String, .. }
+                            ) {
+                                for decl in &dd.declarators {
+                                    let bare = decl.name.name.clone();
+                                    let scoped = format!("{}{}", inst_prefix, bare);
+                                    elab.string_signals.insert(bare);
+                                    elab.string_signals.insert(scoped);
+                                }
+                            }
                             if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &sub_merged_params, &elab.typedefs) {
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
@@ -15149,8 +15169,25 @@ fn inline_module_items(
                                     // 0, not X — same as the top-level decl path.
                                     // `Value::new` left a submodule's `bit` counter
                                     // at X, so `cnt++` stayed X forever (issue #22).
+                                    // §6.16: a string has no declared width, so
+                                    // its initializer must NOT be fit to the
+                                    // 1024-bit placeholder — the same exemption
+                                    // the top-level decl path carries. Fitting
+                                    // it kept only the low 128 characters, i.e.
+                                    // dropped the FRONT of the text (issue #76:
+                                    // a 142-character string in an
+                                    // INSTANTIATED module lost its "HEAD_"
+                                    // prefix, while the identical declaration
+                                    // in the top module was correct).
                                     let init_val = if let Some(init_expr) = &decl.init {
-                                        eval_init_for_width(init_expr, &sub_merged_params, width)
+                                        if matches!(
+                                            &dd.data_type,
+                                            DataType::Simple { kind: SimpleType::String, .. }
+                                        ) {
+                                            eval_const_expr_val(init_expr, &sub_merged_params)
+                                        } else {
+                                            eval_init_for_width(init_expr, &sub_merged_params, width)
+                                        }
                                     } else { default_value_for_type(&dd.data_type, width) };
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: dd.const_kw,
                                         name: sig_name, width, is_signed,
