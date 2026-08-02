@@ -2901,6 +2901,20 @@ pub fn elaborate_module_with_defs(
                                 let mut v = eval_init_for_width(init_eval, &elab.parameters, eff_width);
                                 if is_signed { v.is_signed = true; }
                                 elab.parameters.insert(assign.name.name.clone(), v);
+                                // §7.2.1: a STRUCT-typed package parameter needs
+                                // its field layout registered, or member selects
+                                // (`pkg::CDEF.a`) read x at runtime and 0 in
+                                // const context (module-scope params already do
+                                // this; packages didn't).
+                                if let Some(fields) = flatten_struct_fields(
+                                    data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types,
+                                ) {
+                                    if !fields.is_empty() {
+                                        tls_register_struct_layout(&assign.name.name, &fields);
+                                        elab.packed_struct_fields
+                                            .insert(assign.name.name.clone(), fields);
+                                    }
+                                }
                             }
                         }
                     }
@@ -4517,6 +4531,19 @@ pub fn elaborate_module_with_defs(
                         }
                         elab.note_decl_site(&assign.name.name, assign.name.span, "parameter/localparam", true);
                         // IEEE 1800-2023: keyed assignment-pattern init for
+                        // §6.20.2 unpacked-array parameter in a module BODY
+                        // (`localparam int A [0:2] = '{7,8,9};`) — only the
+                        // header pass called register_array_param, so a body
+                        // decl fell to the scalar path and every element read
+                        // 0. Same registration as the header site.
+                        if !assign.dimensions.is_empty() {
+                            let params_snapshot = elab.parameters.clone();
+                            if register_array_param(&mut elab, "", &assign.name.name,
+                                &assign.dimensions, assign.init.as_ref(), None,
+                                data_type, &params_snapshot) {
+                                continue;
+                            }
+                        }
                         // associative-array typed parameters. Materialize
                         // `'{ "K": V, ... }` as `<param>["K"]` signals so
                         // `WEIGHT["HIGH"]` reads back the supplied value.
@@ -9138,14 +9165,31 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                     // misses and yields None exactly as before. Without this the
                     // whole arm fell through to `_ => None`, so a port declared
                     // `[$bits(some_pkg::some_t)-1:0]` elaborated to ONE BIT and
-                    // silently truncated the bus.
+                    // silently truncated the bus. A struct MEMBER select
+                    // (`$bits(CDEF.b)`) answers from the base's registered
+                    // field layout.
                     ExprKind::MemberAccess { expr: base, member }
                         if matches!(base.kind, ExprKind::Ident(_)) =>
                     {
-                        TYPEDEFS_TLS.with(|td| {
-                            td.borrow().as_ref()
-                                .and_then(|m| m.get(member.name.as_str()).copied())
-                                .map(|w| w as i64)
+                        let from_layout = if let ExprKind::Ident(h) = &base.kind {
+                            let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                            STRUCT_FIELDS_TLS.with(|c| {
+                                c.borrow().get(nm).and_then(|layout| {
+                                    layout
+                                        .iter()
+                                        .find(|(f, _, _)| f == &member.name)
+                                        .map(|&(_, _, w)| w as i64)
+                                })
+                            })
+                        } else {
+                            None
+                        };
+                        from_layout.or_else(|| {
+                            TYPEDEFS_TLS.with(|td| {
+                                td.borrow().as_ref()
+                                    .and_then(|m| m.get(member.name.as_str()).copied())
+                                    .map(|w| w as i64)
+                            })
                         })
                     }
                     ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => Some(*s as i64),
@@ -10604,6 +10648,10 @@ fn register_array_param(
     elab.arrays.insert(full, (0, n as i64 - 1, elem_w));
     for (i, v) in idxs.iter().zip(vals) {
         let sn = format!("{}{}[{}]", prefix, name, i);
+        // Also into the parameter env under the ELEMENT name, so a CONSTANT
+        // context (`localparam A1 = A[1];`) can resolve the element — the
+        // const-eval Index arm consults `params` by "name[idx]".
+        elab.parameters.insert(sn.clone(), v.clone());
         elab.signals.insert(sn.clone(), Signal {
             is_const: true, name: sn, width: elem_w, is_signed: signed,
             is_real: false, direction: None, value: v, type_name: None,
@@ -10970,12 +11018,30 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                         .unwrap_or(0)
                 }
                 // §26.3 package-/class-scoped type — see the matching arm in
-                // `const_eval_i64_with_params`.
+                // `const_eval_i64_with_params`. A struct MEMBER select
+                // (`$bits(CDEF.b)`) answers from the base's field layout.
                 ExprKind::MemberAccess { expr: base, member }
                     if matches!(base.kind, ExprKind::Ident(_)) =>
                 {
-                    TYPEDEFS_TLS.with(|td|
-                        td.borrow().as_ref().and_then(|m| m.get(member.name.as_str()).copied()))
+                    let from_layout = if let ExprKind::Ident(h) = &base.kind {
+                        let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                        STRUCT_FIELDS_TLS.with(|c| {
+                            c.borrow().get(nm).and_then(|layout| {
+                                layout
+                                    .iter()
+                                    .find(|(f, _, _)| f == &member.name)
+                                    .map(|&(_, _, w)| w)
+                            })
+                        })
+                    } else {
+                        None
+                    };
+                    from_layout
+                        .or_else(|| {
+                            TYPEDEFS_TLS.with(|td| {
+                                td.borrow().as_ref().and_then(|m| m.get(member.name.as_str()).copied())
+                            })
+                        })
                         .unwrap_or(0)
                 }
                 ExprKind::Number(NumberLiteral::Integer { size: Some(s), .. }) => *s,
@@ -10986,6 +11052,54 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             Value::from_u64(w as u64, 32)
         }
         // `$unsigned`/`$signed` in const-eval — width-preserving identity.
+        // §6.24.1 casts in CONSTANT context — the parser lowers `5'(x)`,
+        // `int'(x)` and `T'(x)` to intrinsics that had no const-eval arms, so
+        // `localparam int RI = int'(RP * 4.0)` silently became 0.
+        ExprKind::SystemCall { name, args } if name == "$__xz_size_cast" && args.len() == 2 => {
+            let n = eval_const_expr_val(&args[0], params).to_u64().unwrap_or(32).max(1) as u32;
+            // §6.24.1: the cast width is the operand's evaluation CONTEXT —
+            // `5'(3'd7 + 3'd6)` is 13, not the 3-bit-wrapped 5. The i64
+            // evaluator computes unwrapped, which is the context semantics
+            // for casts up to 64 bits; the Value path (which wraps at the
+            // operands' own widths) stays as the fallback.
+            if let Some(iv) = const_eval_i64_with_params(&args[1], Some(params)) {
+                return Value::from_u64(iv as u64, 64).resize(n);
+            }
+            let v = eval_const_expr_val(&args[1], params);
+            if v.is_real {
+                let f = v.to_f64();
+                let r = if f >= 0.0 { (f + 0.5).floor() } else { (f - 0.5).ceil() };
+                Value::from_u64((r as i64) as u64, 64).resize(n)
+            } else {
+                v.resize(n)
+            }
+        }
+        ExprKind::SystemCall { name, args } if name == "$__xz_type_cast" && args.len() == 2 => {
+            let v = eval_const_expr_val(&args[1], params);
+            if let ExprKind::TypeLiteral(dt) = &args[0].kind {
+                if is_type_real(dt) {
+                    return Value::from_f64(v.to_f64());
+                }
+                let w = TYPEDEFS_TLS
+                    .with(|c| {
+                        let b = c.borrow();
+                        resolve_type_width(dt, Some(params), b.as_ref())
+                    })
+                    .max(1);
+                let mut out = if v.is_real {
+                    // §6.24.1: real-to-int conversion ROUNDS (away from zero).
+                    let f = v.to_f64();
+                    let r = if f >= 0.0 { (f + 0.5).floor() } else { (f - 0.5).ceil() };
+                    Value::from_u64((r as i64) as u64, 64).resize(w)
+                } else {
+                    v.resize(w)
+                };
+                out.is_signed = is_type_signed(dt);
+                out
+            } else {
+                v
+            }
+        }
         ExprKind::SystemCall { name, args } if name == "$unsigned" || name == "$signed" => {
             let mut v = args.first().map(|a| eval_const_expr_val(a, params)).unwrap_or_else(|| Value::zero(32));
             // §20.5: `$signed(x)` reinterprets x as signed so a later width
@@ -11119,6 +11233,13 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     if let Some(v) = params.get(&member.name) {
                         return v.clone();
                     }
+                    // A package constant referenced from a scope whose local
+                    // env doesn't carry it (an instance header default
+                    // `parameter cs_t C = cfg_pkg::CDEF`): same global
+                    // fallback the bare-Ident arm uses.
+                    if let Some(v) = param_fallback_get(&member.name) {
+                        return v;
+                    }
                 }
                 if let Some(found) = STRUCT_FIELDS_TLS.with(|c| {
                     c.borrow().get(nm).and_then(|layout|
@@ -11142,6 +11263,11 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             let idx = eval_const_expr_val(index, params).to_u64().unwrap_or(0);
             if let ExprKind::Ident(h) = &base.kind {
                 let nm = h.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                // §6.20.2: element of an unpacked-array parameter — stored in
+                // the env under "name[idx]" by register_array_param.
+                if let Some(ev) = params.get(&format!("{}[{}]", nm, idx)) {
+                    return ev.clone();
+                }
                 if let Some(elem_w) = PACKED_ELEM_W_TLS.with(|c| c.borrow().get(nm).copied()) {
                     if elem_w > 0 {
                         let lo = (idx as u32).saturating_mul(elem_w);
@@ -11156,6 +11282,27 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 base_val.range_select(i, i)
             } else {
                 Value::zero(1)
+            }
+        }
+        // §11.5.1 part-select in CONSTANT context: `P[11:4]`, `P[7-:8]`,
+        // `P[4+:8]` on a parameter. There was no arm, so every range form
+        // fell to the zero fallback and a localparam sliced from another
+        // parameter silently became 0 (bit-selects worked). Bit numbering is
+        // the value's own [width-1:0]; parameters declared with a non-zero
+        // LSB keep their raw bit positions (matching the Index arm above).
+        ExprKind::RangeSelect { expr: base, left, right, kind } => {
+            let base_val = eval_const_expr_val(base, params);
+            let l = eval_const_expr_val(left, params).to_i64().unwrap_or(0);
+            let r = eval_const_expr_val(right, params).to_i64().unwrap_or(0);
+            let (hi, lo) = match kind {
+                crate::ast::expr::RangeKind::Constant => (l.max(r), l.min(r)),
+                crate::ast::expr::RangeKind::IndexedUp => (l + r - 1, l),
+                crate::ast::expr::RangeKind::IndexedDown => (l, l - r + 1),
+            };
+            if lo >= 0 && hi >= lo && (hi as u32) < base_val.width {
+                base_val.range_select(hi as usize, lo as usize)
+            } else {
+                Value::zero(((hi - lo + 1).max(1)) as u32)
             }
         }
         _ => Value::zero(32),
@@ -14115,9 +14262,29 @@ fn inline_module_items(
                 // read $bits = 15 instead of 53). Alternate the two passes
                 // until neither changes.
                 let __tb = std::time::Instant::now();
+                // Names of `parameter type` formals overridden by this
+                // instantiation — their widths were bound by the override
+                // pass; the DEFAULTS are registered per-round below so a
+                // body localparam `$bits(T)` sees the default too (it read 0
+                // otherwise while an overridden T worked).
+                let ovr_type_names: std::collections::HashSet<&str> =
+                    type_overrides.iter().map(|(n, _)| n.as_str()).collect();
                 for _ in 0..4 {
                     let body_items = collect_effective_items(sub_mod.items(), &sub_local_params);
                     let mut local_tds = elab.typedefs.clone();
+                    for p_decl in sub_mod.params() {
+                        if let ParameterKind::Type { assignments } = &p_decl.kind {
+                            for a in assignments {
+                                if ovr_type_names.contains(a.name.name.as_str()) {
+                                    continue;
+                                }
+                                if let Some(def_dt) = &a.init {
+                                    let w = resolve_type_width(def_dt, Some(&sub_local_params), Some(&local_tds));
+                                    local_tds.insert(a.name.name.clone(), w);
+                                }
+                            }
+                        }
+                    }
                     for _ in 0..3 {
                         for it in &body_items {
                             if let ModuleItem::TypedefDeclaration(td) = it {
@@ -14171,6 +14338,26 @@ fn inline_module_items(
                     }
                     m
                 };
+
+                // §7.2.1: STRUCT-typed header parameters of this instance —
+                // register the field layout under the SCOPED name so runtime
+                // member selects (`C.a` inside the instance → "c0.C" + field
+                // slice) resolve; without it they read x.
+                for p_decl in sub_mod.params() {
+                    if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
+                        if let Some(fields) = flatten_struct_fields(
+                            data_type, &sub_merged_params, &elab.typedefs, &elab.typedef_types,
+                        ) {
+                            if !fields.is_empty() {
+                                for assign in assignments {
+                                    let scoped = format!("{}{}", inst_prefix, assign.name.name);
+                                    elab.packed_struct_fields.insert(scoped, fields.clone());
+                                    tls_register_struct_layout(&assign.name.name, &fields);
+                                }
+                            }
+                        }
+                    }
+                }
 
                 // Bind NON-overridden `parameter type` DEFAULTS as scoped
                 // typedefs, resolving their width against the sub-instance's
@@ -17594,6 +17781,20 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             width, is_signed: signed, is_real, direction: None,
                                             value: v, type_name: get_type_name(data_type),
                                         });
+                                        // §7.2.1: STRUCT-typed package param —
+                                        // register its field layout, or member
+                                        // selects (`CDEF.a`) read x at runtime
+                                        // and 0 in const context.
+                                        if let Some(fields) = flatten_struct_fields(
+                                            data_type, &elab.parameters,
+                                            &elab.typedefs, &elab.typedef_types,
+                                        ) {
+                                            if !fields.is_empty() {
+                                                tls_register_struct_layout(&assign.name.name, &fields);
+                                                elab.packed_struct_fields
+                                                    .insert(assign.name.name.clone(), fields);
+                                            }
+                                        }
                                     }
                                 }
                             }
