@@ -1,7 +1,7 @@
 [package]
 name = "xezim-core"
 version = "0.9.7"
-edition = "2021"
+edition = "2024"
 rust-version = "1.85.1"
 description = "Shared SystemVerilog elaboration and runtime primitives for xezim and xezim-b"
 license = "MIT OR Apache-2.0"

@@ -9655,7 +9655,7 @@ fn prebind_bits_from_declared_types(
         }
     }
     macro_rules! rb {
-        ($x:expr) => {
+        ($x:expr_2021) => {
             prebind_bits_from_declared_types(
                 $x, decls, elem_decls, params, typedefs, typedef_types,
             )
@@ -9804,7 +9804,7 @@ fn prebind_bits_of_signals(
     }
     // Recurse into the common composite forms so `$bits(sig)-1` works.
     macro_rules! rb {
-        ($x:expr) => {
+        ($x:expr_2021) => {
             prebind_bits_of_signals(
                 $x, signals, params, prefix, typedefs, typedef_types, struct_fields, arrays,
             )
