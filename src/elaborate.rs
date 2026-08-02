@@ -10260,13 +10260,46 @@ fn packed_typedef_array_dims(
 pub fn packed_inner_elem_width(
     dt: &DataType,
     params: &HashMap<String, Value>,
-    _typedefs: &HashMap<String, u32>,
+    typedefs: &HashMap<String, u32>,
 ) -> Option<u32> {
-    // For a typedef-typed signal (`my_t var;`), look through the typedef chain.
-    let resolved: &DataType = if let DataType::TypeReference { name: _, .. } = dt {
-        // typedef_types isn't passed in here; conservatively return None for
-        // typedef refs so callers can resolve via their own context.
-        return None;
+    // §7.4.1 packed array whose ELEMENT type is a typedef (`u32_t [4:0] x`).
+    // The element width is the typedef's own width — it is not visible in the
+    // declaration's dimensions, which carry only the array index range. This
+    // used to return None ("callers resolve via their own context"), but no
+    // caller did, so the element width defaulted to one bit and `x[i] <= v`
+    // wrote a single BIT: `u32_t [4:0] SEC; SEC[0] <= 32'hDEAD_BEEF` stored 1.
+    // The equivalent inline form (`logic [4:0][31:0]`) was always correct,
+    // which is what made this look like a struct-member problem — a packed
+    // array member of a packed struct is simply the commonest way to hit it.
+    let resolved: &DataType = if let DataType::TypeReference { name, dimensions, .. } = dt {
+        // No array dims => not an element select at all (`u32_t x; x[i]` is a
+        // bit select of the typedef's own vector).
+        if dimensions.is_empty() {
+            return None;
+        }
+        let base = typedefs.get(&name.name.name).copied().filter(|w| *w > 0)?;
+        // Same rule as below: total = base * every dim, element = total / outer.
+        // With several dims (`u32_t [1:0][3:0] y`) an element of the outermost
+        // is the whole remaining sub-array.
+        let mut total = base;
+        for d in dimensions {
+            let PackedDimension::Range { left, right, .. } = d else {
+                return None;
+            };
+            let l = const_eval_i64_with_params(left, Some(params))?;
+            let r = const_eval_i64_with_params(right, Some(params))?;
+            total = total.checked_mul(((l - r).abs() + 1) as u32)?;
+        }
+        let PackedDimension::Range { left, right, .. } = dimensions.first()? else {
+            return None;
+        };
+        let l = const_eval_i64_with_params(left, Some(params))?;
+        let r = const_eval_i64_with_params(right, Some(params))?;
+        let outer = ((l - r).abs() + 1) as u32;
+        if outer == 0 {
+            return None;
+        }
+        return Some(total / outer);
     } else { dt };
     if let DataType::IntegerVector { dimensions, .. } | DataType::Implicit { dimensions, .. } =
         resolved
@@ -14610,6 +14643,39 @@ fn inline_module_items(
                                             fields.iter().map(|(_, o, w)| o + w).max().unwrap_or(0);
                                         tls_register_struct_layout(&sig_name, &fields);
                                         elab.packed_struct_fields.insert(sig_name.clone(), fields);
+                                    }
+                                }
+                                // Per-MEMBER packed-array element widths, keyed
+                                // `<signal>.<member>`, so `cnfg.SEC[0] <= v`
+                                // slices a whole element instead of one bit
+                                // when the member is itself a packed array
+                                // (`u32_t [4:0] SEC`). The body-declaration
+                                // paths register these; this PORT path recorded
+                                // only the struct's field offsets, so a struct
+                                // arriving through a port lost the metadata and
+                                // every element write became a bit write.
+                                {
+                                    let member_dt = resolve_typedef_chain(dt, &elab.typedef_types).clone();
+                                    if let DataType::Struct(su) = &member_dt {
+                                        for m in &su.members {
+                                            let ew = packed_inner_elem_width(
+                                                &m.data_type,
+                                                &sub_merged_params,
+                                                &elab.typedefs,
+                                            );
+                                            let fd = packed_full_dims_of(&m.data_type, &sub_merged_params);
+                                            for mdecl in &m.declarators {
+                                                let key =
+                                                    format!("{}.{}", sig_name, mdecl.name.name);
+                                                if let Some(ew) = ew {
+                                                    elab.packed_signal_elem_widths
+                                                        .insert(key.clone(), ew);
+                                                }
+                                                if let Some(fd) = &fd {
+                                                    elab.packed_full_dims.insert(key, fd.clone());
+                                                }
+                                            }
+                                        }
                                     }
                                 }
                                 // Packed multi-D PORT (`output [3:0][7:0] opv`):
