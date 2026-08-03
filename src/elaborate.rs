@@ -2918,6 +2918,7 @@ pub fn elaborate_module_with_defs(
                                 };
                                 let mut v = eval_init_for_width(init_eval, &elab.parameters, eff_width);
                                 if is_signed { v.is_signed = true; }
+                                alias_pkg_param(&mut elab, &p.name.name, &assign.name.name, &v);
                                 elab.parameters.insert(assign.name.name.clone(), v);
                                 // §7.2.1: a STRUCT-typed package parameter needs
                                 // its field layout registered, or member selects
@@ -9000,6 +9001,12 @@ pub fn is_type_signed(dt: &DataType) -> bool {
         DataType::Implicit { signing, .. } => matches!(signing, Some(Signing::Signed)),
         DataType::Real { .. } => true,
         DataType::Struct(su) => matches!(su.signing, Some(Signing::Signed)),
+        // §6.19: an enum takes the signedness of its BASE type, and the
+        // default base is `int` — which is signed. This arm was missing, so
+        // every enum was unsigned: `enum shortint {A=-1,...} es;` read `es`
+        // as 65534 instead of -2, `es.first()` as 65535 instead of -1, and
+        // `es.first() < 0` was false (ivtest enum_method_signed1..4).
+        DataType::Enum(e) => e.base_type.as_deref().map(is_type_signed).unwrap_or(true),
         _ => false,
     }
 }
@@ -10422,6 +10429,17 @@ fn sized_literal_width(init: &Expression) -> Option<u32> {
 /// Catches direct (`node_t next;`) and mutual (A→B→A) recursion; a `visited`
 /// set bounds the walk. Class-handle "linked list" members are NOT flagged
 /// (classes live outside `typedef_types`, so they never resolve to a struct).
+/// §26.3: register a package parameter under its QUALIFIED name as well as its
+/// bare one. Registered only bare, two packages declaring the SAME parameter
+/// name collided — whichever elaborated last won, and `p1::step` then read
+/// p2's value (ivtest sv_package2). Typedefs already registered both
+/// spellings; parameters did not.
+fn alias_pkg_param(elab: &mut ElaboratedModule, pkg: &str, name: &str, v: &Value) {
+    if !pkg.is_empty() {
+        elab.parameters.insert(format!("{}::{}", pkg, name), v.clone());
+    }
+}
+
 fn struct_typedef_self_reference(
     target: &str,
     dt: &DataType,
@@ -11693,6 +11711,7 @@ pub fn inline_instantiations(
                                             };
                                             let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                             if is_signed { v.is_signed = true; }
+                                            alias_pkg_param(elab, name, &assign.name.name, &v);
                                             elab.parameters.insert(assign.name.name.clone(), v);
                                         }
                                     }
@@ -17942,6 +17961,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             &format!("imported from package '{}'", pkg_name),
                                             false,
                                         );
+                                        alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
                                         elab.parameters.insert(assign.name.name.clone(), v.clone());
                                         elab.signals.insert(assign.name.name.clone(), Signal {
                                             is_const: false, name: assign.name.name.clone(),
@@ -18175,6 +18195,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                             &format!("imported from package '{}'", pkg_name),
                                             false,
                                         );
+                                        alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
                                         elab.parameters.insert(assign.name.name.clone(), v.clone());
                                         elab.signals.insert(assign.name.name.clone(), Signal {
                                             is_const: false, name: assign.name.name.clone(),
