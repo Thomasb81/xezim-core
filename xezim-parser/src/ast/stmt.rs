@@ -26,6 +26,14 @@ pub enum StatementKind {
     /// sentinel; executing it pops + replays the call's deferred cleanup
     /// (frame/context unwind, output copy-back). See `task_cleanup`.
     ScopePop,
+    /// INTERNAL (not parsed): for-loop step barrier. IEEE 1800-2017 §12.7.2 —
+    /// `continue` skips the rest of the loop body but the `for` STEP still
+    /// runs. The suspend-aware path lowers `for` to `while (cond) { body;
+    /// step; }`, so a `continue` in a body that also suspends skipped the step
+    /// too and the index never advanced — the loop spun forever. This sentinel
+    /// sits between body and step: executing it consumes a pending `continue`
+    /// so the step runs, while leaving `break`/`return` set so they still exit.
+    LoopStep,
     /// IEEE 1800-2017 §9.6.3: `disable fork` aborts all currently
     /// active child processes of the enclosing scope's most-recent
     /// fork that haven't yet completed.
