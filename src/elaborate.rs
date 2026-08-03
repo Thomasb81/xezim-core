@@ -4162,6 +4162,33 @@ pub fn elaborate_module_with_defs(
                         // Recursively flatten nested struct/union members so multi-segment
                         // paths like u.s.a resolve via a single packed_struct_fields lookup.
                         fn flatten_subfields(dt: &DataType, params: &HashMap<String, Value>, typedefs: &HashMap<String, u32>, typedef_types: &HashMap<String, DataType>) -> Option<Vec<(String, u32, u32)>> {
+                            // §6.18: a CIRCULAR typedef makes this nesting
+                            // infinite (`typedef T1; struct packed { T1 x; } T2;
+                            // typedef T2 [1:0] T3; typedef T3 T1;`) — the walk
+                            // recursed until the stack overflowed and the
+                            // process ABORTED (ivtest sv_typedef_circular2).
+                            // Bound the depth so malformed input is diagnosed
+                            // instead of crashing the tool. Real designs nest
+                            // far shallower than this.
+                            thread_local! {
+                                static SUBFIELD_DEPTH: std::cell::Cell<u32> =
+                                    const { std::cell::Cell::new(0) };
+                            }
+                            struct DepthGuard;
+                            impl Drop for DepthGuard {
+                                fn drop(&mut self) {
+                                    SUBFIELD_DEPTH.with(|c| c.set(c.get().saturating_sub(1)));
+                                }
+                            }
+                            let depth = SUBFIELD_DEPTH.with(|c| {
+                                let d = c.get();
+                                c.set(d + 1);
+                                d
+                            });
+                            let _guard = DepthGuard;
+                            if depth > 32 {
+                                return None;
+                            }
                             let resolved = resolve_typedef_chain(dt, typedef_types);
                             if let DataType::Struct(su) = resolved {
                                 let is_union = matches!(su.kind, StructUnionKind::Union);
@@ -4260,6 +4287,25 @@ pub fn elaborate_module_with_defs(
                                         }
                                         offset += mw;
                                     }
+                                }
+                                // Resource guard, paired with the depth bound
+                                // above: each level of a packed-array-of-struct
+                                // member MULTIPLIES the generated field names,
+                                // so a circular typedef is exponential in depth
+                                // — bounding depth alone still spun for minutes
+                                // formatting names. Capping each level's result
+                                // bounds the whole walk. A real packed struct
+                                // has orders of magnitude fewer leaves; say so
+                                // rather than silently truncating.
+                                const MAX_FLAT_FIELDS: usize = 8192;
+                                if out.len() > MAX_FLAT_FIELDS {
+                                    crate::elab_diag(format!(
+                                        "[xezim][warning] packed layout for a struct flattens to over {} fields — \
+                                         not registering it (a circular typedef, per IEEE 1800-2017 §6.18, \
+                                         reaches this); member selects on it will not resolve through the layout.",
+                                        MAX_FLAT_FIELDS
+                                    ));
+                                    return None;
                                 }
                                 Some(out)
                             } else { None }
@@ -4830,10 +4876,21 @@ pub fn elaborate_module_with_defs(
                 // clean diagnostic instead of recursing into a stack overflow.
                 if let Some(cycle) = struct_typedef_self_reference(
                     &td.name.name, &td.data_type, &elab.typedef_types) {
-                    return Err(format!(
-                        "type '{}' contains a member of its own type via '{}' \
-                         — recursive struct/union is illegal (IEEE 1800-2017 §7.2.1)",
-                        td.name.name, cycle));
+                    // An empty path means the cycle closed through typedef
+                    // ALIASES only (`typedef T1 T2; typedef T2 T1;`) with no
+                    // struct member on the way — a circular definition rather
+                    // than a self-containing struct. Say which it is.
+                    return Err(if cycle.is_empty() {
+                        format!(
+                            "type '{}' is defined circularly (its definition resolves \
+                             back to itself) — IEEE 1800-2017 §6.18",
+                            td.name.name)
+                    } else {
+                        format!(
+                            "type '{}' contains a member of its own type via '{}' \
+                             — recursive struct/union is illegal (IEEE 1800-2017 §7.2.1)",
+                            td.name.name, cycle)
+                    });
                 }
                 process_typedef(td, &mut elab);
             }
@@ -8959,7 +9016,15 @@ pub fn is_type_signed_resolved(
     dt: &DataType,
     typedef_types: &HashMap<String, DataType>,
 ) -> bool {
-    if let DataType::TypeReference { name, .. } = dt {
+    // Walk the chain ITERATIVELY under the same bound `resolve_typedef_chain`
+    // uses. This was recursive with a guard against a DIRECT self-reference
+    // only (`typedef T T;`), so a cycle through two names —
+    // `typedef T1; typedef T1 T2; typedef T2 T1;` — recursed until the stack
+    // overflowed and the process ABORTED (ivtest sv_typedef_circular1/2).
+    // Malformed input must be diagnosed, never crash the tool.
+    let mut cur = dt;
+    for _ in 0..64 {
+        let DataType::TypeReference { name, .. } = cur else { break };
         let key = &name.name.name;
         // §26.3: scoped `P::T` prefers the qualified registration.
         let inner = name
@@ -8967,14 +9032,17 @@ pub fn is_type_signed_resolved(
             .as_ref()
             .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, key)))
             .or_else(|| typedef_types.get(key));
-        if let Some(inner) = inner {
-            // Guard against a self-referential name.
-            if !matches!(inner, DataType::TypeReference { name: n, .. } if &n.name.name == key) {
-                return is_type_signed_resolved(inner, typedef_types);
+        match inner {
+            // Self-referential name: stop here, as before.
+            Some(next)
+                if !matches!(next, DataType::TypeReference { name: n, .. } if &n.name.name == key) =>
+            {
+                cur = next
             }
+            _ => break,
         }
     }
-    is_type_signed(dt)
+    is_type_signed(cur)
 }
 
 /// Returns the default value for a type: 0 for 2-state types, X for 4-state types.
@@ -10367,6 +10435,40 @@ fn struct_typedef_self_reference(
     ) -> Option<String> {
         let su = match dt {
             DataType::Struct(su) => su,
+            // §6.18: the definition can reach the struct THROUGH a typedef
+            // alias — `typedef T3 T1;` where `T3` is `T2 [1:0]` and `T2` is a
+            // packed struct containing `T1`. Resolving only at MEMBER level
+            // missed that, so the cycle went undetected, the typedef was
+            // registered, and every later type walker
+            // (`flatten_struct_fields`, `flatten_subfields`,
+            // `is_type_signed_resolved`) recursed on it until the stack
+            // overflowed and the process aborted (ivtest sv_typedef_circular2).
+            DataType::TypeReference { name, .. } => {
+                let mn = &name.name.name;
+                // §26.3: a SCOPED reference (`P2::T`) names the PACKAGE's type,
+                // not a same-named local one, so `typedef P2::T T;` is a legal
+                // alias — comparing leaf names alone reported it as a cycle
+                // and rejected a valid design (ivtest sv_typedef_chained).
+                // Only an UNQUALIFIED reference can close a cycle on `target`,
+                // and a scoped one is followed only via its qualified key:
+                // falling back to the bare name would resolve `P2::T` to the
+                // local `T` and re-create the same false positive.
+                if name.scope.is_none() && mn == target {
+                    return Some(String::new());
+                }
+                let key = match &name.scope {
+                    Some(sc) => format!("{}::{}", sc.name, mn),
+                    None => mn.clone(),
+                };
+                if visited.iter().any(|v| v == &key) {
+                    return None;
+                }
+                let inner = typedef_types.get(&key)?;
+                visited.push(key);
+                let found = walk(target, inner, typedef_types, visited);
+                visited.pop();
+                return found;
+            }
             _ => return None,
         };
         for member in &su.members {
@@ -10374,9 +10476,14 @@ fn struct_typedef_self_reference(
                 .map(|d| d.name.name.clone()).unwrap_or_default();
             if let DataType::TypeReference { name, .. } = &member.data_type {
                 let mn = &name.name.name;
-                if mn == target {
+                // Same §26.3 rule as the alias arm above.
+                if name.scope.is_none() && mn == target {
                     return Some(field);
                 }
+                let mn = &match &name.scope {
+                    Some(sc) => format!("{}::{}", sc.name, mn),
+                    None => mn.clone(),
+                };
                 if !visited.iter().any(|v| v == mn) {
                     if let Some(inner) = typedef_types.get(mn) {
                         visited.push(mn.clone());
