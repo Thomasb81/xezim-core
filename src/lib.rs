@@ -2,6 +2,20 @@
 //! artifact format used by both the `xezim` bytecode interpreter and the
 //! `xezim-b` native compiler.
 
+// Rust permits exactly ONE `#[global_allocator]` per binary, so this lives here
+// rather than in the `xezim` bin: declaring it in the shared library means the
+// xezim binary, xezim-b, AND every test binary get it, whereas a declaration in
+// `xezim/src/main.rs` covered only the CLI and left `cargo test` on glibc
+// malloc. Measured on UVM examples: -33% to -45%; c910 memcpy -16%,
+// counter-identical.
+//
+// Default-on but gated: a library that declares a global allocator imposes it
+// on every consumer, so a downstream crate wanting its own (or the system one)
+// opts out with `default-features = false`.
+#[cfg(feature = "mimalloc-allocator")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 pub mod packed_value;
 pub mod value;
 pub mod bits2;

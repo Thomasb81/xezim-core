@@ -8,11 +8,25 @@ license = "MIT OR Apache-2.0"
 
 [dependencies]
 ahash = { version = "0.8", features = ["serde"] }
+# Installed as the global allocator in src/lib.rs (see the `mimalloc-allocator`
+# feature below). A profile of a UVM run put ~41% of self time in glibc malloc
+# machinery. 0.1.52 bundles the mimalloc v3 C library (v3.3.2); pinned so a
+# fresh lockfile cannot resolve to an older v2-era release.
+mimalloc = { version = "0.1.52", optional = true }
 rand = "0.8"
 sv-parser = { path = "xezim-parser" }
 serde = { version = "1", features = ["derive"] }
 bincode = "1.3"
 zstd = "0.13"
+
+[features]
+# On by default because it is a large win for the simulator (UVM -33%..-45%,
+# c910 memcpy -16%, both counter-identical). Gated because a library that
+# declares `#[global_allocator]` imposes it on EVERY consumer, and Rust permits
+# only one per binary — so a downstream crate that wants its own allocator, or
+# the system one, must be able to opt out with `default-features = false`.
+default = ["mimalloc-allocator"]
+mimalloc-allocator = ["dep:mimalloc"]
 
 [lib]
 name = "xezim_core"
