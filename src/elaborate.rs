@@ -933,7 +933,22 @@ pub fn elaborate_class_with_params(
                     // earlier body localparams). An empty map was used, so
                     // `localparam int MYW = W;` in `class C #(parameter int
                     // W = 8)` baked in 0 for every specialization.
-                    let width = resolve_type_width(data_type, Some(&const_scope), None);
+                    // §6.20.2: an UNTYPED parameter takes the type of its
+                    // value — an unsized decimal is signed 32-bit. Sizing it
+                    // with `resolve_type_width` gave an implicit-no-dims type
+                    // ONE bit, so a class `parameter A = 1;` stored 1'b1 and
+                    // read back -1 inside a method, while `localparam B = 2;`
+                    // truncated to 0 (ivtest sv_class_localparam). Module- and
+                    // package-scope parameters already use this rule.
+                    let implicit_no_dims = matches!(
+                        data_type,
+                        DataType::Implicit { dimensions, .. } if dimensions.is_empty()
+                    );
+                    let width = if implicit_no_dims {
+                        a.init.as_ref().and_then(sized_literal_width).unwrap_or(32)
+                    } else {
+                        resolve_type_width(data_type, Some(&const_scope), None)
+                    };
                     let is_string = matches!(data_type, crate::ast::types::DataType::Simple { kind: crate::ast::types::SimpleType::String, .. });
                     let v = if is_string {
                         // String localparams: evaluate using the const-eval path.
@@ -951,7 +966,7 @@ pub fn elaborate_class_with_params(
                         is_const: true,
                         name: a.name.name.clone(),
                         width,
-                        is_signed: false,
+                        is_signed: implicit_no_dims || is_type_signed(data_type),
                         is_real: false,
                         direction: None,
                         value: v,
@@ -15306,9 +15321,58 @@ fn inline_module_items(
                                                 tls_register_struct_layout(&bare, &fields);
                                                 tls_register_struct_layout(&scoped, &fields);
                                                 elab.packed_struct_fields
-                                                    .insert(bare, fields.clone());
+                                                    .insert(bare.clone(), fields.clone());
                                                 elab.packed_struct_fields
                                                     .insert(scoped.clone(), fields.clone());
+                                                // Per-MEMBER packed-array element
+                                                // widths, keyed `<signal>.<member>`
+                                                // — a member that is itself a
+                                                // packed array (`u32_t [4:0] SEC`)
+                                                // needs them or `mcp.SEC[0] <= v`
+                                                // writes ONE BIT. The top-level and
+                                                // PORT paths register these; this
+                                                // SUB-MODULE BODY path did not, so
+                                                // the identical declaration worked
+                                                // at top level and silently lost
+                                                // every element inside an instance.
+                                                {
+                                                    let mdt = resolve_typedef_chain(
+                                                        &dd.data_type, &elab.typedef_types,
+                                                    )
+                                                    .clone();
+                                                    if let DataType::Struct(su) = &mdt {
+                                                        for m in &su.members {
+                                                            let ew = packed_inner_elem_width(
+                                                                &m.data_type,
+                                                                &sub_merged_params,
+                                                                &elab.typedefs,
+                                                            );
+                                                            let fd = packed_full_dims_of(
+                                                                &m.data_type,
+                                                                &sub_merged_params,
+                                                            );
+                                                            for mdecl in &m.declarators {
+                                                                for base in
+                                                                    [&bare, &scoped]
+                                                                {
+                                                                    let key = format!(
+                                                                        "{}.{}",
+                                                                        base, mdecl.name.name
+                                                                    );
+                                                                    if let Some(ew) = ew {
+                                                                        elab
+                                                                          .packed_signal_elem_widths
+                                                                          .insert(key.clone(), ew);
+                                                                    }
+                                                                    if let Some(fd) = &fd {
+                                                                        elab.packed_full_dims
+                                                                            .insert(key, fd.clone());
+                                                                    }
+                                                                }
+                                                            }
+                                                        }
+                                                    }
+                                                }
                                                 // Packed dims written on the
                                                 // typedef itself (`some_t [1:0] g;`)
                                                 // — register the element metadata
