@@ -3452,12 +3452,35 @@ pub fn elaborate_module_with_defs(
                 // Packed multi-D: `logic [3:0][7:0] words;` — record the
                 // per-element width so `words[i]` resolves to an 8-bit slice
                 // instead of a 1-bit select (LRM §7.4.1).
-                if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs) {
+                // §7.4.1: the packed dims may live in the TYPEDEF rather than on
+                // the declaration (`typedef T1 [3:0] T2; T2 val;`). Resolving the
+                // chain first is what makes those visible — declared bare, the
+                // element width was never recorded and `val[i]` degraded to a
+                // BIT select (val[0] happened to read right, val[1] read 0).
+                // ONE step, not the full chain: `resolve_typedef_chain` walks to
+                // the end and would discard the intermediate `[3:0]` (T2 -> T1
+                // -> logic[7:0]). The immediate definition is what carries the
+                // packed dims.
+                let dd_resolved: DataType = match &dd.data_type {
+                    DataType::TypeReference { name, .. } => elab
+                        .typedef_types
+                        .get(&name.name.name)
+                        .cloned()
+                        .unwrap_or_else(|| dd.data_type.clone()),
+                    _ => dd.data_type.clone(),
+                };
+                if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs)
+                    .or_else(|| packed_inner_elem_width(&dd_resolved, &elab.parameters, &elab.typedefs))
+                {
                     for decl in &dd.declarators {
                         elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
                     }
                 }
-                if let Some(fdims) = packed_full_dims_of(&dd.data_type, &elab.parameters) {
+                if let Some(fdims) = packed_full_dims_of(&dd.data_type, &elab.parameters)
+                    .or_else(|| packed_full_dims_of(&dd_resolved, &elab.parameters))
+                    .or_else(|| packed_full_dims_chained(
+                        &dd.data_type, &elab.parameters, &elab.typedef_types))
+                {
                     for decl in &dd.declarators {
                         elab.packed_full_dims.insert(decl.name.name.clone(), fdims.clone());
                     }
@@ -7913,12 +7936,35 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 // empty, and the bytecode emitter falls back to a single-bit
                 // write at `mem[i]` — silent data corruption in any packed-2D
                 // FIFO (e.g. cv32e40p_fifo's mem_n).
-                if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs) {
+                // §7.4.1: the packed dims may live in the TYPEDEF rather than on
+                // the declaration (`typedef T1 [3:0] T2; T2 val;`). Resolving the
+                // chain first is what makes those visible — declared bare, the
+                // element width was never recorded and `val[i]` degraded to a
+                // BIT select (val[0] happened to read right, val[1] read 0).
+                // ONE step, not the full chain: `resolve_typedef_chain` walks to
+                // the end and would discard the intermediate `[3:0]` (T2 -> T1
+                // -> logic[7:0]). The immediate definition is what carries the
+                // packed dims.
+                let dd_resolved: DataType = match &dd.data_type {
+                    DataType::TypeReference { name, .. } => elab
+                        .typedef_types
+                        .get(&name.name.name)
+                        .cloned()
+                        .unwrap_or_else(|| dd.data_type.clone()),
+                    _ => dd.data_type.clone(),
+                };
+                if let Some(elem_w) = packed_inner_elem_width(&dd.data_type, &elab.parameters, &elab.typedefs)
+                    .or_else(|| packed_inner_elem_width(&dd_resolved, &elab.parameters, &elab.typedefs))
+                {
                     for decl in &dd.declarators {
                         elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
                     }
                 }
-                if let Some(fdims) = packed_full_dims_of(&dd.data_type, &elab.parameters) {
+                if let Some(fdims) = packed_full_dims_of(&dd.data_type, &elab.parameters)
+                    .or_else(|| packed_full_dims_of(&dd_resolved, &elab.parameters))
+                    .or_else(|| packed_full_dims_chained(
+                        &dd.data_type, &elab.parameters, &elab.typedef_types))
+                {
                     for decl in &dd.declarators {
                         elab.packed_full_dims.insert(decl.name.name.clone(), fdims.clone());
                     }
@@ -10177,6 +10223,65 @@ fn packed_ascending_width(dt: &DataType, params: &HashMap<String, Value>) -> Opt
         }
     }
     None
+}
+
+/// Packed dimension bounds accumulated ACROSS a typedef chain, outermost
+/// first: `typedef logic [7:0] T1; typedef T1 [3:0] T2;` gives
+/// `[(3,0),(7,0)]` for `T2`.
+///
+/// `resolve_typedef_chain` cannot serve here — it walks to the END of the
+/// chain and DISCARDS the dimensions carried on the intermediate references,
+/// collapsing `T2` to `logic [7:0]`. With no dims recorded, `val[i]` on a
+/// `T2` degraded to a one-bit select (ivtest task_nonansi_parray1/2).
+pub fn packed_full_dims_chained(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<(i64, i64)>> {
+    let mut out: Vec<(i64, i64)> = Vec::new();
+    let mut cur: DataType = dt.clone();
+    for _ in 0..32 {
+        match cur {
+            DataType::TypeReference { ref name, ref dimensions, .. } => {
+                for d in dimensions {
+                    let PackedDimension::Range { left, right, .. } = d else { return None };
+                    let l = const_eval_i64_with_params(left, Some(params))?;
+                    let r = const_eval_i64_with_params(right, Some(params))?;
+                    out.push((l, r));
+                }
+                let next = typedef_types.get(&name.name.name)?.clone();
+                cur = next;
+            }
+            _ => {
+                // The base type's own packed dims complete the shape. Take them
+                // directly (not via `packed_full_dims_of`, which deliberately
+                // reports None for a lone dimension).
+                //
+                // The chain MUST bottom out in a vector: these "full dims" are
+                // read as bit ranges, with the innermost one supplying the bit
+                // width. A chain ending in a STRUCT (`parcel_t [0:0][1:0]`)
+                // has its element width in the struct, not in a dimension —
+                // reporting [(0,0),(1,0)] there made `$bits(nested[0])` read 2
+                // instead of 134. Those types are already handled by the
+                // struct-array path; leave them to it.
+                let base_dims = match &cur {
+                    DataType::IntegerVector { dimensions, .. }
+                    | DataType::Implicit { dimensions, .. } => dimensions.clone(),
+                    _ => return None,
+                };
+                for d in &base_dims {
+                    let PackedDimension::Range { left, right, .. } = d else { return None };
+                    let l = const_eval_i64_with_params(left, Some(params))?;
+                    let r = const_eval_i64_with_params(right, Some(params))?;
+                    out.push((l, r));
+                }
+                break;
+            }
+        }
+    }
+    // A single dimension is an ordinary vector, not a packed ARRAY — same
+    // convention as `packed_full_dims_of`.
+    if out.len() < 2 { None } else { Some(out) }
 }
 
 /// Full packed dimension bounds (outermost first) of a multi-dimensional
