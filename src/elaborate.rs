@@ -17876,6 +17876,146 @@ fn substitute_type_params_stmt(
     Statement { kind, span }
 }
 
+/// §6.21: alpha-rename a PROCESS body's top-level block locals that shadow a
+/// module-scope name. The process executor flattens the body for suspension
+/// (ProcCont), so no block-scope boundary survives to runtime — a frameless
+/// local landed on the module signal itself and the block's writes clobbered
+/// it (`initial begin logic [7:0] v; v = 8'hF0; end` overwrote module `v`).
+/// Renaming the local (and every reference, via the port-map rewriter, which
+/// handles selects, member tails and event controls) removes the collision
+/// entirely. `salt` keeps two processes' same-named locals distinct.
+///
+/// Named blocks are left alone: their locals are hierarchically referenceable
+/// (§23.9) and must keep their spelling. Returns None when there is nothing
+/// to rename.
+pub fn rename_process_shadowed_locals(
+    stmt: &Statement,
+    module_names: &std::collections::HashSet<String>,
+    salt: &str,
+) -> Option<Statement> {
+    let StatementKind::SeqBlock { name, stmts } = &stmt.kind else {
+        return None;
+    };
+    if name.is_some() {
+        return None;
+    }
+    let mut map: HashMap<String, Expression> = HashMap::default();
+    let mut renames: HashMap<String, String> = HashMap::default();
+    for s in stmts.iter() {
+        if let StatementKind::VarDecl { declarators, .. } = &s.kind {
+            for d in declarators {
+                if module_names.contains(&d.name.name) && !renames.contains_key(&d.name.name) {
+                    let fresh = format!("{}__shadow_{}", d.name.name, salt);
+                    let hier = crate::ast::expr::HierarchicalIdentifier {
+                        root: None,
+                        path: vec![crate::ast::expr::HierPathSegment {
+                            name: crate::ast::Identifier {
+                                name: fresh.clone(),
+                                span: d.name.span,
+                            },
+                            selects: Vec::new(),
+                        }],
+                        span: d.name.span,
+                        cached_signal_id: std::cell::Cell::new(None),
+                        cached_resolved_name: std::cell::OnceCell::new(),
+                    };
+                    map.insert(
+                        d.name.name.clone(),
+                        Expression::new(ExprKind::Ident(hier), d.name.span),
+                    );
+                    renames.insert(d.name.name.clone(), fresh);
+                }
+            }
+        }
+    }
+    if renames.is_empty() {
+        return None;
+    }
+    // A NESTED block redeclaring one of these names introduces its own
+    // variable — the blanket reference rewrite below would capture it. Drop
+    // such names from the rename set (their nested uses keep the §6.21
+    // shadow-frame handling instead).
+    fn nested_redeclares(
+        s: &Statement,
+        names: &HashMap<String, String>,
+        hits: &mut Vec<String>,
+        top: bool,
+    ) {
+        match &s.kind {
+            StatementKind::VarDecl { declarators, .. } if !top => {
+                for d in declarators {
+                    if names.contains_key(&d.name.name) {
+                        hits.push(d.name.name.clone());
+                    }
+                }
+            }
+            StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+                for c in stmts {
+                    nested_redeclares(c, names, hits, false);
+                }
+            }
+            StatementKind::If { then_stmt, else_stmt, .. } => {
+                nested_redeclares(then_stmt, names, hits, false);
+                if let Some(e) = else_stmt {
+                    nested_redeclares(e, names, hits, false);
+                }
+            }
+            StatementKind::Case { items, .. } => {
+                for it in items {
+                    nested_redeclares(&it.stmt, names, hits, false);
+                }
+            }
+            StatementKind::For { body, .. }
+            | StatementKind::While { body, .. }
+            | StatementKind::DoWhile { body, .. }
+            | StatementKind::Repeat { body, .. }
+            | StatementKind::Forever { body }
+            | StatementKind::Foreach { body, .. } => {
+                nested_redeclares(body, names, hits, false);
+            }
+            StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+                nested_redeclares(stmt, names, hits, false);
+            }
+            _ => {}
+        }
+    }
+    let mut hits: Vec<String> = Vec::new();
+    for s in stmts.iter() {
+        match &s.kind {
+            StatementKind::VarDecl { .. } => {}
+            _ => nested_redeclares(s, &renames, &mut hits, false),
+        }
+    }
+    for h in hits {
+        renames.remove(&h);
+        map.remove(&h);
+    }
+    if renames.is_empty() {
+        return None;
+    }
+    let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_iface: HashMap<String, String> = HashMap::default();
+    let mut out = rewrite_stmt(stmt, "", &map, &empty_locals, &empty_iface);
+    // `rewrite_stmt` has no VarDecl arm: rename the declarators themselves and
+    // rewrite their initializers (a later decl's init may read an earlier
+    // renamed local).
+    if let StatementKind::SeqBlock { stmts, .. } = &mut out.kind {
+        for s in stmts.iter_mut() {
+            if let StatementKind::VarDecl { declarators, .. } = &mut s.kind {
+                for d in declarators.iter_mut() {
+                    if let Some(f) = renames.get(&d.name.name) {
+                        d.name.name = f.clone();
+                    }
+                    if let Some(init) = &d.init {
+                        d.init = Some(rewrite_expr(init, "", &map, &empty_locals, &empty_iface));
+                    }
+                }
+            }
+        }
+    }
+    Some(out)
+}
+
 fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Statement {
     let new_kind = match &stmt.kind {
         StatementKind::BlockingAssign { lvalue, rvalue } => StatementKind::BlockingAssign {
