@@ -178,6 +178,27 @@ impl Parser {
                     if t2.kind == TokenKind::Identifier {
                         p += 1;
                         if let Some(t3) = self.tokens.get(p) {
+                            // `pkg::Type #(...)` — balance the override list and
+                            // look at what follows: an identifier means a
+                            // declaration (`pkg::Type #(...) var`), `::` means a
+                            // scoped access (`pkg::Cls#(...)::member`).
+                            if t3.kind == TokenKind::Hash
+                                && self.tokens.get(p + 1).is_some_and(|t| t.kind == TokenKind::LParen)
+                            {
+                                let mut q = p + 2;
+                                let mut depth = 1;
+                                while depth > 0 && q < self.tokens.len() {
+                                    match self.tokens[q].kind {
+                                        TokenKind::LParen => depth += 1,
+                                        TokenKind::RParen => depth -= 1,
+                                        _ => {}
+                                    }
+                                    q += 1;
+                                }
+                                if let Some(t4) = self.tokens.get(q) {
+                                    return t4.kind != TokenKind::Identifier;
+                                }
+                            }
                             // If followed by another identifier, it's pkg::Type var (declaration)
                             return t3.kind != TokenKind::Identifier;
                         }

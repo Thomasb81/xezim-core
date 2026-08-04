@@ -2441,12 +2441,28 @@ fn validate_class_constraints(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
     module_enums: Option<&HashMap<String, Vec<(String, u64)>>>,
+    scope: Option<&ElaboratedModule>,
 ) -> Result<(), String> {
     let mut allowed = HashSet::default();
     let mut seen = HashSet::default();
     collect_class_member_names(c, all_defs, &mut allowed, &mut seen);
     if let Some(defs) = all_defs {
         collect_global_constraint_names(defs, &mut allowed);
+    }
+    // §18.3: a constraint expression may reference any variable visible at the
+    // class's declaration scope — for a class declared INSIDE a module that
+    // includes the module's own variables and parameters (state variables,
+    // held constant during solving). For a class inlined FROM an instance the
+    // instance's signals are registered under prefixed names while the
+    // constraint says the bare one, so accept the leaf spelling too.
+    if let Some(elab) = scope {
+        allowed.extend(elab.signals.keys().cloned());
+        allowed.extend(
+            elab.signals
+                .keys()
+                .filter_map(|k| k.rsplit_once('.').map(|(_, leaf)| leaf.to_string())),
+        );
+        allowed.extend(elab.parameters.keys().cloned());
     }
     // Enum typedefs declared at MODULE scope (before the class) are legal
     // constraint references too — `constraint c { m != R0; }` where `reg_t`
@@ -2496,7 +2512,7 @@ pub fn elaborate_module_with_defs(
             match def {
                 Definition::Typedef(td) => { process_typedef(td, &mut elab); }
                 Definition::Class(c) => {
-                    validate_class_constraints(c, Some(defs), Some(&elab.enum_members))?;
+                    validate_class_constraints(c, Some(defs), Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
@@ -2968,7 +2984,7 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 crate::ast::decl::PackageItem::Class(c) => {
-                    validate_class_constraints(c, all_defs, Some(&elab.enum_members))?;
+                    validate_class_constraints(c, all_defs, Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
@@ -5186,7 +5202,7 @@ pub fn elaborate_module_with_defs(
                 elab.clocking_blocks.insert(cd.name.name.clone(), cd_owned);
             }
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
+                validate_class_constraints(cd, all_defs, Some(&elab.enum_members), Some(&elab))?;
                 // Class-body enum typedef members are class constants; without
                 // this, `CB` in a method and `box::CB` both read x for classes
                 // declared in a MODULE body (package/$unit classes already
@@ -7162,6 +7178,11 @@ fn validate_stmt_idents(stmt: &Statement, elab: &ElaboratedModule, locals: &mut 
                 locals.insert(d.name.name.clone());
             }
         }
+        // §6.18: a block-local typedef introduces a type name later statements
+        // may use as a scope (`loc_t::static_method(...)`) or declare with.
+        StatementKind::Typedef(td) => {
+            locals.insert(td.name.name.clone());
+        }
         _ => {}
     }
     Ok(())
@@ -8296,7 +8317,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
 
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd, all_defs, Some(&elab.enum_members))?;
+                validate_class_constraints(cd, all_defs, Some(&elab.enum_members), Some(&elab))?;
                 // Class-body enum typedef members are class constants; without
                 // this, `CB` in a method and `box::CB` both read x for classes
                 // declared in a MODULE body (package/$unit classes already
@@ -15556,6 +15577,14 @@ fn inline_module_items(
                                     Some(UnpackedDimension::Unsized(_))
                                     | Some(UnpackedDimension::Queue { .. }) => {
                                         elab.dynamic_arrays.insert(sig_name.clone());
+                                        // The ELEMENT type, under the scoped
+                                        // name — without it a queue of unpacked
+                                        // structs inside an instance evaluated
+                                        // `push_back(item)` as one packed value
+                                        // (always x) instead of copying member
+                                        // signals, so the queue filled with x.
+                                        elab.var_decl_types
+                                            .insert(sig_name.clone(), dd.data_type.clone());
                                     }
                                     Some(UnpackedDimension::Associative { data_type: kdt, .. }) => {
                                         let is_str = kdt.as_ref().is_some_and(|dt| {
@@ -15854,6 +15883,21 @@ fn inline_module_items(
                             .map(|s| rewrite_stmt(s, &inst_prefix, &rewrite_port_map, &task_locals, &sub_interface_map))
                             .collect();
                         elab.tasks.insert(new_td.name.name.name.clone(), new_td);
+                    }
+                    if let ModuleItem::ClassDeclaration(cd) = sub_item {
+                        // §8.3: a class declared in an INSTANTIATED module was
+                        // silently dropped — `new` at a declaration initializer
+                        // found no class and produced null, and `randomize()`
+                        // saw no rand props or constraints. Register it under
+                        // its bare name like the top module's own classes
+                        // (classes share one namespace; a second instance
+                        // re-registers the identical definition).
+                        validate_class_constraints(cd, Some(definitions), Some(&elab.enum_members), Some(&elab))?;
+                        register_class_enum_members(cd, elab);
+                        elab.classes.insert(
+                            cd.name.name.clone(),
+                            elaborate_class_with_params(cd, Some(&elab.parameters)),
+                        );
                     }
                     if let ModuleItem::ClockingDeclaration(cd) = sub_item {
                         // §14.3 interface-scoped clocking block: register it under
