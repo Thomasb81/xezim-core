@@ -5375,8 +5375,54 @@ pub fn elaborate_module_with_defs(
         let items: Vec<ModuleItem> = module.items().to_vec();
         register_generate_labels(&items, &mut elab);
     }
-    for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut HashSet::default())?; }
-    for ab in &elab.always_blocks { validate_stmt_idents(&ab.stmt, &elab, &mut HashSet::default())?; }
+    // §23.9: a NAMED block's locals are reachable hierarchically
+    // (`nb.q` from a sibling process), so every block label in the module is
+    // a legal reference root — collect them all before validating.
+    let block_labels: HashSet<String> = {
+        fn collect_block_labels(s: &Statement, out: &mut HashSet<String>) {
+            match &s.kind {
+                StatementKind::SeqBlock { name, stmts } | StatementKind::ParBlock { name, stmts, .. } => {
+                    if let Some(n) = name {
+                        out.insert(n.name.clone());
+                    }
+                    for c in stmts {
+                        collect_block_labels(c, out);
+                    }
+                }
+                StatementKind::If { then_stmt, else_stmt, .. } => {
+                    collect_block_labels(then_stmt, out);
+                    if let Some(e) = else_stmt {
+                        collect_block_labels(e, out);
+                    }
+                }
+                StatementKind::Case { items, .. } => {
+                    for it in items {
+                        collect_block_labels(&it.stmt, out);
+                    }
+                }
+                StatementKind::For { body, .. }
+                | StatementKind::While { body, .. }
+                | StatementKind::DoWhile { body, .. }
+                | StatementKind::Repeat { body, .. }
+                | StatementKind::Forever { body }
+                | StatementKind::Foreach { body, .. } => collect_block_labels(body, out),
+                StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+                    collect_block_labels(stmt, out)
+                }
+                _ => {}
+            }
+        }
+        let mut out = HashSet::default();
+        for ib in &elab.initial_blocks {
+            collect_block_labels(&ib.stmt, &mut out);
+        }
+        for ab in &elab.always_blocks {
+            collect_block_labels(&ab.stmt, &mut out);
+        }
+        out
+    };
+    for ib in &elab.initial_blocks { validate_stmt_idents(&ib.stmt, &elab, &mut block_labels.clone())?; }
+    for ab in &elab.always_blocks { validate_stmt_idents(&ab.stmt, &elab, &mut block_labels.clone())?; }
     for ca in &elab.continuous_assigns {
         validate_expr_idents(&ca.lhs, &elab, &HashSet::default())?;
         validate_expr_idents(&ca.rhs, &elab, &HashSet::default())?;
