@@ -3589,7 +3589,7 @@ pub fn elaborate_module_with_defs(
                                 )
                             };
                         }
-                        if is_type_two_state(&dd.data_type) {
+                        if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
                         // A reg/logic completion makes the port a variable, not a net.
@@ -3913,7 +3913,7 @@ pub fn elaborate_module_with_defs(
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
-                        if is_type_two_state(&dd.data_type) {
+                        if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
                             // Element type, for the type-directed `%p` renderer.
@@ -3964,7 +3964,7 @@ pub fn elaborate_module_with_defs(
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
-                        if is_type_two_state(&dd.data_type) {
+                        if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
                         elab.var_decl_types.insert(decl.name.name.clone(), dd.data_type.clone());
@@ -3990,7 +3990,7 @@ pub fn elaborate_module_with_defs(
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
-                        if is_type_two_state(&dd.data_type) {
+                        if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
                         // §15.5 an ARRAY of named events. Only the scalar
@@ -4152,9 +4152,9 @@ pub fn elaborate_module_with_defs(
                                 if is_real { rv = Value::from_f64(rv.to_f64()); }
                                 (rv, None)
                             } else {
-                                (default_value_for_type(&dd.data_type, w), Some(init_expr.clone()))
+                                (default_value_for_type_resolved(&dd.data_type, w, &elab.typedef_types), Some(init_expr.clone()))
                             }
-                        } else { (default_value_for_type(&dd.data_type, w), None) };
+                        } else { (default_value_for_type_resolved(&dd.data_type, w, &elab.typedef_types), None) };
 
                         let sig = Signal { is_const: dd.const_kw,
                             name: decl.name.name.clone(),
@@ -4169,7 +4169,7 @@ pub fn elaborate_module_with_defs(
                         if matches!(&dd.data_type, DataType::Simple { kind: SimpleType::Event, .. }) {
                             elab.events.insert(decl.name.name.clone());
                         }
-                        if is_type_two_state(&dd.data_type) {
+                        if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
                         if let Some(view) = &data_modport_view {
@@ -4605,8 +4605,13 @@ pub fn elaborate_module_with_defs(
                     let mut width = resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     let mut signed = is_type_signed(data_type);
                     let is_real = is_type_real(data_type);
-                    // IEEE 1800-2017 §6.20.2: implicit type → signed 32-bit
-                    if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
+                    // IEEE 1800-2017 §6.20.2: an implicit-typed parameter takes
+                    // the type of its VALUE. Width is refined per-assignment
+                    // below (sized literal keeps its own width); signedness
+                    // likewise — see `untyped_param_is_signed`.
+                    let implicit_untyped =
+                        matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
+                    if implicit_untyped {
                         width = 32;
                         signed = true;
                     }
@@ -4728,6 +4733,13 @@ pub fn elaborate_module_with_defs(
                         {
                             if let Some(w) = assign.init.as_ref().and_then(sized_literal_width) {
                                 current_width = w;
+                            }
+                            // §5.7.1: the value's SIGNEDNESS comes with its
+                            // width — a sized literal is unsigned unless it
+                            // carries `s`, so `parameter P = 8'hF0;` is 240,
+                            // not -16 (and `P > 100` is true).
+                            if let Some(init) = &assign.init {
+                                current_signed = untyped_param_is_signed(init);
                             }
                         }
 
@@ -8040,7 +8052,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
-                        if is_type_two_state(&dd.data_type) {
+                        if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
                         if let Some(UnpackedDimension::Range { left, right, .. }) = decl.dimensions.first() {
@@ -8087,7 +8099,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             if is_real { rv = Value::from_f64(rv.to_f64()); }
                             rv
                         } else {
-                            default_value_for_type(&dd.data_type, width)
+                            default_value_for_type_resolved(&dd.data_type, width, &elab.typedef_types)
                         };
                         let sig = Signal { is_const: dd.const_kw, name: decl.name.name.clone(), width, is_signed, is_real, direction: None, value: init_val, type_name: get_type_name(&dd.data_type) };
                         elab.signals.insert(decl.name.name.clone(), sig);
@@ -9114,6 +9126,28 @@ pub fn is_type_signed_resolved(
 }
 
 /// Returns the default value for a type: 0 for 2-state types, X for 4-state types.
+/// §6.20.2 + §5.7.1: signedness of an UNTYPED parameter, taken from its value.
+/// An unsized decimal (`parameter P = 240;`) is a signed int, but a SIZED
+/// literal is unsigned unless it carries the `s` designator — so
+/// `parameter P = 8'hF0;` is 240, not -16. Untyped parameters were marked
+/// signed unconditionally, which made `P > 100` false. Non-literal
+/// initializers keep the signed default (the prior behaviour).
+fn untyped_param_is_signed(init: &Expression) -> bool {
+    match &init.kind {
+        ExprKind::Number(NumberLiteral::Integer { size: Some(_), signed, .. }) => *signed,
+        ExprKind::Paren(inner) => untyped_param_is_signed(inner),
+        _ => true,
+    }
+}
+
+fn default_value_for_type_resolved(
+    dt: &DataType,
+    width: u32,
+    typedef_types: &HashMap<String, DataType>,
+) -> Value {
+    default_value_for_type(resolve_typedef_chain(dt, typedef_types), width)
+}
+
 fn default_value_for_type(dt: &DataType, width: u32) -> Value {
     if is_type_real(dt) { return Value::from_f64(0.0); }
     // LRM §6.20.3: `chandle` defaults to null. Module-scope `chandle h;`
@@ -9147,6 +9181,21 @@ fn default_port_value(
 }
 
 /// Returns true for 2-state types (bit, byte, shortint, int, longint) whose default is 0.
+/// `is_type_two_state` that resolves a typedef against the type table first.
+///
+/// §6.8 + Table 6-7: a 2-STATE variable initializes to 0, a 4-state one to x,
+/// and §6.18 makes a typedef a pure ALIAS that cannot change that. The plain
+/// predicate has no `TypeReference` arm, so a variable reached through a
+/// typedef (`typedef bit [7:0] bt8; bt8 a;`) was treated as 4-state and came
+/// up x — while the identical direct declaration came up 0. Silent, and it
+/// changed which branch of `if (a == 0)` was taken.
+pub fn is_type_two_state_resolved(
+    dt: &DataType,
+    typedef_types: &HashMap<String, DataType>,
+) -> bool {
+    is_type_two_state(resolve_typedef_chain(dt, typedef_types))
+}
+
 pub fn is_type_two_state(dt: &DataType) -> bool {
     match dt {
         DataType::IntegerVector { kind, .. } => matches!(kind, IntegerVectorType::Bit),
@@ -11933,7 +11982,7 @@ pub fn inline_instantiations(
                         // §6.8: a 2-state ELEMENT type means the array's
                         // slots default to 0 (the simulator consults this
                         // when it builds the element storage).
-                        if is_type_two_state(&dd.data_type) {
+                        if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                             elab.two_state_signals.insert(decl.name.name.clone());
                         }
                                     if let Some(UnpackedDimension::Range { left, right, .. }) = first_dim {
@@ -12002,7 +12051,7 @@ pub fn inline_instantiations(
                                             }
                                             v
                                         }
-                                        _ => default_value_for_type(&dd.data_type, w),
+                                        _ => default_value_for_type_resolved(&dd.data_type, w, &elab.typedef_types),
                                     };
                                     let tn = if is_anon_enum.is_some() {
                                         Some(decl.name.name.clone())
@@ -15449,7 +15498,7 @@ fn inline_module_items(
                                             decl_is_real,
                                         );
                                     }
-                                    if is_type_two_state(&dd.data_type) {
+                                    if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                                         elab.two_state_signals.insert(sig_name.clone());
                                     }
                                     elab.nets.remove(&sig_name);
@@ -15519,7 +15568,7 @@ fn inline_module_items(
                                 }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
-                                    if is_type_two_state(&dd.data_type) {
+                                    if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                                         elab.two_state_signals.insert(sig_name.clone());
                                     }
                                     // Per-element Signals synthesized by
@@ -15549,7 +15598,7 @@ fn inline_module_items(
                                         } else {
                                             eval_init_for_width(init_expr, &sub_merged_params, width)
                                         }
-                                    } else { default_value_for_type(&dd.data_type, width) };
+                                    } else { default_value_for_type_resolved(&dd.data_type, width, &elab.typedef_types) };
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: dd.const_kw,
                                         name: sig_name, width, is_signed,
                                         direction: None, value: init_val,
