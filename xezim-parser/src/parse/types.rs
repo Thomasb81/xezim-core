@@ -421,12 +421,13 @@ fn parse_enum_type(&mut self) -> DataType {
         });
     }
     let base_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
-        if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBrace {
-            // This is the enum name, not a base type
-            None
-        } else {
-            Some(Box::new(self.parse_data_type()))
-        }
+        // §6.19.1 (grammar A.2.2.1): `enum_base_type` may be a
+        // `type_identifier`, and there is NO enum name between `enum` and `{`.
+        // An identifier here was being discarded as a supposed "enum name", so
+        // `typedef enum nib_t {A0,A1} e_t;` silently fell back to the 32-bit
+        // int default — `$bits` read 32 instead of 4, and a signed base
+        // (`enum sb_t {B0=-2,…}`) lost its sign so `e < 0` was false.
+        Some(Box::new(self.parse_data_type()))
     } else { None };
 
     let _name = if self.at(TokenKind::Identifier) {

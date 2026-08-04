@@ -2059,6 +2059,11 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         return;
     }
     if let DataType::Enum(et) = &td.data_type {
+        // §6.19: the enum takes its BASE type's signedness (default base `int`
+        // is signed), and every member constant carries it — `enum byte {Y0=-3}`
+        // makes Y0 equal to -3, not 253. Members were registered unconditionally
+        // unsigned.
+        let enum_signed = is_type_signed_resolved(&td.data_type, &elab.typedef_types);
         let base_width = et.base_type.as_ref()
             .map(|bt| resolve_type_width(bt, Some(&elab.parameters), Some(&elab.typedefs)))
             .unwrap_or(32);
@@ -2068,7 +2073,10 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             let (entries, nv) = expand_enum_member(member, next_val, &elab.parameters);
             next_val = nv;
             for (nm, val) in entries {
-                let v = enum_member_4state(member, val, base_width, &elab.parameters);
+                let mut v = enum_member_4state(member, val, base_width, &elab.parameters);
+                if !v.is_real {
+                    v.is_signed = enum_signed;
+                }
                 // §26.3: a local declaration shadows a wildcard-imported name,
                 // and the enum members of an imported package are registered
                 // under their BARE name. The declaration walk removes the
@@ -2117,7 +2125,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                 elab.signals.insert(nm.clone(), Signal { is_const: false,
                     name: nm.clone(),
                     width: base_width,
-                    is_signed: false,
+                    is_signed: enum_signed,
                     is_real: false,
                     direction: None,
                     value: v,
@@ -2126,8 +2134,14 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                 members_ordered.push((nm.clone(), val));
             }
         }
-        // Register the typedef width
+        // Register the typedef width AND its type. Only the non-enum branch
+        // recorded `typedef_types`, so a variable declared with an enum typedef
+        // (`eb_t e;`) could not be resolved back to the enum — the type walkers
+        // stopped at the bare TypeReference and the variable read UNSIGNED even
+        // when the enum's base was signed.
         elab.typedefs.insert(td.name.name.clone(), base_width);
+        elab.typedef_types
+            .insert(td.name.name.clone(), td.data_type.clone());
         elab.enum_members.insert(td.name.name.clone(), members_ordered);
     } else {
         // Non-enum typedef: resolve width from the underlying type
@@ -8029,7 +8043,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         }
                     }
                 }
-                let is_signed = is_type_signed(&dd.data_type);
+                let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                 let is_real = is_type_real(&dd.data_type);
                 for decl in &dd.declarators {
                     if elab.signals.contains_key(&decl.name.name) || elab.parameters.contains_key(&decl.name.name) {
@@ -9122,6 +9136,16 @@ pub fn is_type_signed_resolved(
             _ => break,
         }
     }
+    // §6.19: an enum's signedness is its BASE type's, and that base may itself
+    // be a typedef (`typedef byte sb_t; typedef enum sb_t {B0=-2,…} eb_t;`).
+    // `is_type_signed` cannot resolve it without the table, so the enum read
+    // unsigned and `e < 0` was false.
+    if let DataType::Enum(e) = cur {
+        return match e.base_type.as_deref() {
+            Some(bt) => is_type_signed_resolved(bt, typedef_types),
+            None => true, // default base is `int` — signed
+        };
+    }
     is_type_signed(cur)
 }
 
@@ -9193,7 +9217,19 @@ pub fn is_type_two_state_resolved(
     dt: &DataType,
     typedef_types: &HashMap<String, DataType>,
 ) -> bool {
-    is_type_two_state(resolve_typedef_chain(dt, typedef_types))
+    let resolved = resolve_typedef_chain(dt, typedef_types);
+    // §6.19.2: likewise for an enum whose BASE is reached through a typedef.
+    if let DataType::Enum(e) = resolved {
+        return match e.base_type.as_deref() {
+            Some(bt) => is_type_two_state_resolved(bt, typedef_types),
+            // No explicit base: preserve the existing behaviour of
+            // `is_type_two_state` (`unwrap_or(false)`). Whether a default-base
+            // enum should be 2-state like its implied `int` is a separate
+            // question the audit did not settle; not changing it here.
+            None => false,
+        };
+    }
+    is_type_two_state(resolved)
 }
 
 pub fn is_type_two_state(dt: &DataType) -> bool {
@@ -11959,7 +11995,7 @@ pub fn inline_instantiations(
                         // been processed from this same package's typedefs).
                         crate::ast::decl::PackageItem::Data(dd) => {
                             let width = resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                            let is_signed = is_type_signed(&dd.data_type);
+                            let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                             for decl in &dd.declarators {
                                 let first_dim = decl.dimensions.first();
                                 let is_dynamic_dim = first_dim.is_some_and(|d| matches!(d,
@@ -15472,7 +15508,7 @@ fn inline_module_items(
                                 }
                                 _ => resolve_type_width(&dd.data_type, Some(&sub_merged_params), Some(&elab.typedefs)),
                             };
-                            let is_signed = is_type_signed(&dd.data_type);
+                            let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                             for decl in &dd.declarators {
                                 let base_name = decl.name.name.clone();
                                 let sig_name = format!("{}{}", inst_prefix, base_name);
@@ -18295,7 +18331,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                     }
                                     _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                                 };
-                                let is_signed = is_type_signed(&dd.data_type);
+                                let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                                 let is_real = is_type_real(&dd.data_type);
                                 for decl in &dd.declarators {
                                     if &decl.name.name == sym_name {
@@ -18475,7 +18511,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 }
                                 _ => resolve_type_width(&dd.data_type, Some(&elab.parameters), Some(&elab.typedefs)),
                             };
-                            let is_signed = is_type_signed(&dd.data_type);
+                            let is_signed = is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                             let is_real = is_type_real(&dd.data_type);
                             // Register the packed-struct field layout for an
                             // imported struct variable so a package subroutine's
