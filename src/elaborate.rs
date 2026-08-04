@@ -1739,9 +1739,14 @@ fn expr_has_call(expr: &Expression) -> bool {
         // walked (order-dependent). Deferring guarantees `elab.arrays`
         // is fully populated and the runtime $size/$left/etc handler
         // resolves correctly.
-        ExprKind::SystemCall { name, .. }
+        // …but a TYPE operand (`$size(int)`, `$left(my_vec_t)`) needs no array
+        // table at all, so deferring it only left the parameter 0 for the rest
+        // of elaboration — long enough for every `logic [W-1:0]` sized from it
+        // to come out as `[-1:0]`, i.e. two bits.
+        ExprKind::SystemCall { name, args }
             if matches!(name.as_str(),
-                "$size" | "$left" | "$right" | "$high" | "$low" | "$dimensions") => true,
+                "$size" | "$left" | "$right" | "$high" | "$low" | "$dimensions") =>
+            !args.first().is_some_and(array_query_operand_is_type),
         ExprKind::Binary { left, right, .. } => expr_has_call(left) || expr_has_call(right),
         ExprKind::Unary { operand, .. } => expr_has_call(operand),
         ExprKind::Paren(e) => expr_has_call(e),
@@ -1749,6 +1754,30 @@ fn expr_has_call(expr: &Expression) -> bool {
             expr_has_call(condition) || expr_has_call(then_expr) || expr_has_call(else_expr),
         _ => false,
     }
+}
+
+/// §20.7: does this array-query operand name a TYPE (a built-in keyword or a
+/// registered typedef) rather than an array? Such a query is answerable from
+/// the type alone, so it need not wait for `elab.arrays`. A name the array
+/// table already knows stays an array — a variable never shares its scope with
+/// a type of the same name, so only a cross-module coincidence could collide.
+fn array_query_operand_is_type(arg: &Expression) -> bool {
+    use crate::ast::expr::ExprKind;
+    let name = match &arg.kind {
+        ExprKind::TypeLiteral(_) => return true,
+        ExprKind::Ident(h) => match h.path.last() {
+            Some(seg) if seg.selects.is_empty() => seg.name.name.as_str(),
+            _ => return false,
+        },
+        _ => return false,
+    };
+    if is_builtin_type_keyword(name) {
+        return true;
+    }
+    if ARRAYS_TLS.with(|ar| ar.borrow().as_ref().is_some_and(|m| m.contains_key(name))) {
+        return false;
+    }
+    TYPEDEFS_TLS.with(|td| td.borrow().as_ref().is_some_and(|m| m.contains_key(name)))
 }
 
 /// A unified representation of a module or interface.
@@ -9628,7 +9657,8 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
             // name: each consults ARRAYS_TLS for `(lo, hi)` and returns
             // the appropriate bound. Falls through to None when the
             // table is empty or the name is not registered.
-            "$size" | "$left" | "$right" | "$high" | "$low" | "$dimensions" => {
+            "$size" | "$left" | "$right" | "$high" | "$low" | "$increment"
+            | "$dimensions" | "$unpacked_dimensions" => {
                 let arg = args.first()?;
                 let arr_name = match &arg.kind {
                     ExprKind::Ident(hier) => {
@@ -9639,14 +9669,44 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                 ARRAYS_TLS.with(|ar| {
                     ar.borrow().as_ref().and_then(|m| m.get(&arr_name).copied())
                 })
-                .map(|(lo, hi, _ndim)| match name.as_str() {
+                .and_then(|(lo, hi, _ndim)| Some(match name.as_str() {
                     "$size" => hi - lo + 1,
                     "$left" => lo,
                     "$right" => hi,
                     "$high" => hi.max(lo),
                     "$low" => lo.min(hi),
                     "$dimensions" => 1,
-                    _ => unreachable!(),
+                    // $increment and $unpacked_dimensions over an array need
+                    // the DECLARED order / full dimension list, which this
+                    // (lo, hi, ndim) table has already normalized away — leave
+                    // them to the runtime rather than answer wrongly.
+                    _ => return None,
+                }))
+                // §20.7 also accepts a TYPE as the operand — `$size(int)` is
+                // 32, `$left(byte)` 7. The name parses as a plain Ident (see
+                // `parse_call_args`), so a `localparam W = $size(int)` used as
+                // a vector width const-folded to nothing and the vector
+                // elaborated one bit wide.
+                .or_else(|| {
+                    let q = TYPEDEFS_TLS.with(|td| {
+                        type_query_dims_by_name(
+                            &arr_name,
+                            params,
+                            td.borrow().as_ref(),
+                            None,
+                            None,
+                        )
+                    })?;
+                    // Width-only typedef knowledge cannot count dimensions;
+                    // leave those to the runtime rather than answer wrongly.
+                    if q.dims.is_empty() && matches!(name.as_str(), "$dimensions" | "$unpacked_dimensions") {
+                        return None;
+                    }
+                    let dim = match args.get(1) {
+                        Some(d) => const_eval_i64_with_params(d, params)? as usize,
+                        None => 1,
+                    };
+                    type_query_bound(name, &q, dim)
                 })
             }
             _ => None,
@@ -10449,6 +10509,220 @@ pub fn packed_full_dims_chained(
     // A single dimension is an ordinary vector, not a packed ARRAY — same
     // convention as `packed_full_dims_of`.
     if out.len() < 2 { None } else { Some(out) }
+}
+
+/// IEEE 1800-2017 §20.7 — what a TYPE operand exposes to the array query
+/// functions (`$left(int)`, `$size(my_vec_t)`, `$dimensions(bit [3:0][7:0])`).
+#[derive(Debug, Clone, Default)]
+pub struct TypeQueryDims {
+    /// The queryable dimensions, unpacked first then packed (§7.4.5 numbers
+    /// them in that order), each as the DECLARED `(left, right)` bounds:
+    /// `int` -> `[(31, 0)]`, `logic [15:4]` -> `[(15, 4)]`,
+    /// `bit [3:0][7:0]` -> `[(3, 0), (7, 0)]`, `byte t [0:2]` ->
+    /// `[(0, 2), (7, 0)]`. Empty for a type with no dimension of its own.
+    pub dims: Vec<(i64, i64)>,
+    /// How many leading `dims` entries are UNPACKED ($unpacked_dimensions).
+    pub unpacked: usize,
+    /// Range the BOUND queries answer over when `dims` is empty: an integral
+    /// type whose width is not written as a dimension (an enum, a packed
+    /// struct) still reports `$left`/`$size` over its whole `[w-1:0]` extent
+    /// while `$dimensions` stays 0. `None` for a scalar `logic`/`bit` and for
+    /// the non-integral types, which have no dimension at all and answer `x`.
+    pub whole: Option<(i64, i64)>,
+}
+
+/// Is `name` a built-in data-type keyword? Such a word can never also name a
+/// variable, so an array query over it is unambiguously a §20.7 type query.
+pub fn is_builtin_type_keyword(name: &str) -> bool {
+    atom_keyword_width(name).is_some()
+        || matches!(
+            name,
+            "bit" | "logic" | "reg" | "real" | "shortreal" | "realtime" | "string" | "chandle"
+                | "event"
+        )
+}
+
+/// Bit width of an integer ATOM type keyword (§6.11.1); None if `name` is not
+/// one. Atom types carry one implicit packed dimension `[w-1:0]`.
+fn atom_keyword_width(name: &str) -> Option<u32> {
+    Some(match name {
+        "byte" => 8,
+        "shortint" => 16,
+        "int" | "integer" => 32,
+        "longint" | "time" => 64,
+        _ => return None,
+    })
+}
+
+/// Append a type's packed dimensions, declared order preserved. Stops at the
+/// first non-constant / unsized dimension.
+fn push_packed_query_dims(
+    dimensions: &[PackedDimension],
+    params: Option<&HashMap<String, Value>>,
+    out: &mut Vec<(i64, i64)>,
+) {
+    for d in dimensions {
+        let PackedDimension::Range { left, right, .. } = d else { return };
+        let (Some(l), Some(r)) = (
+            const_eval_i64_with_params(left, params),
+            const_eval_i64_with_params(right, params),
+        ) else {
+            return;
+        };
+        out.push((l, r));
+    }
+}
+
+/// §20.7 over an explicit type — the packed shape of `dt`, following any
+/// typedef chain. See `type_query_dims_by_name` for the name-keyed form.
+pub fn type_query_dims_of(
+    dt: &DataType,
+    params: Option<&HashMap<String, Value>>,
+    typedefs: Option<&HashMap<String, u32>>,
+    typedef_types: Option<&HashMap<String, DataType>>,
+) -> TypeQueryDims {
+    let mut q = TypeQueryDims::default();
+    let mut cur = Some(dt.clone());
+    for _ in 0..32 {
+        let Some(t) = cur.take() else { break };
+        match t {
+            DataType::TypeReference { ref name, ref dimensions, .. } => {
+                push_packed_query_dims(dimensions, params, &mut q.dims);
+                cur = typedef_types.and_then(|m| m.get(&name.name.name).cloned());
+                if cur.is_none() {
+                    // The chain bottoms out on a typedef known only by width
+                    // (an enum, or one whose definition was never registered).
+                    let w = resolve_type_width(&t, params, typedefs);
+                    if w > 0 && dimensions.is_empty() {
+                        q.whole = Some((w as i64 - 1, 0));
+                    }
+                    break;
+                }
+            }
+            DataType::IntegerVector { ref dimensions, .. }
+            | DataType::Implicit { ref dimensions, .. } => {
+                push_packed_query_dims(dimensions, params, &mut q.dims);
+                break;
+            }
+            DataType::IntegerAtom { .. } => {
+                let w = resolve_type_width(&t, params, typedefs).max(1);
+                q.dims.push((w as i64 - 1, 0));
+                break;
+            }
+            DataType::Enum(_) | DataType::Struct(_) => {
+                // Neither an enum nor a packed struct/union has an array
+                // dimension of its own, so `$dimensions` is 0 — but the bound
+                // queries still describe its whole packed extent.
+                let w = resolve_type_width(&t, params, typedefs);
+                if w > 0 {
+                    q.whole = Some((w as i64 - 1, 0));
+                }
+                break;
+            }
+            // real / string / chandle / event: no dimension to report.
+            _ => break,
+        }
+    }
+    q
+}
+
+/// §20.7 — resolve a type NAME used as an array-query operand (a built-in
+/// type keyword or a typedef) into the dimensions it exposes. None when the
+/// name does not denote a type.
+///
+/// `typedef_types` is optional so const-eval, which carries only the
+/// name->width typedef table, can still answer: without it a typedef is
+/// described by its width alone (`whole`), which gets the bound queries right
+/// for every zero-based type but cannot report `$dimensions`.
+pub fn type_query_dims_by_name(
+    name: &str,
+    params: Option<&HashMap<String, Value>>,
+    typedefs: Option<&HashMap<String, u32>>,
+    typedef_types: Option<&HashMap<String, DataType>>,
+    typedef_unpacked_dims: Option<&HashMap<String, Vec<UnpackedDimension>>>,
+) -> Option<TypeQueryDims> {
+    if let Some(w) = atom_keyword_width(name) {
+        return Some(TypeQueryDims { dims: vec![(w as i64 - 1, 0)], unpacked: 0, whole: None });
+    }
+    // A scalar `bit`/`logic`/`reg` has no packed dimension, and the
+    // non-integral types have none either: every bound query answers `x`.
+    if is_builtin_type_keyword(name) {
+        return Some(TypeQueryDims::default());
+    }
+    let dt = typedef_types.and_then(|m| m.get(name));
+    let width = typedefs.and_then(|m| m.get(name).copied());
+    if dt.is_none() && width.is_none() {
+        return None;
+    }
+    // §7.4.5: unpacked dimensions are numbered BEFORE the packed ones.
+    let mut q = TypeQueryDims::default();
+    if let Some(uds) = typedef_unpacked_dims.and_then(|m| m.get(name)) {
+        for d in uds {
+            match d {
+                UnpackedDimension::Range { left, right, .. } => {
+                    let (Some(l), Some(r)) = (
+                        const_eval_i64_with_params(left, params),
+                        const_eval_i64_with_params(right, params),
+                    ) else {
+                        break;
+                    };
+                    q.dims.push((l, r));
+                }
+                UnpackedDimension::Expression { expr, .. } => {
+                    match const_eval_i64_with_params(expr, params) {
+                        Some(n) if n > 0 => q.dims.push((0, n - 1)),
+                        _ => break,
+                    }
+                }
+                // A queue / dynamic / associative dimension has no static
+                // bounds; §20.7 rejects such a type as a query operand.
+                _ => break,
+            }
+            q.unpacked += 1;
+        }
+    }
+    match dt {
+        Some(dt) => {
+            let inner = type_query_dims_of(dt, params, typedefs, typedef_types);
+            q.dims.extend(inner.dims);
+            q.whole = inner.whole;
+        }
+        // Known only by width (an enum typedef): its extent answers the bound
+        // queries, and it contributes no dimension.
+        None => {
+            if let Some(w) = width.filter(|&w| w > 0) {
+                q.whole = Some((w as i64 - 1, 0));
+            }
+        }
+    }
+    Some(q)
+}
+
+/// §20.7 — one array query over a resolved TYPE operand; `dim` is the 1-based
+/// dimension number. None when that dimension does not exist, which §20.7
+/// answers with `x`.
+pub fn type_query_bound(sn: &str, q: &TypeQueryDims, dim: usize) -> Option<i64> {
+    match sn {
+        "$dimensions" => return Some(q.dims.len() as i64),
+        "$unpacked_dimensions" => return Some(q.unpacked as i64),
+        _ => {}
+    }
+    let (l, r) = match q.dims.get(dim.wrapping_sub(1)) {
+        Some(&d) => d,
+        None if dim == 1 && q.dims.is_empty() => q.whole?,
+        None => return None,
+    };
+    let (lo, hi) = (l.min(r), l.max(r));
+    Some(match sn {
+        "$left" => l,
+        "$right" => r,
+        "$high" => hi,
+        "$low" => lo,
+        "$size" => hi - lo + 1,
+        // §20.7: 1 for a descending range, -1 for an ascending one.
+        "$increment" => if l >= r { 1 } else { -1 },
+        _ => return None,
+    })
 }
 
 /// Full packed dimension bounds (outermost first) of a multi-dimensional
@@ -11731,7 +12005,8 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
         // via runtime path before deferred-param eval).
         ExprKind::SystemCall { name, args }
             if matches!(name.as_str(),
-                "$size" | "$left" | "$right" | "$high" | "$low" | "$dimensions")
+                "$size" | "$left" | "$right" | "$high" | "$low" | "$increment"
+                | "$dimensions" | "$unpacked_dimensions")
                 && args.first().map(|a| matches!(a.kind, ExprKind::Ident(_))).unwrap_or(false) =>
         {
             let arg = args.first().unwrap();
@@ -11752,6 +12027,24 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     _ => 0,
                 };
                 Value::from_u64(v as u64, 32)
+            } else if let Some(v) = TYPEDEFS_TLS
+                .with(|td| type_query_dims_by_name(&arr_name, Some(params), td.borrow().as_ref(), None, None))
+                .and_then(|q| {
+                    // §20.7 accepts a TYPE as the operand: `$size(int)` is 32,
+                    // `$left(byte)` 7. The name parses as a plain Ident (see
+                    // `parse_call_args`), so a `localparam W = $size(int)`
+                    // const-folded to ZERO here and every vector sized `[W-1:0]`
+                    // elaborated to `[-1:0]` — two bits.
+                    let dim = args
+                        .get(1)
+                        .and_then(|d| const_eval_i64_with_params(d, Some(params)))
+                        .unwrap_or(1) as usize;
+                    type_query_bound(name, &q, dim)
+                })
+            {
+                let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
+                out.is_signed = true;
+                out
             } else {
                 Value::zero(32)
             }
