@@ -2077,6 +2077,87 @@ pub fn register_scoped_typedef_alias(pkg: &str, td: &TypedefDeclaration, elab: &
     }
 }
 
+/// Type names a typedef's own definition refers to — its base type and, for a
+/// struct/union, its members' types. Used to order typedef processing so a
+/// typedef is always registered after the ones whose widths it needs.
+fn typedef_type_deps(dt: &DataType, out: &mut Vec<String>) {
+    match dt {
+        DataType::TypeReference { name, .. } => out.push(name.name.name.clone()),
+        DataType::Struct(su) => {
+            for m in &su.members {
+                typedef_type_deps(&m.data_type, out);
+            }
+        }
+        DataType::Enum(e) => {
+            if let Some(base) = &e.base_type {
+                typedef_type_deps(base, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// The `Definition::Typedef` entries of `defs`, in dependency order: a typedef
+/// referenced by another comes first. Ties (and cycles, which a forward
+/// `typedef name;` legitimately creates) fall back to name order, so the result
+/// is deterministic and never depends on HashMap iteration.
+fn ordered_typedefs<'a>(
+    defs: &HashMap<String, Definition<'a>>,
+) -> Vec<&'a TypedefDeclaration> {
+    let mut by_name: Vec<(&str, &'a TypedefDeclaration)> = defs
+        .iter()
+        .filter_map(|(k, d)| match d {
+            Definition::Typedef(td) => Some((k.as_str(), *td)),
+            _ => None,
+        })
+        .collect();
+    by_name.sort_by(|a, b| a.0.cmp(b.0));
+    let index: HashMap<&str, usize> = by_name
+        .iter()
+        .enumerate()
+        .map(|(i, (n, _))| (*n, i))
+        .collect();
+
+    let mut state = vec![0u8; by_name.len()]; // 0 = unvisited, 1 = on stack, 2 = done
+    let mut out: Vec<&'a TypedefDeclaration> = Vec::with_capacity(by_name.len());
+    // Iterative DFS: a typedef chain can be arbitrarily deep, and recursion here
+    // would put that depth on the elaborator's stack.
+    for start in 0..by_name.len() {
+        if state[start] != 0 {
+            continue;
+        }
+        let mut stack = vec![(start, false)];
+        while let Some((i, expanded)) = stack.pop() {
+            if expanded {
+                if state[i] != 2 {
+                    state[i] = 2;
+                    out.push(by_name[i].1);
+                }
+                continue;
+            }
+            if state[i] != 0 {
+                continue; // done, or already on the stack (cycle) — leave it
+            }
+            state[i] = 1;
+            stack.push((i, true));
+            let mut deps = Vec::new();
+            typedef_type_deps(&by_name[i].1.data_type, &mut deps);
+            deps.sort();
+            deps.dedup();
+            // Reversed so that, once popped, dependencies are visited in the
+            // sorted order above.
+            for d in deps.iter().rev() {
+                if let Some(&j) = index.get(d.as_str()) {
+                    if j != i && state[j] == 0 {
+                        stack.push((j, false));
+                    }
+                }
+            }
+        }
+    }
+    out
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // §6.18: a bare forward type declaration `typedef name;`. Record it for the
     // resolution check and register a placeholder, but never clobber a name that
@@ -2543,9 +2624,22 @@ pub fn elaborate_module_with_defs(
 
     // Process top-level typedefs and other global definitions from all_defs
     if let Some(defs) = all_defs {
+        // §6.18: typedefs must be processed in DEPENDENCY order. A struct
+        // typedef's width is resolved from the width map built by the
+        // typedefs processed BEFORE it, and an unresolved member type falls
+        // back to 32 bits. `defs` is a HashMap, so the order was whatever
+        // hashing produced — `typedef struct packed { sp_t inner; logic [15:0]
+        // tail; } via_t;` came out 48 bits instead of 32 whenever `via_t`
+        // hashed ahead of `sp_t`. Adding an unrelated module to the file
+        // changed the map's contents and so its iteration order, which silently
+        // changed `$bits` of a nested struct typedef and every signal declared
+        // with it.
+        for td in ordered_typedefs(defs) {
+            process_typedef(td, &mut elab);
+        }
         for def in defs.values() {
             match def {
-                Definition::Typedef(td) => { process_typedef(td, &mut elab); }
+                Definition::Typedef(_) => {}
                 Definition::Class(c) => {
                     validate_class_constraints(c, Some(defs), Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
