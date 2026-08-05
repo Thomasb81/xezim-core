@@ -13941,6 +13941,55 @@ fn ai_scan_unpacked_shapes(
 /// so a stray `.mp` left in the interface_map strands both (task dispatch
 /// falls through, member reads hit a phantom `bus.mp.<m>` signal). If the
 /// last path segment names a modport of ANY interface definition, drop it.
+/// §25.3.3: the interface INSTANCE that a port connection names, as the flat
+/// path under which that instance is registered.
+///
+/// Four spellings have to land on the same answer: `b`, `b.mp`, `barr[0]` and
+/// `barr[0].mp`. The element index arrives in one of TWO shapes — an `Index`
+/// node, or folded into a path segment's `selects` (which is what happens when
+/// a `.modport` follows it). Matching only a bare `Ident` and joining only the
+/// segment NAMES missed both: an indexed connection inserted no mapping at all
+/// and left the child's port unbound, while `barr[0].mp` silently collapsed to
+/// `barr`, losing which element was meant.
+fn iface_conn_path(
+    e: &Expression,
+    params: &HashMap<String, Value>,
+    definitions: &HashMap<String, Definition>,
+) -> Option<String> {
+    fn walk(e: &Expression, params: &HashMap<String, Value>) -> Option<String> {
+        match &e.kind {
+            ExprKind::Ident(hier) => {
+                let mut out = String::new();
+                for (i, seg) in hier.path.iter().enumerate() {
+                    if i > 0 {
+                        out.push('.');
+                    }
+                    out.push_str(&seg.name.name);
+                    for sel in &seg.selects {
+                        let idx = const_eval_i64_with_params(sel, Some(params))?;
+                        out.push_str(&format!("[{}]", idx));
+                    }
+                }
+                Some(out)
+            }
+            ExprKind::Index { expr: base, index } => {
+                let b = walk(base, params)?;
+                let idx = const_eval_i64_with_params(index, Some(params))?;
+                Some(format!("{}[{}]", b, idx))
+            }
+            // `r[0].snk` can also arrive as a MemberAccess over the index
+            // rather than as one Ident whose segment carries the select.
+            ExprKind::MemberAccess { expr: base, member } => {
+                let b = walk(base, params)?;
+                Some(format!("{}.{}", b, member.name))
+            }
+            ExprKind::Paren(inner) => walk(inner, params),
+            _ => None,
+        }
+    }
+    walk(e, params).map(|full| strip_modport_suffix(&full, definitions))
+}
+
 fn strip_modport_suffix(
     full_path: &str,
     definitions: &HashMap<String, Definition>,
@@ -14725,9 +14774,9 @@ fn inline_module_items(
                                 if let Some(e) = expr {
                                     let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
                                     if sub_iface_ports.contains(&name.name) {
-                                        if let ExprKind::Ident(hier) = &rewritten_e.kind {
-                                            let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
-                                            let if_full_path = strip_modport_suffix(&if_full_path, definitions);
+                                        if let Some(if_full_path) =
+                                            iface_conn_path(&rewritten_e, local_params, definitions)
+                                        {
                                             sub_interface_map.insert(name.name.clone(), if_full_path);
                                         }
                                     } else {
@@ -14775,9 +14824,9 @@ fn inline_module_items(
                                     if let Some(port) = sub_mod.ports().get(i) {
                                         let port_name = port.name();
                                         if sub_iface_ports.contains(port_name) {
-                                            if let ExprKind::Ident(hier) = &rewritten_e.kind {
-                                                let if_full_path = hier.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join(".");
-                                                let if_full_path = strip_modport_suffix(&if_full_path, definitions);
+                                            if let Some(if_full_path) =
+                                                iface_conn_path(&rewritten_e, local_params, definitions)
+                                            {
                                                 sub_interface_map.insert(port_name.to_string(), if_full_path);
                                             }
                                         } else {
