@@ -13360,7 +13360,16 @@ fn is_interface_type(dt: &DataType, definitions: &HashMap<String, Definition>) -
             matches!(definitions.get(&name.name.name), Some(Definition::Interface(_)))
         }
         DataType::Interface { name, .. } => {
-            matches!(definitions.get(&name.name), Some(Definition::Interface(_)))
+            // §25.3.2 generic interface port — `module m(interface b);`. The
+            // parser records the keyword itself as the name because no
+            // interface is named at the port; `interface` is reserved, so it
+            // cannot collide with a real one. Without this the port was routed
+            // as an ordinary data port and its connection went through the
+            // value port map: `b.data` became `<conn>.data`, which resolves to
+            // nothing once the connection carries a modport suffix
+            // (`g.tx.data`), so every write through the port vanished.
+            name.name == "interface"
+                || matches!(definitions.get(&name.name), Some(Definition::Interface(_)))
         }
         _ => false,
     }
