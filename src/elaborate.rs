@@ -16001,6 +16001,36 @@ fn inline_module_items(
                                 }
                                 if let Some((lo, hi)) = array_range {
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
+                                    // The ELEMENT type of a child array — the
+                                    // top-level path records one and every
+                                    // type-directed operation needs it
+                                    // (`arr[i] = '{...}` resolves the element
+                                    // struct through it).
+                                    elab.var_decl_types
+                                        .entry(sig_name.clone())
+                                        .or_insert_with(|| dd.data_type.clone());
+                                    // §7.2: an array of UNPACKED structs stores
+                                    // each element member-wise, exactly as the
+                                    // top-level path registers it. Without this
+                                    // the child's elements were packed vectors
+                                    // with no member leaves, so `arr[i].m = v`
+                                    // wrote somewhere the read never looked
+                                    // (`arr[i].m` came back x) — while the same
+                                    // declaration at top level was correct.
+                                    if let DataType::Struct(su) =
+                                        resolve_typedef_chain(&dd.data_type, &elab.typedef_types).clone()
+                                    {
+                                        if !su.packed
+                                            && !(matches!(su.kind, StructUnionKind::Union) && !su.tagged)
+                                            && hi >= lo
+                                            && (hi - lo) < 4096
+                                        {
+                                            for i in lo..=hi {
+                                                let ebase = format!("{}[{}]", sig_name, i);
+                                                register_unpacked_aggregate(elab, &ebase, &dd.data_type);
+                                            }
+                                        }
+                                    }
                                     if is_type_two_state_resolved(&dd.data_type, &elab.typedef_types) {
                                         elab.two_state_signals.insert(sig_name.clone());
                                     }
