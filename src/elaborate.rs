@@ -16046,6 +16046,46 @@ fn inline_module_items(
                                             eval_init_for_width(init_expr, &sub_merged_params, width)
                                         }
                                     } else { default_value_for_type_resolved(&dd.data_type, width, &elab.typedef_types) };
+                                    // §7.2: an UNPACKED struct is per-member
+                                    // storage, not one packed vector. The child
+                                    // path registered a single packed signal, so
+                                    // no member leaves existed: a member write
+                                    // created an ad-hoc runtime entry and a
+                                    // member read of an unwritten struct fell
+                                    // through the suffix scan into ANOTHER
+                                    // struct's member — two distinct variables
+                                    // silently shared storage. Register the
+                                    // member signals the way the top-level path
+                                    // does, and skip the packed signal.
+                                    let unpacked_struct_decl = match resolve_typedef_chain(
+                                        &dd.data_type,
+                                        &elab.typedef_types,
+                                    ) {
+                                        DataType::Struct(su) => {
+                                            !su.packed
+                                                && !(matches!(su.kind, StructUnionKind::Union)
+                                                    && !su.tagged)
+                                        }
+                                        _ => false,
+                                    };
+                                    if unpacked_struct_decl {
+                                        register_unpacked_aggregate(elab, &sig_name, &dd.data_type);
+                                        elab.var_decl_types
+                                            .insert(sig_name.clone(), dd.data_type.clone());
+                                        continue;
+                                    }
+                                    // The declared type of a SCALAR child
+                                    // declaration. Only the array/collection
+                                    // branches above recorded one, so an
+                                    // unpacked STRUCT in an instance had no
+                                    // type on file and every type-directed
+                                    // path missed it — `s = '{a:1, b:2}` found
+                                    // no aggregate to spread into and left the
+                                    // members x, while the same declaration at
+                                    // top level worked.
+                                    elab.var_decl_types
+                                        .entry(sig_name.clone())
+                                        .or_insert_with(|| dd.data_type.clone());
                                     elab.signals.insert(sig_name.clone(), Signal { is_const: dd.const_kw,
                                         name: sig_name, width, is_signed,
                                         direction: None, value: init_val,
