@@ -2553,6 +2553,34 @@ fn collect_global_constraint_names(
     }
 }
 
+/// §8.20/§18.5: the definition map a class declared in a MODULE body must be
+/// validated against. A nested class's base is a `ModuleItem::ClassDeclaration`
+/// of the same body, not a top-level definition, so resolving `extends` through
+/// `all_defs` alone never found it: the base's properties never joined the
+/// allowed set and a derived constraint referring to an INHERITED property was
+/// rejected outright ("Undeclared identifier"), aborting the whole simulation.
+/// The identical code at $unit or package scope was accepted, which is what
+/// made it look like a constraint bug rather than a scoping one.
+fn defs_with_local_classes<'a>(
+    items: &'a [ModuleItem],
+    all_defs: Option<&HashMap<String, Definition<'a>>>,
+) -> Option<HashMap<String, Definition<'a>>> {
+    let mut local: Vec<(&'a str, &'a crate::ast::decl::ClassDeclaration)> = Vec::new();
+    for it in items {
+        if let ModuleItem::ClassDeclaration(cd) = it {
+            local.push((cd.name.name.as_str(), cd));
+        }
+    }
+    if local.is_empty() {
+        return None;
+    }
+    let mut merged: HashMap<String, Definition<'a>> = all_defs.cloned().unwrap_or_default();
+    for (n, cd) in local {
+        merged.entry(n.to_string()).or_insert(Definition::Class(cd));
+    }
+    Some(merged)
+}
+
 fn validate_class_constraints(
     c: &ClassDeclaration,
     all_defs: Option<&HashMap<String, Definition>>,
@@ -3298,6 +3326,10 @@ pub fn elaborate_module_with_defs(
         }
     }
 
+    // Classes declared in THIS module body must be visible to each other's
+    // `extends` when their constraints are validated.
+    let local_defs = defs_with_local_classes(module.items(), all_defs);
+    let cls_defs = local_defs.as_ref().or(all_defs);
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -5348,7 +5380,7 @@ pub fn elaborate_module_with_defs(
                 elab.clocking_blocks.insert(cd.name.name.clone(), cd_owned);
             }
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd, all_defs, Some(&elab.enum_members), Some(&elab))?;
+                validate_class_constraints(cd, cls_defs, Some(&elab.enum_members), Some(&elab))?;
                 // Class-body enum typedef members are class constants; without
                 // this, `CB` in a method and `box::CB` both read x for classes
                 // declared in a MODULE body (package/$unit classes already
@@ -8080,6 +8112,9 @@ fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
 /// Helper: process a slice of module items into the elaborated module.
 /// This is extracted so it can be called recursively for generate regions.
 fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
+    // Classes declared in THIS body must be visible to each other's `extends`.
+    let local_defs = defs_with_local_classes(items, all_defs);
+    let cls_defs = local_defs.as_ref().or(all_defs);
     for item in items {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -8509,7 +8544,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
 
             ModuleItem::ClassDeclaration(cd) => {
-                validate_class_constraints(cd, all_defs, Some(&elab.enum_members), Some(&elab))?;
+                validate_class_constraints(cd, cls_defs, Some(&elab.enum_members), Some(&elab))?;
                 // Class-body enum typedef members are class constants; without
                 // this, `CB` in a method and `box::CB` both read x for classes
                 // declared in a MODULE body (package/$unit classes already
