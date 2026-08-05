@@ -11649,6 +11649,23 @@ fn register_unpacked_aggregate(elab: &mut ElaboratedModule, base: &str, dt: &Dat
                 &normalize_unpacked_dims(&mdecl.dimensions, &elab.parameters, &elab.typedef_types),
                 &elab.parameters,
             ) {
+                // §7.4.2: the member is an ARRAY — record its bounds so
+                // `s.arr[i]` is an ELEMENT select. Only the per-element leaves
+                // were registered here; without the bounds the index degraded
+                // to a bit-select of a 1-bit unknown, so a struct with an array
+                // member read x for every element inside an instance (the
+                // top-level declaration got these bounds elsewhere).
+                if let (Some(&f), Some(&l)) = (idxs.first(), idxs.last()) {
+                    let ew = resolve_type_width(
+                        &member.data_type,
+                        Some(&elab.parameters),
+                        Some(&elab.typedefs),
+                    )
+                    .max(1);
+                    elab.arrays
+                        .entry(mbase.clone())
+                        .or_insert((f.min(l), f.max(l), ew));
+                }
                 for i in idxs {
                     register_member_leaf(elab, &format!("{}[{}]", mbase, i), &member.data_type);
                 }
