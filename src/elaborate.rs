@@ -14422,6 +14422,12 @@ fn inline_module_items(
                 let __th = std::time::Instant::now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                // §6.8: child-module declaration initializers that are NOT
+                // constant expressions are deferred to an initial-block
+                // assignment (mirroring the top-level path). Collected during
+                // the declaration walk below and emitted once the instance's
+                // rewrite context exists.
+                let mut deferred_decl_inits: Vec<(String, Expression)> = Vec::new();
                 if elab_trace_enabled() {
                     eprintln!(
                         "[xezim][elab] inline instance path='{}' target='{}'",
@@ -16017,7 +16023,21 @@ fn inline_module_items(
                                     // prefix, while the identical declaration
                                     // in the top module was correct).
                                     let init_val = if let Some(init_expr) = &decl.init {
-                                        if matches!(
+                                        // An initializer that is NOT a constant
+                                        // expression reads a sibling VARIABLE
+                                        // (`string cmd = $sformatf("%s", dir);`,
+                                        // `int m = n + 1;`). The parameter map
+                                        // holds no variables, so const-folding it
+                                        // here silently produced 0 / "" — while
+                                        // the identical declaration at top level
+                                        // was correct. Defer it to an
+                                        // initial-block assignment exactly as the
+                                        // top-level declaration path does.
+                                        if !is_const_expr(init_expr, &sub_merged_params) {
+                                            deferred_decl_inits
+                                                .push((sig_name.clone(), init_expr.clone()));
+                                            default_value_for_type_resolved(&dd.data_type, width, &elab.typedef_types)
+                                        } else if matches!(
                                             &dd.data_type,
                                             DataType::Simple { kind: SimpleType::String, .. }
                                         ) {
@@ -16177,6 +16197,52 @@ fn inline_module_items(
                     interface_map: sub_interface_map.clone(),
                     type_binds: pend_type_binds,
                 });
+
+                // §6.8: the deferred (non-constant) declaration initializers of
+                // this instance, in DECLARATION ORDER and ahead of the
+                // instance's own initial blocks (pushed further below). One
+                // SeqBlock keeps the order; the LHS is already the
+                // instance-qualified signal, the RHS is rewritten into the
+                // instance scope so sibling references resolve.
+                if !deferred_decl_inits.is_empty() {
+                    let stmts: Vec<Statement> = deferred_decl_inits
+                        .drain(..)
+                        .map(|(target, init_expr)| {
+                            let rhs = rewrite_expr(
+                                &init_expr,
+                                &inst_prefix,
+                                &rewrite_port_map,
+                                &prepared_sub.local_names,
+                                &sub_interface_map,
+                            );
+                            Statement::new(
+                                StatementKind::BlockingAssign {
+                                    lvalue: make_ident_expr(&target),
+                                    rvalue: rhs,
+                                },
+                                Span::dummy(),
+                            )
+                        })
+                        .collect();
+                    // §6.8: "variable declaration assignments ... shall occur
+                    // before any initial or always block is started", so this
+                    // goes on the STATIC-init list, which the simulator
+                    // schedules ahead of every initial block. Using
+                    // `initial_blocks` was not enough: an inlined child's own
+                    // blocks travel via `pending_initial`, which is chained
+                    // FIRST, so the initializer landed after the code reading it.
+                    // Both sides are already instance-qualified (LHS is
+                    // `sig_name`, RHS went through `rewrite_expr`), so the block
+                    // carries NO scope — a scope would look for
+                    // `<inst>.<inst>.name`.
+                    elab.static_init_blocks.push(InitialBlock {
+                        stmt: Statement::new(
+                            StatementKind::SeqBlock { name: None, stmts },
+                            Span::dummy(),
+                        ),
+                        scope: String::new(),
+                    });
+                }
 
                 // A task/function formal whose width uses a MODULE PARAMETER
                 // (`input [word_width-1:0] d`) must have that parameter baked in
