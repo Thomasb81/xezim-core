@@ -18832,6 +18832,20 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
             condition: rewrite_expr(condition, prefix, port_map, local_names, interface_map),
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
         },
+        // §12.7.3: a `foreach` in an inlined child. Without an arm here the
+        // statement passed through UNREWRITTEN, so both the array expression
+        // and every name in the body kept the child's bare form. The runtime's
+        // scope-hint fallbacks rescued the loop bounds and the writes, which is
+        // why the loop ran and the array filled correctly — but a READ of the
+        // array inside the body resolves through the base name, which no hint
+        // reaches, so it returned x while the identical read outside the loop
+        // was fine. The loop VARIABLES stay untouched: they are declared by the
+        // foreach itself, not inherited from the child's scope.
+        StatementKind::Foreach { array, vars, body } => StatementKind::Foreach {
+            array: rewrite_expr(array, prefix, port_map, local_names, interface_map),
+            vars: vars.clone(),
+            body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
+        },
         StatementKind::Repeat { count, body } => StatementKind::Repeat {
             count: rewrite_expr(count, prefix, port_map, local_names, interface_map),
             body: Box::new(rewrite_stmt(body, prefix, port_map, local_names, interface_map)),
