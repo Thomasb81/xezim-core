@@ -77,7 +77,15 @@ impl Parser {
     pub(super) fn parse_identifier(&mut self) -> Identifier {
         let tok = self.current().clone();
         match tok.kind {
-            TokenKind::Identifier | TokenKind::EscapedIdentifier => {
+            TokenKind::EscapedIdentifier => {
+                self.bump();
+                // IEEE 1800-2017 §5.6.1: an escaped identifier (`\cpu3 `) is the
+                // same identifier as the nonescaped spelling (`cpu3`). Strip the
+                // leading backslash so both forms resolve to one symbol.
+                let name = tok.text.strip_prefix('\\').unwrap_or(&tok.text).to_string();
+                Identifier { name, span: tok.span }
+            }
+            TokenKind::Identifier => {
                 self.bump();
                 Identifier { name: tok.text, span: tok.span }
             }
