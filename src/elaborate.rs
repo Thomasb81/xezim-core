@@ -16598,10 +16598,30 @@ fn inline_module_items(
                         for s in &new_cd.signals {
                             dirs.insert(s.name.name.clone(), s.direction);
                         }
-                        elab.clocking_signal_dirs
-                            .insert(new_cd.name.name.clone(), dirs);
-                        elab.clocking_blocks
-                            .insert(new_cd.name.name.clone(), new_cd);
+                        // §14.12: a standalone `default clocking <name>;` is an
+                        // empty, clock-less marker. Both module paths fold it
+                        // into the real same-named block; this instance path did
+                        // not, so the marker OVERWROTE the real block and every
+                        // clocking access through the interface became x — one
+                        // innocuous line disabling the whole block.
+                        let is_designation = new_cd.clock_signal.is_none()
+                            && new_cd.signals.is_empty()
+                            && new_cd.is_default;
+                        if is_designation {
+                            if let Some(existing) =
+                                elab.clocking_blocks.get_mut(&new_cd.name.name)
+                            {
+                                existing.is_default = true;
+                            } else {
+                                elab.clocking_blocks
+                                    .insert(new_cd.name.name.clone(), new_cd);
+                            }
+                        } else {
+                            elab.clocking_signal_dirs
+                                .insert(new_cd.name.name.clone(), dirs);
+                            elab.clocking_blocks
+                                .insert(new_cd.name.name.clone(), new_cd);
+                        }
                     }
                     if matches!(sub_item, ModuleItem::ContinuousAssign(_)) {
                         // #7: Rc-share source ASTs across sibling instances.
