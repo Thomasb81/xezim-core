@@ -47,6 +47,20 @@ pub fn delay_select() -> u8 {
     DELAY_SELECT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Reserved storage name for a compilation-unit (`$unit`) declaration that a
+/// module SHADOWS with a declaration of its own (§3.12.1). The two are
+/// distinct objects, but the elaborated namespace is flat, so the $unit copy
+/// is kept under this name — which no user identifier can spell — and
+/// `$unit::name` resolves to it.
+pub fn unit_scope_name(name: &str) -> String {
+    format!("$unit::{}", name)
+}
+
+/// The bare name behind [`unit_scope_name`], or `None` for anything else.
+pub fn strip_unit_scope_name(name: &str) -> Option<&str> {
+    name.strip_prefix("$unit::")
+}
+
 pub fn set_sv2023(enabled: bool) {
     SV2023_ENABLED.store(enabled, Ordering::Relaxed);
 }

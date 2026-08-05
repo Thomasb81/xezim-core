@@ -1230,6 +1230,11 @@ pub struct ElaboratedModule {
     /// 2D unpacked arrays: name -> ((dim1_lo,dim1_hi),(dim2_lo,dim2_hi),elem_width).
     pub arrays_2d: HashMap<String, ((i64, i64), (i64, i64), u32)>,
     pub packages: HashSet<String>,
+    /// §26.3: declaring package of each package-scope subroutine's BARE key
+    /// (`name` → `pkg`). Used by the runtime to keep a bare sibling call from
+    /// inside a package subroutine in ITS package when two packages contest
+    /// the name.
+    pub pkg_subr_owner: HashMap<String, String>,
     /// Names of declared sequences and properties (so `@name` event control resolves).
     pub sequences: HashSet<String>,
     /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
@@ -1626,6 +1631,7 @@ impl ElaboratedModule {
             queue_max_sizes: HashMap::default(),
             arrays_2d: HashMap::default(),
             packages: HashSet::default(),
+            pkg_subr_owner: HashMap::default(),
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
             var_decl_types: HashMap::default(),
@@ -2566,9 +2572,26 @@ pub fn elaborate_module_with_defs(
                         match item {
                             crate::ast::decl::PackageItem::Function(f) if f.name.scope.is_none() => {
                                 elab.functions.entry(f.name.name.name.clone()).or_insert_with(|| f.clone());
+                                // §26.3: the qualified key — `pkg::f(...)` must
+                                // reach THIS package's declaration even when a
+                                // later package hoists the same bare name.
+                                elab.functions.insert(
+                                    format!("{}::{}", p.name.name, f.name.name.name),
+                                    f.clone(),
+                                );
+                                elab.pkg_subr_owner
+                                    .entry(f.name.name.name.clone())
+                                    .or_insert_with(|| p.name.name.clone());
                             }
                             crate::ast::decl::PackageItem::Task(t) if t.name.scope.is_none() => {
                                 elab.tasks.entry(t.name.name.name.clone()).or_insert_with(|| t.clone());
+                                elab.tasks.insert(
+                                    format!("{}::{}", p.name.name, t.name.name.name),
+                                    t.clone(),
+                                );
+                                elab.pkg_subr_owner
+                                    .entry(t.name.name.name.clone())
+                                    .or_insert_with(|| p.name.name.clone());
                             }
                             // §26.3: register package classes by name so an
                             // (imported or scoped) reference like
@@ -17974,6 +17997,22 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
         ExprKind::Ident(hier) => {
             if hier.root.is_some() { return expr.clone(); }
             if hier.path.is_empty() { return expr.clone(); }
+            // §3.12.1: `$unit::x` carries the qualifier as the reserved name
+            // `$unit::x`, which only EXISTS in a scope that shadows `x` with a
+            // declaration of its own. Where nothing shadows it the $unit
+            // variable was injected under its plain name, so drop the
+            // qualifier and let the normal port-map / local-name handling
+            // below bind (and prefix) it like any other reference.
+            if !local_names.contains(hier.path[0].name.name.as_str()) {
+                if let Some(bare) = crate::sv_parser::strip_unit_scope_name(&hier.path[0].name.name) {
+                    let mut new_hier = hier.clone();
+                    new_hier.path[0].name.name = bare.to_string();
+                    new_hier.cached_signal_id = std::cell::Cell::new(None);
+                    new_hier.cached_resolved_name = std::cell::OnceCell::new();
+                    let bare_expr = Expression::new(ExprKind::Ident(new_hier), expr.span);
+                    return rewrite_expr_impl(&bare_expr, prefix, port_map, local_names, interface_map);
+                }
+            }
             let name = &hier.path[0].name.name;
             if let Some(if_prefix) = interface_map.get(name) {
                 let mut new_hier = hier.clone();
@@ -17991,12 +18030,37 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                 if !has_tail {
                     return mapped.clone();
                 }
+                // Graft only when the mapped target's last segment carries NO
+                // selects of its own: stacking the port reference's select
+                // after a part-select connection (`.p(arr[15:0])` used as
+                // `p[11]`) makes `arr[15:0][11]` read as bit-11-of-a-16-bit-
+                // slice instead of ELEMENT 11 (§11.5.1 keeps element labels).
+                // Selected connections fall through to the Index-node path
+                // below, which the evaluator normalizes correctly.
                 if let ExprKind::Ident(mut mhier) = mapped.kind.clone() {
                     // Graft seg0's selects onto the mapped target's last
                     // segment, then append the trailing segments verbatim
                     // (each keeps its own selects).
                     if !hier.path[0].selects.is_empty() {
                         if let Some(last) = mhier.path.last_mut() {
+                            // §11.5.1: a constant part-select keeps the
+                            // original labels, so indexing THROUGH a ranged
+                            // connection selects the same element of the
+                            // underlying signal: `p[11]` over `.p(arr[15:0])`
+                            // is `arr[11]`. Stacking the selects instead
+                            // (`arr[15:0][11]`) read bit 11 of a 16-bit
+                            // slice — a one-hot arbiter granted element 0
+                            // forever. Drop the redundant range before
+                            // grafting an index select.
+                            if last.selects.len() == 1
+                                && matches!(last.selects[0].kind, ExprKind::Range(..))
+                                && !hier.path[0]
+                                    .selects
+                                    .iter()
+                                    .any(|s| matches!(s.kind, ExprKind::Range(..)))
+                            {
+                                last.selects.clear();
+                            }
                             last.selects.extend(hier.path[0].selects.iter().cloned());
                         }
                     }
@@ -18005,14 +18069,49 @@ fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String,
                     }
                     return Expression::new(ExprKind::Ident(mhier), expr.span);
                 }
-                // Non-ident mapped target (e.g. an Index/concat connection):
-                // rebuild the trailing member chain as MemberAccess.
+                // Non-ident mapped target (e.g. an Index/part-select/concat
+                // connection): rebuild the reference over the mapped
+                // expression. Every segment's SELECTS must be preserved as
+                // Index nodes — dropping them turned `p[11]` through a
+                // `.p(arr[15:0])` connection into plain `arr[15:0]`, which
+                // reads ELEMENT 0 instead of element 11 (a one-hot arbiter
+                // granted bank 0 forever).
                 let mut acc = mapped.clone();
+                for sel in &hier.path[0].selects {
+                    acc = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(acc),
+                            index: Box::new(rewrite_expr_impl(
+                                sel,
+                                prefix,
+                                port_map,
+                                local_names,
+                                interface_map,
+                            )),
+                        },
+                        expr.span,
+                    );
+                }
                 for seg in &hier.path[1..] {
                     acc = Expression::new(ExprKind::MemberAccess {
                         expr: Box::new(acc),
                         member: seg.name.clone(),
                     }, expr.span);
+                    for sel in &seg.selects {
+                        acc = Expression::new(
+                            ExprKind::Index {
+                                expr: Box::new(acc),
+                                index: Box::new(rewrite_expr_impl(
+                                    sel,
+                                    prefix,
+                                    port_map,
+                                    local_names,
+                                    interface_map,
+                                )),
+                            },
+                            expr.span,
+                        );
+                    }
                 }
                 return acc;
             }
@@ -18227,6 +18326,37 @@ fn substitute_type_params_stmt(
 /// Named blocks are left alone: their locals are hierarchically referenceable
 /// (§23.9) and must keep their spelling. Returns None when there is nothing
 /// to rename.
+/// Substitute bare identifier references (`name` → `replacement`) throughout a
+/// statement, using the inlining rewriter (selects, member tails and event
+/// controls all handled). Used for §3.12.1: a $unit subroutine injected into a
+/// module that SHADOWS a $unit variable must keep its body's references bound
+/// to the $unit copy, not the module's shadow.
+pub fn substitute_bare_idents_stmt(
+    stmt: &Statement,
+    map: &std::collections::HashMap<String, String>,
+) -> Statement {
+    let mut port_map: HashMap<String, Expression> = HashMap::default();
+    for (from, to) in map {
+        let hier = crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path: vec![crate::ast::expr::HierPathSegment {
+                name: crate::ast::Identifier {
+                    name: to.clone(),
+                    span: stmt.span,
+                },
+                selects: Vec::new(),
+            }],
+            span: stmt.span,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        port_map.insert(from.clone(), Expression::new(ExprKind::Ident(hier), stmt.span));
+    }
+    let empty_locals: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let empty_iface: HashMap<String, String> = HashMap::default();
+    rewrite_stmt(stmt, "", &port_map, &empty_locals, &empty_iface)
+}
+
 pub fn rename_process_shadowed_locals(
     stmt: &Statement,
     module_names: &std::collections::HashSet<String>,
@@ -18445,6 +18575,15 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
             stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
             join_type: *join_type,
         },
+
+
+        // A subroutine body usually ENDS in `return <expr>` — leaving it
+        // unrewritten silently bound the returned name to the wrong scope
+        // (an inlined instance's function returned the caller-scope variable;
+        // a $unit subroutine returned the module's shadow).
+        StatementKind::Return(Some(expr)) => StatementKind::Return(Some(
+            rewrite_expr(expr, prefix, port_map, local_names, interface_map),
+        )),
         other => other.clone(),
     };
     Statement::new(new_kind, stmt.span)
@@ -18814,12 +18953,20 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         PackageItem::Function(fd)
                             if &fd.name.name.name == sym_name && fd.name.scope.is_none() => {
                                 elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                                elab.functions
+                                    .insert(format!("{}::{}", pkg_name, fd.name.name.name), fd.clone());
+                                elab.pkg_subr_owner
+                                    .insert(fd.name.name.name.clone(), pkg_name.clone());
                                 elab.func_decl_scope.insert(fd.name.name.name.clone(), pkg_name.clone());
                                 found = true;
                             }
                         PackageItem::Task(td)
                             if &td.name.name.name == sym_name && td.name.scope.is_none() => {
                                 elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                                elab.tasks
+                                    .insert(format!("{}::{}", pkg_name, td.name.name.name), td.clone());
+                                elab.pkg_subr_owner
+                                    .insert(td.name.name.name.clone(), pkg_name.clone());
                                 elab.func_decl_scope.insert(td.name.name.name.clone(), pkg_name.clone());
                                 found = true;
                             }
@@ -19003,10 +19150,18 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         PackageItem::Function(fd) if fd.name.scope.is_none() => {
                             elab.func_decl_scope.insert(fd.name.name.name.clone(), pkg_name.clone());
                             elab.functions.insert(fd.name.name.name.clone(), fd.clone());
+                            elab.functions
+                                .insert(format!("{}::{}", pkg_name, fd.name.name.name), fd.clone());
+                            elab.pkg_subr_owner
+                                .insert(fd.name.name.name.clone(), pkg_name.clone());
                         }
                         PackageItem::Task(td) if td.name.scope.is_none() => {
                             elab.func_decl_scope.insert(td.name.name.name.clone(), pkg_name.clone());
                             elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                            elab.tasks
+                                .insert(format!("{}::{}", pkg_name, td.name.name.name), td.clone());
+                            elab.pkg_subr_owner
+                                .insert(td.name.name.name.clone(), pkg_name.clone());
                         }
                         PackageItem::DPIImport(di) => {
                             register_dpi_import(di, elab)?;

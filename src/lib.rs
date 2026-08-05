@@ -775,6 +775,52 @@ pub fn parse_and_elaborate_multi(
     Ok((defs, elab))
 }
 
+/// Every name a module declares in its OWN scope: ports, nets, variables,
+/// parameters and genvars. Used to decide whether a compilation-unit (`$unit`)
+/// declaration is shadowed here (§3.12.1) — items nested in a generate region
+/// or a subroutine belong to an inner scope and are deliberately not counted.
+fn module_declared_names(m: &ast::module::ModuleDeclaration) -> std::collections::HashSet<String> {
+    use ast::decl::{ModuleItem, ParameterKind};
+    let mut names: std::collections::HashSet<String> = std::collections::HashSet::new();
+    match &m.ports {
+        ast::module::PortList::Ansi(ports) => {
+            names.extend(ports.iter().map(|p| p.name.name.clone()));
+        }
+        ast::module::PortList::NonAnsi(ids) => {
+            names.extend(ids.iter().map(|i| i.name.clone()));
+        }
+        ast::module::PortList::Empty => {}
+    }
+    for p in &m.params {
+        if let ParameterKind::Data { assignments, .. } = &p.kind {
+            names.extend(assignments.iter().map(|a| a.name.name.clone()));
+        }
+    }
+    for it in &m.items {
+        match it {
+            ModuleItem::PortDeclaration(pd) => {
+                names.extend(pd.declarators.iter().map(|d| d.name.name.clone()));
+            }
+            ModuleItem::NetDeclaration(nd) => {
+                names.extend(nd.declarators.iter().map(|d| d.name.name.clone()));
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                names.extend(dd.declarators.iter().map(|d| d.name.name.clone()));
+            }
+            ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => {
+                if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                    names.extend(assignments.iter().map(|a| a.name.name.clone()));
+                }
+            }
+            ModuleItem::GenvarDeclaration(gd) => {
+                names.extend(gd.names.iter().map(|n| n.name.clone()));
+            }
+            _ => {}
+        }
+    }
+    names
+}
+
 fn parse_and_elaborate(
     all_descriptions: Vec<ast::Description>,
     top_module_name: Option<&str>,
@@ -1087,47 +1133,129 @@ fn parse_and_elaborate(
         for def in definitions.values_mut() {
             if let SourceDefinition::Module(m) = def {
                 let m = Rc::make_mut(m);
+                // What this module declares ITSELF, captured before anything is
+                // injected — a name in here shadows the $unit declaration of
+                // the same name (§3.12.1), see the variable injection below.
+                let local_decl_names: std::collections::HashSet<String> =
+                    module_declared_names(m);
+                // §3.12.1: a $unit subroutine's body resolves its free names
+                // in $UNIT scope. When this module SHADOWS a $unit variable,
+                // the shadowed copy is injected under the reserved
+                // `$unit::<name>` (see the variable injection below) — rewrite
+                // the injected body to reference THAT, or the subroutine would
+                // silently read/write the module's shadow instead.
+                let shadowed_unit_vars: std::collections::HashMap<String, String> =
+                    top_level_vars
+                        .iter()
+                        .flat_map(|d| d.declarators.iter())
+                        .filter(|v| local_decl_names.contains(&v.name.name))
+                        .map(|v| {
+                            (
+                                v.name.name.clone(),
+                                sv_parser::unit_scope_name(&v.name.name),
+                            )
+                        })
+                        .collect();
+                let subst_body = |items: &[ast::stmt::Statement],
+                                  ports: &[ast::decl::FunctionPort]|
+                 -> Option<Vec<ast::stmt::Statement>> {
+                    if shadowed_unit_vars.is_empty() {
+                        return None;
+                    }
+                    // A formal or body-local of the same name re-shadows —
+                    // drop those from the substitution for this subroutine.
+                    let mut map = shadowed_unit_vars.clone();
+                    for p in ports {
+                        map.remove(&p.name.name);
+                    }
+                    for it in items {
+                        if let ast::stmt::StatementKind::VarDecl { declarators, .. } = &it.kind {
+                            for d in declarators {
+                                map.remove(&d.name.name);
+                            }
+                        }
+                    }
+                    if map.is_empty() {
+                        return None;
+                    }
+                    Some(
+                        items
+                            .iter()
+                            .map(|s| elaborate::substitute_bare_idents_stmt(s, &map))
+                            .collect(),
+                    )
+                };
                 for f in top_level_functions.iter().rev() {
-                    m.items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f.clone()));
+                    let mut f = f.clone();
+                    if let Some(items) = subst_body(&f.items, &f.ports) {
+                        f.items = items;
+                    }
+                    m.items.insert(0, ast::decl::ModuleItem::FunctionDeclaration(f));
                 }
                 for t in top_level_tasks.iter().rev() {
-                    m.items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t.clone()));
+                    let mut t = t.clone();
+                    if let Some(items) = subst_body(&t.items, &t.ports) {
+                        t.items = items;
+                    }
+                    m.items.insert(0, ast::decl::ModuleItem::TaskDeclaration(t));
                 }
                 for n in top_level_nettypes.iter().rev() {
                     m.items.insert(0, ast::decl::ModuleItem::NettypeDeclaration(n.clone()));
                 }
                 // $unit-scope parameters become body localparams (constants):
                 // visible inside the module, not part of its override interface.
-                // A module-local parameter/localparam of the same name SHADOWS
-                // the $unit one (LRM §3.12.1 name resolution) — skip injecting
-                // any $unit param the module already declares, else the two
-                // collide as a "Duplicate declaration".
-                let local_param_names: std::collections::HashSet<String> = m.items.iter()
-                    .filter_map(|it| match it {
-                        ast::decl::ModuleItem::ParameterDeclaration(pd)
-                        | ast::decl::ModuleItem::LocalparamDeclaration(pd) => Some(pd),
-                        _ => None,
-                    })
-                    .flat_map(|pd| match &pd.kind {
-                        ast::decl::ParameterKind::Data { assignments, .. } =>
-                            assignments.iter().map(|a| a.name.name.clone()).collect::<Vec<_>>(),
-                        _ => Vec::new(),
-                    })
-                    .collect();
+                // A module-local declaration of the same name SHADOWS the $unit
+                // one (LRM §3.12.1 name resolution) — skip injecting any $unit
+                // param the module already declares, else the two collide as a
+                // "Duplicate declaration". The skip is per DECLARATOR: with
+                // `localparam int A = 1, B = 2;` at $unit scope and a module
+                // declaring only `B`, dropping the whole declaration would have
+                // lost `A` and keeping it re-declared `B`.
                 for p in top_level_params.iter().rev() {
-                    let shadowed = match &p.kind {
-                        ast::decl::ParameterKind::Data { assignments, .. } =>
-                            assignments.iter().all(|a| local_param_names.contains(&a.name.name)),
-                        _ => false,
-                    };
-                    if shadowed { continue; }
-                    m.items.insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p.clone()));
+                    let mut p = p.clone();
+                    if let ast::decl::ParameterKind::Data { assignments, .. } = &mut p.kind {
+                        assignments.retain(|a| !local_decl_names.contains(&a.name.name));
+                        if assignments.is_empty() { continue; }
+                    }
+                    m.items.insert(0, ast::decl::ModuleItem::LocalparamDeclaration(p));
                 }
                 // $unit-scope variables (`string label = "X";`) become module
                 // signals so references — including from class methods
                 // validated against this module — resolve.
+                //
+                // §3.12.1: a module-local declaration of the same name SHADOWS
+                // the $unit variable — they are two DISTINCT objects. Injecting
+                // the $unit copy verbatim collided with the module's own
+                // declaration ("duplicate declaration of 'gv'"). A shadowed
+                // $unit variable is instead injected under the reserved name
+                // `$unit::<name>`, which is what a qualified `$unit::gv`
+                // reference resolves to; the module's own `gv` keeps the bare
+                // name, so the two no longer share one storage slot.
                 for d in top_level_vars.iter().rev() {
-                    m.items.insert(0, ast::decl::ModuleItem::DataDeclaration(d.clone()));
+                    if !d.declarators.iter().any(|v| local_decl_names.contains(&v.name.name)) {
+                        m.items.insert(0, ast::decl::ModuleItem::DataDeclaration(d.clone()));
+                        continue;
+                    }
+                    // `int a, b;` where only `b` is shadowed: split the
+                    // declaration so each declarator lands under the right name.
+                    let (shadowed, plain): (Vec<_>, Vec<_>) = d
+                        .declarators
+                        .iter()
+                        .cloned()
+                        .partition(|v| local_decl_names.contains(&v.name.name));
+                    if !shadowed.is_empty() {
+                        let mut dd = d.clone();
+                        dd.declarators = shadowed;
+                        for v in dd.declarators.iter_mut() {
+                            v.name.name = sv_parser::unit_scope_name(&v.name.name);
+                        }
+                        m.items.insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
+                    }
+                    if !plain.is_empty() {
+                        let mut dd = d.clone();
+                        dd.declarators = plain;
+                        m.items.insert(0, ast::decl::ModuleItem::DataDeclaration(dd));
+                    }
                 }
             }
         }

@@ -1059,6 +1059,32 @@ impl Parser {
                 Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
             }
 
+            // IEEE 1800-2023 §3.12.1 / §22.4: `$unit::name` is a QUALIFIED
+            // reference to a compilation-unit declaration, not a system call —
+            // the parser rejected it outright. A module that declares `name`
+            // itself shadows the $unit object, so the qualifier has to survive
+            // into the identifier: the compilation-unit copy is injected under
+            // the reserved name `$unit::name` wherever it is shadowed (see
+            // xezim-core/src/lib.rs), and resolution falls back to the bare
+            // name where it is not.
+            // A CALL (`$unit::f(...)`) keeps the bare name: $unit subroutines
+            // are injected into every module under their own name and are
+            // never shadow-renamed, so the qualifier has nothing to select.
+            TokenKind::SystemIdentifier
+                if self.current().text == "$unit"
+                    && self.peek_kind() == TokenKind::DoubleColon =>
+            {
+                self.bump(); // $unit
+                self.bump(); // ::
+                let mut hier = self.parse_hierarchical_identifier();
+                if !self.at(TokenKind::LParen) {
+                    if let Some(seg) = hier.path.first_mut() {
+                        seg.name.name = crate::unit_scope_name(&seg.name.name);
+                    }
+                }
+                Expression::new(ExprKind::Ident(hier), self.span_from(start))
+            }
+
             // System call: $display, etc.
             TokenKind::SystemIdentifier => {
                 let tok = self.bump();
