@@ -9258,9 +9258,17 @@ pub fn resolve_type_width(
             let mut member_count = 0u32;
             for member in &s.members {
                 let mw = resolve_type_width(&member.data_type, params, typedefs);
-                total += mw * member.declarators.len() as u32;
-                for _ in &member.declarators {
-                    if mw > max_w { max_w = mw; }
+                for mdecl in &member.declarators {
+                    // §7.4.2: an UNPACKED dimension on the member multiplies its
+                    // contribution — `logic [7:0] arr [3]` is 24 bits of the
+                    // struct, not 8. Counting one element made `$bits` of any
+                    // struct with an array member too small, and (worse) that
+                    // width sized the variable, so a return value was truncated
+                    // and the members laid out above the cut were lost.
+                    let n = unpacked_dims_elem_count(&mdecl.dimensions, params);
+                    let dw = mw.saturating_mul(n);
+                    total += dw;
+                    if dw > max_w { max_w = dw; }
                     member_count += 1;
                 }
             }
@@ -11436,6 +11444,36 @@ pub fn normalize_unpacked_dims(
 
 /// Constant element indices of a declarator's (single) unpacked dimension.
 /// Empty for a scalar; empty for dynamic/queue/associative (size unknown here).
+/// Element count of a declarator's FIXED unpacked dimensions (§7.4.2), for
+/// width computations. Dynamic / queue / associative dimensions have no static
+/// size and count as one, leaving the pre-existing behaviour for those.
+fn unpacked_dims_elem_count(
+    dims: &[UnpackedDimension],
+    params: Option<&HashMap<String, Value>>,
+) -> u32 {
+    let mut n: u32 = 1;
+    for d in dims {
+        let c = match d {
+            UnpackedDimension::Expression { expr, .. } => {
+                match const_eval_i64_with_params(expr, params) {
+                    Some(v) if v > 0 => v as u32,
+                    _ => 1,
+                }
+            }
+            UnpackedDimension::Range { left, right, .. } => match (
+                const_eval_i64_with_params(left, params),
+                const_eval_i64_with_params(right, params),
+            ) {
+                (Some(l), Some(r)) => ((l - r).abs() + 1) as u32,
+                _ => 1,
+            },
+            _ => 1,
+        };
+        n = n.saturating_mul(c.max(1));
+    }
+    n
+}
+
 fn const_dim_indices(
     dims: &[UnpackedDimension],
     params: &HashMap<String, Value>,
