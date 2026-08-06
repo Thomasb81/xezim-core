@@ -14576,6 +14576,28 @@ fn scope_local_typerefs(
     }
 }
 
+/// §23.10: prefix a port-connection path whose ROOT names a sibling instance
+/// of the module currently being inlined — see `sibling_inst_names` at the top
+/// of `inline_module_items`.
+fn qualify_sibling_conn(
+    path: String,
+    prefix: &str,
+    siblings: &std::collections::HashSet<String>,
+) -> String {
+    if prefix.is_empty() {
+        return path;
+    }
+    let root = path
+        .split(|c| c == '.' || c == '[')
+        .next()
+        .unwrap_or("");
+    if siblings.contains(root) {
+        format!("{}{}", prefix, path)
+    } else {
+        path
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -14590,6 +14612,21 @@ fn inline_module_items(
     pending_defparams: &[(Vec<String>, Value)],
 ) -> Result<(), String> {
     let prepared_source = prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
+    // §23.10: names of THIS module's own sub-instances. A port connection
+    // naming a SIBLING instance (`h_leaf lf(li.mp);` where `li` is the same
+    // module's interface instance) is not in `local_names`, so the inlining
+    // rewrite leaves it unprefixed — the connection then bound the port to a
+    // phantom top-level name and, e.g., a whole-struct write through it
+    // silently vanished for every NON-top instantiation of the module.
+    let sibling_inst_names: std::collections::HashSet<String> = prepared_source
+        .effective_items
+        .iter()
+        .filter_map(|it| match it {
+            ModuleItem::ModuleInstantiation(mi) => Some(mi),
+            _ => None,
+        })
+        .flat_map(|mi| mi.instances.iter().map(|hi| hi.name.name.clone()))
+        .collect();
     // Collect defparams: those propagated in from a parent scope, plus this
     // module's own `defparam` items (RHS evaluated in THIS scope, §23.10.1).
     let mut defparams: Vec<(Vec<String>, Value)> = pending_defparams.to_vec();
@@ -14862,6 +14899,11 @@ fn inline_module_items(
                                         if let Some(if_full_path) =
                                             iface_conn_path(&rewritten_e, local_params, definitions)
                                         {
+                                            let if_full_path = qualify_sibling_conn(
+                                                if_full_path,
+                                                prefix,
+                                                &sibling_inst_names,
+                                            );
                                             sub_interface_map.insert(name.name.clone(), if_full_path);
                                         }
                                     } else {
@@ -14912,6 +14954,11 @@ fn inline_module_items(
                                             if let Some(if_full_path) =
                                                 iface_conn_path(&rewritten_e, local_params, definitions)
                                             {
+                                                let if_full_path = qualify_sibling_conn(
+                                                    if_full_path,
+                                                    prefix,
+                                                    &sibling_inst_names,
+                                                );
                                                 sub_interface_map.insert(port_name.to_string(), if_full_path);
                                             }
                                         } else {
