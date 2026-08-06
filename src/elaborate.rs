@@ -14535,6 +14535,47 @@ fn defparam_path_segments(e: &Expression) -> Option<Vec<String>> {
     }
 }
 
+/// §6.18/§23.10: rename every bare `TypeReference` in `dt` that names one of
+/// `local_names` to its instance-scoped form `"<prefix><name>"`. A typedef
+/// stored under a scoped key still carried BARE member-type references, so a
+/// param-dependent struct's members resolved against whichever same-named
+/// typedef some OTHER instance registered last.
+fn scope_local_typerefs(
+    dt: &DataType,
+    local_names: &std::collections::HashSet<String>,
+    prefix: &str,
+) -> DataType {
+    match dt {
+        DataType::TypeReference { name, dimensions, type_args, span }
+            if name.scope.is_none() && local_names.contains(&name.name.name) =>
+        {
+            let mut nn = name.clone();
+            nn.name.name = format!("{}{}", prefix, name.name.name);
+            DataType::TypeReference {
+                name: nn,
+                dimensions: dimensions.clone(),
+                type_args: type_args.clone(),
+                span: *span,
+            }
+        }
+        DataType::Struct(su) => {
+            let mut s2 = su.clone();
+            for m in &mut s2.members {
+                m.data_type = scope_local_typerefs(&m.data_type, local_names, prefix);
+            }
+            DataType::Struct(s2)
+        }
+        DataType::Enum(e) => {
+            let mut e2 = e.clone();
+            if let Some(b) = &e.base_type {
+                e2.base_type = Some(Box::new(scope_local_typerefs(b, local_names, prefix)));
+            }
+            DataType::Enum(e2)
+        }
+        _ => dt.clone(),
+    }
+}
+
 fn inline_module_items(
     elab: &mut ElaboratedModule,
     source_def: Definition,
@@ -15521,6 +15562,16 @@ fn inline_module_items(
                 // Build the merged param map ONCE — used for both port-signal
                 // declaration and the later sub-item processing. Skip the
                 // parent clone when local_params is empty (top-level case).
+                // §6.18/§23.10: this sub-module's own typedef names — used to
+                // rename type references to their instance-scoped keys.
+                let sub_typedef_names_all: std::collections::HashSet<String> = prepared_sub
+                    .effective_items
+                    .iter()
+                    .filter_map(|it| match it {
+                        ModuleItem::TypedefDeclaration(td) => Some(td.name.name.clone()),
+                        _ => None,
+                    })
+                    .collect();
                 let sub_merged_params: HashMap<String, Value> = if local_params.is_empty() {
                     sub_local_params.clone()
                 } else if sub_local_params.is_empty() {
@@ -15820,9 +15871,30 @@ fn inline_module_items(
                             elab.typedef_types
                                 .entry(td.name.name.clone())
                                 .or_insert_with(|| td.data_type.clone());
+                            // §6.18/§23.10: the INSTANCE-scoped key. The bare
+                            // key is last-writer-wins across differently
+                            // parameterized instances of the same module, so a
+                            // subroutine signature resolved later by name read
+                            // the LAST instance's width — see below, where the
+                            // signature's type references are renamed to this
+                            // key.
+                            elab.typedefs
+                                .insert(format!("{}{}", inst_prefix, td.name.name), base_width);
+                            elab.typedef_types
+                                .entry(format!("{}{}", inst_prefix, td.name.name))
+                                .or_insert_with(|| {
+                                    scope_local_typerefs(
+                                        &td.data_type,
+                                        &sub_typedef_names_all,
+                                        &inst_prefix,
+                                    )
+                                });
                         } else {
                             let w = resolve_type_width(&td.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
                             elab.typedefs.insert(td.name.name.clone(), w);
+                            // Instance-scoped key — see the enum branch above.
+                            elab.typedefs
+                                .insert(format!("{}{}", inst_prefix, td.name.name), w);
                             // Register the TYPE too (not just its width) so a
                             // struct/union member access (`s.m0`) on a submodule
                             // variable of this typedef can resolve to its bit
@@ -15834,6 +15906,15 @@ fn inline_module_items(
                             elab.typedef_types
                                 .entry(td.name.name.clone())
                                 .or_insert_with(|| td.data_type.clone());
+                            elab.typedef_types
+                                .entry(format!("{}{}", inst_prefix, td.name.name))
+                                .or_insert_with(|| {
+                                    scope_local_typerefs(
+                                        &td.data_type,
+                                        &sub_typedef_names_all,
+                                        &inst_prefix,
+                                    )
+                                });
                         }
                     }
                 }
@@ -16578,8 +16659,32 @@ fn inline_module_items(
                     .collect();
                 let no_local: std::collections::HashSet<String> = std::collections::HashSet::default();
                 let no_iface: HashMap<String, String> = HashMap::default();
+                // §6.18/§23.10: the sub-module's OWN typedef names. A signature
+                // type naming one must resolve against THIS instance's widths —
+                // the bare typedef key is last-writer-wins across differently
+                // parameterized instances, so `function word_t f();` in a W=4
+                // instance returned the W=20 instance's width once that one
+                // elaborated later. The references are renamed to the
+                // instance-scoped key registered above.
+                let sub_typedef_names: &std::collections::HashSet<String> =
+                    &sub_typedef_names_all;
+                let scope_local_typeref = |dt: &DataType| -> DataType {
+                    if let DataType::TypeReference { name, dimensions, type_args, span } = dt {
+                        if name.scope.is_none() && sub_typedef_names.contains(&name.name.name) {
+                            let mut nn = name.clone();
+                            nn.name.name = format!("{}{}", inst_prefix, name.name.name);
+                            return DataType::TypeReference {
+                                name: nn,
+                                dimensions: dimensions.clone(),
+                                type_args: type_args.clone(),
+                                span: *span,
+                            };
+                        }
+                    }
+                    dt.clone()
+                };
                 let bake_formal_type = |p: &mut FunctionPort| {
-                    p.data_type = rewrite_data_type_genvar(&p.data_type, &param_expr_map, &no_local, &no_iface);
+                    p.data_type = scope_local_typeref(&rewrite_data_type_genvar(&p.data_type, &param_expr_map, &no_local, &no_iface));
                     p.dimensions = rewrite_unpacked_dims_genvar(&p.dimensions, &param_expr_map, &no_local, &no_iface);
                 };
                 // Inline the sub-module's continuous assigns
@@ -16590,7 +16695,7 @@ fn inline_module_items(
                         let mut new_fd = fd.clone();
                         new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
                         // Return-type width can also use a module parameter.
-                        new_fd.return_type = rewrite_data_type_genvar(&new_fd.return_type, &param_expr_map, &no_local, &no_iface);
+                        new_fd.return_type = scope_local_typeref(&rewrite_data_type_genvar(&new_fd.return_type, &param_expr_map, &no_local, &no_iface));
                         // A FORMAL shadows any same-named module-scope object
                         // inside the body (§13.4): `local_names` is the set of
                         // module-scope names that GET the instance prefix, so
