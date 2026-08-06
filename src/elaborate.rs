@@ -7556,7 +7556,16 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
             if !generated {
                 validate_expr_idents(func, elab, locals)?;
             }
-            for a in args { validate_expr_idents(a, elab, locals)?; }
+            // §18.11: the arguments of `obj.randomize(a, b)` name MEMBERS of
+            // the object's class, not identifiers of the enclosing scope, so
+            // validating them here rejected perfectly legal code outright
+            // ("Undeclared identifier 'a'") and aborted the whole run. The
+            // members are resolved against the object at call time instead.
+            let randomize_members = matches!(&func.kind,
+                ExprKind::MemberAccess { member, .. } if member.name == "randomize");
+            if !randomize_members {
+                for a in args { validate_expr_idents(a, elab, locals)?; }
+            }
         }
         ExprKind::SystemCall { name, args } => {
             // Args can be scope/module/instance references (not value lookups)
