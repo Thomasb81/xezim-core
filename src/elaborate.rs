@@ -14243,10 +14243,17 @@ fn prepare_module_items(
                 local_names.insert(td.name.name.name.clone());
             }
             ModuleItem::ModuleInstantiation(inst) => {
-                if typedef_widths.contains_key(&inst.module_name.name) || local_typedefs.contains(&inst.module_name.name) {
-                    for hi in &inst.instances {
-                        local_names.insert(hi.name.name.clone());
-                    }
+                // §23.6: CHILD INSTANCE names are local names of this module —
+                // a downward hierarchical reference (`child.grandchild.sig`,
+                // e.g. in an event control's `iff` guard) must take the
+                // instance prefix when this module is inlined. They were only
+                // added for the typedef-disambiguation corner, so every copy
+                // of a multiply-instanced module kept the SAME bare path and
+                // all of them resolved to ONE instance's signal: two sibling
+                // hierarchies waiting on their own strobes both fired on the
+                // first one's, and the second sampled x-data too early.
+                for hi in &inst.instances {
+                    local_names.insert(hi.name.name.clone());
                 }
                 // §6.10: a bare undeclared identifier used as an instance PORT
                 // CONNECTION is an implicit net local to THIS module. It must be
