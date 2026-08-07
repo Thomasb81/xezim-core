@@ -883,8 +883,10 @@ impl Parser {
             // Concatenation / replication: { ... }
             TokenKind::LBrace => self.parse_concatenation(),
 
-            // Tagged union member expression: `tagged Name` or `tagged Name(expr)`.
-            // We discard the tag and return the payload (or 0 for void members).
+            // Tagged union member expression: `tagged Name`, `tagged Name(expr)`,
+            // or — IEEE 1800-2023 §7.3.1 — the pattern literal
+            // `tagged Name '{ ... }`. The inner of the last form is the
+            // assignment pattern `'{ ... }` parsed by the shared item loop.
             TokenKind::KwTagged => {
                 self.bump();
                 let tag = if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
@@ -897,6 +899,13 @@ impl Parser {
                     let e = self.parse_expression();
                     self.expect(TokenKind::RParen);
                     Some(Box::new(e))
+                } else if self.eat(TokenKind::ApostropheLBrace).is_some() {
+                    let items = self.parse_assignment_pattern_items();
+                    self.expect(TokenKind::RBrace);
+                    Some(Box::new(Expression::new(
+                        ExprKind::AssignmentPattern(items),
+                        self.span_from(start),
+                    )))
                 } else {
                     None
                 };
@@ -906,89 +915,7 @@ impl Parser {
             // Assignment pattern: '{ ... }
             TokenKind::ApostropheLBrace => {
                 self.bump();
-                let mut items = Vec::new();
-                let mut first = true;
-                loop {
-                    if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
-
-                    // Possible items:
-                    // 1. default: expr
-                    // 2. type: expr
-                    // 3. name: expr
-                    // 4. expr (ordered)
-                    // 5. count { expr {, expr} } — replication form,
-                    //    only as the first item: `'{N{expr}}` (IEEE 1800-2017
-                    //    §10.10.1).
-
-                    if self.at(TokenKind::KwDefault) {
-                        self.bump();
-                        self.expect(TokenKind::Colon);
-                        let expr = self.parse_expression();
-                        items.push(AssignmentPatternItem::Default(expr));
-                    } else if self.is_data_type_keyword() && self.peek_kind() == TokenKind::Colon {
-                        let dt = self.parse_data_type();
-                        self.expect(TokenKind::Colon);
-                        let expr = self.parse_expression();
-                        items.push(AssignmentPatternItem::Typed(dt, expr));
-                    } else if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier)) && self.peek_kind() == TokenKind::Colon {
-                        let name = self.parse_identifier();
-                        self.expect(TokenKind::Colon);
-                        let expr = self.parse_expression();
-                        items.push(AssignmentPatternItem::Named(name, expr));
-                    } else if self.at(TokenKind::StringLiteral) && self.peek_kind() == TokenKind::Colon {
-                        // IEEE 1800-2023 §10.10: associative-array literal
-                        // with a string key — `'{"key": value, ...}`.
-                        let key = self.parse_expression();
-                        self.expect(TokenKind::Colon);
-                        let val = self.parse_expression();
-                        items.push(AssignmentPatternItem::Keyed(key, val));
-                    } else {
-                        let count_expr = self.parse_expression();
-                        if self.at(TokenKind::Colon) {
-                            // Expression-keyed entry `1 : val` — an
-                            // associative-array / integer-indexed literal key
-                            // (§10.9.2), e.g. `'{1:1, default:0}`.
-                            self.bump();
-                            let val = self.parse_expression();
-                            items.push(AssignmentPatternItem::Keyed(count_expr, val));
-                        } else if first && self.at(TokenKind::LBrace) {
-                            // Replication form: count { e1, e2, ... }
-                            self.bump(); // '{'
-                            let mut rep_items = Vec::new();
-                            loop {
-                                rep_items.push(self.parse_expression());
-                                if self.eat(TokenKind::Comma).is_none() { break; }
-                            }
-                            self.expect(TokenKind::RBrace);
-                            items.push(AssignmentPatternItem::Ordered(Expression::new(
-                                ExprKind::Replication { count: Box::new(count_expr), exprs: rep_items },
-                                self.span_from(start),
-                            )));
-                        } else {
-                            // An explicit-brace concat/replication ITEM —
-                            // `'{{3{y}}}` is ONE element whose value is the
-                            // 24-bit concat — parses to the same Replication
-                            // node as the multiplier form `'{3{y}}` (three
-                            // elements). Wrap the explicit form in Paren so
-                            // the expansion sites can tell them apart: a bare
-                            // Ordered(Replication) always means the
-                            // §10.10.1 multiplier.
-                            let item_expr = if matches!(count_expr.kind, ExprKind::Replication { .. })
-                            {
-                                Expression::new(
-                                    ExprKind::Paren(Box::new(count_expr)),
-                                    self.span_from(start),
-                                )
-                            } else {
-                                count_expr
-                            };
-                            items.push(AssignmentPatternItem::Ordered(item_expr));
-                        }
-                    }
-                    first = false;
-
-                    if self.eat(TokenKind::Comma).is_none() { break; }
-                }
+                let items = self.parse_assignment_pattern_items();
                 self.expect(TokenKind::RBrace);
                 Expression::new(ExprKind::AssignmentPattern(items), self.span_from(start))
             }
@@ -1463,6 +1390,97 @@ impl Parser {
                 Expression::new(ExprKind::Empty, self.span_from(start))
             }
         }
+    }
+
+    /// Parse the items of an assignment pattern (`'{ ... }`) up to — but not
+    /// including — the closing `}`. The opening `'{` must already be consumed.
+    /// Shared by the `'{ ... }` and the tagged-union pattern-literal forms
+    /// (`tagged member '{ ... }`, IEEE 1800-2023 §7.3.1).
+    fn parse_assignment_pattern_items(&mut self) -> Vec<AssignmentPatternItem> {
+        let start = self.current().span.start;
+        let mut items = Vec::new();
+        let mut first = true;
+        loop {
+            if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+
+            // Possible items:
+            // 1. default: expr
+            // 2. type: expr
+            // 3. name: expr
+            // 4. expr (ordered)
+            // 5. count { expr {, expr} } — replication form,
+            //    only as the first item: `'{N{expr}}` (IEEE 1800-2017 §10.10.1).
+
+            if self.at(TokenKind::KwDefault) {
+                self.bump();
+                self.expect(TokenKind::Colon);
+                let expr = self.parse_expression();
+                items.push(AssignmentPatternItem::Default(expr));
+            } else if self.is_data_type_keyword() && self.peek_kind() == TokenKind::Colon {
+                let dt = self.parse_data_type();
+                self.expect(TokenKind::Colon);
+                let expr = self.parse_expression();
+                items.push(AssignmentPatternItem::Typed(dt, expr));
+            } else if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier)) && self.peek_kind() == TokenKind::Colon {
+                let name = self.parse_identifier();
+                self.expect(TokenKind::Colon);
+                let expr = self.parse_expression();
+                items.push(AssignmentPatternItem::Named(name, expr));
+            } else if self.at(TokenKind::StringLiteral) && self.peek_kind() == TokenKind::Colon {
+                // IEEE 1800-2023 §10.10: associative-array literal
+                // with a string key — `'{"key": value, ...}`.
+                let key = self.parse_expression();
+                self.expect(TokenKind::Colon);
+                let val = self.parse_expression();
+                items.push(AssignmentPatternItem::Keyed(key, val));
+            } else {
+                let count_expr = self.parse_expression();
+                if self.at(TokenKind::Colon) {
+                    // Expression-keyed entry `1 : val` — an
+                    // associative-array / integer-indexed literal key
+                    // (§10.9.2), e.g. `'{1:1, default:0}`.
+                    self.bump();
+                    let val = self.parse_expression();
+                    items.push(AssignmentPatternItem::Keyed(count_expr, val));
+                } else if first && self.at(TokenKind::LBrace) {
+                    // Replication form: count { e1, e2, ... }
+                    self.bump(); // '{'
+                    let mut rep_items = Vec::new();
+                    loop {
+                        rep_items.push(self.parse_expression());
+                        if self.eat(TokenKind::Comma).is_none() { break; }
+                    }
+                    self.expect(TokenKind::RBrace);
+                    items.push(AssignmentPatternItem::Ordered(Expression::new(
+                        ExprKind::Replication { count: Box::new(count_expr), exprs: rep_items },
+                        self.span_from(start),
+                    )));
+                } else {
+                    // An explicit-brace concat/replication ITEM —
+                    // `'{{3{y}}}` is ONE element whose value is the
+                    // 24-bit concat — parses to the same Replication
+                    // node as the multiplier form `'{3{y}}` (three
+                    // elements). Wrap the explicit form in Paren so
+                    // the expansion sites can tell them apart: a bare
+                    // Ordered(Replication) always means the
+                    // §10.10.1 multiplier.
+                    let item_expr = if matches!(count_expr.kind, ExprKind::Replication { .. })
+                    {
+                        Expression::new(
+                            ExprKind::Paren(Box::new(count_expr)),
+                            self.span_from(start),
+                        )
+                    } else {
+                        count_expr
+                    };
+                    items.push(AssignmentPatternItem::Ordered(item_expr));
+                }
+            }
+            first = false;
+
+            if self.eat(TokenKind::Comma).is_none() { break; }
+        }
+        items
     }
 
     fn parse_concatenation(&mut self) -> Expression {
