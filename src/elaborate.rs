@@ -9249,9 +9249,8 @@ pub fn resolve_type_width(
                     .as_ref()
                     .and_then(|sc| td.get(&format!("{}::{}", sc.name, name.name.name)))
                     .copied();
-                scoped
-                    .or_else(|| td.get(&name.name.name).copied())
-                    .unwrap_or(32)
+                let raw = scoped.or_else(|| td.get(&name.name.name).copied());
+                raw.map(|w| if w == 0 { 32 } else { w }).unwrap_or(32)
             } else {
                 32
             };
