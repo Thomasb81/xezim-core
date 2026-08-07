@@ -9722,6 +9722,23 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                                     .and_then(|m| m.get(name).copied())
                                     .map(|w| w as i64)
                             }))
+                            // LRM §20.7: `$bits(<builtin type name>)`.
+                            // A builtin like `shortint` / `int` / `byte` is not
+                            // a parameter or typedef, so without this fallback
+                            // `bit[SIZE-1:0] where SIZE=$bits(shortint)`
+                            // elaborated to ONE BIT and truncated the key. The
+                            // atom keyword width `atom_keyword_width` answers
+                            // the fixed intrinsic width.
+                            .or_else(|| atom_keyword_width(name).map(|w| w as i64))
+                            .or_else(|| match name {
+                                "real" => Some(64),
+                                "shortreal" => Some(32),
+                                "realtime" => Some(64),
+                                "string" => Some(1024),
+                                "bit" | "logic" | "reg" => Some(1),
+                                "void" => Some(0),
+                                _ => None,
+                            })
                     }
                     // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
                     // `::` lowers to the SAME `MemberAccess` node as a struct
