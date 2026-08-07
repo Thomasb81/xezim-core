@@ -15924,10 +15924,24 @@ fn inline_module_items(
                                 // element-RANGE selects on the inlined signal
                                 // (`u_s.opv[2:1] = …` from the submodule's own
                                 // assigns) slice elements instead of bits.
-                                if let Some(ew) = packed_inner_elem_width(dt, &sub_merged_params, &elab.typedefs) {
+                                // A port declared with a TYPEDEF'd packed multi-D
+                                // type (`typedef logic [1:0][3:0] pair_t; input
+                                // pair_t p`) carries no dimensions of its own, so
+                                // both helpers bail on the `TypeReference` and the
+                                // port registered nothing — `p[i]` then degraded to
+                                // a one-BIT select exactly as an unregistered inline
+                                // `logic [1:0][3:0]` port used to. Resolve the
+                                // typedef and retry; the inline form already works,
+                                // which is what made this look type-specific.
+                                let resolved_dt = resolve_typedef_chain(dt, &elab.typedef_types).clone();
+                                if let Some(ew) = packed_inner_elem_width(dt, &sub_merged_params, &elab.typedefs)
+                                    .or_else(|| packed_inner_elem_width(&resolved_dt, &sub_merged_params, &elab.typedefs))
+                                {
                                     elab.packed_signal_elem_widths.insert(sig_name.clone(), ew);
                                 }
-                                if let Some(fdims) = packed_full_dims_of(dt, &sub_merged_params) {
+                                if let Some(fdims) = packed_full_dims_of(dt, &sub_merged_params)
+                                    .or_else(|| packed_full_dims_of(&resolved_dt, &sub_merged_params))
+                                {
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
                                 // Packed array of a STRUCT TYPEDEF as a PORT
