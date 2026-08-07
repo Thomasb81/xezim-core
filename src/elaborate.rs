@@ -14082,6 +14082,161 @@ struct PreparedModuleItems {
     interface_ports: std::collections::HashSet<String>,
     port_directions: HashMap<String, PortDirection>,
     local_names: std::rc::Rc<std::collections::HashSet<String>>,
+    /// Port names this module's own body DRIVES: a continuous-assign or
+    /// procedural-assignment target, a gate output, or an actual bound to an
+    /// output/inout of a sub-instance.
+    ///
+    /// Driving an `input` is illegal (§23.3.3) but xezim runs such designs,
+    /// and it only works because the port is substituted away — the write
+    /// then lands on the parent net directly. Such a port must therefore keep
+    /// its substitution even when its shape argues against it (see
+    /// `no_subst_ports`): routing the write to the port's own signal instead
+    /// would leave it fighting the connection assign, and the parent net
+    /// would never see the value.
+    ///
+    /// Deliberately OVER-approximates — an unresolvable sub-instance counts
+    /// as driving every actual it is passed. Naming a port here only forgoes
+    /// a shape fix; missing one would break a working design.
+    body_driven_ports: std::collections::HashSet<String>,
+}
+
+/// Base identifier of an assignment target (`a`, `a[i]`, `a[3:0].b`, and
+/// concat elements) — the name whose signal the write ultimately lands on.
+fn lvalue_base_names(e: &Expression, out: &mut std::collections::HashSet<String>) {
+    match &e.kind {
+        ExprKind::Ident(h) => {
+            if let Some(seg) = h.path.first() {
+                out.insert(seg.name.name.clone());
+            }
+        }
+        ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Paren(expr) => lvalue_base_names(expr, out),
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                lvalue_base_names(p, out);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Collect assignment targets inside a statement tree. Mirrors the walk in
+/// `check_lvalue`'s `walk_stmt`; unhandled statement kinds simply contribute
+/// nothing, which is why callers over-approximate elsewhere.
+fn collect_driven_in_stmt(s: &Statement, out: &mut std::collections::HashSet<String>) {
+    match &s.kind {
+        StatementKind::BlockingAssign { lvalue, .. }
+        | StatementKind::NonblockingAssign { lvalue, .. } => lvalue_base_names(lvalue, out),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts {
+                collect_driven_in_stmt(s, out);
+            }
+        }
+        StatementKind::If { then_stmt, else_stmt, .. } => {
+            collect_driven_in_stmt(then_stmt, out);
+            if let Some(e) = else_stmt {
+                collect_driven_in_stmt(e, out);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                collect_driven_in_stmt(&it.stmt, out);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body, .. }
+        | StatementKind::Foreach { body, .. } => collect_driven_in_stmt(body, out),
+        StatementKind::TimingControl { stmt, .. } => collect_driven_in_stmt(stmt, out),
+        _ => {}
+    }
+}
+
+/// Every name this module's body drives — see `body_driven_ports`.
+fn collect_body_driven_names(
+    items: &[ModuleItem],
+    definitions: &HashMap<String, Definition>,
+    out: &mut std::collections::HashSet<String>,
+) {
+    for item in items {
+        match item {
+            ModuleItem::ContinuousAssign(ca) => {
+                for (lhs, _) in &ca.assignments {
+                    lvalue_base_names(lhs, out);
+                }
+            }
+            ModuleItem::AlwaysConstruct(ac) => collect_driven_in_stmt(&ac.stmt, out),
+            ModuleItem::InitialConstruct(ic) => collect_driven_in_stmt(&ic.stmt, out),
+            ModuleItem::FinalConstruct(fc) => collect_driven_in_stmt(&fc.stmt, out),
+            ModuleItem::GateInstantiation(gi) => {
+                // §28.3: the OUTPUT terminal comes first on every gate xezim
+                // models (pullup/pulldown have only that one).
+                for inst in &gi.instances {
+                    if let Some(first) = inst.terminals.first() {
+                        lvalue_base_names(first, out);
+                    }
+                }
+            }
+            ModuleItem::ModuleInstantiation(mi) => {
+                let child = definitions.get(&mi.module_name.name);
+                let dirs: Option<Vec<Option<PortDirection>>> = child.map(|d| match d.ports() {
+                    PortList::Ansi(ps) => ps.iter().map(|p| p.direction).collect(),
+                    _ => Vec::new(),
+                });
+                let named_dir = |n: &str| -> Option<PortDirection> {
+                    match child?.ports() {
+                        PortList::Ansi(ps) => {
+                            ps.iter().find(|p| p.name.name == n).and_then(|p| p.direction)
+                        }
+                        _ => None,
+                    }
+                };
+                for inst in &mi.instances {
+                    for (i, conn) in inst.connections.iter().enumerate() {
+                        let (dir, expr) = match conn {
+                            PortConnection::Named { name, expr, .. } => {
+                                (named_dir(&name.name), expr.as_ref())
+                            }
+                            PortConnection::Ordered(e) => (
+                                dirs.as_ref().and_then(|d| d.get(i).copied().flatten()),
+                                e.as_ref(),
+                            ),
+                            // `.*` binds same-named nets; an output among them
+                            // drives its net, and the names are not listed
+                            // here, so leave those to the child's own pass.
+                            PortConnection::Wildcard => (None, None),
+                        };
+                        let Some(expr) = expr else { continue };
+                        // Unknown child (unresolved definition / non-ANSI
+                        // ports) => assume it may drive. See the field doc.
+                        match dir {
+                            Some(PortDirection::Input) => {}
+                            _ => lvalue_base_names(expr, out),
+                        }
+                    }
+                }
+            }
+            ModuleItem::GenerateRegion(gr) => collect_body_driven_names(&gr.items, definitions, out),
+            ModuleItem::GenerateFor(gf) => collect_body_driven_names(&gf.items, definitions, out),
+            ModuleItem::GenerateIf(gi) => {
+                // Every branch counts: which one elaborates is a per-instance
+                // parameter decision, and this set is cached per module.
+                for (_, items) in &gi.branches {
+                    collect_body_driven_names(items, definitions, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    collect_body_driven_names(&arm.items, definitions, out);
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 type InlinePrepCache = HashMap<String, Rc<PreparedModuleItems>>;
@@ -14366,6 +14521,15 @@ fn prepare_module_items(
         }
     }).collect();
 
+    let body_driven_ports = {
+        let mut driven = std::collections::HashSet::default();
+        collect_body_driven_names(&effective_items, definitions, &mut driven);
+        // Keep only PORT names — everything else is a local and irrelevant to
+        // the substitution decision.
+        driven.retain(|n| port_directions.contains_key(n));
+        driven
+    };
+
     let prepared = Rc::new(PreparedModuleItems {
         effective_items,
         body_sources,
@@ -14373,6 +14537,7 @@ fn prepare_module_items(
         interface_ports,
         port_directions,
         local_names: std::rc::Rc::new(local_names),
+        body_driven_ports,
     });
     cache.insert(cache_key, Rc::clone(&prepared));
     prepared
@@ -16584,6 +16749,12 @@ fn inline_module_items(
                 // carries the FORMAL width under this instance's parameters;
                 // compare with each actual's self-determined width and warn on
                 // mismatch, naming the instance and port.
+                //
+                // The same walk decides which INPUT ports must keep their own
+                // signal instead of being substituted away — see
+                // `no_subst_ports` and the `rewrite_port_map` filter below.
+                let mut no_subst_ports: std::collections::HashSet<String> =
+                    std::collections::HashSet::default();
                 for (pname, actual) in port_map.iter() {
                     let Some(formal) = elab
                         .signals
@@ -16592,10 +16763,40 @@ fn inline_module_items(
                     else {
                         continue;
                     };
+                    // Only a pure INPUT — one the body never drives — can be
+                    // safely de-substituted. A driven port (illegal for an
+                    // input, but xezim allows it) must keep reaching the
+                    // parent net through substitution; see
+                    // `PreparedModuleItems::body_driven_ports`.
+                    let is_input = matches!(
+                        prepared_sub.port_directions.get(pname.as_str()),
+                        Some(PortDirection::Input)
+                    ) && !prepared_sub.body_driven_ports.contains(pname.as_str());
+                    // §7.4.1: a packed multi-D formal indexes by its OWN
+                    // element stride. Substituting the actual makes `p[i]`
+                    // index the actual instead, so the stride silently becomes
+                    // whatever the parent net happens to be declared as — 1 bit
+                    // for a flat vector / concat / part-select, or the parent's
+                    // own element width for a differently-shaped packed array.
+                    if is_input
+                        && elab
+                            .packed_signal_elem_widths
+                            .get(&format!("{}{}", inst_prefix, pname))
+                            .is_some_and(|&w| w > 1)
+                    {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     let Some(actual_w) = port_conn_width(actual, elab) else {
                         continue;
                     };
                     if actual_w != formal && actual_w != 0 && formal != 0 {
+                        // §23.3.3: the formal keeps its declared size and the
+                        // CONNECTION truncates/extends. Substitution would hand
+                        // the body the actual's width instead, so `$bits(p)`
+                        // reported the parent net's size.
+                        if is_input {
+                            no_subst_ports.insert(pname.clone());
+                        }
                         warn_port_width_mismatch(
                             sub_mod_name,
                             pname,
@@ -16613,9 +16814,19 @@ fn inline_module_items(
                 //   - Input ports: the sub-module reads from the parent → use parent expr
                 //   - Output ports: the sub-module writes to its local reg → use prefixed local name
                 //     (a continuous assign parent = local handles the connection)
+                //
+                // Substituting the actual for an input port is a rename, and a
+                // rename is only sound when formal and actual have the same
+                // shape: the formal's declared type is what governs `$bits` and
+                // every select inside the body (§23.3.3). `no_subst_ports`
+                // (built with the width lint above) carries the inputs where
+                // the two disagree — those resolve to `<inst>.<port>` instead,
+                // which is registered with the FORMAL's width and element
+                // stride and is driven by the connection assign pushed above.
                 let rewrite_port_map: HashMap<String, Expression> = port_map.iter()
                     .filter(|(name, _)| {
                         !matches!(prepared_sub.port_directions.get(name.as_str()), Some(PortDirection::Output))
+                            && !no_subst_ports.contains(name.as_str())
                     })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
