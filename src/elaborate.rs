@@ -9714,7 +9714,7 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                     ExprKind::Ident(hier) => {
                         let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
                         // First try parameter ident → its Value width.
-                        params?.get(name).map(|v| v.width as i64)
+                        params.and_then(|p| p.get(name)).map(|v| v.width as i64)
                             // Then fall through to the thread-local typedef
                             // table (set by callers that have one available).
                             .or_else(|| TYPEDEFS_TLS.with(|td| {
@@ -9722,6 +9722,13 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                                     .and_then(|m| m.get(name).copied())
                                     .map(|w| w as i64)
                             }))
+                            // §20.6.2 over a BUILT-IN integer atom type.
+                            // `$bits(int)` parses to a bare Ident (the operand
+                            // is not a typedef and not a parameter), so both
+                            // lookups above miss and the call answered 0 — a
+                            // `localparam W = $bits(int)` used as a vector
+                            // width then declared a degenerate vector.
+                            .or_else(|| atom_keyword_width(name).map(|w| w as i64))
                     }
                     // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
                     // `::` lowers to the SAME `MemberAccess` node as a struct
@@ -12163,6 +12170,9 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     params.get(n).map(|v| v.width)
                         .or_else(|| TYPEDEFS_TLS.with(|td|
                             td.borrow().as_ref().and_then(|m| m.get(n).copied())))
+                        // §20.6.2 over a BUILT-IN integer atom type — see the
+                        // matching arm in `const_eval_i64_with_params`.
+                        .or_else(|| atom_keyword_width(n))
                         .unwrap_or(0)
                 }
                 // §26.3 package-/class-scoped type — see the matching arm in
