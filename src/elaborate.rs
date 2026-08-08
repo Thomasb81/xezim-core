@@ -2075,6 +2075,11 @@ pub fn register_scoped_typedef_alias(pkg: &str, td: &TypedefDeclaration, elab: &
     if let Some(dt) = elab.typedef_types.get(&td.name.name).cloned() {
         elab.typedef_types.insert(key, dt);
     }
+    // `process_typedef` refreshes the const-eval snapshot, but it runs BEFORE
+    // this alias exists — so `$bits(pkg::T)` never saw the qualified key.
+    TYPEDEFS_TLS.with(|cell| {
+        *cell.borrow_mut() = Some(elab.typedefs.clone());
+    });
 }
 
 /// Type names a typedef's own definition refers to — its base type and, for a
@@ -9756,10 +9761,24 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                         } else {
                             None
                         };
+                        // §26.3: `P::T` must reach THAT package's typedef —
+                        // the bare name is one global slot a same-named typedef
+                        // in another package can own.
+                        let scoped = if let ExprKind::Ident(h) = &base.kind {
+                            h.path
+                                .last()
+                                .map(|s| format!("{}::{}", s.name.name, member.name))
+                        } else {
+                            None
+                        };
                         from_layout.or_else(|| {
                             TYPEDEFS_TLS.with(|td| {
-                                td.borrow().as_ref()
-                                    .and_then(|m| m.get(member.name.as_str()).copied())
+                                let b = td.borrow();
+                                let m = b.as_ref()?;
+                                scoped
+                                    .as_deref()
+                                    .and_then(|k| m.get(k).copied())
+                                    .or_else(|| m.get(member.name.as_str()).copied())
                                     .map(|w| w as i64)
                             })
                         })
@@ -9809,13 +9828,26 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
                                         .last()
                                         .map(|s| s.name.name.as_str())
                                         .unwrap_or("");
+                                    // §26.3: prefer the qualified `P::T` key —
+                                    // the bare name is a single global slot a
+                                    // same-named typedef elsewhere can own.
+                                    let scoped = (hier.path.len() >= 2).then(|| {
+                                        format!(
+                                            "{}::{}",
+                                            hier.path[hier.path.len() - 2].name.name,
+                                            n
+                                        )
+                                    });
                                     params
                                         .and_then(|m| m.get(n).map(|v| v.width as i64))
                                         .or_else(|| {
                                             TYPEDEFS_TLS.with(|td| {
-                                                td.borrow()
-                                                    .as_ref()
-                                                    .and_then(|m| m.get(n).copied())
+                                                let b = td.borrow();
+                                                let m = b.as_ref()?;
+                                                scoped
+                                                    .as_deref()
+                                                    .and_then(|k| m.get(k).copied())
+                                                    .or_else(|| m.get(n).copied())
                                                     .map(|w| w as i64)
                                             })
                                         })
@@ -12167,9 +12199,20 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             let w: u32 = match &inner.kind {
                 ExprKind::Ident(hier) => {
                     let n = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
+                    // §26.3: prefer the qualified `P::T` key — the bare name is
+                    // one global slot a same-named typedef elsewhere can own.
+                    let scoped = (hier.path.len() >= 2).then(|| {
+                        format!("{}::{}", hier.path[hier.path.len() - 2].name.name, n)
+                    });
                     params.get(n).map(|v| v.width)
-                        .or_else(|| TYPEDEFS_TLS.with(|td|
-                            td.borrow().as_ref().and_then(|m| m.get(n).copied())))
+                        .or_else(|| TYPEDEFS_TLS.with(|td| {
+                            let b = td.borrow();
+                            let m = b.as_ref()?;
+                            scoped
+                                .as_deref()
+                                .and_then(|k| m.get(k).copied())
+                                .or_else(|| m.get(n).copied())
+                        }))
                         // §20.6.2 over a BUILT-IN integer atom type — see the
                         // matching arm in `const_eval_i64_with_params`.
                         .or_else(|| atom_keyword_width(n))
@@ -12194,10 +12237,26 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     } else {
                         None
                     };
+                    // §26.3: `P::T` must reach THAT package's typedef. Package
+                    // typedefs also occupy one global bare-name table, so a
+                    // same-named typedef in another package can own the bare
+                    // key — answering from it reported the wrong type's width.
+                    let scoped = if let ExprKind::Ident(h) = &base.kind {
+                        h.path
+                            .last()
+                            .map(|s| format!("{}::{}", s.name.name, member.name))
+                    } else {
+                        None
+                    };
                     from_layout
                         .or_else(|| {
                             TYPEDEFS_TLS.with(|td| {
-                                td.borrow().as_ref().and_then(|m| m.get(member.name.as_str()).copied())
+                                let b = td.borrow();
+                                let m = b.as_ref()?;
+                                scoped
+                                    .as_deref()
+                                    .and_then(|k| m.get(k).copied())
+                                    .or_else(|| m.get(member.name.as_str()).copied())
                             })
                         })
                         .unwrap_or(0)
@@ -14946,6 +15005,12 @@ fn inline_module_items(
     // scope that declared the defparam. Path[0] is a child instance name.
     pending_defparams: &[(Vec<String>, Value)],
 ) -> Result<(), String> {
+    // Bind this module's imported type names BEFORE its body is prepared or
+    // resolved. The top-module path re-runs its imports
+    // (`elaborate_module_with_defs`); the inlined-instance path never processed
+    // imports at all, so an unqualified `T [1:0] s;` in a sub-module silently
+    // took whichever package last hoisted that bare name.
+    rebind_imported_typedefs(elab, source_def.items(), definitions);
     let prepared_source = prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
     // §23.10: names of THIS module's own sub-instances. A port connection
     // naming a SIBLING instance (`h_leaf lf(li.mp);` where `li` is the same
@@ -15102,6 +15167,12 @@ fn inline_module_items(
                 // Was: `let scoped_eval_params = local_params.clone();` — wasted clone, only read.
                 let scoped_eval_params: &HashMap<String, Value> = local_params;
 
+                // Bind the SUB-module's own imported type names before any of
+                // its items are read. Its declarations are resolved here, in the
+                // parent's walk, so rebinding at the recursive call would be too
+                // late — an unqualified `T [1:0] s;` in a module that imports
+                // `P::*` took whichever package last hoisted that bare name.
+                rebind_imported_typedefs(elab, sub_mod.items(), definitions);
                 // §6.10 implicit nets bound by port connections INSIDE the
                 // module being inlined. The top-level pass only sees the top
                 // module's instantiations, and the pending pass only sees
@@ -19788,6 +19859,63 @@ fn compute_wildcard_shadowed(
         }
     }
     out
+}
+
+/// §26.2/§26.3: bind a scope's IMPORTED type names into the bare namespace.
+///
+/// Package typedefs are hoisted into ONE global bare-name table, so a
+/// same-named typedef in an unrelated package can end up owning the bare key
+/// (and which one does depends on `definitions` iteration order). An
+/// unqualified reference inside a module must resolve to the package THAT
+/// module imports, so re-point the bare keys at the qualified entries before
+/// anything in the body is resolved.
+///
+/// Only the TYPE tables are rebound. The rest of `process_import` has
+/// design-wide side effects (package parameters become signals, classes are
+/// elaborated) that must not re-run per instance.
+fn rebind_imported_typedefs(
+    elab: &mut ElaboratedModule,
+    items: &[ModuleItem],
+    definitions: &HashMap<String, Definition>,
+) {
+    let mut changed = false;
+    for item in items {
+        let ModuleItem::ImportDeclaration(imp) = item else { continue };
+        for ii in &imp.items {
+            let pkg = &ii.package.name;
+            let Some(Definition::Package(p)) = definitions.get(pkg) else { continue };
+            // `import P::sym` binds one name; `import P::*` binds all of P's.
+            let names: Vec<String> = match &ii.item {
+                Some(sym) => vec![sym.name.clone()],
+                None => p
+                    .items
+                    .iter()
+                    .filter_map(|pi| match pi {
+                        PackageItem::Typedef(td) => Some(td.name.name.clone()),
+                        _ => None,
+                    })
+                    .collect(),
+            };
+            for n in names {
+                let key = format!("{}::{}", pkg, n);
+                if let Some(w) = elab.typedefs.get(&key).copied() {
+                    if elab.typedefs.insert(n.clone(), w) != Some(w) {
+                        changed = true;
+                    }
+                }
+                if let Some(t) = elab.typedef_types.get(&key).cloned() {
+                    elab.typedef_types.insert(n.clone(), t);
+                }
+            }
+        }
+    }
+    // Keep the const-eval snapshot in step, but only when a width actually
+    // moved — this runs per inlined instance and the map is large.
+    if changed {
+        TYPEDEFS_TLS.with(|cell| {
+            *cell.borrow_mut() = Some(elab.typedefs.clone());
+        });
+    }
 }
 
 fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &HashMap<String, Definition>) -> Result<(), String> {
