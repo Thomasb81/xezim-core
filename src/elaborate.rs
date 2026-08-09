@@ -8701,6 +8701,67 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         if let Some(view) = &data_modport_view {
                             elab.modport_views.insert(decl.name.name.clone(), view.clone());
                         }
+                        // Packed-struct metadata for a GENERATE-scope (or other
+                        // elaborate_items-routed) declaration, mirroring the
+                        // top-level DataDeclaration arm. This arm registered
+                        // widths and generic dims but never the struct layout,
+                        // the typedef-array shape, or the declared type — so a
+                        // `burst_t [0:0][1:0] sig;` inside `if (1) begin : g`
+                        // read $bits(g.sig[0][0]) = 1 and every member select
+                        // returned garbage, while the identical module-scope
+                        // declaration worked.
+                        elab.var_decl_types
+                            .entry(decl.name.name.clone())
+                            .or_insert_with(|| dd.data_type.clone());
+                        let chain2 =
+                            resolve_typedef_chain(&dd.data_type, &elab.typedef_types).clone();
+                        if let DataType::Struct(su) = &chain2 {
+                            if su.packed {
+                                if let Some(fields) = flatten_struct_fields(
+                                    &dd.data_type,
+                                    &elab.parameters,
+                                    &elab.typedefs,
+                                    &elab.typedef_types,
+                                ) {
+                                    if !fields.is_empty() {
+                                        let struct_w = fields
+                                            .iter()
+                                            .map(|(_, o, w)| o + w)
+                                            .max()
+                                            .unwrap_or(0);
+                                        tls_register_struct_layout(&decl.name.name, &fields);
+                                        elab.packed_struct_fields
+                                            .insert(decl.name.name.clone(), fields);
+                                        // Dims on the typedef reference itself
+                                        // (`burst_t [0:0][1:0] sig;`): the
+                                        // precise registration OVERRIDES the
+                                        // generic chain that ran above — full
+                                        // dims carry the struct width as the
+                                        // innermost entry.
+                                        if let Some(fdims) = packed_typedef_array_dims(
+                                            &dd.data_type,
+                                            struct_w,
+                                            &elab.parameters,
+                                        ) {
+                                            let total: i64 = fdims
+                                                .iter()
+                                                .map(|(l, r)| (l - r).abs() + 1)
+                                                .product();
+                                            let (ol, orr) = fdims[0];
+                                            let outer = (ol - orr).abs() + 1;
+                                            if outer > 0 && total > 0 {
+                                                elab.packed_signal_elem_widths.insert(
+                                                    decl.name.name.clone(),
+                                                    (total / outer) as u32,
+                                                );
+                                            }
+                                            elab.packed_full_dims
+                                                .insert(decl.name.name.clone(), fdims);
+                                        }
+                                    }
+                                }
+                            }
+                        }
                     }
                 }
             }
