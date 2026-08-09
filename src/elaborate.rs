@@ -12992,6 +12992,33 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 v.resize(n)
             }
         }
+        ExprKind::SystemCall { name, args } if name == "$__xz_named_cast" && args.len() == 2 => {
+            // §6.24.1: `id'(v)` where `id` resolves to a CONSTANT — a size
+            // cast at that width (`localparam [AW-1:0] TOP = AW'(6);` read 0
+            // because this intrinsic had no const arm at all).
+            let nm = match &args[0].kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.clone()),
+                _ => None,
+            };
+            if let Some(nm) = nm {
+                if let Some(w) = params
+                    .get(&nm)
+                    .and_then(|v| v.to_u64())
+                    .or_else(|| param_fallback_get(&nm).and_then(|v| v.to_u64()))
+                {
+                    let w = (w.max(1)) as u32;
+                    if let Some(iv) = const_eval_i64_with_params(&args[1], Some(params)) {
+                        let mut out = Value::from_u64(iv as u64, 64).resize(w);
+                        out.is_signed = false;
+                        return out;
+                    }
+                    let mut out = eval_const_expr_val(&args[1], params).resize(w);
+                    out.is_signed = false;
+                    return out;
+                }
+            }
+            eval_const_expr_val(&args[1], params)
+        }
         ExprKind::SystemCall { name, args } if name == "$__xz_type_cast" && args.len() == 2 => {
             let v = eval_const_expr_val(&args[1], params);
             if let ExprKind::TypeLiteral(dt) = &args[0].kind {
@@ -16233,6 +16260,26 @@ fn inline_module_items(
                             if assignments.iter().any(|a| a.name.name == formal)))
                 };
                 let mut type_overrides: Vec<(String, DataType)> = Vec::new();
+                // §23.10: ORDERED overrides bind to the flattened assignment
+                // list — `parameter A=1, B=2` is ONE declaration with TWO
+                // positional slots. Indexing declarations dropped every value
+                // after the first of each group.
+                enum FlatSlot<'a> {
+                    Data(&'a DataType, &'a crate::ast::decl::ParamAssignment),
+                    Type(&'a crate::ast::decl::TypeParamAssignment),
+                }
+                let flat_slots: Vec<FlatSlot> = sub_param_decls
+                    .iter()
+                    .flat_map(|p| match &p.kind {
+                        ParameterKind::Data { data_type, assignments } => assignments
+                            .iter()
+                            .map(|a| FlatSlot::Data(data_type, a))
+                            .collect::<Vec<_>>(),
+                        ParameterKind::Type { assignments } => {
+                            assignments.iter().map(FlatSlot::Type).collect()
+                        }
+                    })
+                    .collect();
                 if let Some(param_conns) = &inst.params {
                     for (i, conn) in param_conns.iter().enumerate() {
                         match conn {
@@ -16254,6 +16301,25 @@ fn inline_module_items(
                                         &elab.typedefs, &elab.typedef_types,
                                         &elab.packed_struct_fields, &elab.arrays,
                                     );
+                                    // §13.4.3: const function calls in the
+                                    // override expression (`.N(pkg::f(5))`)
+                                    // — unsubstituted they eval to 0.
+                                    let subbed_ov;
+                                    let v: &Expression = if expr_has_call(v) {
+                                        match substitute_const_fn_calls(
+                                            v, scoped_eval_params, elab, 0,
+                                        )
+                                        .filter(|e| !expr_has_call(e))
+                                        {
+                                            Some(e) => {
+                                                subbed_ov = e;
+                                                &subbed_ov
+                                            }
+                                            None => v,
+                                        }
+                                    } else {
+                                        v
+                                    };
                                     let mut val = eval_const_expr_val(v, scoped_eval_params);
                                     // Check if target parameter is real or implicit real
                                     for p_decl in sub_mod.params() {
@@ -16296,53 +16362,62 @@ fn inline_module_items(
                                         }));
                                 }
                                 if let Some(ParamValue::Type(dt)) = value {
-                                    if let Some(p_decl) = sub_param_decls.get(i) {
-                                        if let ParameterKind::Type { assignments } = &p_decl.kind {
-                                            if let Some(a) = assignments.first() {
-                                                type_overrides.push((a.name.name.clone(), dt.clone()));
-                                            }
+                                    if let Some(FlatSlot::Type(a)) = flat_slots.get(i) {
+                                        type_overrides.push((a.name.name.clone(), dt.clone()));
+                                    }
+                                }
+                                if let Some(ParamValue::Expr(v)) = value {
+                                    if let Some(FlatSlot::Type(a)) = flat_slots.get(i) {
+                                        if let Some(dt) = expr_as_type_ref(v) {
+                                            type_overrides.push((a.name.name.clone(), dt));
+                                            continue;
                                         }
                                     }
                                 }
                                 if let Some(ParamValue::Expr(v)) = value {
-                                    if let Some(p_decl) = sub_param_decls.get(i) {
-                                        if let ParameterKind::Type { assignments } = &p_decl.kind {
-                                            if let Some(a) = assignments.first() {
-                                                if let Some(dt) = expr_as_type_ref(v) {
-                                                    type_overrides.push((a.name.name.clone(), dt));
-                                                    continue;
+                                    if let Some(FlatSlot::Data(data_type, a)) = flat_slots.get(i) {
+                                        let data_type: &DataType = data_type;
+                                        // §13.4.3: const-fn calls, as in the
+                                        // Named branch.
+                                        let subbed_ov;
+                                        let v: &Expression = if expr_has_call(v) {
+                                            match substitute_const_fn_calls(
+                                                v, scoped_eval_params, elab, 0,
+                                            )
+                                            .filter(|e| !expr_has_call(e))
+                                            {
+                                                Some(e) => {
+                                                    subbed_ov = e;
+                                                    &subbed_ov
                                                 }
+                                                None => v,
                                             }
+                                        } else {
+                                            v
+                                        };
+                                        let mut val = eval_const_expr_val(v, scoped_eval_params);
+                                        if dbg_param {
+                                            eprintln!("[DBG_PARAM]     eval -> {} = {}",
+                                                a.name.name, val.to_u64().unwrap_or(0));
                                         }
-                                    }
-                                }
-                                if let Some(ParamValue::Expr(v)) = value {
-                                    if let Some(p_decl) = sub_param_decls.get(i) {
-                                        if let ParameterKind::Data { data_type, assignments } = &p_decl.kind {
-                                            let mut val = eval_const_expr_val(v, scoped_eval_params);
-                                            if dbg_param {
-                                                eprintln!("[DBG_PARAM]     eval -> {} = {}",
-                                                    assignments[0].name.name, val.to_u64().unwrap_or(0));
-                                            }
-                                            if is_type_real(data_type) {
+                                        if is_type_real(data_type) {
+                                            val = Value::from_f64(val.to_f64());
+                                        } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                                            && val.is_real {
                                                 val = Value::from_f64(val.to_f64());
-                                            } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                                                && val.is_real {
-                                                    val = Value::from_f64(val.to_f64());
-                                                }
-                                            // See the Named branch: a pattern
-                                            // override needs the formal's type.
-                                            if let Some(pv) = pack_packed_vector_pattern(
-                                                data_type, v, scoped_eval_params,
-                                                &elab.typedef_types,
-                                            ).or_else(|| pack_struct_const_value(
-                                                data_type, v, scoped_eval_params,
-                                                &elab.typedefs, &elab.typedef_types,
-                                            )) {
-                                                val = pv;
                                             }
-                                            sub_params.insert(assignments[0].name.name.clone(), val);
+                                        // See the Named branch: a pattern
+                                        // override needs the formal's type.
+                                        if let Some(pv) = pack_packed_vector_pattern(
+                                            data_type, v, scoped_eval_params,
+                                            &elab.typedef_types,
+                                        ).or_else(|| pack_struct_const_value(
+                                            data_type, v, scoped_eval_params,
+                                            &elab.typedefs, &elab.typedef_types,
+                                        )) {
+                                            val = pv;
                                         }
+                                        sub_params.insert(a.name.name.clone(), val);
                                     }
                                 }
                             }
@@ -16506,6 +16581,20 @@ fn inline_module_items(
                                                 } else if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty()) {
                                                     if val.is_real {
                                                         val = Value::from_f64(val.to_f64());
+                                                    }
+                                                } else if !val.is_real {
+                                                    // §5.7.1/§10.9: a DECLARED
+                                                    // shape sizes the init —
+                                                    // `localparam [N-1:0] X='1`
+                                                    // must fill N bits, not
+                                                    // stay a 1-bit fill.
+                                                    let w = resolve_type_width(
+                                                        data_type,
+                                                        Some(local_map),
+                                                        Some(&elab_ro.typedefs),
+                                                    );
+                                                    if w > 0 && (val.is_fill || val.width != w) {
+                                                        val = val.resize(w);
                                                     }
                                                 }
                                                 if local_map.get(&assign.name.name) != Some(&val) {
@@ -18944,11 +19033,48 @@ fn substitute_const_fn_calls(
     let sub = |e: &Expression| substitute_const_fn_calls(e, params, elab, depth);
     Some(match &expr.kind {
         ExprKind::Call { func, args } => {
-            let fname = match &func.kind {
-                ExprKind::Ident(h) => h.path.last().map(|s| s.name.name.clone())?,
-                _ => return None,
+            // §26.3: a scoped call `pkg::f(...)` reaches this pass as
+            // MemberAccess{Ident(pkg), f} in inlined-submodule items (the
+            // top-module path sees a flat 2-segment Ident) — both forms
+            // resolve, preferring the package-qualified registration.
+            let (fname, scoped_key) = match &func.kind {
+                ExprKind::Ident(h) => {
+                    let leaf = h.path.last().map(|s| s.name.name.clone())?;
+                    let sk = (h.path.len() >= 2).then(|| {
+                        format!("{}::{}", h.path[h.path.len() - 2].name.name, leaf)
+                    });
+                    (leaf, sk)
+                }
+                ExprKind::MemberAccess { expr: base, member } => {
+                    let sk = match &base.kind {
+                        ExprKind::Ident(bh) if bh.path.len() == 1 => Some(format!(
+                            "{}::{}",
+                            bh.path[0].name.name, member.name
+                        )),
+                        _ => None,
+                    };
+                    (member.name.clone(), sk)
+                }
+                other => {
+                    param_trace(
+                        "const-fn:unsupported-func-shape",
+                        "call",
+                        &format!("{:?}", std::mem::discriminant(other)),
+                    );
+                    return None;
+                }
             };
-            let fd = elab.functions.get(&fname)?.clone();
+            let fd = match scoped_key
+                .as_deref()
+                .and_then(|k| elab.functions.get(k))
+                .or_else(|| elab.functions.get(&fname))
+            {
+                Some(fd) => fd.clone(),
+                None => {
+                    param_trace("const-fn:MISS", &fname, "no function registration");
+                    return None;
+                }
+            };
             let mut argv = Vec::with_capacity(args.len());
             for a in args {
                 if !const_fn_expr_supported(a) {
