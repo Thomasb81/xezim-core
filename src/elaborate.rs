@@ -5658,7 +5658,7 @@ pub fn elaborate_module_with_defs(
                 elaborate_items(&gr.items, &mut elab, all_defs)?;
             }
             ModuleItem::GenerateIf(gi) => {
-                elaborate_generate_if(&gi.branches, &mut elab, all_defs)?;
+                elaborate_generate_if(gi, &mut elab, all_defs)?;
             }
             ModuleItem::GenerateCase(gc) => {
                 elaborate_generate_case(gc, &mut elab, all_defs)?;
@@ -8928,7 +8928,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 elaborate_items(&gr.items, elab, all_defs)?;
             }
             ModuleItem::GenerateIf(gi) => {
-                elaborate_generate_if(&gi.branches, elab, all_defs)?;
+                elaborate_generate_if(gi, elab, all_defs)?;
             }
             ModuleItem::GenerateCase(gc) => {
                 elaborate_generate_case(gc, elab, all_defs)?;
@@ -9122,8 +9122,25 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
 }
 
 /// Evaluate a generate-if: pick the first branch whose condition is true (or the else branch).
-fn elaborate_generate_if(branches: &[(Option<Expression>, Vec<ModuleItem>)], elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
-    for (cond, items) in branches {
+fn elaborate_generate_if(gi: &GenerateIf, elab: &mut ElaboratedModule, all_defs: Option<&HashMap<String, Definition>>) -> Result<(), String> {
+    // §27.6: a LABELED branch is a scope — rename its declarations to their
+    // hierarchical name (`g.x`), the same convention for-generate now uses.
+    // Bare storage made `g.x` resolvable only through ad-hoc fallbacks: a
+    // continuous assign READING `g.x` recorded a dependency on a name that
+    // matched no signal (so it evaluated once and stayed X forever), and a
+    // same-named declaration at module scope was a false "duplicate" error.
+    // Unlabeled branches keep bare names (their genblk ordinal is not known
+    // here, and in-suite code relies on the historical leakage).
+    let take_branch = |bi: usize, items: &Vec<ModuleItem>, elab: &mut ElaboratedModule| {
+        match gi.branch_labels.get(bi).and_then(|l| l.as_ref()) {
+            Some(label) => {
+                let renamed = rename_decls_in_iter(items, &GenRename::Scope(label));
+                elaborate_items(&renamed, elab, all_defs)
+            }
+            None => elaborate_items(items, elab, all_defs),
+        }
+    };
+    for (bi, (cond, items)) in gi.branches.iter().enumerate() {
         match cond {
             Some(c) => {
                 if !is_const_expr(c, &elab.parameters) {
@@ -9131,12 +9148,12 @@ fn elaborate_generate_if(branches: &[(Option<Expression>, Vec<ModuleItem>)], ela
                 }
                 let val = eval_const_expr(c, &elab.parameters);
                 if val != 0 {
-                    return elaborate_items(items, elab, all_defs);
+                    return take_branch(bi, items, elab);
                 }
             }
             None => {
                 // Unconditional else branch
-                return elaborate_items(items, elab, all_defs);
+                return take_branch(bi, items, elab);
             }
         }
     }
@@ -9156,17 +9173,33 @@ fn elaborate_generate_case(gc: &GenerateCase, elab: &mut ElaboratedModule, all_d
                 return Err("Generate case value must be a constant expression".to_string());
             }
             if eval_const_expr(v, &elab.parameters) == sel {
-                return elaborate_items(&arm.items, elab, all_defs);
+                return elaborate_generate_case_arm(arm, elab, all_defs);
             }
         }
     }
     // No non-default match — fall through to default arm if present.
     for arm in &gc.arms {
         if arm.values.is_empty() {
-            return elaborate_items(&arm.items, elab, all_defs);
+            return elaborate_generate_case_arm(arm, elab, all_defs);
         }
     }
     Ok(())
+}
+
+/// Labeled case arms scope their declarations like labeled if branches do —
+/// see elaborate_generate_if.
+fn elaborate_generate_case_arm(
+    arm: &GenerateCaseArm,
+    elab: &mut ElaboratedModule,
+    all_defs: Option<&HashMap<String, Definition>>,
+) -> Result<(), String> {
+    match &arm.label {
+        Some(label) => {
+            let renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label));
+            elaborate_items(&renamed, elab, all_defs)
+        }
+        None => elaborate_items(&arm.items, elab, all_defs),
+    }
 }
 
 fn scope_generated_subroutines(items: &mut [ModuleItem], scope: &str) {
@@ -13645,10 +13678,20 @@ fn rename_item_decls(
     match item {
         ModuleItem::DataDeclaration(dd) => {
             let mut new_dd = dd.clone();
+            // The RANGE may reference a renamed sibling localparam
+            // (`localparam NL = 3; logic [2**NL-2:0] vec;` in the same
+            // block): the declarator and its INIT were rewritten but the
+            // data type's dimensions kept the bare name, which then
+            // resolved to nothing and the width clamped to 1 bit — every
+            // write past bit 0 silently dropped.
+            new_dd.data_type =
+                rewrite_data_type_genvar(&dd.data_type, port_map, local_names, interface_map);
             for d in &mut new_dd.declarators {
                 if rename_set.contains(&d.name.name) {
                     d.name.name = rename.apply(&d.name.name);
                 }
+                d.dimensions =
+                    rewrite_unpacked_dims_genvar(&d.dimensions, port_map, local_names, interface_map);
                 if let Some(init) = &d.init {
                     d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
                 }
@@ -13657,10 +13700,14 @@ fn rename_item_decls(
         }
         ModuleItem::NetDeclaration(nd) => {
             let mut new_nd = nd.clone();
+            new_nd.data_type =
+                rewrite_data_type_genvar(&nd.data_type, port_map, local_names, interface_map);
             for d in &mut new_nd.declarators {
                 if rename_set.contains(&d.name.name) {
                     d.name.name = rename.apply(&d.name.name);
                 }
+                d.dimensions =
+                    rewrite_unpacked_dims_genvar(&d.dimensions, port_map, local_names, interface_map);
                 if let Some(init) = &d.init {
                     d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
                 }
@@ -13669,6 +13716,8 @@ fn rename_item_decls(
         }
         ModuleItem::PortDeclaration(pd) => {
             let mut new_pd = pd.clone();
+            new_pd.data_type =
+                rewrite_data_type_genvar(&pd.data_type, port_map, local_names, interface_map);
             for d in &mut new_pd.declarators {
                 if rename_set.contains(&d.name.name) {
                     d.name.name = rename.apply(&d.name.name);
@@ -14153,6 +14202,18 @@ fn collect_effective_items_scoped(items: &[ModuleItem], params: &HashMap<String,
                         // scope name unless the taken branch is labeled.
                         let label = gi.branch_labels.get(bi).and_then(|l| l.as_ref());
                         let scope = gen_scope_name(label, *gen_ordinal);
+                        // Labeled branch: scope the declarations themselves
+                        // (see elaborate_generate_if) so this expansion path
+                        // registers the same `g.x` keys as the direct path.
+                        let scoped_items;
+                        let branch_items = match label {
+                            Some(l) => {
+                                scoped_items =
+                                    rename_decls_in_iter(branch_items, &GenRename::Scope(l));
+                                &scoped_items
+                            }
+                            None => branch_items,
+                        };
                         let mut inner = collect_effective_items(branch_items, params);
                         prefix_gen_scope(&mut inner, &scope);
                         result.extend(inner);
@@ -14180,7 +14241,16 @@ fn collect_effective_items_scoped(items: &[ModuleItem], params: &HashMap<String,
                 }
                 if let Some(arm) = chosen {
                     let scope = gen_scope_name(arm.label.as_ref(), *gen_ordinal);
-                    let mut inner = collect_effective_items(&arm.items, params);
+                    let scoped_items;
+                    let arm_items = match &arm.label {
+                        Some(l) => {
+                            scoped_items =
+                                rename_decls_in_iter(&arm.items, &GenRename::Scope(l));
+                            &scoped_items
+                        }
+                        None => &arm.items,
+                    };
+                    let mut inner = collect_effective_items(arm_items, params);
                     prefix_gen_scope(&mut inner, &scope);
                     result.extend(inner);
                 }
