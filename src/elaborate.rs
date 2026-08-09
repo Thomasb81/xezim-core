@@ -2209,6 +2209,47 @@ fn restore_overlay(elab: &mut ElaboratedModule, saved: Vec<(String, Option<Value
     }
 }
 
+/// `XEZIM_TRACE_SIGNAL=<substr>[,<substr>...]` — trace every write to the
+/// elaboration signal table for matching names. The type-table tracer proved
+/// a declaration can be SIZED correctly (resolve:type_ref logs 292) while the
+/// simulated signal ends up narrower: a later plain `signals.insert` silently
+/// replaces the entry, and no width-resolution trace can see that. Each hit
+/// logs the source line of the insert, the new width, and the width it
+/// replaced — `prev_width=Some(292)` with a smaller new width is the smoking
+/// gun, and the line number names the guilty path.
+fn signal_trace_patterns() -> &'static Option<Vec<String>> {
+    static PATS: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    PATS.get_or_init(|| match std::env::var("XEZIM_TRACE_SIGNAL") {
+        Ok(v) if !v.trim().is_empty() => Some(
+            v.split(',')
+                .map(|s| s.trim().to_string())
+                .filter(|s| !s.is_empty())
+                .collect(),
+        ),
+        _ => None,
+    })
+}
+
+pub(crate) fn signals_insert_traced(
+    map: &mut HashMap<String, Signal>,
+    line: u32,
+    name: String,
+    sig: Signal,
+) -> Option<Signal> {
+    if let Some(pats) = signal_trace_patterns() {
+        if pats.iter().any(|p| name.contains(p.as_str())) {
+            eprintln!(
+                "[xezim][trace-signal] insert@elaborate.rs:{} key={} width={} prev_width={:?}",
+                line,
+                name,
+                sig.width,
+                map.get(&name).map(|s| s.width)
+            );
+        }
+    }
+    map.insert(name, sig)
+}
+
 fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut ElaboratedModule) {
     let mut pkgs: Vec<&crate::ast::module::PackageDeclaration> = defs
         .values()
@@ -2452,7 +2493,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
                     false,
                 );
                 elab.parameters.insert(nm.clone(), v.clone());
-                elab.signals.insert(nm.clone(), Signal { is_const: false,
+                signals_insert_traced(&mut elab.signals, line!(), nm.clone(), Signal { is_const: false,
                     name: nm.clone(),
                     width: base_width,
                     is_signed: enum_signed,
@@ -3058,7 +3099,7 @@ pub fn elaborate_module_with_defs(
                                     };
                                     let val_v = eval_init_for_width(v, &elab.parameters, elem_w);
                                     let signal_name = format!("{}[{}]", assign.name.name, key_str);
-                                    elab.signals.insert(
+                                    signals_insert_traced(&mut elab.signals, line!(), 
                                         signal_name.clone(),
                                         Signal {
                                             is_const: true,
@@ -3284,7 +3325,7 @@ pub fn elaborate_module_with_defs(
                 };
                 elab.port_order.push(port.name.name.clone());
                 if port_shape.is_empty() {
-                    elab.signals.insert(port.name.name.clone(), sig);
+                    signals_insert_traced(&mut elab.signals, line!(), port.name.name.clone(), sig);
                 } else {
                     register_fixed_unpacked_array(
                         &mut elab,
@@ -3711,7 +3752,7 @@ pub fn elaborate_module_with_defs(
                     if !elab.port_order.contains(&decl.name.name) {
                         elab.port_order.push(decl.name.name.clone());
                     }
-                    elab.signals.insert(decl.name.name.clone(), sig);
+                    signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(view) = &port_modport_view {
                         elab.modport_views.insert(decl.name.name.clone(), view.clone());
                     }
@@ -3803,7 +3844,7 @@ pub fn elaborate_module_with_defs(
                         value: init_value,
                         type_name: get_type_name(&nd.data_type),
                     };
-                    elab.signals.insert(decl.name.name.clone(), sig);
+                    signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     elab.nets.insert(decl.name.name.clone());
                     // The declared type, same as the variable arm: the
                     // simulator's `register_struct_member_packed_dims` walks
@@ -4541,7 +4582,7 @@ pub fn elaborate_module_with_defs(
                                 for i in lo..=hi {
                                     let en = format!("{}[{}]", decl.name.name, i);
                                     elab.events.insert(en.clone());
-                                    elab.signals.insert(
+                                    signals_insert_traced(&mut elab.signals, line!(), 
                                         en.clone(),
                                         Signal {
                                             is_const: false,
@@ -4633,7 +4674,7 @@ pub fn elaborate_module_with_defs(
                                 if is_dynamic_dim {
                                     let size_name = format!("{}.size", decl.name.name);
                                     let size_sig = Signal { is_const: false, name: size_name.clone(), width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None };
-                                    elab.signals.insert(size_name, size_sig);
+                                    signals_insert_traced(&mut elab.signals, line!(), size_name, size_sig);
                                 }
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
@@ -4694,7 +4735,7 @@ pub fn elaborate_module_with_defs(
                             value: init_val,
                             type_name: get_type_name(&dd.data_type),
                         };
-                        elab.signals.insert(decl.name.name.clone(), sig);
+                        signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                         if matches!(&dd.data_type, DataType::Simple { kind: SimpleType::Event, .. }) {
                             elab.events.insert(decl.name.name.clone());
                         }
@@ -5213,7 +5254,7 @@ pub fn elaborate_module_with_defs(
                                                 _ => eval_const_expr_val(k, &elab.parameters).to_dec_string(),
                                             };
                                             let val_v = eval_init_for_width(v, &elab.parameters, width);
-                                            elab.signals.insert(
+                                            signals_insert_traced(&mut elab.signals, line!(), 
                                                 format!("{}[{}]", assign.name.name, key_str),
                                                 Signal {
                                                     is_const: true,
@@ -5438,7 +5479,7 @@ pub fn elaborate_module_with_defs(
                         }
 
                         // Also add as a signal so it can be read in expressions
-                        elab.signals.insert(assign.name.name.clone(), Signal { is_const: false,
+                        signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal { is_const: false,
                             name: assign.name.name.clone(),
                             width: current_width,
                             is_signed: current_signed,
@@ -5769,7 +5810,7 @@ pub fn elaborate_module_with_defs(
                     // Register the instance name so it's recognized during validation.
                     // It will be fully elaborated during inlining.
                     if !elab.signals.contains_key(&hi.name.name) {
-                        elab.signals.insert(hi.name.name.clone(), Signal {
+                        signals_insert_traced(&mut elab.signals, line!(), hi.name.name.clone(), Signal {
                             is_const: false,
                             name: hi.name.name.clone(),
                             width: 1,
@@ -7536,7 +7577,7 @@ fn register_generate_labels(items: &[ModuleItem], elab: &mut ElaboratedModule) {
     collect_generate_labels(items, &mut labels);
     for l in labels {
         if !elab.signals.contains_key(&l) {
-            elab.signals.insert(
+            signals_insert_traced(&mut elab.signals, line!(), 
                 l.clone(),
                 Signal {
                     is_const: false,
@@ -8084,7 +8125,7 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
                 name
             ));
         }
-        elab.signals.insert(name.clone(), Signal { is_const: false,
+        signals_insert_traced(&mut elab.signals, line!(), name.clone(), Signal { is_const: false,
             name: name.clone(), width: 1, is_signed: false,
             direction: None, value: Value::new(1),
             is_real: false, type_name: None,
@@ -8323,7 +8364,7 @@ fn create_implicit_nets(
                     name
                 ));
             }
-            elab.signals.insert(name.clone(), Signal { is_const: false,
+            signals_insert_traced(&mut elab.signals, line!(), name.clone(), Signal { is_const: false,
                 name: name.clone(), width: 1, is_signed: false,
                 direction: None, value: Value::new(1),
                 is_real: false, type_name: None,
@@ -8371,7 +8412,7 @@ fn create_implicit_nets(
                 name
             ));
         }
-        elab.signals.insert(name.clone(), Signal { is_const: false,
+        signals_insert_traced(&mut elab.signals, line!(), name.clone(), Signal { is_const: false,
             name: name.clone(), width: 1, is_signed: false,
             direction: None, value: Value::new(1),
             is_real: false, type_name: None,
@@ -8508,7 +8549,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         ),
                         is_real, type_name: get_type_name(&pd.data_type),
                     };
-                    elab.signals.insert(decl.name.name.clone(), sig);
+                    signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     elab.port_order.push(decl.name.name.clone());
                     if let Some(view) = &port_modport_view {
                         elab.modport_views.insert(decl.name.name.clone(), view.clone());
@@ -8538,7 +8579,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         direction: None, value: init_value,
                         is_real, type_name: get_type_name(&nd.data_type),
                     };
-                    elab.signals.insert(decl.name.name.clone(), sig);
+                    signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(init_expr) = &decl.init {
                         elab.continuous_assigns.push(ContinuousAssignment {
                             lhs: make_ident_expr(&decl.name.name),
@@ -8681,7 +8722,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                 if is_dynamic_dim {
                                     let size_name = format!("{}.size", decl.name.name);
                                     let size_sig = Signal { is_const: false, name: size_name.clone(), width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None };
-                                    elab.signals.insert(size_name, size_sig);
+                                    signals_insert_traced(&mut elab.signals, line!(), size_name, size_sig);
                                 }
                                 elab.initial_blocks.push(InitialBlock {
                                     stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
@@ -8697,7 +8738,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             default_value_for_type_resolved(&dd.data_type, width, &elab.typedef_types)
                         };
                         let sig = Signal { is_const: dd.const_kw, name: decl.name.name.clone(), width, is_signed, is_real, direction: None, value: init_val, type_name: get_type_name(&dd.data_type) };
-                        elab.signals.insert(decl.name.name.clone(), sig);
+                        signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                         if let Some(view) = &data_modport_view {
                             elab.modport_views.insert(decl.name.name.clone(), view.clone());
                         }
@@ -8791,7 +8832,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                         let mut pv = Value::fill_of(*c);
                                         pv.is_fill = false;
                                         elab.parameters.insert(assign.name.name.clone(), pv.clone());
-                                        elab.signals.insert(assign.name.name.clone(), Signal { is_const: false,
+                                        signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal { is_const: false,
                                             name: assign.name.name.clone(), width: 1, is_signed: false,
                                             direction: None, value: pv, is_real: false, type_name: get_type_name(data_type),
                                         });
@@ -8833,7 +8874,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                                 v
                             } else { Value::zero(width) };
                             elab.parameters.insert(assign.name.name.clone(), val.clone());
-                            elab.signals.insert(assign.name.name.clone(), Signal { is_const: false,
+                            signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal { is_const: false,
                                 name: assign.name.name.clone(), width, is_signed: signed,
                                 direction: None, value: val, is_real: is_type_real(data_type), type_name: get_type_name(data_type),
                             });
@@ -8912,7 +8953,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &inst.instances {
                     if !elab.signals.contains_key(&hi.name.name) {
-                        elab.signals.insert(hi.name.name.clone(), Signal {
+                        signals_insert_traced(&mut elab.signals, line!(), hi.name.name.clone(), Signal {
                             is_const: false,
                             name: hi.name.name.clone(), width: 1,
                             is_signed: false, direction: None, value: Value::new(1), type_name: Some(inst.module_name.name.clone()),
@@ -12277,7 +12318,7 @@ fn register_array_param(
         // context (`localparam A1 = A[1];`) can resolve the element — the
         // const-eval Index arm consults `params` by "name[idx]".
         elab.parameters.insert(sn.clone(), v.clone());
-        elab.signals.insert(sn.clone(), Signal {
+        signals_insert_traced(&mut elab.signals, line!(), sn.clone(), Signal {
             is_const: true, name: sn, width: elem_w, is_signed: signed,
             is_real: false, direction: None, value: v, type_name: None,
         });
@@ -13419,7 +13460,7 @@ pub fn inline_instantiations(
                                     }
                                     if is_dynamic_dim {
                                         let size_name = format!("{}.size", decl.name.name);
-                                        elab.signals.insert(size_name.clone(), Signal { is_const: false, name: size_name, width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None });
+                                        signals_insert_traced(&mut elab.signals, line!(), size_name.clone(), Signal { is_const: false, name: size_name, width: 32, is_signed: false, is_real: false, direction: None, value: Value::from_u64(init_items.len() as u64, 32), type_name: None });
                                     }
                                     elab.static_init_blocks.push(InitialBlock {
                                         stmt: Statement::new(StatementKind::SeqBlock { name: None, stmts }, Span::dummy()), scope: String::new(), });
@@ -15624,7 +15665,7 @@ fn inline_module_items(
                         let is_real = sub_mod_name == "real";
                         for hi in &inst.instances {
                             let sig_name = format!("{}{}", prefix, hi.name.name);
-                            elab.signals.insert(sig_name.clone(), Signal { is_const: false,
+                            signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                 name: sig_name, width, is_signed: is_real, direction: None,
                                 value: if is_real { Value::from_f64(0.0) } else { Value::new(width) },
                                 is_real, type_name: Some(sub_mod_name.clone()),
@@ -15647,7 +15688,7 @@ fn inline_module_items(
                         );
                         for hi in &inst.instances {
                             let sig_name = format!("{}{}", prefix, hi.name.name);
-                            elab.signals.insert(sig_name.clone(), Signal {
+                            signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal {
                                 is_const: false,
                                 name: sig_name,
                                 width: 1,
@@ -15782,7 +15823,7 @@ fn inline_module_items(
                                 scoped
                             ));
                         }
-                        elab.signals.insert(scoped.clone(), Signal { is_const: false,
+                        signals_insert_traced(&mut elab.signals, line!(), scoped.clone(), Signal { is_const: false,
                             name: scoped.clone(), width: 1, is_signed: false,
                             direction: None, value: Value::new(1),
                             is_real: false, type_name: None,
@@ -16406,7 +16447,7 @@ fn inline_module_items(
                                                         elem_w,
                                                     );
                                                     let sname = format!("{}[{}]", arr_full, key_str);
-                                                    elab.signals.insert(
+                                                    signals_insert_traced(&mut elab.signals, line!(), 
                                                         sname.clone(),
                                                         Signal {
                                                             is_const: true,
@@ -16551,7 +16592,7 @@ fn inline_module_items(
                     let full_name = format!("{}{}", inst_prefix, name);
                     elab.parameters.insert(full_name.clone(), val.clone());
                     // Also add as a signal for simulation access
-                    elab.signals.insert(full_name.clone(), Signal { is_const: false,
+                    signals_insert_traced(&mut elab.signals, line!(), full_name.clone(), Signal { is_const: false,
                         name: full_name,
                         width: val.width,
                         is_signed: val.is_signed,
@@ -16753,7 +16794,7 @@ fn inline_module_items(
                                 }
                             }
                             if port_shape.is_empty() {
-                                elab.signals.insert(sig_name.clone(), Signal { is_const: false,
+                                signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
                                     is_signed: port.data_type.as_ref().map(is_type_signed).unwrap_or(false),
                                     is_real,
@@ -16817,7 +16858,7 @@ fn inline_module_items(
                                             elab.packed_struct_fields.entry(sig_name.clone()).or_insert(fields);
                                         }
                                     }
-                                    elab.signals.insert(sig_name.clone(), Signal { is_const: false,
+                                    signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                         name: sig_name, width, is_signed,
                                         direction: Some(pd.direction),
                                         value: default_port_value(
@@ -16872,7 +16913,7 @@ fn inline_module_items(
                                 };
                                 if should_insert {
                                     elab.parameters.insert(member.name.name.clone(), v.clone());
-                                    elab.signals.insert(member.name.name.clone(), Signal {
+                                    signals_insert_traced(&mut elab.signals, line!(), member.name.name.clone(), Signal {
                                         is_const: false,
                                         name: member.name.name.clone(),
                                         width: base_width,
@@ -17012,7 +17053,7 @@ fn inline_module_items(
                                         }
                                     }
                                 };
-                                elab.signals.insert(sig_name.clone(), Signal { is_const: false,
+                                signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: false,
                                     name: sig_name, width,
                                     is_signed: is_type_signed(&nd.data_type),
                                     is_real: is_type_real(&nd.data_type),
@@ -17052,7 +17093,7 @@ fn inline_module_items(
                                     let v = Value::from_u64(val, base_width);
                                     let scoped = format!("{}.{}", inst_prefix_no_dot, member.name.name);
                                     elab.parameters.insert(scoped.clone(), v.clone());
-                                    elab.signals.insert(scoped.clone(), Signal {
+                                    signals_insert_traced(&mut elab.signals, line!(), scoped.clone(), Signal {
                                         is_const: false,
                                         name: scoped,
                                         width: base_width,
@@ -17463,7 +17504,7 @@ fn inline_module_items(
                                     elab.var_decl_types
                                         .entry(sig_name.clone())
                                         .or_insert_with(|| dd.data_type.clone());
-                                    elab.signals.insert(sig_name.clone(), Signal { is_const: dd.const_kw,
+                                    signals_insert_traced(&mut elab.signals, line!(), sig_name.clone(), Signal { is_const: dd.const_kw,
                                         name: sig_name, width, is_signed,
                                         direction: None, value: init_val,
                                         is_real: is_type_real(&dd.data_type), type_name: get_type_name(&dd.data_type),
@@ -19351,7 +19392,7 @@ fn lower_udp_instances(
                                     name, inst_path
                                 ));
                             }
-                            elab.signals.insert(name.clone(), Signal { is_const: false,
+                            signals_insert_traced(&mut elab.signals, line!(), name.clone(), Signal { is_const: false,
                                 name: name.clone(), width: 1, is_signed: false,
                                 direction: None, value: Value::new(1),
                                 is_real: false, type_name: None,
@@ -20563,7 +20604,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
                                         elab.parameters.insert(assign.name.name.clone(), v.clone());
-                                        elab.signals.insert(assign.name.name.clone(), Signal {
+                                        signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal {
                                             is_const: false, name: assign.name.name.clone(),
                                             width, is_signed: signed, is_real, direction: None,
                                             value: v, type_name: get_type_name(data_type),
@@ -20609,7 +20650,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                                     false,
                                                 );
                                                 elab.parameters.insert(nm.clone(), v.clone());
-                                                elab.signals.insert(nm.clone(), Signal {
+                                                signals_insert_traced(&mut elab.signals, line!(), nm.clone(), Signal {
                                                     is_const: false,
                                                     name: nm.clone(),
                                                     width: base_width,
@@ -20692,7 +20733,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         let v = if let Some(init) = &decl.init {
                                             eval_init_for_width(init, &elab.parameters, width)
                                         } else { Value::zero(width) };
-                                        elab.signals.insert(decl.name.name.clone(), Signal {
+                                        signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), Signal {
                                             is_const: dd.const_kw, name: decl.name.name.clone(),
                                             width, is_signed, is_real, direction: None,
                                             value: v, type_name: get_type_name(&dd.data_type),
@@ -20805,7 +20846,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         );
                                         alias_pkg_param(elab, pkg_name, &assign.name.name, &v);
                                         elab.parameters.insert(assign.name.name.clone(), v.clone());
-                                        elab.signals.insert(assign.name.name.clone(), Signal {
+                                        signals_insert_traced(&mut elab.signals, line!(), assign.name.name.clone(), Signal {
                                             is_const: false, name: assign.name.name.clone(),
                                             width, is_signed: signed, is_real, direction: None,
                                             value: v, type_name: get_type_name(data_type),
@@ -20913,7 +20954,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 } else {
                                     get_type_name(&dd.data_type)
                                 };
-                                elab.signals.insert(decl.name.name.clone(), Signal {
+                                signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), Signal {
                                     is_const: dd.const_kw, name: decl.name.name.clone(),
                                     width, is_signed, is_real, direction: None,
                                     value: v, type_name: tn,
