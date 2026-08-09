@@ -3805,6 +3805,17 @@ pub fn elaborate_module_with_defs(
                     };
                     elab.signals.insert(decl.name.name.clone(), sig);
                     elab.nets.insert(decl.name.name.clone());
+                    // The declared type, same as the variable arm: the
+                    // simulator's `register_struct_member_packed_dims` walks
+                    // `packed_struct_fields` and needs the declaring type to
+                    // derive per-MEMBER element strides (`x.lanes` -> 64).
+                    // The net arm only recorded it on the unpacked-array
+                    // branch, so `x[0][0].lanes[0]` on a typedef'd wire read
+                    // one bit of the wrong field while the identical variable
+                    // declaration worked.
+                    elab.var_decl_types
+                        .entry(decl.name.name.clone())
+                        .or_insert_with(|| nd.data_type.clone());
                     // §7.2.1: a packed-struct-typed NET needs its field layout
                     // registered in `packed_struct_fields` so member reads/writes
                     // (`word2.high`, `assign word2.high = ...`) slice into the
@@ -3842,11 +3853,82 @@ pub fn elaborate_module_with_defs(
                     // unconditionally; the net arm gated it behind
                     // "no unpacked dims", so element selects into an unpacked
                     // array of packed vectors lost their width.
-                    if let Some(elem_w) = packed_inner_elem_width(&nd.data_type, &elab.parameters, &elab.typedefs) {
-                        elab.packed_signal_elem_widths.insert(decl.name.name.clone(), elem_w);
+                    // Typedef'd element type (`wire burst_t [0:0][1:0] x;`,
+                    // scoped or bare): the direct calls see only a
+                    // TypeReference and return None, so element selects lost
+                    // their width — `$bits(x[0][0])` read 1. Chase the typedef
+                    // exactly like the variable (DataDeclaration) arm does.
+                    let nd_resolved: DataType = match &nd.data_type {
+                        DataType::TypeReference { name, .. } => name
+                            .scope
+                            .as_ref()
+                            .and_then(|sc| {
+                                elab.typedef_types
+                                    .get(&format!("{}::{}", sc.name, name.name.name))
+                            })
+                            .or_else(|| elab.typedef_types.get(&name.name.name))
+                            .cloned()
+                            .unwrap_or_else(|| nd.data_type.clone()),
+                        _ => nd.data_type.clone(),
+                    };
+                    // Packed dims written on the typedef itself
+                    // (`wire burst_t [0:0][1:0] x;` over a packed struct):
+                    // the SAME registration the variable arm performs — the
+                    // full-dims vector carries the element type's own width as
+                    // its innermost entry, and the element width is the
+                    // product of the inner dims. Without it `x[0][0]` was a
+                    // 1-bit select on a net where the identical variable
+                    // declaration worked.
+                    {
+                        let chain2 =
+                            resolve_typedef_chain(&nd.data_type, &elab.typedef_types).clone();
+                        let base_w = match &chain2 {
+                            DataType::Struct(su) if su.packed => flatten_struct_fields(
+                                &chain2,
+                                &elab.parameters,
+                                &elab.typedefs,
+                                &elab.typedef_types,
+                            )
+                            .map(|f| f.iter().map(|(_, o, w)| o + w).max().unwrap_or(0))
+                            .unwrap_or(0),
+                            _ => 0,
+                        };
+                        if base_w > 0 {
+                            if let Some(fdims) = packed_typedef_array_dims(
+                                &nd.data_type,
+                                base_w,
+                                &elab.parameters,
+                            ) {
+                                let total: i64 =
+                                    fdims.iter().map(|(l, r)| (l - r).abs() + 1).product();
+                                let (ol, orr) = fdims[0];
+                                let outer = (ol - orr).abs() + 1;
+                                if outer > 0 && total > 0 {
+                                    elab.packed_signal_elem_widths.insert(
+                                        decl.name.name.clone(),
+                                        (total / outer) as u32,
+                                    );
+                                }
+                                elab.packed_full_dims
+                                    .insert(decl.name.name.clone(), fdims);
+                            }
+                        }
                     }
-                    if let Some(fdims) = packed_full_dims_of(&nd.data_type, &elab.parameters) {
-                        elab.packed_full_dims.insert(decl.name.name.clone(), fdims);
+                    if let Some(elem_w) = packed_inner_elem_width(&nd.data_type, &elab.parameters, &elab.typedefs)
+                        .or_else(|| packed_inner_elem_width(&nd_resolved, &elab.parameters, &elab.typedefs))
+                    {
+                        elab.packed_signal_elem_widths
+                            .entry(decl.name.name.clone())
+                            .or_insert(elem_w);
+                    }
+                    if let Some(fdims) = packed_full_dims_of(&nd.data_type, &elab.parameters)
+                        .or_else(|| packed_full_dims_of(&nd_resolved, &elab.parameters))
+                        .or_else(|| packed_full_dims_chained(
+                            &nd.data_type, &elab.parameters, &elab.typedef_types))
+                    {
+                        elab.packed_full_dims
+                            .entry(decl.name.name.clone())
+                            .or_insert(fdims);
                     }
                     if let Some(shape) = fixed_unpacked_shape(&effective_dims, &elab.parameters)
                         .filter(|shape| !shape.is_empty())

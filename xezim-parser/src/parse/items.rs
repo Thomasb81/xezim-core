@@ -1223,6 +1223,36 @@ impl Parser {
                 && matches!(self.peek_kind(),
                     TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)
             { self.parse_data_type() }
+            // `wire word_t [1:0][7:0] x;` — identifier followed by packed dims
+            // and THEN another identifier is a typedef'd net with packed
+            // dimensions (§6.7.1). Distinguish from `wire foo [3:0];` (a net
+            // NAMED foo with an unpacked dim) by looking past the balanced
+            // bracket groups: an identifier there means the first token was a
+            // type. This form used to be a hard parse error ("expected
+            // Semicolon"), because the type name was taken as the declarator.
+            else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket
+                && {
+                    let mut p = self.pos + 1;
+                    while p < self.tokens.len() && self.tokens[p].kind == TokenKind::LBracket {
+                        let mut depth = 0usize;
+                        while p < self.tokens.len() {
+                            match self.tokens[p].kind {
+                                TokenKind::LBracket => depth += 1,
+                                TokenKind::RBracket => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        p += 1;
+                                        break;
+                                    }
+                                }
+                                _ => {}
+                            }
+                            p += 1;
+                        }
+                    }
+                    p < self.tokens.len() && self.tokens[p].kind == TokenKind::Identifier
+                }
+            { self.parse_data_type() }
             else if self.at(TokenKind::LBracket) {
                 let dimensions = self.parse_packed_dimensions();
                 DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
