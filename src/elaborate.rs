@@ -5212,6 +5212,26 @@ pub fn elaborate_module_with_defs(
                                 }
                             }
                         }
+                        // §7.8: an ASSOCIATIVE array OF STRUCTS
+                        // (`S sa[string]`) — the struct-var path never
+                        // registered the container, so `num()/exists()/
+                        // foreach` all treated `sa` as a scalar while the
+                        // composed element writes worked.
+                        if matches!(dt_resolved, DataType::Struct(_)) {
+                            if let Some(UnpackedDimension::Associative {
+                                data_type: key_dt, ..
+                            }) = decl.dimensions.first()
+                            {
+                                let is_string_key = key_dt.as_ref().is_some_and(|dt| {
+                                    matches!(
+                                        dt.as_ref(),
+                                        DataType::Simple { kind: SimpleType::String, .. }
+                                    )
+                                });
+                                elab.associative_arrays
+                                    .insert(decl.name.name.clone(), is_string_key);
+                            }
+                        }
                         // Per-field packed-array element widths so that
                         // `obj.field[i]` slices instead of bit-selects when
                         // the field is `logic [3:0][7:0] field;`. Walks
