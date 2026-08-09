@@ -3714,7 +3714,15 @@ pub fn elaborate_module_with_defs(
                             let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
                             existing.direction = Some(pd.direction);
                             if explicit_type {
-                                existing.width = width;
+                                if let Some(pats) = signal_trace_patterns() {
+                                if pats.iter().any(|p| existing.name.contains(p.as_str())) {
+                                    eprintln!(
+                                        "[xezim][trace-signal] width_mut@elaborate.rs:{} key={} width={} prev_width=Some({})",
+                                        line!(), existing.name, width, existing.width
+                                    );
+                                }
+                            }
+                            existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
                                 existing.type_name = get_type_name(&pd.data_type);
@@ -4144,6 +4152,14 @@ pub fn elaborate_module_with_defs(
                         let decl_is_real = is_type_real(&dd.data_type);
                         let existing = elab.signals.get_mut(&decl.name.name).unwrap();
                         if explicit_type {
+                            if let Some(pats) = signal_trace_patterns() {
+                                if pats.iter().any(|p| existing.name.contains(p.as_str())) {
+                                    eprintln!(
+                                        "[xezim][trace-signal] width_mut@elaborate.rs:{} key={} width={} prev_width=Some({})",
+                                        line!(), existing.name, width, existing.width
+                                    );
+                                }
+                            }
                             existing.width = width;
                             existing.is_signed = is_signed;
                             existing.is_real = decl_is_real;
@@ -8517,7 +8533,15 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             let explicit_type = !matches!(pd.data_type, DataType::Implicit { .. });
                             existing.direction = Some(pd.direction);
                             if explicit_type {
-                                existing.width = width;
+                                if let Some(pats) = signal_trace_patterns() {
+                                if pats.iter().any(|p| existing.name.contains(p.as_str())) {
+                                    eprintln!(
+                                        "[xezim][trace-signal] width_mut@elaborate.rs:{} key={} width={} prev_width=Some({})",
+                                        line!(), existing.name, width, existing.width
+                                    );
+                                }
+                            }
+                            existing.width = width;
                                 existing.is_signed = is_signed;
                                 existing.is_real = is_real;
                                 existing.type_name = get_type_name(&pd.data_type);
@@ -17300,7 +17324,15 @@ fn inline_module_items(
                                     let decl_is_real = is_type_real(&dd.data_type);
                                     let existing = elab.signals.get_mut(&sig_name).unwrap();
                                     if explicit_type {
-                                        existing.width = width;
+                                        if let Some(pats) = signal_trace_patterns() {
+                                if pats.iter().any(|p| existing.name.contains(p.as_str())) {
+                                    eprintln!(
+                                        "[xezim][trace-signal] width_mut@elaborate.rs:{} key={} width={} prev_width=Some({})",
+                                        line!(), existing.name, width, existing.width
+                                    );
+                                }
+                            }
+                            existing.width = width;
                                         existing.is_signed = is_signed;
                                         existing.is_real = decl_is_real;
                                         existing.type_name = get_type_name(&dd.data_type);
