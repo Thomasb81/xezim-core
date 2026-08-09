@@ -1966,25 +1966,34 @@ fn decode_string_escapes_checked(raw: &str) -> (String, Vec<(bool, String)>) {
 
 fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> String {
     let bytes = raw.as_bytes();
-    let mut out: Vec<u8> = Vec::with_capacity(bytes.len());
+    // A SystemVerilog string is a BYTE string (§5.9/§6.16). Every source
+    // byte — literal text and escape-produced alike — is stored as its
+    // Latin-1 char (U+0000..U+00FF, one char per byte), the exact inverse of
+    // `Value::from_string`'s byte extraction; the stdout sink re-encodes
+    // those chars as single bytes. NEVER route through a lossy UTF-8
+    // conversion (it collapsed every escape byte >= 0x80 to U+FFFD, which
+    // read back as 0xBD), and never keep multi-byte source chars as one Rust
+    // char (the byte count — string width, len(), getc() — must match the
+    // reference's byte semantics).
+    let mut out = String::with_capacity(bytes.len());
     let mut i = 0;
     while i < bytes.len() {
         if bytes[i] != b'\\' || i + 1 >= bytes.len() {
-            out.push(bytes[i]);
+            out.push(char::from(bytes[i]));
             i += 1;
             continue;
         }
         match bytes[i + 1] {
-            b'n' => { out.push(b'\n'); i += 2; }
-            b't' => { out.push(b'\t'); i += 2; }
-            b'r' => { out.push(b'\r'); i += 2; }
-            b'\\' => { out.push(b'\\'); i += 2; }
-            b'"' => { out.push(b'"'); i += 2; }
-            b'\'' => { out.push(b'\''); i += 2; }
-            b'a' => { out.push(0x07); i += 2; }
-            b'b' => { out.push(0x08); i += 2; }
-            b'f' => { out.push(0x0c); i += 2; }
-            b'v' => { out.push(0x0b); i += 2; }
+            b'n' => { out.push('\n'); i += 2; }
+            b't' => { out.push('\t'); i += 2; }
+            b'r' => { out.push('\r'); i += 2; }
+            b'\\' => { out.push('\\'); i += 2; }
+            b'"' => { out.push('"'); i += 2; }
+            b'\'' => { out.push('\''); i += 2; }
+            b'a' => { out.push('\u{07}'); i += 2; }
+            b'b' => { out.push('\u{08}'); i += 2; }
+            b'f' => { out.push('\u{0c}'); i += 2; }
+            b'v' => { out.push('\u{0b}'); i += 2; }
             b'0' | b'1' | b'2' | b'3' | b'4' | b'5' | b'6' | b'7' => {
                 // 1-3 octal digits
                 let mut j = i + 1;
@@ -1995,7 +2004,7 @@ fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> St
                     j += 1;
                     digits += 1;
                 }
-                out.push((val & 0xff) as u8);
+                out.push(char::from((val & 0xff) as u8));
                 i = j;
             }
             b'x' => {
@@ -2022,7 +2031,7 @@ fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> St
                     // the remaining characters are still processed normally.
                     i += 2;
                 } else {
-                    out.push((val & 0xff) as u8);
+                    out.push(char::from((val & 0xff) as u8));
                     i = j;
                 }
             }
@@ -2035,10 +2044,10 @@ fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> St
                     "unknown escape sequence '\\{}' in string literal (IEEE 1800-2017 §5.9)",
                     bytes[i + 1] as char
                 )));
-                out.push(bytes[i + 1]);
+                out.push(char::from(bytes[i + 1]));
                 i += 2;
             }
         }
     }
-    String::from_utf8_lossy(&out).into_owned()
+    out
 }

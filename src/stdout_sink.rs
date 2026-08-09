@@ -127,6 +127,30 @@ pub struct StdoutSink {
     mode: Mode,
 }
 
+/// Encode simulation text for output: SystemVerilog strings are BYTE
+/// strings carried through Rust `String`s as one Latin-1 char per byte
+/// (see the parser's escape decoder / `Value::to_sv_string`), so chars
+/// U+0080..U+00FF must leave as their single raw byte — `"\xab"` prints
+/// byte 0xAB, not the two-byte UTF-8 of U+00AB. Chars above U+00FF (not
+/// producible from SV string data) fall back to UTF-8. ASCII text — the
+/// overwhelming common case — is borrowed unchanged.
+fn encode_sim_bytes(s: &str) -> std::borrow::Cow<'_, [u8]> {
+    if s.is_ascii() {
+        return std::borrow::Cow::Borrowed(s.as_bytes());
+    }
+    let mut out = Vec::with_capacity(s.len());
+    for c in s.chars() {
+        let u = c as u32;
+        if u <= 0xFF {
+            out.push(u as u8);
+        } else {
+            let mut b = [0u8; 4];
+            out.extend_from_slice(c.encode_utf8(&mut b).as_bytes());
+        }
+    }
+    std::borrow::Cow::Owned(out)
+}
+
 impl StdoutSink {
     pub fn inline() -> Self {
         StdoutSink { mode: Mode::Inline(BufWriter::with_capacity(BUF_CAPACITY, io::stdout())) }
@@ -174,7 +198,7 @@ impl StdoutSink {
 
     #[inline]
     pub fn write_str(&mut self, s: &str) {
-        self.write_bytes(s.as_bytes());
+        self.write_bytes(&encode_sim_bytes(s));
     }
 
     #[inline]
@@ -186,13 +210,14 @@ impl StdoutSink {
         // WITHOUT its terminator — and with `--log` (stdout and stderr dup2'd to
         // one file) a diagnostic written meanwhile landed inside it, producing
         // `...status=running[PROF] settle=...`.
+        let bytes = encode_sim_bytes(s);
         match &mut self.mode {
             Mode::Inline(w) => {
-                let _ = w.write_all(s.as_bytes());
+                let _ = w.write_all(&bytes);
                 let _ = w.write_all(b"\n");
             }
             Mode::Threaded { buf, .. } => {
-                buf.extend_from_slice(s.as_bytes());
+                buf.extend_from_slice(&bytes);
                 buf.push(b'\n');
             }
         }

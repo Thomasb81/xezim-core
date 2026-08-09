@@ -4736,6 +4736,19 @@ pub fn elaborate_module_with_defs(
                                 // variable-declaration twin.)
                                 if !is_real { rv.is_signed = is_signed; }
                                 if is_real { rv = Value::from_f64(rv.to_f64()); }
+                                // §6.3.1/§6.11: converting to a 2-STATE type
+                                // maps x/z to 0. The procedural-assign path
+                                // already did this; the declaration
+                                // initializer skipped it, so `bit b = 1'bx;`
+                                // stored an "impossible" x in a 2-state var.
+                                if !is_real
+                                    && is_type_two_state_resolved(
+                                        &dd.data_type,
+                                        &elab.typedef_types,
+                                    )
+                                {
+                                    rv = rv.to_two_state();
+                                }
                                 (rv, None)
                             } else {
                                 (default_value_for_type_resolved(&dd.data_type, w, &elab.typedef_types), Some(init_expr.clone()))
@@ -10015,7 +10028,9 @@ pub fn is_type_two_state(dt: &DataType) -> bool {
         DataType::Real { .. } => true,
         // §6.19.2: an enum's state-ness follows its BASE type — `enum bit
         // [3:0] {...} e;` default-initializes to 0, `enum reg [3:0]` to x.
-        DataType::Enum(e) => e.base_type.as_deref().map(is_type_two_state).unwrap_or(false),
+        // §6.19: with NO base type the default is `int` — 2-STATE, so a bare
+        // `enum {A0,A1} k;` initializes to 0 (it read x before).
+        DataType::Enum(e) => e.base_type.as_deref().map(is_type_two_state).unwrap_or(true),
         _ => false,
     }
 }

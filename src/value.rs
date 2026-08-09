@@ -287,6 +287,31 @@ impl Value {
         natural.max(32)
     }
 
+    /// §5.7.1 — an UNSIZED based literal whose digits are uniformly x (or
+    /// uniformly z/?) extends with that digit "to the size of the expression",
+    /// exactly like an unbased-unsized fill: `u64 = 'bx` must be 64 x bits,
+    /// not 32 x bits zero-extended. Returns the fill char when the digit
+    /// string qualifies, so the literal evaluators can mark the (32-bit)
+    /// value `is_fill`. A MIXED leading-x/z literal (`'bx1`) stays a plain
+    /// 32-bit value — extension past 32 bits is not attempted for it.
+    pub fn unsized_xz_fill_char(value: &str) -> Option<char> {
+        let mut fill: Option<char> = None;
+        for c in value.chars() {
+            let f = match c {
+                '_' => continue,
+                'x' | 'X' => 'x',
+                'z' | 'Z' | '?' => 'z',
+                _ => return None,
+            };
+            match fill {
+                None => fill = Some(f),
+                Some(prev) if prev != f => return None,
+                _ => {}
+            }
+        }
+        fill
+    }
+
     /// Bit mask for the valid bits of an inline value.
     #[inline(always)]
     fn mask(width: u32) -> u64 {
