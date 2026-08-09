@@ -453,7 +453,30 @@ pub fn elab_diag_capture_take() -> Vec<String> {
 /// How many times one KIND of elaboration diagnostic is reported before the
 /// rest are summarized away. A design with hundreds of implicit nets (or
 /// width-mismatched ports) otherwise buries every other message.
-const DIAG_KIND_LIMIT: u32 = 5;
+const DIAG_KIND_LIMIT_DEFAULT: u32 = 5;
+
+/// The active cap, from `XEZIM_DIAG_LIMIT` (`0` = unlimited).
+///
+/// The default keeps a noisy design readable, but it hides exactly the
+/// messages you reach for when a whole CLASS of things is wrong: five port
+/// width mismatches followed by "further messages suppressed" reads as "there
+/// were five", and the count that would have told you it was systemic is gone.
+/// Raise it when a diagnostic is the thing you are chasing rather than noise.
+///
+/// Read once — the cap must not change mid-elaboration, or a warm-cache replay
+/// would not reproduce the same output. An unparseable value keeps the default
+/// rather than failing a run over a diagnostic setting.
+fn diag_kind_limit() -> u32 {
+    static LIMIT: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *LIMIT.get_or_init(|| match std::env::var("XEZIM_DIAG_LIMIT") {
+        Ok(v) => match v.trim().parse::<u32>() {
+            Ok(0) => u32::MAX,
+            Ok(n) => n,
+            Err(_) => DIAG_KIND_LIMIT_DEFAULT,
+        },
+        Err(_) => DIAG_KIND_LIMIT_DEFAULT,
+    })
+}
 
 /// Group key for the duplicate cap: the message up to the first quoted name.
 /// "…undeclared identifier 'a'" and "…undeclared identifier 'b'" share a key,
@@ -478,9 +501,10 @@ pub fn elab_diag_reset_counts() {
 /// Emit an elaboration diagnostic: printed live, and recorded when capture is
 /// active so a warm cache hit can replay it.
 ///
-/// At most `DIAG_KIND_LIMIT` messages of a given kind are emitted; the last one
-/// carries a note that the rest are suppressed. Suppressed messages are dropped
-/// from the capture sink too, so a warm-cache replay reproduces the same output.
+/// At most `diag_kind_limit()` messages of a given kind are emitted; the last
+/// one carries a note that the rest are suppressed, and names the env var so
+/// the reader can see the rest. Suppressed messages are dropped from the
+/// capture sink too, so a warm-cache replay reproduces the same output.
 pub(crate) fn elab_diag(msg: String) {
     let n = ELAB_DIAG_COUNTS.with(|c| {
         let mut m = c.borrow_mut();
@@ -488,14 +512,16 @@ pub(crate) fn elab_diag(msg: String) {
         *e += 1;
         *e
     });
-    if n > DIAG_KIND_LIMIT {
+    let limit = diag_kind_limit();
+    if n > limit {
         return;
     }
-    let msg = if n == DIAG_KIND_LIMIT {
+    // `u32::MAX` is the unlimited sentinel: no cap, and no suppression note.
+    let msg = if n == limit && limit != u32::MAX {
         format!(
             "{}\n[xezim][warning] further messages of this kind are suppressed \
-             (limit {}).",
-            msg, DIAG_KIND_LIMIT
+             (limit {}; set XEZIM_DIAG_LIMIT=N, or 0 for unlimited, to see them).",
+            msg, limit
         )
     } else {
         msg
