@@ -9457,10 +9457,14 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
     let mut i = gf.init_val;
     let trace = elab_trace_enabled();
     let mut iter_count = 0u32;
+    let mut hit_cap = true;
     for _ in 0..10000 {
         params_insert_traced(&mut elab.parameters, line!(), var.clone(), Value::from_u64(i as u64, 32));
         let cond_val = eval_const_expr(&gf.cond, &elab.parameters);
-        if cond_val == 0 { break; }
+        if cond_val == 0 {
+            hit_cap = false;
+            break;
+        }
         // Rename per-iteration declarations so each iteration owns a fresh
         // copy. Without this, two iterations both declare e.g. `valid_q` and
         // the elaborator's flat signal table flags a duplicate.
@@ -9537,6 +9541,36 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
         }
     }
     elab.parameters.remove(var);
+    if hit_cap {
+        return Err(format!(
+            "generate-for loop for genvar '{}' exceeded 10000 iterations \
+             without its condition becoming false (IEEE 1800-2017 \u{a7}27.4)",
+            var
+        ));
+    }
+    // §27.4: bounds must be elaboration-time constants. An unresolvable
+    // name in the condition made it evaluate 0 and the whole loop silently
+    // elaborated ZERO iterations — hardware vanished without a diagnostic.
+    if iter_count == 0 {
+        let mut names: Vec<String> = Vec::new();
+        collect_ident_names(&gf.cond, &mut names);
+        let unresolved: Vec<String> = names
+            .into_iter()
+            .filter(|n| {
+                n != var
+                    && !elab.parameters.contains_key(n)
+                    && param_fallback_get(n).is_none()
+            })
+            .collect();
+        if !unresolved.is_empty() {
+            return Err(format!(
+                "generate-for condition references non-constant name(s) {:?}; \
+                 generate bounds must be elaboration-time constants \
+                 (IEEE 1800-2017 \u{a7}27.4)",
+                unresolved
+            ));
+        }
+    }
     Ok(())
 }
 
@@ -15949,6 +15983,23 @@ fn inline_module_items(
                 let __th = std::time::Instant::now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
+                // §3.3/§23.3.2: one instance name per scope. Accepting a
+                // duplicate elaborated BOTH instances and applied the second
+                // #() override to each (the override map is name-keyed) —
+                // silent parameter cross-contamination. decl_sites keeps
+                // first-seen spans, so the collision check is one lookup.
+                {
+                    let key = format!("\u{2}inst:{}", inst_prefix);
+                    if elab.decl_sites.contains_key(&key) {
+                        return Err(format!(
+                            "duplicate instance name '{}' in the same scope \
+                             (IEEE 1800-2017 \u{a7}23.3.2); a second #() override \
+                             would silently apply to both instances",
+                            inst_name
+                        ));
+                    }
+                    elab.note_decl_site(&key, hi.name.span, "instance", true);
+                }
                 // §6.8: child-module declaration initializers that are NOT
                 // constant expressions are deferred to an initial-block
                 // assignment (mirroring the top-level path). Collected during
