@@ -9242,7 +9242,18 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
             Some(l) => format!("__gf_{}_{}_{}_", l, var, i),
             None => format!("__gf_{}_{}_", var, i),
         };
-        let mut renamed = rename_decls_in_iter(&subst, &suffix);
+        let mut renamed = match &gf.name {
+            // Named block: rename declarations to their LRM hierarchical name
+            // (`gl[1].plain`) so `label[i].x` reads and writes resolve — the
+            // opaque suffix made every for-generate signal unreachable from
+            // outside its block (reads returned a 32-bit zero, writes
+            // vanished) while the identical named IF-generate worked.
+            Some(label) => {
+                let scope = format!("{}[{}]", label, i);
+                rename_decls_in_iter(&subst, &GenRename::Scope(&scope))
+            }
+            None => rename_decls_in_iter(&subst, &GenRename::Suffix(&suffix)),
+        };
         if let Some(label) = &gf.name {
             scope_generated_subroutines(&mut renamed, &format!("{}[{}]", label, i));
         }
@@ -13569,7 +13580,37 @@ fn collect_decl_names_in_items(items: &[ModuleItem], names: &mut Vec<String>) {
 /// Rename declarations inside a generate-for iteration so that each iteration
 /// owns a distinct copy of every locally declared name. References in
 /// always/initial/contassign/instance ports get rewritten via a port_map.
-fn rename_decls_in_iter(items: &[ModuleItem], suffix: &str) -> Vec<ModuleItem> {
+/// How a generate-for iteration's declarations are renamed.
+///
+/// `Scope("gl[1]")` produces the LRM-visible hierarchical name
+/// (`gl[1].plain`, §27.6) — the same dotted-flat-key convention named
+/// IF-generate blocks already use (`g.sig`), so hierarchical reads AND writes
+/// (`gl[1].plain = ...`) resolve with no aliasing layer, and the packed
+/// metadata registered under the declarator's name is found by the same key.
+/// Nested loops insert the inner scope BEFORE the base name
+/// (`outer[0].x` + `inner[1]` → `outer[0].inner[1].x`), matching the LRM path.
+///
+/// `Suffix` is the historical opaque rename (`x__gf_<label>_<var>_<i>_`), kept
+/// for UNNAMED blocks: their `genblk<n>` ordinal is not known at this point,
+/// so there is no LRM name to expose — uniqueness is all that's needed.
+enum GenRename<'a> {
+    Suffix(&'a str),
+    Scope(&'a str),
+}
+
+impl GenRename<'_> {
+    fn apply(&self, n: &str) -> String {
+        match self {
+            GenRename::Suffix(sfx) => format!("{}{}", n, sfx),
+            GenRename::Scope(sc) => match n.rsplit_once('.') {
+                Some((outer, base)) => format!("{}.{}.{}", outer, sc, base),
+                None => format!("{}.{}", sc, n),
+            },
+        }
+    }
+}
+
+fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleItem> {
     let mut names = Vec::new();
     collect_decl_names_in_items(items, &mut names);
     if names.is_empty() { return items.to_vec(); }
@@ -13577,7 +13618,7 @@ fn rename_decls_in_iter(items: &[ModuleItem], suffix: &str) -> Vec<ModuleItem> {
     let mut port_map: HashMap<String, Expression> = HashMap::default();
     let rename_set: std::collections::HashSet<String> = names.iter().cloned().collect();
     for n in &names {
-        let renamed = format!("{}{}", n, suffix);
+        let renamed = rename.apply(n);
         let id = Identifier { name: renamed.clone(), span: Span { start: 0, end: 0 } };
         let hier = HierarchicalIdentifier {
             root: None,
@@ -13590,12 +13631,12 @@ fn rename_decls_in_iter(items: &[ModuleItem], suffix: &str) -> Vec<ModuleItem> {
     }
     let local_names: std::collections::HashSet<String> = std::collections::HashSet::default();
     let interface_map: HashMap<String, String> = HashMap::default();
-    items.iter().map(|item| rename_item_decls(item, suffix, &rename_set, &port_map, &local_names, &interface_map)).collect()
+    items.iter().map(|item| rename_item_decls(item, rename, &rename_set, &port_map, &local_names, &interface_map)).collect()
 }
 
 fn rename_item_decls(
     item: &ModuleItem,
-    suffix: &str,
+    rename: &GenRename,
     rename_set: &std::collections::HashSet<String>,
     port_map: &HashMap<String, Expression>,
     local_names: &std::collections::HashSet<String>,
@@ -13606,7 +13647,7 @@ fn rename_item_decls(
             let mut new_dd = dd.clone();
             for d in &mut new_dd.declarators {
                 if rename_set.contains(&d.name.name) {
-                    d.name.name = format!("{}{}", d.name.name, suffix);
+                    d.name.name = rename.apply(&d.name.name);
                 }
                 if let Some(init) = &d.init {
                     d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
@@ -13618,7 +13659,7 @@ fn rename_item_decls(
             let mut new_nd = nd.clone();
             for d in &mut new_nd.declarators {
                 if rename_set.contains(&d.name.name) {
-                    d.name.name = format!("{}{}", d.name.name, suffix);
+                    d.name.name = rename.apply(&d.name.name);
                 }
                 if let Some(init) = &d.init {
                     d.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
@@ -13630,7 +13671,7 @@ fn rename_item_decls(
             let mut new_pd = pd.clone();
             for d in &mut new_pd.declarators {
                 if rename_set.contains(&d.name.name) {
-                    d.name.name = format!("{}{}", d.name.name, suffix);
+                    d.name.name = rename.apply(&d.name.name);
                 }
             }
             ModuleItem::PortDeclaration(new_pd)
@@ -13640,7 +13681,7 @@ fn rename_item_decls(
             if let ParameterKind::Data { assignments, .. } = &mut new_pd.kind {
                 for a in assignments {
                     if rename_set.contains(&a.name.name) {
-                        a.name.name = format!("{}{}", a.name.name, suffix);
+                        a.name.name = rename.apply(&a.name.name);
                     }
                     if let Some(init) = &a.init {
                         a.init = Some(rewrite_expr(init, "", port_map, local_names, interface_map));
@@ -13728,7 +13769,7 @@ fn rename_item_decls(
         }
         ModuleItem::GenerateRegion(gr) => {
             let mut new_gr = gr.clone();
-            new_gr.items = gr.items.iter().map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map)).collect();
+            new_gr.items = gr.items.iter().map(|i| rename_item_decls(i, rename, rename_set, port_map, local_names, interface_map)).collect();
             ModuleItem::GenerateRegion(new_gr)
         }
         ModuleItem::GenerateIf(gi) => {
@@ -13736,7 +13777,7 @@ fn rename_item_decls(
             new_gi.branches = gi.branches.iter().map(|(cond, branch_items)| {
                 let new_cond = cond.as_ref().map(|c| rewrite_expr(c, "", port_map, local_names, interface_map));
                 let new_items: Vec<ModuleItem> = branch_items.iter()
-                    .map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map))
+                    .map(|i| rename_item_decls(i, rename, rename_set, port_map, local_names, interface_map))
                     .collect();
                 (new_cond, new_items)
             }).collect();
@@ -13746,7 +13787,7 @@ fn rename_item_decls(
             let new_arms: Vec<GenerateCaseArm> = gc.arms.iter().map(|arm| {
                 GenerateCaseArm {
                     values: arm.values.iter().map(|v| rewrite_expr(v, "", port_map, local_names, interface_map)).collect(),
-                    items: arm.items.iter().map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map)).collect(),
+                    items: arm.items.iter().map(|i| rename_item_decls(i, rename, rename_set, port_map, local_names, interface_map)).collect(),
                     label: arm.label.clone(),
                 }
             }).collect();
@@ -13762,7 +13803,7 @@ fn rename_item_decls(
             let mut new_gf = gf.clone();
             new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
             new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
-            new_gf.items = gf.items.iter().map(|i| rename_item_decls(i, suffix, rename_set, port_map, local_names, interface_map)).collect();
+            new_gf.items = gf.items.iter().map(|i| rename_item_decls(i, rename, rename_set, port_map, local_names, interface_map)).collect();
             ModuleItem::GenerateFor(new_gf)
         }
         other => other.clone(),
@@ -14165,11 +14206,20 @@ fn collect_effective_items_scoped(items: &[ModuleItem], params: &HashMap<String,
                     // iteration gets its own unique copy. Without this, two
                     // iterations both declare `valid_q` and the elaborator
                     // sees a flat duplicate.
-                    let suffix = match &gf.name {
-                        Some(l) => format!("__gf_{}_{}_{}_", l, gf.var, i),
-                        None => format!("__gf_{}_{}_", gf.var, i),
+                    // Same named/unnamed split as elaborate_generate_for:
+                    // named blocks take the LRM hierarchical name so both
+                    // expansion paths (top module and inlined sub-module)
+                    // register the same `label[i].x` keys.
+                    let subst = match &gf.name {
+                        Some(l) => {
+                            let scope = format!("{}[{}]", l, i);
+                            rename_decls_in_iter(&subst, &GenRename::Scope(&scope))
+                        }
+                        None => {
+                            let suffix = format!("__gf_{}_{}_", gf.var, i);
+                            rename_decls_in_iter(&subst, &GenRename::Suffix(&suffix))
+                        }
                     };
-                    let subst = rename_decls_in_iter(&subst, &suffix);
                     let scope = format!("{}[{}]", gen_scope_name(gf.name.as_ref(), *gen_ordinal), i);
                     let mut inner = collect_effective_items(&subst, &local_params);
                     prefix_gen_scope(&mut inner, &scope);
