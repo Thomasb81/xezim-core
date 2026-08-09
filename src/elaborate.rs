@@ -467,6 +467,10 @@ pub struct ElaboratedClass {
     /// Has at least one `pure virtual` method prototype.
     #[serde(default)]
     pub has_pure_virtual: bool,
+    /// §8.23: for a class declared INSIDE another class, the lexically
+    /// enclosing class — its statics are visible to this class's methods.
+    #[serde(default)]
+    pub enclosing: Option<String>,
     /// Names listed in the `implements` clause.
     #[serde(default)]
     pub implements: Vec<String>,
@@ -1135,6 +1139,7 @@ pub fn elaborate_class_with_params(
     }
     ElaboratedClass {
         name: c.name.name.clone(),
+        enclosing: None,
         extends: c.extends.as_ref().map(|e| e.name.name.clone()),
         extends_args: c.extends.as_ref().map(|e| {
             e.args.iter().filter_map(|a| match a {
@@ -13477,6 +13482,30 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
 }
 
 /// Inline module instantiations: replace instances with their continuous assigns and always blocks.
+/// §8.23 nested class declarations: hoist each `class Inner` found inside a
+/// class body into the class table, keyed BOTH as `Outer::Inner` (the
+/// qualified reference form) and — first declaration wins — as the bare
+/// inner name. Records the enclosing class so methods of the inner class
+/// can resolve the outer class's statics. Without this the inner class was
+/// silently invisible: `Outer::Inner x = new;` produced a null handle.
+fn register_nested_classes(
+    c: &crate::ast::decl::ClassDeclaration,
+    outer: &str,
+    elab: &mut ElaboratedModule,
+) {
+    for item in &c.items {
+        if let ClassItem::Class(inner) = item {
+            register_class_enum_members(inner, elab);
+            let mut cls = elaborate_class_with_params(inner, Some(&elab.parameters));
+            cls.enclosing = Some(outer.to_string());
+            let scoped = format!("{}::{}", outer, inner.name.name);
+            elab.classes.insert(scoped.clone(), cls.clone());
+            elab.classes.entry(inner.name.name.clone()).or_insert(cls);
+            register_nested_classes(inner, &scoped, elab);
+        }
+    }
+}
+
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
 pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
@@ -13489,6 +13518,7 @@ pub fn inline_instantiations(
                 register_class_enum_members(c, elab);
                 let cls = elaborate_class_with_params(c, Some(&elab.parameters));
                 elab.classes.insert(name.clone(), cls);
+                register_nested_classes(c, name, elab);
             }
             Definition::Covergroup(cg) => { elab.covergroups.insert(name.clone(), (*cg).clone()); }
             Definition::Package(p) => {
