@@ -7971,6 +7971,16 @@ fn validate_expr_idents(expr: &Expression, elab: &ElaboratedModule, locals: &Has
                 {
                     return Ok(());
                 }
+                // §27.6: `genblk<N>` — the implicit name of an unnamed
+                // generate block, legal as a hierarchical-reference root.
+                // (The simulator resolves through it by stripping the
+                // implicit segment; unnamed-block decls keep bare names.)
+                if name.starts_with("genblk")
+                    && name.len() > 6
+                    && name[6..].chars().all(|c| c.is_ascii_digit())
+                {
+                    return Ok(());
+                }
                 // A built-in type keyword captured as an Ident — only the parser's
                 // `$bits(<type>)` / `$size(<type>)` type-argument path produces
                 // these (a bare keyword can't appear in normal expression
