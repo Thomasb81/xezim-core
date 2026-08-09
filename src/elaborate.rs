@@ -1360,6 +1360,11 @@ pub struct ElaboratedModule {
     pub typedef_unpacked_dims: HashMap<String, Vec<UnpackedDimension>>,
     /// Bounded queue max sizes: name -> max element count (i.e., $:N means N+1).
     pub queue_max_sizes: HashMap<String, u32>,
+    /// Variables declared as QUEUES (`[$]`/`[$:N]`) — distinguishes them from
+    /// dynamic arrays inside `dynamic_arrays` (§7.10.1 out-of-range write
+    /// semantics differ: a queue write at index==size appends).
+    #[serde(default)]
+    pub queue_vars: HashSet<String>,
     /// 2D unpacked arrays: name -> ((dim1_lo,dim1_hi),(dim2_lo,dim2_hi),elem_width).
     pub arrays_2d: HashMap<String, ((i64, i64), (i64, i64), u32)>,
     pub packages: HashSet<String>,
@@ -1762,6 +1767,7 @@ impl ElaboratedModule {
             ascending_packed: HashMap::default(),
             typedef_unpacked_dims: HashMap::default(),
             queue_max_sizes: HashMap::default(),
+            queue_vars: HashSet::default(),
             arrays_2d: HashMap::default(),
             packages: HashSet::default(),
             pkg_subr_owner: HashMap::default(),
@@ -4374,6 +4380,9 @@ pub fn elaborate_module_with_defs(
                     if is_dynamic_dim {
                         elab.dynamic_arrays.insert(decl.name.name.clone());
                     }
+                    if matches!(effective_dims.first(), Some(UnpackedDimension::Queue { .. })) {
+                        elab.queue_vars.insert(decl.name.name.clone());
+                    }
                     if let Some(UnpackedDimension::Queue { max_size: Some(ms), .. }) = effective_dims.first() {
                         let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
                         if n >= 0 { elab.queue_max_sizes.insert(decl.name.name.clone(), (n + 1) as u32); }
@@ -5255,6 +5264,9 @@ pub fn elaborate_module_with_defs(
                                             }
                                             _ => {
                                                 elab.dynamic_arrays.insert(key.clone());
+                                                if matches!(dyn_dim, UnpackedDimension::Queue { .. }) {
+                                                    elab.queue_vars.insert(key.clone());
+                                                }
                                                 if let UnpackedDimension::Queue {
                                                     max_size: Some(ms),
                                                     ..
