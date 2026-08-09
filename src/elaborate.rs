@@ -52,6 +52,76 @@ fn elab_trace_enabled() -> bool {
     }).unwrap_or(false)
 }
 
+/// XEZIM_TRACE_TYPE=name[,name...] — trace every WRITE to the typedef-width
+/// tables and every type-width resolution whose key CONTAINS one of the
+/// comma-separated substrings. Exists because a wrong width observed mid-
+/// elaboration can be overwritten back to the right one before runtime, so
+/// only a log of the full writer sequence identifies the offending site.
+/// Parsed once; `None` when unset/empty so the untraced path is a single
+/// OnceLock load and an early return before any formatting.
+fn type_trace_patterns() -> Option<&'static Vec<String>> {
+    static PATS: std::sync::OnceLock<Option<Vec<String>>> = std::sync::OnceLock::new();
+    PATS.get_or_init(|| {
+        let v = std::env::var("XEZIM_TRACE_TYPE").ok()?;
+        let pats: Vec<String> = v
+            .split(',')
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect();
+        if pats.is_empty() { None } else { Some(pats) }
+    })
+    .as_ref()
+}
+
+/// True when `key` is traced. Callers whose `detail` is expensive to build
+/// must check this FIRST — `type_trace` takes an already-formatted &str.
+pub(crate) fn type_trace_on(key: &str) -> bool {
+    match type_trace_patterns() {
+        None => false,
+        Some(pats) => pats.iter().any(|p| key.contains(p.as_str())),
+    }
+}
+
+pub(crate) fn type_trace(site: &str, key: &str, detail: &str) {
+    if type_trace_on(key) {
+        eprintln!("[xezim][trace-type] {site} key={key} {detail}");
+    }
+}
+
+/// Insert into a typedef-width table, logging the written width and the value
+/// it replaced when the key is traced. Same result as `HashMap::insert`; the
+/// untraced path is the plain insert.
+fn typedefs_insert_traced(
+    map: &mut HashMap<String, u32>,
+    site: &str,
+    key: String,
+    w: u32,
+) -> Option<u32> {
+    if !type_trace_on(&key) {
+        return map.insert(key, w);
+    }
+    let prev = map.insert(key.clone(), w);
+    let prev_s = prev.map(|p| p.to_string()).unwrap_or_else(|| "<none>".into());
+    type_trace(site, &key, &format!("width={w} prev={prev_s}"));
+    prev
+}
+
+/// TYPEDEFS_TLS snapshot refreshes: when tracing is enabled, report each
+/// traced pattern's EXACT-key width in the map being installed — O(patterns)
+/// lookups per refresh, nothing at all when the variable is unset. A stale
+/// snapshot is indistinguishable from a bad write without this.
+fn type_trace_tls_refresh(at: &str, map: &HashMap<String, u32>) {
+    let Some(pats) = type_trace_patterns() else { return };
+    for p in pats {
+        let w_s = map
+            .get(p.as_str())
+            .map(|w| w.to_string())
+            .unwrap_or_else(|| "<absent>".into());
+        type_trace("tls:refresh", p, &format!("at={at} width={w_s}"));
+    }
+}
+
 /// A resolved signal in the simulation model.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct Signal {
@@ -2070,13 +2140,14 @@ pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedMo
 pub fn register_scoped_typedef_alias(pkg: &str, td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     let key = format!("{}::{}", pkg, td.name.name);
     if let Some(w) = elab.typedefs.get(&td.name.name).copied() {
-        elab.typedefs.insert(key.clone(), w);
+        typedefs_insert_traced(&mut elab.typedefs, "insert:scoped_alias", key.clone(), w);
     }
     if let Some(dt) = elab.typedef_types.get(&td.name.name).cloned() {
         elab.typedef_types.insert(key, dt);
     }
     // `process_typedef` refreshes the const-eval snapshot, but it runs BEFORE
     // this alias exists — so `$bits(pkg::T)` never saw the qualified key.
+    type_trace_tls_refresh("scoped_alias", &elab.typedefs);
     TYPEDEFS_TLS.with(|cell| {
         *cell.borrow_mut() = Some(elab.typedefs.clone());
     });
@@ -2175,7 +2246,9 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         if !already_resolved {
             elab.typedef_types.entry(td.name.name.clone())
                 .or_insert_with(|| td.data_type.clone());
-            elab.typedefs.entry(td.name.name.clone()).or_insert(0);
+            if !elab.typedefs.contains_key(&td.name.name) {
+                typedefs_insert_traced(&mut elab.typedefs, "insert:forward_placeholder", td.name.name.clone(), 0);
+            }
         }
         return;
     }
@@ -2260,14 +2333,14 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         // (`eb_t e;`) could not be resolved back to the enum — the type walkers
         // stopped at the bare TypeReference and the variable read UNSIGNED even
         // when the enum's base was signed.
-        elab.typedefs.insert(td.name.name.clone(), base_width);
+        typedefs_insert_traced(&mut elab.typedefs, "insert:process_typedef_enum", td.name.name.clone(), base_width);
         elab.typedef_types
             .insert(td.name.name.clone(), td.data_type.clone());
         elab.enum_members.insert(td.name.name.clone(), members_ordered);
     } else {
         // Non-enum typedef: resolve width from the underlying type
         let w = resolve_type_width(&td.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-        elab.typedefs.insert(td.name.name.clone(), w);
+        typedefs_insert_traced(&mut elab.typedefs, "insert:process_typedef", td.name.name.clone(), w);
         elab.typedef_types.insert(td.name.name.clone(), td.data_type.clone());
     }
     // §6.18/§7.4: record any unpacked dimensions on the typedef
@@ -2278,6 +2351,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     }
     // Refresh the thread-local typedef snapshot so any subsequent
     // const-eval `$bits(typedef_name)` call sees this typedef (M2).
+    type_trace_tls_refresh("process_typedef", &elab.typedefs);
     TYPEDEFS_TLS.with(|cell| {
         *cell.borrow_mut() = Some(elab.typedefs.clone());
     });
@@ -2967,7 +3041,7 @@ pub fn elaborate_module_with_defs(
             for a in assignments {
                 if let Some(dt) = &a.init {
                     let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs));
-                    elab.typedefs.insert(a.name.name.clone(), w);
+                    typedefs_insert_traced(&mut elab.typedefs, "insert:type_param_hdr", a.name.name.clone(), w);
                     elab.typedef_types.insert(a.name.name.clone(), dt.clone());
                     register_anonymous_enum_members(dt, &mut elab);
                 }
@@ -3190,7 +3264,7 @@ pub fn elaborate_module_with_defs(
         if let ModuleItem::NettypeDeclaration(nd) = item {
             user_nettypes.insert(nd.name.name.clone());
             let w = resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
-            elab.typedefs.insert(nd.name.name.clone(), w);
+            typedefs_insert_traced(&mut elab.typedefs, "insert:nettype", nd.name.name.clone(), w);
         }
     }
 
@@ -4808,7 +4882,7 @@ pub fn elaborate_module_with_defs(
                     for a in assignments {
                         if let Some(dt) = &a.init {
                             let w = resolve_type_width(dt, Some(&elab.parameters), Some(&elab.typedefs));
-                            elab.typedefs.insert(a.name.name.clone(), w);
+                            typedefs_insert_traced(&mut elab.typedefs, "insert:type_param_body", a.name.name.clone(), w);
                             elab.typedef_types.insert(a.name.name.clone(), dt.clone());
                             register_anonymous_enum_members(dt, &mut elab);
                         }
@@ -9246,6 +9320,10 @@ pub fn resolve_type_width(
             clamp_packed_width(total, "Implicit", "")
         }
         DataType::TypeReference { name, dimensions, .. } => {
+            // XEZIM_TRACE_TYPE: this fn is HOT, so the guard runs before any
+            // formatting; `hit` records which table answered for the trace.
+            let traced = type_trace_on(&name.name.name);
+            let mut hit = "no-table";
             let mut base_width = if let Some(td) = typedefs {
                 // §26.3: prefer the package-qualified key for `P::T` so a
                 // module-local `typedef ... T` cannot capture it.
@@ -9255,10 +9333,16 @@ pub fn resolve_type_width(
                     .and_then(|sc| td.get(&format!("{}::{}", sc.name, name.name.name)))
                     .copied();
                 let raw = scoped.or_else(|| td.get(&name.name.name).copied());
+                if traced {
+                    hit = if scoped.is_some() { "scoped" }
+                        else if raw.is_some() { "bare" }
+                        else { "miss" };
+                }
                 raw.map(|w| if w == 0 { 32 } else { w }).unwrap_or(32)
             } else {
                 32
             };
+            let traced_base = base_width;
             if !dimensions.is_empty() {
                 let mut total = base_width as u64;
                 for dim in dimensions {
@@ -9270,6 +9354,13 @@ pub fn resolve_type_width(
                     }
                 }
                 base_width = clamp_packed_width(total, "TypeReference", "");
+            }
+            if traced {
+                type_trace(
+                    "resolve:type_ref",
+                    &name.name.name,
+                    &format!("hit={hit} base={traced_base} dims={} final={base_width}", dimensions.len()),
+                );
             }
             base_width
         }
@@ -10577,6 +10668,7 @@ fn bits_of_signal_expr(
 /// consulted by const-eval `$bits(typedef_name)`. The previous binding
 /// is restored on exit so nested calls compose correctly.
 pub fn with_typedefs<R>(typedefs: &HashMap<String, u32>, f: impl FnOnce() -> R) -> R {
+    type_trace_tls_refresh("with_typedefs", typedefs);
     let snapshot = typedefs.clone();
     let prev = TYPEDEFS_TLS.with(|td| (*td.borrow_mut()).replace(snapshot));
     let r = f();
@@ -15670,7 +15762,7 @@ fn inline_module_items(
                         elab.typedefs.get(tp_name).copied(),
                         elab.typedef_types.get(tp_name).cloned(),
                     ));
-                    elab.typedefs.insert(tp_name.clone(), w);
+                    typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_type_param", tp_name.clone(), w);
                     elab.typedef_types.insert(tp_name.clone(), resolved_dt);
                 }
 
@@ -15981,6 +16073,7 @@ fn inline_module_items(
                             }
                         }
                     }
+                    type_trace_tls_refresh("submodule_local", &local_tds);
                     TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(local_tds));
 
                     // 2. Parameters from module items
@@ -16086,7 +16179,7 @@ fn inline_module_items(
                                 elab.typedefs.get(&a.name.name).copied(),
                                 elab.typedef_types.get(&a.name.name).cloned(),
                             ));
-                            elab.typedefs.insert(a.name.name.clone(), w);
+                            typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_type_param_default", a.name.name.clone(), w);
                             elab.typedef_types.insert(a.name.name.clone(), resolved_dt);
                         }
                     }
@@ -16334,7 +16427,7 @@ fn inline_module_items(
                                     });
                                 }
                             }
-                            elab.typedefs.insert(td.name.name.clone(), base_width);
+                            typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef_enum", td.name.name.clone(), base_width);
                             elab.typedef_types
                                 .entry(td.name.name.clone())
                                 .or_insert_with(|| td.data_type.clone());
@@ -16345,8 +16438,7 @@ fn inline_module_items(
                             // the LAST instance's width — see below, where the
                             // signature's type references are renamed to this
                             // key.
-                            elab.typedefs
-                                .insert(format!("{}{}", inst_prefix, td.name.name), base_width);
+                            typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef_enum_scoped", format!("{}{}", inst_prefix, td.name.name), base_width);
                             elab.typedef_types
                                 .entry(format!("{}{}", inst_prefix, td.name.name))
                                 .or_insert_with(|| {
@@ -16358,10 +16450,9 @@ fn inline_module_items(
                                 });
                         } else {
                             let w = resolve_type_width(&td.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
-                            elab.typedefs.insert(td.name.name.clone(), w);
+                            typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef", td.name.name.clone(), w);
                             // Instance-scoped key — see the enum branch above.
-                            elab.typedefs
-                                .insert(format!("{}{}", inst_prefix, td.name.name), w);
+                            typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef_scoped", format!("{}{}", inst_prefix, td.name.name), w);
                             // Register the TYPE too (not just its width) so a
                             // struct/union member access (`s.m0`) on a submodule
                             // variable of this typedef can resolve to its bit
@@ -17484,8 +17575,14 @@ fn inline_module_items(
                 // parameter overrides.
                 for (tp_name, prev_w, prev_dt) in saved_type_binds {
                     match prev_w {
-                        Some(w) => { elab.typedefs.insert(tp_name.clone(), w); }
-                        None => { elab.typedefs.remove(&tp_name); }
+                        Some(w) => { typedefs_insert_traced(&mut elab.typedefs, "restore:type_param", tp_name.clone(), w); }
+                        None => {
+                            let removed = elab.typedefs.remove(&tp_name);
+                            if type_trace_on(&tp_name) {
+                                let prev_s = removed.map(|p| p.to_string()).unwrap_or_else(|| "<none>".into());
+                                type_trace("remove:type_param", &tp_name, &format!("prev={prev_s}"));
+                            }
+                        }
                     }
                     match prev_dt {
                         Some(dt) => { elab.typedef_types.insert(tp_name, dt); }
@@ -19899,7 +19996,9 @@ fn rebind_imported_typedefs(
             for n in names {
                 let key = format!("{}::{}", pkg, n);
                 if let Some(w) = elab.typedefs.get(&key).copied() {
-                    if elab.typedefs.insert(n.clone(), w) != Some(w) {
+                    // trace tag "rebind:import" — logs the old width alongside
+                    // the qualified-key width being rebound onto the bare name.
+                    if typedefs_insert_traced(&mut elab.typedefs, "rebind:import", n.clone(), w) != Some(w) {
                         changed = true;
                     }
                 }
@@ -19912,6 +20011,7 @@ fn rebind_imported_typedefs(
     // Keep the const-eval snapshot in step, but only when a width actually
     // moved — this runs per inlined instance and the map is large.
     if changed {
+        type_trace_tls_refresh("rebind_import", &elab.typedefs);
         TYPEDEFS_TLS.with(|cell| {
             *cell.borrow_mut() = Some(elab.typedefs.clone());
         });
@@ -20037,9 +20137,9 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         }
                                     }
                                     if found {
-                                        elab.typedefs
-                                            .entry(td.name.name.clone())
-                                            .or_insert(base_width);
+                                        if !elab.typedefs.contains_key(&td.name.name) {
+                                            typedefs_insert_traced(&mut elab.typedefs, "insert:import_enum", td.name.name.clone(), base_width);
+                                        }
                                         elab.enum_members
                                             .entry(td.name.name.clone())
                                             .or_insert(members_ordered);
