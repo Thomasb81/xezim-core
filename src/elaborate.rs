@@ -16084,6 +16084,51 @@ fn inline_module_items(
                                 span: v.span,
                             });
                         }
+                        // §26.3: `pkg::wide_t` — the parser never fills
+                        // `hier.root`; `::` produces a TWO-SEGMENT path.
+                        // Requiring len()==1 silently DROPPED every scoped
+                        // type override, so `#(.T(pkg::wide_t))` left the
+                        // port at the DEFAULT type's width.
+                        if hier.path.len() == 2
+                            && hier.path.iter().all(|s| s.selects.is_empty())
+                        {
+                            return Some(DataType::TypeReference {
+                                name: TypeName {
+                                    scope: Some(Identifier {
+                                        name: hier.path[0].name.name.clone(),
+                                        span: v.span,
+                                    }),
+                                    name: hier.path[1].name.clone(),
+                                    span: v.span,
+                                },
+                                dimensions: Vec::new(),
+                                type_args: Vec::new(),
+                                span: v.span,
+                            });
+                        }
+                    }
+                    // Same scoped shape arriving as MemberAccess — expression
+                    // context lowers `pkg::wide_t` to
+                    // MemberAccess(Ident(pkg), wide_t) just as it does for
+                    // package constants.
+                    if let ExprKind::MemberAccess { expr: base, member } = &v.kind {
+                        if let ExprKind::Ident(bh) = &base.kind {
+                            if bh.path.len() == 1 && bh.path[0].selects.is_empty() {
+                                return Some(DataType::TypeReference {
+                                    name: TypeName {
+                                        scope: Some(Identifier {
+                                            name: bh.path[0].name.name.clone(),
+                                            span: v.span,
+                                        }),
+                                        name: member.clone(),
+                                        span: v.span,
+                                    },
+                                    dimensions: Vec::new(),
+                                    type_args: Vec::new(),
+                                    span: v.span,
+                                });
+                            }
+                        }
                     }
                     None
                 };
@@ -16949,6 +16994,15 @@ fn inline_module_items(
                                     });
                                 }
                             }
+                            // Width-only restore — see the non-enum twin below.
+                            saved_type_binds.push((
+                                td.name.name.clone(),
+                                elab.typedefs.get(&td.name.name).copied(),
+                                elab.typedef_types
+                                    .get(&td.name.name)
+                                    .cloned()
+                                    .or_else(|| Some(td.data_type.clone())),
+                            ));
                             typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef_enum", td.name.name.clone(), base_width);
                             elab.typedef_types
                                 .entry(td.name.name.clone())
@@ -16972,6 +17026,29 @@ fn inline_module_items(
                                 });
                         } else {
                             let w = resolve_type_width(&td.data_type, Some(&sub_merged_params), Some(&elab.typedefs));
+                            // The BARE key must hold this module's local
+                            // typedef only for the DURATION of this instance's
+                            // inlining (its own body and children resolve it),
+                            // then restore: leaving it permanently clobbered
+                            // the $unit/global entry, so a LATER module with
+                            // no local `t` sized its `t v;` from whichever
+                            // instance inlined last (order-dependent 64 vs 16).
+                            // Same save/restore rail the type-parameter
+                            // overrides use.
+                            // Restore the WIDTH slot only: typedef_types is
+                            // first-wins-and-KEPT (the struct-member machinery
+                            // consults it AFTER inlining — reverting it broke
+                            // every struct-typed member in an instance), so
+                            // hand the restore loop the POST-state type and it
+                            // no-ops there while healing the width table.
+                            saved_type_binds.push((
+                                td.name.name.clone(),
+                                elab.typedefs.get(&td.name.name).copied(),
+                                elab.typedef_types
+                                    .get(&td.name.name)
+                                    .cloned()
+                                    .or_else(|| Some(td.data_type.clone())),
+                            ));
                             typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef", td.name.name.clone(), w);
                             // Instance-scoped key — see the enum branch above.
                             typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef_scoped", format!("{}{}", inst_prefix, td.name.name), w);

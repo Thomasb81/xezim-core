@@ -1014,6 +1014,15 @@ impl Parser {
 
             // System call: $display, etc.
             TokenKind::SystemIdentifier => {
+                // §23.6: `$root.tb.x` is a HIERARCHICAL reference, not a
+                // system call — as a SystemCall it warned "unknown system
+                // task" and read/wrote nothing (every `$root.` reference was
+                // a silent 32-bit zero). Route it into the hierarchical
+                // parser, which accepts `$root` as an ordinary first segment.
+                if self.current().text == "$root" && self.peek_kind() == TokenKind::Dot {
+                    let hier = self.parse_hierarchical_identifier();
+                    return Expression::new(ExprKind::Ident(hier), self.span_from(start));
+                }
                 let tok = self.bump();
                 let name = tok.text.clone();
                 let args = if self.at(TokenKind::LParen) {
