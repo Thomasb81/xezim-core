@@ -5205,11 +5205,77 @@ pub fn elaborate_module_with_defs(
                         // for now — covers the most common case).
                         if let DataType::Struct(su) = dt_resolved {
                             for m in &su.members {
+                                // §7.2.1: a DYNAMIC member (`int d[]` /
+                                // `int q[$]` / `int a[key_t]`) is its own
+                                // collection object under "var.member".
+                                // Unregistered, `new[n]`, `.size()` and
+                                // `push_back` on the member silently no-op'd
+                                // (size read 0 while direct element writes
+                                // worked) — the whole struct-with-dynamic-
+                                // member family was broken.
+                                for mdecl in &m.declarators {
+                                    let dyn_dim = mdecl.dimensions.first().filter(|d| {
+                                        matches!(
+                                            d,
+                                            UnpackedDimension::Unsized(_)
+                                                | UnpackedDimension::Queue { .. }
+                                                | UnpackedDimension::Associative { .. }
+                                        )
+                                    });
+                                    if let Some(dyn_dim) = dyn_dim {
+                                        let key = format!(
+                                            "{}.{}",
+                                            decl.name.name, mdecl.name.name
+                                        );
+                                        let mw = resolve_type_width(
+                                            &m.data_type,
+                                            Some(&elab.parameters),
+                                            Some(&elab.typedefs),
+                                        )
+                                        .max(1);
+                                        match dyn_dim {
+                                            UnpackedDimension::Associative {
+                                                data_type: kdt, ..
+                                            } => {
+                                                let is_str = kdt.as_ref().is_some_and(|dt| {
+                                                    matches!(
+                                                        dt.as_ref(),
+                                                        DataType::Simple {
+                                                            kind: SimpleType::String,
+                                                            ..
+                                                        }
+                                                    )
+                                                });
+                                                elab.associative_arrays.insert(key, is_str);
+                                            }
+                                            _ => {
+                                                elab.dynamic_arrays.insert(key.clone());
+                                                if let UnpackedDimension::Queue {
+                                                    max_size: Some(ms),
+                                                    ..
+                                                } = dyn_dim
+                                                {
+                                                    if let Some(n) =
+                                                        const_eval_i64_with_params(
+                                                            ms,
+                                                            Some(&elab.parameters),
+                                                        )
+                                                        .filter(|n| *n >= 0)
+                                                    {
+                                                        elab.queue_max_sizes.insert(
+                                                            key.clone(),
+                                                            (n + 1) as u32,
+                                                        );
+                                                    }
+                                                }
+                                                elab.arrays.insert(key, (0, 63, mw));
+                                            }
+                                        }
+                                    }
+                                }
                                 if let Some(ew) = packed_inner_elem_width(&m.data_type, &elab.parameters, &elab.typedefs) {
                                     for mdecl in &m.declarators {
                                         let key = format!("{}.{}", decl.name.name, mdecl.name.name);
-                                        if std::env::var_os("XEZIM_PEW_DBG").is_some() {
-                                        }
                                         elab.packed_signal_elem_widths.insert(key, ew);
                                     }
                                 }
