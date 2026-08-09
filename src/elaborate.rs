@@ -2128,7 +2128,143 @@ pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedMo
     for item in &c.items {
         if let ClassItem::Typedef(td) = item {
             register_anonymous_enum_members(&td.data_type, elab);
+            // A class-local typedef must not STOMP an existing package/$unit
+            // type of the same name in the global bare table: classes are
+            // registered during the design-wide hoist, whose HashMap order is
+            // arbitrary, so `typedef logic [63:0] wdata_t` inside some class
+            // could transiently own the bare slot while a TOP-module
+            // declaration of the package's 146-bit `wdata_t` was being sized —
+            // carving the signal at the wrong width even though every later
+            // probe of the table read the healed value. Register fully (the
+            // class body still needs absent names resolvable — UVM's
+            // `typedef bit edges_t[uvm_phase]`), then restore any pre-existing
+            // bare entry: on a collision the package type keeps the slot.
+            let prev_w = elab.typedefs.get(&td.name.name).copied();
+            let prev_t = elab.typedef_types.get(&td.name.name).cloned();
             process_typedef(td, elab);
+            if let Some(w) = prev_w {
+                typedefs_insert_traced(
+                    &mut elab.typedefs,
+                    "restore:class_local_typedef",
+                    td.name.name.clone(),
+                    w,
+                );
+                if let Some(t) = prev_t {
+                    elab.typedef_types.insert(td.name.name.clone(), t);
+                }
+                TYPEDEFS_TLS.with(|cell| {
+                    *cell.borrow_mut() = Some(elab.typedefs.clone());
+                });
+            }
+        }
+    }
+}
+
+/// Evaluate every package's parameters to a fixpoint, registering each under
+/// its scoped `pkg::name` alias. Bare names are NOT registered — visibility
+/// stays with the import machinery (`import p::A` must not expose `B`).
+///
+/// Three passes: parameters may reference other packages' parameters through
+/// scoped names or import chains, and `defs` is a HashMap, so a single pass in
+/// iteration order resolved a dependent parameter only when its dependency
+/// happened to hash first. Values are recomputed each pass, so pass N heals
+/// what pass N-1 computed from missing inputs; anything still unresolvable
+/// (genuine forward cycles) keeps the last computed value exactly as before.
+/// Overlay a package's OWN parameters onto the bare map (from their scoped
+/// aliases) for the duration of processing THAT package's items, returning
+/// what to restore. A package typedef sized by its own parameter
+/// (`logic [LOG-1:0]`) resolves through the bare map inside `process_typedef`;
+/// without the overlay the width came from whatever the bare slot held
+/// design-wide, and with a permanent bare insert an un-imported parameter
+/// would leak into every scope.
+fn overlay_pkg_params(
+    p: &crate::ast::module::PackageDeclaration,
+    elab: &mut ElaboratedModule,
+) -> Vec<(String, Option<Value>)> {
+    let mut saved: Vec<(String, Option<Value>)> = Vec::new();
+    for item in &p.items {
+        let crate::ast::decl::PackageItem::Parameter(pd) = item else { continue };
+        let ParameterKind::Data { assignments, .. } = &pd.kind else { continue };
+        for a in assignments {
+            let key = format!("{}::{}", p.name.name, a.name.name);
+            if let Some(v) = elab.parameters.get(&key).cloned() {
+                saved.push((a.name.name.clone(), elab.parameters.get(&a.name.name).cloned()));
+                elab.parameters.insert(a.name.name.clone(), v);
+            }
+        }
+    }
+    saved
+}
+
+fn restore_overlay(elab: &mut ElaboratedModule, saved: Vec<(String, Option<Value>)>) {
+    for (k, prev) in saved.into_iter().rev() {
+        match prev {
+            Some(v) => {
+                elab.parameters.insert(k, v);
+            }
+            None => {
+                elab.parameters.remove(&k);
+            }
+        }
+    }
+}
+
+fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut ElaboratedModule) {
+    let mut pkgs: Vec<&crate::ast::module::PackageDeclaration> = defs
+        .values()
+        .filter_map(|d| match d {
+            Definition::Package(p) => Some(*p),
+            _ => None,
+        })
+        .collect();
+    pkgs.sort_by(|a, b| a.name.name.cmp(&b.name.name));
+    for _pass in 0..3 {
+        for p in &pkgs {
+            for item in &p.items {
+                let crate::ast::decl::PackageItem::Parameter(pd) = item else { continue };
+                let ParameterKind::Data { data_type, assignments } = &pd.kind else { continue };
+                let base_width =
+                    resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
+                let is_implicit = matches!(data_type, DataType::Implicit { .. });
+                for assign in assignments {
+                    let Some(init) = &assign.init else { continue };
+                    let width = if is_implicit {
+                        sized_literal_width(init).unwrap_or(32)
+                    } else {
+                        base_width
+                    };
+                    // §13.4.3 const-function calls, mirroring the import path.
+                    let subbed;
+                    let init: &Expression = if expr_has_call(init) {
+                        match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                            .filter(|e| !expr_has_call(e))
+                        {
+                            Some(e) => {
+                                subbed = e;
+                                &subbed
+                            }
+                            None => init,
+                        }
+                    } else {
+                        init
+                    };
+                    let mut v = eval_init_for_width(init, &elab.parameters, width);
+                    if is_type_signed(data_type) || is_implicit {
+                        v.is_signed = true;
+                    }
+                    if is_type_real(data_type) {
+                        v = Value::from_f64(v.to_f64());
+                    }
+                    // SCOPED alias only. Registering bare names here would
+                    // make every package parameter visible everywhere — an
+                    // explicit `import p::A;` must NOT expose `B` (§26.2.2,
+                    // and the repro_import_too_much guard). Bare visibility
+                    // stays owned by the import machinery; scopes that need a
+                    // package's own params for its own typedefs get a bounded
+                    // overlay in the hoist loop below.
+                    alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
+                }
+            }
         }
     }
 }
@@ -2741,6 +2877,17 @@ pub fn elaborate_module_with_defs(
         // changed the map's contents and so its iteration order, which silently
         // changed `$bits` of a nested struct typedef and every signal declared
         // with it.
+        // Package PARAMETERS first, to a fixpoint, so that (a) a package
+        // typedef sized by its own or another package's parameter
+        // (`logic [LOG-1:0]`, `LOG = $clog2(cfg::DEPTH) - 6`) resolves during
+        // the hoist below, and (b) a $unit typedef referencing `pkg::param`
+        // resolves in the pass that follows. Previously package parameters
+        // only materialized on IMPORT, so any width computed before the first
+        // import of the owning package saw 0 — the classic symptom being a
+        // parameter "resolved to -6" and five 7-bit fields clamping to 1 bit,
+        // narrowing a struct port's testbench side by exactly 30 bits while
+        // the DUT side (healed by the child fixpoint) stayed correct.
+        hoist_package_params(defs, &mut elab);
         for td in ordered_typedefs(defs) {
             process_typedef(td, &mut elab);
         }
@@ -2765,6 +2912,9 @@ pub fn elaborate_module_with_defs(
                 Definition::Covergroup(cg) => { elab.covergroups.insert(cg.name.name.clone(), (*cg).clone()); }
                 Definition::Package(p) => {
                     elab.packages.insert(p.name.name.clone());
+                    // Bounded bare view of this package's own parameters while
+                    // ITS items are hoisted (see overlay_pkg_params).
+                    let __pkg_overlay = overlay_pkg_params(p, &mut elab);
                     // Hoist package-scope functions/tasks for `pkg::f(...)`
                     // and bare-name resolution after `import pkg::*`. A
                     // scoped name (`ClassName::m`) is an out-of-class method
@@ -2828,9 +2978,19 @@ pub fn elaborate_module_with_defs(
                             _ => {}
                         }
                     }
-                }
+                                    restore_overlay(&mut elab, __pkg_overlay);
+}
                 _ => {}
             }
+        }
+        // Second pass over $unit typedefs, now that every package typedef has
+        // its scoped `pkg::name` alias. A compilation-unit typedef whose member
+        // names a package type (`typedef struct packed { CHIP::t w; ... }`)
+        // was processed BEFORE any package existed, fell back to 32 bits for
+        // that member, and was never revisited. `process_typedef` recomputes
+        // and overwrites, so correct entries are unchanged and stale ones heal.
+        for td in ordered_typedefs(defs) {
+            process_typedef(td, &mut elab);
         }
     }
 
@@ -9626,7 +9786,20 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
         ExprKind::Number(NumberLiteral::Time(s)) => Some((*s * 1e9) as i64),
         ExprKind::Ident(hier) => {
             let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            params.and_then(|p| p.get(name)).and_then(|v| v.to_i64())
+            // §26.3: a SCOPED `P::x` resolves against THAT package's parameter
+            // alias (`alias_pkg_param` registers every package parameter under
+            // `pkg::name`). Taking only the leaf dropped the qualifier, so a
+            // cross-package reference (`$clog2(cfg_pkg::DEPTH) - 6`) read the
+            // bare slot — absent unless someone imported it — and evaluated 0,
+            // driving every dependent range negative.
+            let scoped = (hier.path.len() >= 2).then(|| {
+                format!("{}::{}", hier.path[hier.path.len() - 2].name.name, name)
+            });
+            scoped
+                .as_deref()
+                .and_then(|k| params.and_then(|p| p.get(k)))
+                .or_else(|| params.and_then(|p| p.get(name)))
+                .and_then(|v| v.to_i64())
                 // Fall back to the global package/$unit param snapshot so that a
                 // dimension like `[paddr_width_p - page_offset_width_gp - 1:0]`
                 // (where the global `page_offset_width_gp` is absent from the
@@ -12196,7 +12369,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 }
             }
             let name = hier.path.last().map(|s| s.name.name.as_str()).unwrap_or("");
-            params.get(name).cloned()
+            // §26.3: prefer the `P::x` alias for a scoped reference — see the
+            // matching arm in `const_eval_i64_with_params`.
+            let scoped = (hier.path.len() >= 2).then(|| {
+                format!("{}::{}", hier.path[hier.path.len() - 2].name.name, name)
+            });
+            scoped
+                .as_deref()
+                .and_then(|k| params.get(k).cloned())
+                .or_else(|| params.get(name).cloned())
                 .or_else(|| param_fallback_get(name))
                 .unwrap_or(Value::zero(32))
         }
@@ -12655,6 +12836,16 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 // imported package constant / enum member (held by bare name).
                 let base_is_struct = STRUCT_FIELDS_TLS.with(|c| c.borrow().contains_key(nm));
                 if !base_is_struct && !params.contains_key(nm) {
+                    // §26.3: the EXACT scoped alias first (`alias_pkg_param`
+                    // registers every package parameter as `pkg::name`).
+                    // Resolving by bare member name alone meant a package
+                    // constant referenced scoped-but-never-imported
+                    // (`$clog2(cfg_pkg::DEPTH) - 6`) read whatever the bare
+                    // slot held — usually nothing — and evaluated 0, driving
+                    // the dependent parameter negative.
+                    if let Some(v) = params.get(&format!("{}::{}", nm, member.name)) {
+                        return v.clone();
+                    }
                     if let Some(v) = params.get(&member.name) {
                         return v.clone();
                     }
@@ -19981,20 +20172,51 @@ fn rebind_imported_typedefs(
         for ii in &imp.items {
             let pkg = &ii.package.name;
             let Some(Definition::Package(p)) = definitions.get(pkg) else { continue };
-            // `import P::sym` binds one name; `import P::*` binds all of P's.
-            let names: Vec<String> = match &ii.item {
-                Some(sym) => vec![sym.name.clone()],
-                None => p
-                    .items
-                    .iter()
-                    .filter_map(|pi| match pi {
-                        PackageItem::Typedef(td) => Some(td.name.name.clone()),
-                        _ => None,
-                    })
-                    .collect(),
+            // `import P::sym` binds one name; `import P::*` binds all of P's
+            // AND, transitively, its own wildcard imports' — `import P::*`
+            // where P does `import CHIP::*` is how large testbenches reach
+            // core types without ever naming CHIP. Rebinding only P's own
+            // typedefs left every chained name exposed to transient
+            // re-binding of the global bare slot.
+            fn wildcard_names(
+                pkg: &crate::ast::module::PackageDeclaration,
+                defs: &HashMap<String, Definition>,
+                depth: u32,
+                out: &mut Vec<(String, String)>, // (owning pkg, typedef name)
+            ) {
+                if depth > 8 {
+                    return;
+                }
+                for pi in &pkg.items {
+                    match pi {
+                        PackageItem::Typedef(td) => {
+                            out.push((pkg.name.name.clone(), td.name.name.clone()))
+                        }
+                        PackageItem::Import(inner) => {
+                            for jj in &inner.items {
+                                if jj.item.is_none() {
+                                    if let Some(Definition::Package(q)) =
+                                        defs.get(&jj.package.name)
+                                    {
+                                        wildcard_names(q, defs, depth + 1, out);
+                                    }
+                                }
+                            }
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            let names: Vec<(String, String)> = match &ii.item {
+                Some(sym) => vec![(pkg.clone(), sym.name.clone())],
+                None => {
+                    let mut v = Vec::new();
+                    wildcard_names(p, definitions, 0, &mut v);
+                    v
+                }
             };
-            for n in names {
-                let key = format!("{}::{}", pkg, n);
+            for (owner, n) in names {
+                let key = format!("{}::{}", owner, n);
                 if let Some(w) = elab.typedefs.get(&key).copied() {
                     // trace tag "rebind:import" — logs the old width alongside
                     // the qualified-key width being rebound onto the bare name.
@@ -20439,6 +20661,43 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                         _ => {}
                     }
                 }
+                // §26.2: follow the package's OWN wildcard imports one hop per
+                // level (depth-guarded). `import P::*;` where P itself does
+                // `import CHIP::*;` is how large testbenches reach core types —
+                // the TB never names CHIP directly. Processing only P's own
+                // items left every chained name to whatever the global bare
+                // table happened to hold, i.e. unprotected against any
+                // transient re-binding. The reference tooling accepts the
+                // chained reference, so bind the chained packages here too.
+                IMPORT_DEPTH.with(|d| -> Result<(), String> {
+                    if d.get() >= 8 {
+                        return Ok(());
+                    }
+                    d.set(d.get() + 1);
+                    let r = (|| {
+                        for pi in &pkg.items {
+                            let PackageItem::Import(inner) = pi else { continue };
+                            for ii2 in &inner.items {
+                                if ii2.item.is_some() {
+                                    continue; // explicit member import: already visible via its own processing
+                                }
+                                let synth = ImportDeclaration {
+                                    items: vec![ImportItem {
+                                        package: ii2.package.clone(),
+                                        item: None,
+                                        span: Span::dummy(),
+                                    }],
+                                    span: Span::dummy(),
+                                };
+                                process_import(&synth, elab, defs)?;
+                            }
+                        }
+                        Ok(())
+                    })();
+                    d.set(d.get() - 1);
+                    r
+                })?;
+
             }
         } else {
             return Err(format!("Package '{}' not found", pkg_name));
