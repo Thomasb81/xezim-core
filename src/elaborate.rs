@@ -2469,6 +2469,63 @@ fn ordered_typedefs<'a>(
     out
 }
 
+/// §20.6.2: `$bits(<signal>)` inside a TYPE's packed dims (`typedef
+/// logic[$bits(sig)-1:0] t;`) — rewrite the dims with the signal's known
+/// width so `resolve_type_width` sees a constant. Without this the dim
+/// silently evaluated to nothing and the typedef registered 1 bit wide.
+fn prebind_type_dims(dt: &DataType, elab: &ElaboratedModule) -> Option<DataType> {
+    fn dims_mention_bits(dims: &[PackedDimension]) -> bool {
+        dims.iter().any(|d| match d {
+            PackedDimension::Range { left, right, .. } => {
+                expr_mentions_bits(left) || expr_mentions_bits(right)
+            }
+            PackedDimension::Unsized(_) => false,
+        })
+    }
+    let rewrite = |dims: &[PackedDimension]| -> Vec<PackedDimension> {
+        dims.iter()
+            .map(|d| match d {
+                PackedDimension::Range { left, right, span } => PackedDimension::Range {
+                    left: Box::new(prebind_bits_of_signals(
+                        left, &elab.signals, &elab.parameters, "",
+                        &elab.typedefs, &elab.typedef_types,
+                        &elab.packed_struct_fields, &elab.arrays,
+                    )),
+                    right: Box::new(prebind_bits_of_signals(
+                        right, &elab.signals, &elab.parameters, "",
+                        &elab.typedefs, &elab.typedef_types,
+                        &elab.packed_struct_fields, &elab.arrays,
+                    )),
+                    span: *span,
+                },
+                other => other.clone(),
+            })
+            .collect()
+    };
+    match dt {
+        DataType::IntegerVector { kind, signing, dimensions, span }
+            if dims_mention_bits(dimensions) =>
+        {
+            Some(DataType::IntegerVector {
+                kind: *kind,
+                signing: *signing,
+                dimensions: rewrite(dimensions),
+                span: *span,
+            })
+        }
+        DataType::Implicit { signing, dimensions, span }
+            if dims_mention_bits(dimensions) =>
+        {
+            Some(DataType::Implicit {
+                signing: *signing,
+                dimensions: rewrite(dimensions),
+                span: *span,
+            })
+        }
+        _ => None,
+    }
+}
+
 pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // §6.18: a bare forward type declaration `typedef name;`. Record it for the
     // resolution check and register a placeholder, but never clobber a name that
@@ -2573,10 +2630,15 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
             .insert(td.name.name.clone(), td.data_type.clone());
         elab.enum_members.insert(td.name.name.clone(), members_ordered);
     } else {
-        // Non-enum typedef: resolve width from the underlying type
-        let w = resolve_type_width(&td.data_type, Some(&elab.parameters), Some(&elab.typedefs));
+        // Non-enum typedef: resolve width from the underlying type.
+        // `$bits(<signal>)` in the dims is prebound against the signal
+        // table first (and the REWRITTEN type is what gets recorded, so
+        // every later resolution agrees).
+        let bound_dt = prebind_type_dims(&td.data_type, elab);
+        let eff_dt: &DataType = bound_dt.as_ref().unwrap_or(&td.data_type);
+        let w = resolve_type_width(eff_dt, Some(&elab.parameters), Some(&elab.typedefs));
         typedefs_insert_traced(&mut elab.typedefs, "insert:process_typedef", td.name.name.clone(), w);
-        elab.typedef_types.insert(td.name.name.clone(), td.data_type.clone());
+        elab.typedef_types.insert(td.name.name.clone(), eff_dt.clone());
     }
     // §6.18/§7.4: record any unpacked dimensions on the typedef
     // (`typedef logic [7:0] A [0:3];`) so a variable `A v;` inherits them.
