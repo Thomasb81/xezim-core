@@ -724,6 +724,18 @@ pub fn parse_and_elaborate_multi(
         // rather than declared here.
         pp.begin_top_level_file();
         let preprocessed = pp.preprocess_file(source, source_path.as_deref());
+        // Preprocessor-fatal conditions (missing/unreadable `include, include
+        // recursion, strict directive violations): fail the run at the first
+        // affected file. Continuing used to silently drop the include's
+        // declarations, and the damage surfaced far away as implicit nets and
+        // width mismatches.
+        if !pp.errors().is_empty() {
+            progress_clear();
+            return Err(format!(
+                "Preprocessing failed in '{}' (file {} of {}):\n{}",
+                label, i + 1, sources.len(), pp.errors().join("\n")
+            ));
+        }
 
         let tokens = lexer::Lexer::new(&preprocessed).tokenize();
         let mut parser = sv_parser::parse::Parser::new(tokens);

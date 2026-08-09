@@ -757,14 +757,35 @@ impl Preprocessor {
                                     continue;
                                 }
                                 Err(e) => {
-                                    eprintln!("[PP] warning: cannot read `include file '{}': {}", resolved.display(), e);
+                                    // FATAL: the design text that follows may
+                                    // silently depend on declarations from this
+                                    // file — every mainstream tool errors here.
+                                    self.errors.push(format!(
+                                        "cannot read `include file '{}': {}",
+                                        resolved.display(), e
+                                    ));
+                                    eprintln!("[PP] error: cannot read `include file '{}': {}", resolved.display(), e);
                                 }
                             }
                         } else {
-                            eprintln!("[PP] warning: cannot find `include file '{}'", inc_file);
+                            // FATAL, not a warning: a failed `include used to
+                            // continue preprocessing, and the missing
+                            // declarations then degraded downstream — an
+                            // undeclared port actual became a silent implicit
+                            // net and a whole testbench checked garbage. The
+                            // reference tooling hard-errors here; so do we.
+                            self.errors.push(format!(
+                                "cannot find `include file '{}' (searched the including file's directory and {} include dir(s))",
+                                inc_file, self.include_dirs.len()
+                            ));
+                            eprintln!("[PP] error: cannot find `include file '{}'", inc_file);
                         }
                     } else {
-                        eprintln!("[PP] warning: `include depth limit ({}) exceeded for '{}'", MAX_INCLUDE_DEPTH, inc_file);
+                        self.errors.push(format!(
+                            "`include depth limit ({}) exceeded for '{}' — recursive include?",
+                            MAX_INCLUDE_DEPTH, inc_file
+                        ));
+                        eprintln!("[PP] error: `include depth limit ({}) exceeded for '{}'", MAX_INCLUDE_DEPTH, inc_file);
                     }
                 }
                 output.push('\n');

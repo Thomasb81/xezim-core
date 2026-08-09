@@ -8282,7 +8282,10 @@ fn create_implicit_nets(
         if crate::implicit_net_warn() {
             crate::elab_diag(format!(
                 "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
-                 (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
+                 used as a port actual (scalar per IEEE 1800-2017 §6.10, matching the \
+                 reference tooling; a wider port truncates/extends per §23.3.3). An \
+                 undeclared port actual is usually a missing declaration — check for a \
+                 failed `include — so add an explicit declaration to silence.",
                 name
             ));
         }
