@@ -2356,7 +2356,22 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
     // module-context dimension call silently missed and the dim fell to 1.
     set_funcs_tls(&elab.functions);
     for _pass in 0..3 {
+        // Bare visibility of EVERY package's params (read back from their
+        // pkg:: aliases, i.e. the PREVIOUS pass's values) for the whole pass.
+        // Without this each pass restarted blind: a reference to a parameter
+        // that this pass has not reached yet — a forward reference, or a bare
+        // cross-package reference to a package that sorts later — missed and
+        // const-eval defaulted it to 0, so `X - 6` froze at -6 and the
+        // fixpoint could never heal it. Restored at the end of the pass, so
+        // nothing leaks past the hoist.
+        let mut pass_overlay: Vec<(String, Option<Value>)> = Vec::new();
         for p in &pkgs {
+            pass_overlay.extend(overlay_pkg_params(p, elab));
+        }
+        for p in &pkgs {
+            // This package's OWN params win over a same-named param from
+            // another package while its items are evaluated.
+            let own_overlay = overlay_pkg_params(p, elab);
             // A bare call inside THIS package binds this package's own
             // function even when another package registered the same bare
             // name first (`pa::f` won the or_insert; `pb`'s `W = f(3)` must
@@ -2439,6 +2454,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 }
             }
             restore_overlay(elab, pkg_overlay);
+            restore_overlay(elab, own_overlay);
             for (k, prev) in fn_overlay.into_iter().rev() {
                 match prev {
                     Some(f) => {
@@ -2450,6 +2466,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 }
             }
         }
+        restore_overlay(elab, pass_overlay);
     }
 }
 
