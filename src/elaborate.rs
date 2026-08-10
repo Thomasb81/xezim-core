@@ -8467,6 +8467,22 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
                 validate_expr_idents(&ee.expr, elab, locals)?;
             }
         }
+        // §14.11: `##N` desugars to the reserved `__xz_default_clocking`
+        // marker. It is only legal when a `default clocking` block exists —
+        // a clocking block declared WITHOUT `default` does not qualify.
+        EventControl::Identifier(id)
+            if id.name == "__xz_default_clocking"
+                && !elab.clocking_blocks.values().any(|cd| cd.is_default) =>
+        {
+            let loc = span_location(elab, id.span)
+                .map(|l| format!(" at {}", l))
+                .unwrap_or_default();
+            return Err(format!(
+                "A default clocking block must be specified to use the ##n \
+                 timing statement{}",
+                loc
+            ));
+        }
         EventControl::Identifier(id)
             // §14.3/§14.11: `@(cb)` may name a clocking block, and the parser
             // desugars procedural `##N` to a wait on the reserved
