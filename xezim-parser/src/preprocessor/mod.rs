@@ -498,7 +498,17 @@ impl Preprocessor {
             ("`else", false),
         ] {
             if let Some(rest) = s.strip_prefix(kw) {
-                if rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace()) {
+                // §22: the directive name is an identifier — it ends at the
+                // first character that cannot continue one. Requiring
+                // WHITESPACE meant `\`endif;` (and `\`endif)`, `\`else,`)
+                // was not recognised as a directive here, so it was never
+                // split onto its own line and the `\`endif` handler swallowed
+                // the whole line — dropping the `;` that terminated the
+                // statement the conditional was wrapping. `\`elseif` still
+                // does NOT match `\`else`, since `i` continues the identifier.
+                if rest.is_empty()
+                    || !rest.starts_with(|c: char| c.is_alphanumeric() || c == '_' || c == '$')
+                {
                     return Some((kw.len(), takes_name));
                 }
             }
