@@ -2350,8 +2350,28 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 .or_insert_with(|| p.name.name.clone());
         }
     }
+    // Refresh the TLS function table consulted by const_eval for DIRECT
+    // fn calls in range dimensions (`logic [p::LOG2(64)-1:0] x;`) — before
+    // this, TLS held whatever the last package elaboration left, so a
+    // module-context dimension call silently missed and the dim fell to 1.
+    set_funcs_tls(&elab.functions);
     for _pass in 0..3 {
         for p in &pkgs {
+            // A bare call inside THIS package binds this package's own
+            // function even when another package registered the same bare
+            // name first (`pa::f` won the or_insert; `pb`'s `W = f(3)` must
+            // still call pb::f). Override bare entries for the duration of
+            // this package's params, then restore.
+            let mut fn_overlay: Vec<(String, Option<FunctionDeclaration>)> = Vec::new();
+            for item in &p.items {
+                let crate::ast::decl::PackageItem::Function(f) = item else { continue };
+                if f.name.scope.is_some() {
+                    continue;
+                }
+                let key = f.name.name.name.clone();
+                fn_overlay.push((key.clone(), elab.functions.get(&key).cloned()));
+                elab.functions.insert(key, f.clone());
+            }
             // Sequential bare visibility of this package's OWN params while
             // its inits are evaluated (`LOG2(SZ)` — the formal binds the bare
             // name), restored after the package so nothing leaks unimported.
@@ -2419,6 +2439,16 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 }
             }
             restore_overlay(elab, pkg_overlay);
+            for (k, prev) in fn_overlay.into_iter().rev() {
+                match prev {
+                    Some(f) => {
+                        elab.functions.insert(k, f);
+                    }
+                    None => {
+                        elab.functions.remove(&k);
+                    }
+                }
+            }
         }
     }
 }
@@ -3104,6 +3134,26 @@ pub fn elaborate_module_with_defs(
         // narrowing a struct port's testbench side by exactly 30 bits while
         // the DUT side (healed by the child fixpoint) stayed correct.
         hoist_package_params(defs, &mut elab);
+        // §26.3: a package typedef can reference ANOTHER package's scoped
+        // typedef (`q::inner_t` inside p's struct). The per-package
+        // processing below runs in map order, so p's struct width fell back
+        // to 32 per unresolved member whenever p hashed ahead of q.
+        // Pre-register every package's typedefs to a fixpoint (two passes,
+        // re-processing is idempotent) so cross-package members resolve
+        // regardless of iteration order.
+        for _pass in 0..2 {
+            for def in defs.values() {
+                let Definition::Package(pkg) = def else { continue };
+                let ov = overlay_pkg_params(pkg, &mut elab);
+                for item in &pkg.items {
+                    if let crate::ast::decl::PackageItem::Typedef(td) = item {
+                        process_typedef(td, &mut elab);
+                        register_scoped_typedef_alias(&pkg.name.name, td, &mut elab);
+                    }
+                }
+                restore_overlay(&mut elab, ov);
+            }
+        }
         for td in ordered_typedefs(defs) {
             process_typedef(td, &mut elab);
         }
@@ -5002,6 +5052,19 @@ pub fn elaborate_module_with_defs(
                         // Recursively flatten nested struct/union members so multi-segment
                         // paths like u.s.a resolve via a single packed_struct_fields lookup.
                         fn flatten_subfields(dt: &DataType, params: &HashMap<String, Value>, typedefs: &HashMap<String, u32>, typedef_types: &HashMap<String, DataType>) -> Option<Vec<(String, u32, u32)>> {
+                            // A NESTED member typed by ANOTHER package's
+                            // scoped typedef (`q::inner_t` inside p's struct)
+                            // needs q's params bare for ITS member dims —
+                            // re-derive the owner at every nesting level.
+                            let owner_aug;
+                            let params: &HashMap<String, Value> =
+                                match scoped_type_owner(dt, typedef_types) {
+                                    Some(pkg) => {
+                                        owner_aug = overlay_owner_params(&pkg, params);
+                                        &owner_aug
+                                    }
+                                    None => params,
+                                };
                             // §6.18: a CIRCULAR typedef makes this nesting
                             // infinite (`typedef T1; struct packed { T1 x; } T2;
                             // typedef T2 [1:0] T3; typedef T3 T1;`) — the walk
@@ -10862,19 +10925,44 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
         // fallback below only fires when the declaration isn't visible, and
         // silently assumes $clog2 semantics (wrong for floor-log2 variants).
         ExprKind::Call { func, args } => {
-            let fname = if let ExprKind::Ident(h) = &func.kind {
-                h.path.last().map(|s| s.name.name.clone())?
-            } else {
-                return None;
+            // A SCOPED call (`p::LOG2(64)`) reaches here as either a
+            // 2-segment Ident or MemberAccess{Ident(p), LOG2} — resolve the
+            // qualified registration first so the right package's fn wins.
+            let (fname, scoped_key) = match &func.kind {
+                ExprKind::Ident(h) => {
+                    let leaf = h.path.last().map(|s| s.name.name.clone())?;
+                    let sk = (h.path.len() >= 2).then(|| {
+                        format!("{}::{}", h.path[h.path.len() - 2].name.name, leaf)
+                    });
+                    (leaf, sk)
+                }
+                ExprKind::MemberAccess { expr: base, member } => {
+                    let sk = match &base.kind {
+                        ExprKind::Ident(bh) if bh.path.len() == 1 => Some(format!(
+                            "{}::{}",
+                            bh.path[0].name.name, member.name
+                        )),
+                        _ => None,
+                    };
+                    (member.name.clone(), sk)
+                }
+                _ => return None,
             };
             let fd_rc = FUNCS_TLS.with(|cell| {
                 cell.borrow()
                     .as_ref()
-                    .filter(|m| m.contains_key(&fname))
+                    .filter(|m| {
+                        scoped_key.as_deref().is_some_and(|k| m.contains_key(k))
+                            || m.contains_key(&fname)
+                    })
                     .cloned()
             });
             if let Some(funcs) = fd_rc {
-                let fd = funcs.get(&fname).cloned()?;
+                let fd = scoped_key
+                    .as_deref()
+                    .and_then(|k| funcs.get(k))
+                    .or_else(|| funcs.get(&fname))
+                    .cloned()?;
                 let mut argv = Vec::with_capacity(args.len());
                 for a in args {
                     let av = const_eval_i64_with_params(a, params)?;
@@ -19360,6 +19448,16 @@ fn eval_const_user_function(
     ) -> Option<Value> {
         if !const_fn_expr_supported(e) {
             return None;
+        }
+        // §13.4: a conditional must evaluate LAZILY — the classic recursive
+        // clog2 idiom (`f = (v <= 1) ? 0 : 1 + f(v/2)`) puts the recursive
+        // call in the untaken branch at the base case, and the eager
+        // substitution below would recurse on it until the depth cap killed
+        // the whole evaluation (every such parameter silently became 0).
+        if let ExprKind::Conditional { condition, then_expr, else_expr } = &e.kind {
+            let c = eval_fn_expr(condition, locals, elab, depth)?;
+            let taken = if c.is_true() { then_expr } else { else_expr };
+            return eval_fn_expr(taken, locals, elab, depth);
         }
         // Nested calls: substitute first, then const-eval.
         let subbed = substitute_const_fn_calls(e, locals, elab, depth + 1)?;
