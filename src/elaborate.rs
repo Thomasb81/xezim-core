@@ -9931,9 +9931,46 @@ fn describe_packed_range(
     let mut idents: Vec<String> = Vec::new();
     collect_ident_names(left, &mut idents);
     collect_ident_names(right, &mut idents);
+    // Scoped refs (`pkg::P`, parsed as multi-segment Ident or MemberAccess)
+    // aren't collected above (that walker also feeds implicit-net creation);
+    // gather them here so the diagnostic can resolve their alias keys.
+    fn collect_scoped(e: &Expression, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) if h.path.len() == 2 => {
+                out.push(format!("{}::{}", h.path[0].name.name, h.path[1].name.name));
+            }
+            ExprKind::MemberAccess { expr: base, member } => {
+                if let ExprKind::Ident(bh) = &base.kind {
+                    if bh.path.len() == 1 {
+                        out.push(format!("{}::{}", bh.path[0].name.name, member.name));
+                    }
+                }
+            }
+            ExprKind::Unary { operand, .. } => collect_scoped(operand, out),
+            ExprKind::Binary { left, right, .. } => {
+                collect_scoped(left, out);
+                collect_scoped(right, out);
+            }
+            ExprKind::Paren(i) => collect_scoped(i, out),
+            _ => {}
+        }
+    }
+    collect_scoped(left, &mut idents);
+    collect_scoped(right, &mut idents);
     idents.sort();
     idents.dedup();
     let mut d = format!("range resolved to [{}:{}]", l, r);
+    // Drop a bare scope segment (`cfgp`) when its scoped form
+    // (`cfgp::X`) is also listed — the segment alone is never a param.
+    let scoped_prefixes: Vec<String> = idents
+        .iter()
+        .filter(|n| n.contains("::"))
+        .filter_map(|n| n.split("::").next().map(|s| s.to_string()))
+        .collect();
+    let idents: Vec<String> = idents
+        .into_iter()
+        .filter(|n| n.contains("::") || !scoped_prefixes.contains(n))
+        .collect();
     if !idents.is_empty() {
         let vals: Vec<String> = idents
             .iter()
@@ -9946,6 +9983,37 @@ fn describe_packed_range(
             })
             .collect();
         d.push_str(&format!(" with {}", vals.join(", ")));
+        // Owning-scope hint: a package parameter also lives under its
+        // `pkg::name` alias, so listing matching aliases names the package
+        // that computed the bad value — module-scope params have none.
+        // Signed view too: 4294967290 is far more recognizable as -6.
+        if let Some(pm) = params {
+            let mut owners: Vec<String> = Vec::new();
+            for n in idents.iter().take(4) {
+                let suffix = format!("::{}", n);
+                for (k, v) in pm.iter() {
+                    if k.ends_with(&suffix) {
+                        owners.push(format!("{}={}", k, v.to_u64().unwrap_or(0) as i64 as i32));
+                    }
+                }
+            }
+            owners.sort();
+            owners.dedup();
+            if owners.is_empty() {
+                d.push_str("; no pkg:: alias found (module-scope or unhoisted)");
+            } else {
+                d.push_str(&format!("; aliases: {}", owners.join(", ")));
+            }
+        }
+        d.push_str(&format!(
+            "; rerun --compile with XEZIM_TRACE_PARAM={} for the full write trail",
+            idents
+                .iter()
+                .take(4)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join(",")
+        ));
     }
     d.push_str(&format!(" (source offset {})", left.span.start));
     d
