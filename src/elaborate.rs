@@ -4494,6 +4494,27 @@ pub fn elaborate_module_with_defs(
                     if matches!(effective_dims.first(), Some(UnpackedDimension::Queue { .. })) {
                         elab.queue_vars.insert(decl.name.name.clone());
                     }
+                    // §7.8 / §8.4: record the ELEMENT CLASS for associative,
+                    // queue and dynamic collections, exactly as the fixed-size
+                    // array branches above do. Without it the simulator's
+                    // `coll[key] = new` route cannot resolve which class to
+                    // construct, so it stored X — `q.push_back(new)` and
+                    // `pool[k] = new` silently produced a null/X element while
+                    // `arr[i] = new` on a FIXED array worked. UVM hits this on
+                    // every `uvm_create_random_seed` call.
+                    if matches!(
+                        effective_dims.first(),
+                        Some(
+                            UnpackedDimension::Associative { .. }
+                                | UnpackedDimension::Queue { .. }
+                                | UnpackedDimension::Unsized(_)
+                        )
+                    ) {
+                        if let DataType::TypeReference { name: tn, .. } = &dd.data_type {
+                            elab.array_elem_class
+                                .insert(decl.name.name.clone(), tn.name.name.clone());
+                        }
+                    }
                     if let Some(UnpackedDimension::Queue { max_size: Some(ms), .. }) = effective_dims.first() {
                         let n = const_eval_i64_with_params(ms, Some(&elab.parameters)).unwrap_or(0);
                         if n >= 0 { elab.queue_max_sizes.insert(decl.name.name.clone(), (n + 1) as u32); }
@@ -14058,8 +14079,32 @@ pub fn inline_instantiations(
                                 if is_dynamic_dim {
                                     elab.dynamic_arrays.insert(decl.name.name.clone());
                                 }
+                                // Same element-class registration the module-scope
+                                // path does — a PACKAGE-level collection of class
+                                // handles (`seed_map lookup [string];`, the UVM
+                                // seed-pool shape) otherwise had no recorded element
+                                // class, so `lookup[k] = new` stored X.
+                                if is_dynamic_dim || is_assoc {
+                                    if let DataType::TypeReference { name: tn, .. } = &dd.data_type {
+                                        elab.array_elem_class
+                                            .insert(decl.name.name.clone(), tn.name.name.clone());
+                                    }
+                                }
                                 if is_assoc {
-                                    elab.associative_arrays.insert(decl.name.name.clone(), false);
+                                    // The key type was hardcoded non-string here,
+                                    // unlike the module-scope path — a package-level
+                                    // `[string]` map indexed by a string key then
+                                    // hashed through the integer path.
+                                    let is_string_key = matches!(
+                                        first_dim,
+                                        Some(UnpackedDimension::Associative { data_type: Some(kdt), .. })
+                                            if matches!(
+                                                kdt.as_ref(),
+                                                DataType::Simple { kind: SimpleType::String, .. }
+                                            )
+                                    );
+                                    elab.associative_arrays
+                                        .insert(decl.name.name.clone(), is_string_key);
                                     continue;
                                 }
                                 // Element reads/writes go through `module.arrays`
