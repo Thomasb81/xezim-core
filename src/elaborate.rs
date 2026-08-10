@@ -1450,6 +1450,13 @@ pub struct ElaboratedModule {
     /// this, the assignment falls back to a zero value (null handle).
     #[serde(default)]
     pub array_elem_class: HashMap<String, String>,
+    /// Associative-array KEY type name, when the key is a named type
+    /// (`int cnt [sev_e];`). `foreach (cnt[s])` binds `s` with this type so
+    /// `s.name()` resolves against the RIGHT enum — without it the lookup
+    /// scans every enum and picks the largest, printing a member of an
+    /// unrelated enum (UVM's report summary showed `UVM_NORADIX` where a
+    /// severity belonged).
+    pub assoc_key_type_names: HashMap<String, String>,
     /// N-dimensional unpacked array shapes (N >= 3): name → Vec of (lo, hi) per dim.
     pub arrays_nd: HashMap<String, (Vec<(i64, i64)>, u32)>,
     /// Parameter init expressions that couldn't be evaluated at elaboration time
@@ -1784,6 +1791,7 @@ impl ElaboratedModule {
             checker_decls: HashMap::default(),
             property_decls: HashMap::default(),
             array_elem_class: HashMap::default(),
+            assoc_key_type_names: HashMap::default(),
             arrays_nd: HashMap::default(),
             deferred_param_exprs: Vec::new(),
             nets: HashSet::default(),
@@ -4474,6 +4482,10 @@ pub fn elaborate_module_with_defs(
                     if let Some(UnpackedDimension::Associative { data_type: key_dt, .. }) = effective_dims.first() {
                         let is_string_key = key_dt.as_ref().is_some_and(|dt| matches!(dt.as_ref(), DataType::Simple { kind: SimpleType::String, .. }));
                         elab.associative_arrays.insert(decl.name.name.clone(), is_string_key);
+                        if let Some(DataType::TypeReference { name: kt, .. }) = key_dt.as_deref() {
+                            elab.assoc_key_type_names
+                                .insert(decl.name.name.clone(), kt.name.name.clone());
+                        }
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
