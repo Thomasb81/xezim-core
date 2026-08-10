@@ -4560,6 +4560,18 @@ pub fn elaborate_module_with_defs(
                             typedefs: &HashMap<String, u32>,
                             typedef_types: &HashMap<String, DataType>,
                         ) -> Option<Vec<(String, u32, u32)>> {
+                            // Scoped element types (`p::r_t arr[4]`): member
+                            // dims bind the OWNING package's params bare —
+                            // re-derive per level (see scoped_type_owner).
+                            let owner_aug;
+                            let params: &HashMap<String, Value> =
+                                match scoped_type_owner(dt, typedef_types) {
+                                    Some(pkg) => {
+                                        owner_aug = overlay_owner_params(&pkg, params);
+                                        &owner_aug
+                                    }
+                                    None => params,
+                                };
                             let resolved = resolve_typedef_chain(dt, typedef_types);
                             if let DataType::Struct(su) = resolved {
                                 let is_union = matches!(su.kind, StructUnionKind::Union);
@@ -4593,7 +4605,16 @@ pub fn elaborate_module_with_defs(
                         }
                         let elem_resolved: &DataType =
                             if let DataType::TypeReference { name, .. } = &dd.data_type {
-                                elab.typedef_types.get(&name.name.name).unwrap_or(&dd.data_type)
+                                // §26.3: scoped element type — qualified key
+                                // first so a same-named local can't capture.
+                                name.scope
+                                    .as_ref()
+                                    .and_then(|sc| {
+                                        elab.typedef_types
+                                            .get(&format!("{}::{}", sc.name, name.name.name))
+                                    })
+                                    .or_else(|| elab.typedef_types.get(&name.name.name))
+                                    .unwrap_or(&dd.data_type)
                             } else { &dd.data_type };
                         // Only a PACKED struct element has a contiguous bit layout that
                         // `arr[i].member` can slice. An UNPACKED struct element stores each
@@ -4605,7 +4626,7 @@ pub fn elaborate_module_with_defs(
                             DataType::Struct(su) if su.packed
                         );
                         if elem_is_packed {
-                            if let Some(fields) = flatten_elem(elem_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
+                            if let Some(fields) = flatten_elem(&dd.data_type, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
                                 if !fields.is_empty() {
                                     tls_register_struct_layout(&decl.name.name, &fields);
                                     elab.packed_struct_fields.insert(decl.name.name.clone(), fields);
@@ -19505,7 +19526,18 @@ fn const_fn_expr_supported(e: &Expression) -> bool {
     use crate::ast::expr::{BinaryOp, UnaryOp};
     match &e.kind {
         ExprKind::Number(_) => true,
-        ExprKind::Ident(h) => h.path.len() == 1 && h.path[0].selects.is_empty(),
+        // 1 segment: local/param. 2 segments: a SCOPED package param
+        // (`q::DEPTH`) — eval_const_expr_val resolves it via the `q::DEPTH`
+        // alias, so `LOG2(q::DEPTH)` args are safe to admit.
+        ExprKind::Ident(h) => {
+            h.path.len() <= 2 && h.path.iter().all(|seg| seg.selects.is_empty())
+        }
+        // `q::DEPTH` also parses as MemberAccess{Ident(q), DEPTH};
+        // eval_const_expr_val resolves it through the scoped alias (and falls
+        // back to struct-param field slicing, also supported).
+        ExprKind::MemberAccess { expr: base, member: _ } => {
+            matches!(&base.kind, ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty())
+        }
         ExprKind::Paren(i) => const_fn_expr_supported(i),
         ExprKind::Unary { op, operand } => !matches!(
             op,
