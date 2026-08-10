@@ -2328,8 +2328,34 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
         })
         .collect();
     pkgs.sort_by(|a, b| a.name.name.cmp(&b.name.name));
+    // §13.4.3: sizing-helper FUNCTIONS must be visible before any parameter
+    // init is evaluated — `LOG = LOG2(DEPTH)` hoisted before LOG2 registered
+    // silently evaluated the call to 0, and every scoped `p::LOG` dimension
+    // resolved against that 0 until the import path healed it, too late for
+    // module signal widths. Same registration shape as the import path
+    // (bare or_insert + qualified insert), so ordering can't change outcomes.
+    for p in &pkgs {
+        for item in &p.items {
+            let crate::ast::decl::PackageItem::Function(f) = item else { continue };
+            if f.name.scope.is_some() {
+                continue;
+            }
+            elab.functions
+                .entry(f.name.name.name.clone())
+                .or_insert_with(|| f.clone());
+            elab.functions
+                .insert(format!("{}::{}", p.name.name, f.name.name.name), f.clone());
+            elab.pkg_subr_owner
+                .entry(f.name.name.name.clone())
+                .or_insert_with(|| p.name.name.clone());
+        }
+    }
     for _pass in 0..3 {
         for p in &pkgs {
+            // Sequential bare visibility of this package's OWN params while
+            // its inits are evaluated (`LOG2(SZ)` — the formal binds the bare
+            // name), restored after the package so nothing leaks unimported.
+            let mut pkg_overlay: Vec<(String, Option<Value>)> = Vec::new();
             for item in &p.items {
                 let crate::ast::decl::PackageItem::Parameter(pd) = item else { continue };
                 let ParameterKind::Data { data_type, assignments } = &pd.kind else { continue };
@@ -2353,7 +2379,14 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                                 subbed = e;
                                 &subbed
                             }
-                            None => init,
+                            None => {
+                                // The call didn't reduce — registering the
+                                // 0 that eval_init_for_width would produce
+                                // poisons every dimension sized by this
+                                // param. Leave it for a later pass / the
+                                // import path.
+                                continue;
+                            }
                         }
                     } else {
                         init
@@ -2365,6 +2398,16 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     if is_type_real(data_type) {
                         v = Value::from_f64(v.to_f64());
                     }
+                    pkg_overlay.push((
+                        assign.name.name.clone(),
+                        elab.parameters.get(&assign.name.name).cloned(),
+                    ));
+                    params_insert_traced(
+                        &mut elab.parameters,
+                        line!(),
+                        assign.name.name.clone(),
+                        v.clone(),
+                    );
                     // SCOPED alias only. Registering bare names here would
                     // make every package parameter visible everywhere — an
                     // explicit `import p::A;` must NOT expose `B` (§26.2.2,
@@ -2375,6 +2418,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     alias_pkg_param(elab, &p.name.name, &assign.name.name, &v);
                 }
             }
+            restore_overlay(elab, pkg_overlay);
         }
     }
 }
@@ -4928,9 +4972,33 @@ pub fn elaborate_module_with_defs(
                         // Owned so later `&mut elab` calls (member pre-registration)
                         // don't conflict with a borrow of `elab.typedef_types`.
                         let dt_resolved_owned: DataType = if let DataType::TypeReference { name, .. } = &dd.data_type {
-                            elab.typedef_types.get(&name.name.name).cloned().unwrap_or_else(|| dd.data_type.clone())
+                            // §26.3: a SCOPED reference (`P::T`) names the
+                            // package's typedef — qualified key first, so a
+                            // same-named local typedef can't capture it.
+                            let scoped = name.scope.as_ref().and_then(|sc| {
+                                elab.typedef_types.get(&format!("{}::{}", sc.name, name.name.name))
+                            });
+                            scoped
+                                .or_else(|| elab.typedef_types.get(&name.name.name))
+                                .cloned()
+                                .unwrap_or_else(|| dd.data_type.clone())
                         } else { dd.data_type.clone() };
                         let dt_resolved: &DataType = &dt_resolved_owned;
+                        // Member dims of a scoped package type reference the
+                        // OWNING package's params by bare name (see
+                        // scoped_type_owner) — overlay them for the layout walk;
+                        // dt_resolved is already the raw Struct, so the walk
+                        // itself can't recover the owner.
+                        let layout_params_owned;
+                        let layout_params: &HashMap<String, Value> =
+                            match scoped_type_owner(&dd.data_type, &elab.typedef_types) {
+                                Some(pkg) => {
+                                    layout_params_owned =
+                                        overlay_owner_params(&pkg, &elab.parameters);
+                                    &layout_params_owned
+                                }
+                                None => &elab.parameters,
+                            };
                         // Recursively flatten nested struct/union members so multi-segment
                         // paths like u.s.a resolve via a single packed_struct_fields lookup.
                         fn flatten_subfields(dt: &DataType, params: &HashMap<String, Value>, typedefs: &HashMap<String, u32>, typedef_types: &HashMap<String, DataType>) -> Option<Vec<(String, u32, u32)>> {
@@ -5082,7 +5150,7 @@ pub fn elaborate_module_with_defs(
                                 Some(out)
                             } else { None }
                         }
-                        if let Some(fields) = flatten_subfields(dt_resolved, &elab.parameters, &elab.typedefs, &elab.typedef_types) {
+                        if let Some(fields) = flatten_subfields(dt_resolved, layout_params, &elab.typedefs, &elab.typedef_types) {
                             if !fields.is_empty() {
                                 tls_register_struct_layout(&decl.name.name, &fields);
                                 // Only register packed-struct layouts in
@@ -12721,6 +12789,53 @@ pub fn struct_member_names(
     }
 }
 
+
+/// Owning package of a scoped type-reference chain (`cfg::req_t` → "cfg").
+/// A package typedef's member dimensions reference the OWNING package's
+/// parameters by BARE name (`logic [LOG_DEPTH-1:0] addr;`), but consumers
+/// resolve layouts with the USING scope's parameter map, where those names
+/// only exist under their `pkg::` aliases — so member widths silently went
+/// to 0 in any module that didn't import the package.
+fn scoped_type_owner(dt: &DataType, typedef_types: &HashMap<String, DataType>) -> Option<String> {
+    let mut cur = dt;
+    let mut owner: Option<String> = None;
+    for _ in 0..64 {
+        let DataType::TypeReference { name, .. } = cur else { break };
+        if let Some(sc) = &name.scope {
+            let key = format!("{}::{}", sc.name, name.name.name);
+            if let Some(next) = typedef_types.get(&key) {
+                owner = Some(format!("{}", sc.name));
+                cur = next;
+                continue;
+            }
+        }
+        match typedef_types.get(&name.name.name) {
+            Some(next) => cur = next,
+            None => break,
+        }
+    }
+    owner
+}
+
+/// Overlay `pkg::X` parameter aliases as bare `X` for evaluating the members
+/// of a scoped package type. Package params override same-named module ones
+/// here — inside the package's own typedef, bare names bind to the package.
+fn overlay_owner_params(
+    owner: &str,
+    params: &HashMap<String, Value>,
+) -> HashMap<String, Value> {
+    let mut m = params.clone();
+    let pfx = format!("{}::", owner);
+    for (k, v) in params.iter() {
+        if let Some(bare) = k.strip_prefix(&pfx) {
+            if !bare.contains("::") {
+                m.insert(bare.to_string(), v.clone());
+            }
+        }
+    }
+    m
+}
+
 pub fn packed_struct_field_layout(
     dt: &DataType,
     params: &HashMap<String, Value>,
@@ -12740,6 +12855,16 @@ fn flatten_struct_fields(
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Vec<(String, u32, u32)>> {
+    // See scoped_type_owner — member dims of a `pkg::T` struct need the
+    // package's own params visible bare.
+    let owner_aug;
+    let params: &HashMap<String, Value> = match scoped_type_owner(dt, typedef_types) {
+        Some(pkg) => {
+            owner_aug = overlay_owner_params(&pkg, params);
+            &owner_aug
+        }
+        None => params,
+    };
     let resolved = resolve_typedef_chain(dt, typedef_types);
     if let DataType::Struct(su) = resolved {
         let is_union = matches!(su.kind, StructUnionKind::Union);
@@ -12785,6 +12910,15 @@ fn pack_struct_const_value(
     typedefs: &HashMap<String, u32>,
     typedef_types: &HashMap<String, DataType>,
 ) -> Option<Value> {
+    // See scoped_type_owner — same bare-name rule as flatten_struct_fields.
+    let owner_aug;
+    let params: &HashMap<String, Value> = match scoped_type_owner(dt, typedef_types) {
+        Some(pkg) => {
+            owner_aug = overlay_owner_params(&pkg, params);
+            &owner_aug
+        }
+        None => params,
+    };
     let su = match resolve_typedef_chain(dt, typedef_types) {
         DataType::Struct(su) => su.clone(),
         _ => return None,
@@ -13669,6 +13803,24 @@ pub fn inline_instantiations(
                                     } else { base_width };
                                     register_packed_array_elem_w(&assign.name.name, data_type, &elab.typedefs);
                                     if let Some(init) = &assign.init {
+                                        // §13.4.3 const-function calls. If the
+                                        // call does NOT reduce, skip: evaluating
+                                        // it raw yields 0 and CLOBBERS the value
+                                        // the package hoist already healed
+                                        // (`LOG = LOG2(DEPTH)` went 6 -> 0 here,
+                                        // re-shrinking every typedef processed
+                                        // after this point).
+                                        let subbed_init7;
+                                        let init: &Expression = if expr_has_call(init) {
+                                            match substitute_const_fn_calls(init, &elab.parameters, elab, 0)
+                                                .filter(|e| !expr_has_call(e))
+                                            {
+                                                Some(e) => { subbed_init7 = e; &subbed_init7 }
+                                                None => continue,
+                                            }
+                                        } else {
+                                            init
+                                        };
                                         let mut v = eval_param_value(data_type, init, &elab.parameters, &elab.typedefs, &elab.typedef_types, width);
                                         if is_signed { v.is_signed = true; }
                                         params_insert_traced(&mut elab.parameters, line!(), assign.name.name.clone(), v);
