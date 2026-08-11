@@ -18812,6 +18812,19 @@ fn inline_module_items(
                             .collect();
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
                     }
+                    // §35.4: a DPI import declared inside a CHILD module was
+                    // never registered — only the top module's and packages'
+                    // items reach register_dpi_import — so every call in an
+                    // instantiated module silently resolved to nothing and
+                    // "returned" 0/null with no diagnostic (GitHub xezim#108;
+                    // the parameterized case in the report is just the common
+                    // spelling of "child"). The import's SV name is global by
+                    // symbol (§35.5.2 allows consistent re-imports, and
+                    // register_dpi_import treats them as no-ops), so no
+                    // instance prefix applies.
+                    if let ModuleItem::DPIImport(di) = sub_item {
+                        register_dpi_import(di, elab)?;
+                    }
                     if let ModuleItem::TaskDeclaration(td) = sub_item {
                         let mut new_td = td.clone();
                         new_td.name.name.name = format!("{}{}", inst_prefix, td.name.name.name);
