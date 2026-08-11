@@ -10652,6 +10652,27 @@ fn ceil_log2(n: u64) -> u64 {
 
 pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<String, Value>>) -> Option<i64> {
     match &expr.kind {
+        // §25.5 interface-port parameter (`c.DEPTH`) — dotted key seeded at
+        // child inlining; parses as MemberAccess.
+        ExprKind::MemberAccess { expr: base, member }
+            if matches!(&base.kind,
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty()
+                    && params.is_some_and(|p|
+                        p.contains_key(&format!("{}.{}", h.path[0].name.name, member.name))
+                            || p.contains_key(&format!("{}::{}", h.path[0].name.name, member.name)))) =>
+        {
+            let base_name = if let ExprKind::Ident(h) = &base.kind {
+                h.path[0].name.name.as_str()
+            } else {
+                unreachable!()
+            };
+            params
+                .and_then(|p| {
+                    p.get(&format!("{}.{}", base_name, member.name))
+                        .or_else(|| p.get(&format!("{}::{}", base_name, member.name)))
+                })
+                .and_then(|v| v.to_i64())
+        }
         ExprKind::Number(NumberLiteral::Integer { value, base, .. }) => {
             let r = match base { NumberBase::Binary => 2, NumberBase::Octal => 8, NumberBase::Hex => 16, NumberBase::Decimal => 10 };
             i64::from_str_radix(&value.replace('_', ""), r).ok()
@@ -10671,9 +10692,19 @@ pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<Str
             let scoped = (hier.path.len() >= 2).then(|| {
                 format!("{}::{}", hier.path[hier.path.len() - 2].name.name, name)
             });
+            // §25.5: interface-port parameter (`c.DEPTH`) — seeded under its
+            // dotted spelling at child inlining; try it before the bare name.
+            let dotted = (hier.path.len() >= 2).then(|| {
+                hier.path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
             scoped
                 .as_deref()
                 .and_then(|k| params.and_then(|p| p.get(k)))
+                .or_else(|| dotted.as_deref().and_then(|k| params.and_then(|p| p.get(k))))
                 .or_else(|| params.and_then(|p| p.get(name)))
                 .and_then(|v| v.to_i64())
                 // Fall back to the global package/$unit param snapshot so that a
@@ -13305,6 +13336,27 @@ fn eval_init_for_width(expr: &Expression, params: &HashMap<String, Value>, width
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).
 fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
     let res = match &expr.kind {
+        // §25.5: a parameter reached through an interface PORT formal
+        // (`c.DEPTH`) parses as MemberAccess; the child's param map carries
+        // it under the dotted spelling (seeded at inlining). Without this
+        // arm the expression fell into the default and evaluated 0.
+        ExprKind::MemberAccess { expr: base, member }
+            if matches!(&base.kind,
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty()
+                    && (params.contains_key(&format!("{}.{}", h.path[0].name.name, member.name))
+                        || params.contains_key(&format!("{}::{}", h.path[0].name.name, member.name)))) =>
+        {
+            let base_name = if let ExprKind::Ident(h) = &base.kind {
+                h.path[0].name.name.clone()
+            } else {
+                unreachable!()
+            };
+            params
+                .get(&format!("{}.{}", base_name, member.name))
+                .or_else(|| params.get(&format!("{}::{}", base_name, member.name)))
+                .cloned()
+                .unwrap_or_else(|| Value::new(32))
+        }
         ExprKind::Number(num) => {
             match num {
                 NumberLiteral::Integer { size, signed, base, value, .. } => {
@@ -13353,9 +13405,20 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             let scoped = (hier.path.len() >= 2).then(|| {
                 format!("{}::{}", hier.path[hier.path.len() - 2].name.name, name)
             });
+            // §25.5: a parameter reached through an interface PORT formal
+            // (`c.DEPTH`) is seeded into the child's param map under its
+            // dotted spelling — try that before the bare-name fallback.
+            let dotted = (hier.path.len() >= 2).then(|| {
+                hier.path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(".")
+            });
             scoped
                 .as_deref()
                 .and_then(|k| params.get(k).cloned())
+                .or_else(|| dotted.as_deref().and_then(|k| params.get(k).cloned()))
                 .or_else(|| params.get(name).cloned())
                 .or_else(|| param_fallback_get(name))
                 .unwrap_or_else(|| {
@@ -17537,6 +17600,28 @@ fn inline_module_items(
                 // otherwise while an overridden T worked).
                 let ovr_type_names: std::collections::HashSet<&str> =
                     type_overrides.iter().map(|(n, _)| n.as_str()).collect();
+                // §25.5 J2e: parameters of a BOUND interface instance are
+                // visible through the port formal in the child's CONSTANT
+                // contexts (`localparam D = c.DEPTH;`, `[c.DEPTH-1:0]`).
+                // Seed `<formal>.<param>` entries from the already-elaborated
+                // instance's prefixed parameters, so the fixpoint below and
+                // every width resolution see them instead of a silent 0.
+                // (Requires the interface instance to appear before this
+                // child in source order — the overwhelmingly common layout.)
+                for (formal, bound) in sub_interface_map.iter() {
+                    let bound_prefix = format!("{}.", bound);
+                    let seeds: Vec<(String, Value)> = elab
+                        .parameters
+                        .iter()
+                        .filter(|(k, _)| k.starts_with(&bound_prefix))
+                        .map(|(k, v)| {
+                            (format!("{}.{}", formal, &k[bound_prefix.len()..]), v.clone())
+                        })
+                        .collect();
+                    for (k, v) in seeds {
+                        sub_local_params.entry(k).or_insert(v);
+                    }
+                }
                 for _ in 0..4 {
                     let body_items = collect_effective_items(sub_mod.items(), &sub_local_params);
                     let mut local_tds = elab.typedefs.clone();
