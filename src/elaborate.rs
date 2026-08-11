@@ -18682,8 +18682,47 @@ fn inline_module_items(
                     let sub_expr = make_ident_expr(&sub_sig_name);
                     match prepared_sub.port_directions.get(port_name) {
                         Some(PortDirection::Input) | Some(PortDirection::Inout) => {
+                            // §23.3.3: a NARROWER actual drives only the low
+                            // bits of the formal; the unconnected high bits
+                            // read z (measured: 4-bit actual on an 8-bit
+                            // input -> "zzzz1010"). A plain resize would
+                            // zero-extend, silently driving the top bits 0.
+                            let mut rhs = parent_expr.clone();
+                            let fw = elab
+                                .signals
+                                .get(&sub_sig_name)
+                                .map(|s| s.width)
+                                .unwrap_or(0);
+                            let is_real_port = elab
+                                .signals
+                                .get(&sub_sig_name)
+                                .map(|s| s.is_real)
+                                .unwrap_or(false);
+                            if !is_real_port && fw > 0 {
+                                if let Some(aw) = port_conn_width(parent_expr, elab) {
+                                    if aw > 0 && aw < fw {
+                                        let span = parent_expr.span;
+                                        let zfill = Expression::new(
+                                            ExprKind::Number(
+                                                crate::ast::expr::NumberLiteral::Integer {
+                                                    size: Some(fw - aw),
+                                                    signed: false,
+                                                    base: crate::ast::expr::NumberBase::Binary,
+                                                    value: "z".to_string(),
+                                                    cached_val: std::cell::Cell::new(None),
+                                                },
+                                            ),
+                                            span,
+                                        );
+                                        rhs = Expression::new(
+                                            ExprKind::Concatenation(vec![zfill, rhs]),
+                                            span,
+                                        );
+                                    }
+                                }
+                            }
                             elab.continuous_assigns.push(ContinuousAssignment {
-                                lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
+                                lhs: sub_expr, rhs, delay: 0,
                             });
                         }
                         Some(PortDirection::Output) => {                            elab.continuous_assigns.push(ContinuousAssignment {

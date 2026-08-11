@@ -317,6 +317,13 @@ impl Parser {
         }
 
         match self.current_kind() {
+            // §23.4 nested module declaration — parsed whole and hoisted to
+            // the definitions map by the top-level pipeline.
+            TokenKind::KwModule | TokenKind::KwMacromodule => {
+                return Some(ModuleItem::NestedModule(Box::new(
+                    self.parse_module_declaration(),
+                )));
+            }
             // `timeunit 1ns / 10ps;` / `timeprecision …;` inside a module —
             // already parsed at top-level via Description::TimeunitsDecl;
             // accept and discard inside modules too (LRM allows both).

@@ -121,6 +121,11 @@ pub enum ModuleItem {
     /// instance path relative to the enclosing scope.
     Defparam(Vec<(Expression, Expression)>),
     Null,
+    /// §23.4 NESTED module declaration. The top-level pipeline hoists these
+    /// into the definitions map before elaboration (the nested module's
+    /// access to the enclosing scope's names is NOT modeled — self-contained
+    /// nested modules only). Appended last for bincode index stability.
+    NestedModule(Box<crate::ast::module::ModuleDeclaration>),
 }
 
 /// IEEE 1800-2023 §23.11 — `bind` directive. A lightweight, top-level form

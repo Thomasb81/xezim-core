@@ -61,7 +61,8 @@ pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x0e = \x0d + ResolvedNetKind::ChargeStorage (§6.6.4
+/// Version byte: \x0f = \x0e + ModuleItem::NestedModule (§23.4);
+/// \x0e = \x0d + ResolvedNetKind::ChargeStorage (§6.6.4
 /// trireg); \x0d = \x0c + EventTrigger target expression (§15.5
 /// runtime-select receivers);
 /// \x0a = \x09 + ElaboratedModule.elab_diagnostics (warm-cache
@@ -73,7 +74,7 @@ pub use elaborate::{elaborate_module, ElaboratedModule};
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x0e";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x0f";
 
 /// zstd compression level used for `.xez` artifacts. Level 3 is zstd's own
 /// default — strong compression at high throughput. Empirically shrinks
@@ -1024,6 +1025,40 @@ fn parse_and_elaborate(
     for desc in all_descriptions {
         match desc {
             ast::Description::Module(mut m) => {
+                // §23.4: hoist NESTED module declarations (recursively) into
+                // the definitions map; the enclosing body keeps everything
+                // else. Scope access into the enclosing module is not modeled.
+                fn hoist_nested(
+                    m: &mut ast::module::ModuleDeclaration,
+                    out: &mut Vec<ast::module::ModuleDeclaration>,
+                ) {
+                    let mut kept = Vec::with_capacity(m.items.len());
+                    for item in m.items.drain(..) {
+                        if let ast::decl::ModuleItem::NestedModule(inner) = item {
+                            let mut inner = *inner;
+                            hoist_nested(&mut inner, out);
+                            out.push(inner);
+                        } else {
+                            kept.push(item);
+                        }
+                    }
+                    m.items = kept;
+                }
+                let mut nested: Vec<ast::module::ModuleDeclaration> = Vec::new();
+                hoist_nested(&mut m, &mut nested);
+                for n in nested {
+                    let nname = n.name.name.clone();
+                    if definitions.contains_key(&nname) {
+                        log_eprintln(&format!(
+                            "[xezim][warning] module '{}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 \u{00a7}3.3)",
+                            nname
+                        ));
+                    }
+                    let unit_s = eff_ts.get(&nname).map(|&(u, _)| u).unwrap_or(tick_s);
+                    let mut n = n;
+                    elaborate::rewrite_module_delays_pub(&mut n.items, unit_s, tick_s);
+                    definitions.insert(nname, SourceDefinition::Module(Rc::new(n)));
+                }
                 let name = m.name.name.clone();
                 if definitions.contains_key(&name) {
                     // The reference simulator ACCEPTS a redefinition with a
