@@ -60,10 +60,6 @@ pub enum StatementKind {
         body: Box<Statement>,
         keys: Vec<String>,
         is_str: bool,
-        /// (key_width, key_signed) — the AA index type, so signed/narrowed
-        /// keys round-trip through the tail continuation without a failed
-        /// u64 parse clobbering them to 0.
-        key_type: (u32, bool),
         idx: usize,
         fe_auto_len: usize,
         /// When set, `idx` is bounds-checked against the LIVE queue/dynamic-
@@ -72,6 +68,12 @@ pub enum StatementKind {
         /// unspecified, but UVM routinely shrinks `arb_sequence_q` mid-loop;
         /// a frozen key list would then access deleted indices (QUEUEDEL).
         live_size_name: Option<String>,
+        /// (key_width, key_signed) — the AA index type, so signed/narrowed
+        /// keys round-trip through the tail continuation without a failed
+        /// u64 parse clobbering them to 0. Appended last (serde default) so
+        /// the serialized field order stays a prefix of older layouts.
+        #[cfg_attr(feature = "serde", serde(default))]
+        key_type: (u32, bool),
     },
     While { condition: Expression, body: Box<Statement> },
     DoWhile { body: Box<Statement>, condition: Expression },
