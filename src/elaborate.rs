@@ -21933,6 +21933,109 @@ fn rebind_imported_typedefs(
     }
 }
 
+/// §26.6: does `pkg` EXPORT symbols coming from `src` (by name or `*::*`)?
+/// A specific symbol name narrows the check to exports naming that symbol
+/// (or wildcard exports).
+fn package_exports(pkg: &crate::ast::module::PackageDeclaration, src: &str, sym: Option<&str>) -> bool {
+    pkg.items.iter().any(|pi| {
+        if let PackageItem::Export(e) = pi {
+            e.items.iter().any(|it| {
+                (it.package.name == "*" || it.package.name == src)
+                    && match (&it.item, sym) {
+                        (None, _) => true,
+                        (Some(exp_sym), Some(want)) => exp_sym.name == want,
+                        (Some(_), None) => false,
+                    }
+            })
+        } else {
+            false
+        }
+    })
+}
+
+/// §26.6 candidacy: bare identifier names REFERENCED in the package's
+/// parameter/variable INITIALIZERS — only these become export candidates
+/// from a wildcard-exported nested import ("Failed to find" is the
+/// reference's error for exporting an unreferenced name). Subroutine bodies
+/// are not scanned (initializer references are the overwhelmingly common
+/// re-export shape); an explicit `export P::sym` bypasses candidacy.
+fn package_referenced_names(pkg: &crate::ast::module::PackageDeclaration) -> crate::hasher::HashSet<String> {
+    fn walk_expr(e: &Expression, out: &mut crate::hasher::HashSet<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                for seg in &h.path {
+                    out.insert(seg.name.name.clone());
+                    for sel in &seg.selects {
+                        walk_expr(sel, out);
+                    }
+                }
+            }
+            ExprKind::Binary { left, right, .. } => {
+                walk_expr(left, out);
+                walk_expr(right, out);
+            }
+            ExprKind::Unary { operand, .. } => walk_expr(operand, out),
+            ExprKind::Conditional { condition, then_expr, else_expr } => {
+                walk_expr(condition, out);
+                walk_expr(then_expr, out);
+                walk_expr(else_expr, out);
+            }
+            ExprKind::Paren(inner) => walk_expr(inner, out),
+            ExprKind::Concatenation(parts) => {
+                for p in parts {
+                    walk_expr(p, out);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                walk_expr(count, out);
+                for p in exprs {
+                    walk_expr(p, out);
+                }
+            }
+            ExprKind::Call { func, args } => {
+                walk_expr(func, out);
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    walk_expr(a, out);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                walk_expr(expr, out);
+                walk_expr(index, out);
+            }
+            ExprKind::MemberAccess { expr, .. } => walk_expr(expr, out),
+            _ => {}
+        }
+    }
+    let mut out = crate::hasher::HashSet::default();
+    for pi in &pkg.items {
+        match pi {
+            PackageItem::Parameter(pd) => {
+                if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                    for a in assignments {
+                        if let Some(init) = &a.init {
+                            walk_expr(init, &mut out);
+                        }
+                    }
+                }
+            }
+            PackageItem::Data(dd) => {
+                for d in &dd.declarators {
+                    if let Some(init) = &d.init {
+                        walk_expr(init, &mut out);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
 fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &HashMap<String, Definition>) -> Result<(), String> {
     for ii in &imp.items {
         let pkg_name = &ii.package.name;
@@ -22152,6 +22255,17 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                         None => true,                   // import Src::*
                                     };
                                     if !provides { continue; }
+                                    // §26.6 (measured): only exported names are
+                                    // re-exposed; a wildcard export covers only
+                                    // names the package itself references.
+                                    let explicit = pkg.items.iter().any(|pi| {
+                                        matches!(pi, PackageItem::Export(e) if e.items.iter().any(|it|
+                                            (it.package.name == "*" || it.package.name == ii2.package.name)
+                                                && it.item.as_ref().is_some_and(|i| i.name == *sym_name)))
+                                    });
+                                    let wild_ok = package_exports(pkg, &ii2.package.name, None)
+                                        && package_referenced_names(pkg).contains(sym_name.as_str());
+                                    if !explicit && !wild_ok { continue; }
                                     let synth = ImportDeclaration {
                                         items: vec![ImportItem {
                                             package: ii2.package.clone(),
@@ -22368,21 +22482,45 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                     }
                     d.set(d.get() + 1);
                     let r = (|| {
+                        // §26.6 (measured): a nested import is only re-exposed
+                        // when this package EXPORTS it — and a wildcard export
+                        // only covers names the package actually REFERENCES.
+                        // The unconditional chase accepted designs the
+                        // reference rejects ("Failed to find 'base_val'").
+                        let referenced = package_referenced_names(pkg);
                         for pi in &pkg.items {
                             let PackageItem::Import(inner) = pi else { continue };
                             for ii2 in &inner.items {
                                 if ii2.item.is_some() {
                                     continue; // explicit member import: already visible via its own processing
                                 }
-                                let synth = ImportDeclaration {
-                                    items: vec![ImportItem {
-                                        package: ii2.package.clone(),
-                                        item: None,
-                                        span: Span::dummy(),
-                                    }],
-                                    span: Span::dummy(),
-                                };
-                                process_import(&synth, elab, defs)?;
+                                if !package_exports(pkg, &ii2.package.name, None) {
+                                    continue;
+                                }
+                                // Wildcard-exported source: import only the
+                                // REFERENCED candidates, per symbol.
+                                if let Some(Definition::Package(src)) = defs.get(&ii2.package.name)
+                                {
+                                    for spi in &src.items {
+                                        for n in package_item_names(spi) {
+                                            if !referenced.contains(&n) {
+                                                continue;
+                                            }
+                                            let synth = ImportDeclaration {
+                                                items: vec![ImportItem {
+                                                    package: ii2.package.clone(),
+                                                    item: Some(Identifier {
+                                                        name: n.clone(),
+                                                        span: Span::dummy(),
+                                                    }),
+                                                    span: Span::dummy(),
+                                                }],
+                                                span: Span::dummy(),
+                                            };
+                                            let _ = process_import(&synth, elab, defs);
+                                        }
+                                    }
+                                }
                             }
                         }
                         Ok(())

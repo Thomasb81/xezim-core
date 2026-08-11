@@ -802,14 +802,34 @@ impl Parser {
                 if self.peek_kind() == TokenKind::StringLiteral {
                     Some(PackageItem::DPIExport(self.parse_dpi_export()))
                 } else {
-                    // Non-DPI export declarations are not modeled; consume statement.
-                    // Return PackageItem::Null (not None) so the package-decl loop
-                    // doesn't fall through to its `else { self.bump(); }` recovery
-                    // and accidentally swallow the next token (e.g. `endpackage`).
-                    self.bump();
-                    while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                    // §26.6 `export P::*;` / `export P::sym;` / `export *::*;`
+                    // — modeled so a wildcard import only re-exposes nested
+                    // imports the package actually EXPORTS (and, for
+                    // wildcards, references). `*::*` records package "*".
+                    let start_sp = self.current().span.start;
+                    self.bump(); // export
+                    let mut items = Vec::new();
+                    loop {
+                        let item_start = self.current().span.start;
+                        let package = if self.at(TokenKind::Star) {
+                            self.bump();
+                            Identifier { name: "*".to_string(), span: crate::ast::Span { start: item_start, end: item_start } }
+                        } else {
+                            self.parse_identifier()
+                        };
+                        self.expect(TokenKind::DoubleColon);
+                        let item = if self.eat(TokenKind::Star).is_some() {
+                            None
+                        } else {
+                            Some(self.parse_identifier())
+                        };
+                        items.push(ImportItem { package, item, span: self.span_from(item_start) });
+                        if self.eat(TokenKind::Comma).is_none() {
+                            break;
+                        }
+                    }
                     self.expect(TokenKind::Semicolon);
-                    Some(PackageItem::Null)
+                    Some(PackageItem::Export(ImportDeclaration { items, span: self.span_from(start_sp) }))
                 }
             }
             // §8.26: `interface class …` inside a package is a class.

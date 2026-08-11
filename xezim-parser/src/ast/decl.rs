@@ -1008,4 +1008,8 @@ pub enum PackageItem {
     /// through to its `else { self.bump(); }` recovery, which would otherwise
     /// eat the `endpackage` keyword and corrupt parsing.
     Null,
+    /// §26.6 `export P::*;` / `export P::sym;` / `export *::*;` — reuses the
+    /// import-declaration shape (package `*` spells the export-everything
+    /// form). Appended last for bincode index stability.
+    Export(ImportDeclaration),
 }
