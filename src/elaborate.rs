@@ -564,6 +564,12 @@ pub struct ElaboratedClass {
     /// mapped to whether the key type is `string`. Stored per-instance.
     #[serde(default)]
     pub assoc_properties: HashMap<String, bool>,
+    /// §6.19.6: the NAMED key type of an assoc property (`int cnt[sev_e];`)
+    /// — property name → type name. Consulted by the simulator's `foreach`
+    /// so the index variable carries the enum type when the collection is a
+    /// CLASS PROPERTY (the module-scope map cannot see it).
+    #[serde(default)]
+    pub assoc_key_types: HashMap<String, String>,
     /// Properties declared as queues / dynamic arrays (`T m[$];`, `T m[];`) —
     /// name mapped to (element width, optional bounded-queue max+1). Stored
     /// per-instance like associative arrays, so each object's queue is
@@ -737,6 +743,7 @@ pub fn elaborate_class_with_params(
     let mut static_properties = HashSet::default();
     let mut static_methods = HashSet::default();
     let mut assoc_properties: HashMap<String, bool> = HashMap::default();
+    let mut assoc_key_types: HashMap<String, String> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
@@ -863,6 +870,12 @@ pub fn elaborate_class_with_params(
                                 DataType::Simple { kind: SimpleType::String, .. })
                         });
                         assoc_properties.insert(decl.name.name.clone(), is_string_key);
+                        // §6.19.6: record a NAMED key type so `foreach` binds
+                        // the index variable with it (enum `.name()` etc.).
+                        if let Some(DataType::TypeReference { name: kt, .. }) = key_dt.as_deref() {
+                            assoc_key_types
+                                .insert(decl.name.name.clone(), kt.name.name.clone());
+                        }
                     }
                     // Queue (`m[$]`) / dynamic-array (`m[]`) member — track so
                     // it gets independent per-instance storage. Bounded queues
@@ -1186,6 +1199,7 @@ pub fn elaborate_class_with_params(
         static_properties,
         static_methods,
         assoc_properties,
+        assoc_key_types,
         queue_properties,
         property_inits,
         static_collections,
