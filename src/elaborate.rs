@@ -6953,15 +6953,39 @@ fn validate_ref_arg_lvalues(elab: &ElaboratedModule) -> Result<(), String> {
             Some(f.ports.as_slice())
         } else { None };
         if let Some(ports) = formals {
-            for (i, p) in ports.iter().enumerate() {
-                if matches!(p.direction, crate::ast::types::PortDirection::Ref) {
-                    if let Some(a) = args.get(i) {
-                        if !is_lvalue_expr(a) {
-                            return Err(format!(
-                                "Argument to `ref` formal '{}' of '{}' must be a variable (IEEE 1800-2017 §13.5.2)",
-                                p.name.name, callee_name
-                            ));
+            // §13.5.3: actuals may be named (`.r(x)`) or omitted (`f(a, , c)`),
+            // so map each actual to ITS formal instead of assuming pure
+            // positional order — the old positional check flagged the wrong
+            // formal (or a NamedArg wrapper) as a non-lvalue ref argument.
+            let mut pos = 0usize;
+            for a in args {
+                let (formal, actual): (Option<&crate::ast::decl::FunctionPort>, &Expression) =
+                    match &a.kind {
+                        ExprKind::NamedArg { name, expr } => {
+                            let f = ports.iter().find(|p| p.name.name == name.name);
+                            match expr {
+                                Some(e) => (f, e.as_ref()),
+                                None => continue,
+                            }
                         }
+                        ExprKind::Empty => {
+                            pos += 1;
+                            continue;
+                        }
+                        _ => {
+                            let f = ports.get(pos);
+                            pos += 1;
+                            (f, a)
+                        }
+                    };
+                if let Some(p) = formal {
+                    if matches!(p.direction, crate::ast::types::PortDirection::Ref)
+                        && !is_lvalue_expr(actual)
+                    {
+                        return Err(format!(
+                            "Argument to `ref` formal '{}' of '{}' must be a variable (IEEE 1800-2017 §13.5.2)",
+                            p.name.name, callee_name
+                        ));
                     }
                 }
             }
