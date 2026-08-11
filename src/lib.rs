@@ -1026,8 +1026,13 @@ fn parse_and_elaborate(
             ast::Description::Module(mut m) => {
                 let name = m.name.name.clone();
                 if definitions.contains_key(&name) {
-                    return Err(format!(
-                        "Duplicate module definition '{}' (IEEE 1800-2017 §3.3)",
+                    // The reference simulator ACCEPTS a redefinition with a
+                    // warning and the LAST definition wins (measured:
+                    // "Existing module 'm' ... will be overwritten", the
+                    // second body's output appears). Rejecting broke multi-
+                    // file flows that deliberately override a module.
+                    log_eprintln(&format!(
+                        "[xezim][warning] module '{}' redefined; the later definition overwrites the earlier one (IEEE 1800-2017 \u{00a7}3.3)",
                         name
                     ));
                 }

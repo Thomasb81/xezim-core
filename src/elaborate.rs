@@ -3504,6 +3504,18 @@ pub fn elaborate_module_with_defs(
     match module.ports() {
         PortList::Ansi(ports) => {
             for port in ports {
+                // §23.2.2: ANSI port names are unique, and the declaration is
+                // COMPLETE — a later variable of the same name is a clash too
+                // (the reference rejects both, vlog-2388). Registering the
+                // port as an incompatible typed decl routes both cases
+                // through the standard duplicate machinery.
+                if elab.typed_decls.contains_key(&port.name.name) {
+                    return Err(duplicate_decl_error(
+                        &elab, &port.name.name, port.name.span, "port",
+                    ));
+                }
+                elab.note_decl_site(&port.name.name, port.name.span, "ANSI port", true);
+                elab.typed_decls.insert(port.name.name.clone(), true);
                 let modport_view = match port.data_type.as_ref() {
                     Some(DataType::Interface { name, modport: Some(mp), .. }) => {
                         resolve_interface_modport_view(&name.name, &mp.name, all_defs)
@@ -5948,6 +5960,16 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::TypedefDeclaration(td) => {
+                // §6.18: a typedef may not reuse a name already declared as a
+                // variable/net/port in the same scope (reference: "'T' already
+                // declared as a non-typedef"). Forward declarations and the
+                // legal restatement of a forward name are exempt (they pass
+                // through process_typedef's own handling).
+                if !td.forward && elab.typed_decls.contains_key(&td.name.name) {
+                    return Err(duplicate_decl_error(
+                        &elab, &td.name.name, td.name.span, "typedef",
+                    ));
+                }
                 // IEEE 1800-2017 §7.2.1: a struct/union may not contain a member
                 // of its own type (it would have infinite size). Reject with a
                 // clean diagnostic instead of recursing into a stack overflow.
@@ -6064,6 +6086,17 @@ pub fn elaborate_module_with_defs(
                 // so a bare `run_test()` dispatches the class body without
                 // `this` binding and crashes.
                 if td.name.scope.is_none() {
+                    // §3.3 one task per name per scope — the reference rejects
+                    // a redefinition; silently letting the later one win made
+                    // every call dispatch the wrong body.
+                    if elab.tasks.contains_key(&td.name.name.name)
+                        && !elab.pkg_subr_owner.contains_key(&td.name.name.name)
+                    {
+                        return Err(duplicate_decl_error(
+                            &elab, &td.name.name.name, td.name.name.span, "task",
+                        ));
+                    }
+                    elab.note_decl_site(&td.name.name.name, td.name.name.span, "task", true);
                     elab.tasks.insert(td.name.name.name.clone(), td.clone());
                 }
             }
