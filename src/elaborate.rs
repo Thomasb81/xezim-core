@@ -3137,6 +3137,48 @@ fn validate_class_constraints(
     Ok(())
 }
 
+/// §6.21 (measured): a local variable WITH an initializer inside a
+/// STATIC-lifetime task/function must carry an explicit `static` or
+/// `automatic` keyword — the reference rejects the implicit form at compile
+/// time ("implicitly static"), even under an explicit `task static`, and in
+/// package scope too. Measured exemptions: for-header declarations,
+/// initial/always block locals, no-init locals, automatic subroutines,
+/// `module automatic` scope, and class methods.
+fn check_implicit_static_inits(stmts: &[crate::ast::stmt::Statement]) -> Result<(), String> {
+    use crate::ast::stmt::StatementKind as SK;
+    fn walk(s: &crate::ast::stmt::Statement) -> Result<(), String> {
+        match &s.kind {
+            SK::VarDecl { lifetime: None, declarators, .. } => {
+                for d in declarators {
+                    if d.init.is_some() {
+                        return Err(format!(
+                            "Variable '{}' is implicitly static; declare it explicitly static or automatic (§6.21)",
+                            d.name.name
+                        ));
+                    }
+                }
+                Ok(())
+            }
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for st in stmts { walk(st)?; }
+                Ok(())
+            }
+            SK::If { then_stmt, else_stmt, .. } => {
+                walk(then_stmt)?;
+                if let Some(eb) = else_stmt { walk(eb)?; }
+                Ok(())
+            }
+            SK::For { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. } | SK::Forever { body } | SK::Foreach { body, .. } => walk(body),
+            SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => walk(stmt),
+            SK::Case { items, .. } => { for it in items { walk(&it.stmt)?; } Ok(()) }
+            _ => Ok(()),
+        }
+    }
+    for s in stmts { walk(s)?; }
+    Ok(())
+}
+
 pub fn elaborate_module_with_defs(
     module: Definition,
     param_overrides: &HashMap<String, Value>,
@@ -3884,6 +3926,31 @@ pub fn elaborate_module_with_defs(
                     .is_none()
             {
                 process_typedef(td, &mut elab);
+            }
+        }
+    }
+
+    // §6.21: subroutines default to the enclosing scope's lifetime.
+    use crate::ast::types::Lifetime;
+    let sub_default_static = !matches!(module, Definition::Module(m) if m.lifetime == Some(Lifetime::Automatic));
+    if let Some(defs) = all_defs {
+        for def in defs.values() {
+            let Definition::Package(pkg) = def else { continue };
+            if pkg.lifetime == Some(Lifetime::Automatic) { continue; }
+            for it in &pkg.items {
+                match it {
+                    // Out-of-class method bodies (`function C::m`) are class
+                    // methods — automatic lifetime (§8.6) — not package subs.
+                    crate::ast::decl::PackageItem::Function(fd)
+                        if fd.lifetime != Some(Lifetime::Automatic)
+                            && fd.name.scope.is_none() =>
+                        check_implicit_static_inits(&fd.items)?,
+                    crate::ast::decl::PackageItem::Task(td)
+                        if td.lifetime != Some(Lifetime::Automatic)
+                            && td.name.scope.is_none() =>
+                        check_implicit_static_inits(&td.items)?,
+                    _ => {}
+                }
             }
         }
     }
@@ -6069,6 +6136,12 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 for it in &fd.items { check_fn_fork(it)?; }
+                if sub_default_static
+                    && fd.lifetime != Some(Lifetime::Automatic)
+                    && fd.name.scope.is_none()
+                {
+                    check_implicit_static_inits(&fd.items)?;
+                }
                 // Out-of-class method definitions (`function Class::method`)
                 // have `scope.is_some()` — they belong in the class, not in
                 // the module's free-function namespace. Inserting them here
@@ -6079,6 +6152,12 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::TaskDeclaration(td) => {
+                if sub_default_static
+                    && td.lifetime != Some(Lifetime::Automatic)
+                    && td.name.scope.is_none()
+                {
+                    check_implicit_static_inits(&td.items)?;
+                }
                 fn check_no_return_in_fork(s: &crate::ast::stmt::Statement, in_fork: bool) -> Result<(), String> {
                     use crate::ast::stmt::StatementKind as SK;
                     match &s.kind {
