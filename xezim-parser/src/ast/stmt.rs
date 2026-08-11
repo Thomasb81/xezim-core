@@ -85,7 +85,12 @@ pub enum StatementKind {
     SeqBlock { name: Option<Identifier>, stmts: Vec<Statement> },
     ParBlock { name: Option<Identifier>, join_type: JoinType, stmts: Vec<Statement> },
     TimingControl { control: TimingControl, stmt: Box<Statement> },
-    EventTrigger { nonblocking: bool, name: Identifier, span: Span },
+    /// `-> target` / `->> target`. `name` is the legacy flattened dotted
+    /// string (kept for the simple module-scope paths); `target` carries the
+    /// full parsed expression so receivers with runtime selects
+    /// (`-> m_events[obj].all_dropped`, §15.5) can be evaluated at fire time
+    /// — the string form cannot express them.
+    EventTrigger { nonblocking: bool, name: Identifier, target: Option<Box<Expression>>, span: Span },
     Wait { condition: Expression, stmt: Box<Statement> },
     WaitFork,
     Disable(Identifier),

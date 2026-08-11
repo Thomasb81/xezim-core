@@ -21340,7 +21340,7 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
             name: name.clone(),
             stmts: stmts.iter().map(|s| rewrite_stmt(s, prefix, port_map, local_names, interface_map)).collect(),
         },
-        StatementKind::EventTrigger { nonblocking, name, span } => StatementKind::EventTrigger {
+        StatementKind::EventTrigger { nonblocking, name, target, span } => StatementKind::EventTrigger {
             nonblocking: *nonblocking,
             name: Identifier {
                 name: if let Some(mapped) = port_map.get(&name.name) {
@@ -21352,6 +21352,7 @@ fn rewrite_stmt(stmt: &Statement, prefix: &str, port_map: &HashMap<String, Expre
                 },
                 span: name.span,
             },
+            target: target.as_ref().map(|t| Box::new(rewrite_expr(t, prefix, port_map, local_names, interface_map))),
             span: *span,
         },
         StatementKind::ParBlock { name, stmts, join_type } => StatementKind::ParBlock {

@@ -303,6 +303,7 @@ impl Parser {
                 let nonblocking = self.bump().kind == TokenKind::DoubleArrow;
                 let target = self.parse_expression();
                 self.expect(TokenKind::Semicolon);
+                let target_expr = target.clone();
                 let name = match target.kind {
                     // Trailing element select parses as Index (`-> ev_arr[1]`):
                     // bake a literal index into the element sync-object name.
@@ -392,7 +393,7 @@ impl Parser {
                         span: self.span_from(start),
                     },
                 };
-                Statement::new(StatementKind::EventTrigger { nonblocking, name, span: self.span_from(start) }, self.span_from(start))
+                Statement::new(StatementKind::EventTrigger { nonblocking, name, target: Some(Box::new(target_expr)), span: self.span_from(start) }, self.span_from(start))
             }
             // Delay control: #
             TokenKind::Hash => {
