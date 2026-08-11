@@ -172,6 +172,13 @@ citing the LRM § → document any new flag/env knob in the `xezim` README.
   and the version-ladder comment.
 - Determinism preserved; no `std` hash/RNG order leaks.
 - Minimal diff: no unrelated refactors, no dead code added.
+- **Retiring or replacing a test?** Requirements outlive mechanisms: map every
+  deleted assertion to a named successor test in the same PR ("superseded by
+  X"), and if the old test checked a behavior through a mechanism being
+  removed, port the assertion to the new mechanism — never delete coverage
+  with the workaround it rode on. (Learned the hard way: the PURE_SV_LRM=0
+  TLM-routing test was deleted with the shims; the exact requirement broke
+  four days later and CI stayed green.)
 - If this guide becomes wrong (paths, commands, conventions), fix it in the same PR.
 
 ## Resources
