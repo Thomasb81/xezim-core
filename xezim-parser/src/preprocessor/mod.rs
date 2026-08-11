@@ -1451,7 +1451,15 @@ fn apply_token_pasting(text: &str) -> String {
                                 Some(a) if !a.trim().is_empty() => Some(a),
                                 _ => match default {
                                     Some(d) => { arg_owned = d.clone(); Some(&arg_owned) }
-                                    None => None,
+                                    // §22.5.1: an empty (or white-space) actual
+                                    // with no default substitutes NOTHING.
+                                    // Leaving the formal name in the body
+                                    // corrupted the expansion (`F(1,)` of
+                                    // `a b` produced `1 b`, a parse error)
+                                    // and stringified as the formal's own
+                                    // name (`` `"b`" `` gave "b", the
+                                    // reference gives "").
+                                    None => { arg_owned = String::new(); Some(&arg_owned) }
                                 },
                             };
                             {
