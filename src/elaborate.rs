@@ -1604,6 +1604,11 @@ pub struct ElaboratedModule {
     /// root.
     #[serde(default)]
     pub port_aliases: HashMap<String, String>,
+    /// §10.11 `alias` net unification: (canonical, other) flat-name pairs.
+    /// The simulator repoints `other`'s signal-table id at `canonical`'s so
+    /// the names share ONE storage slot.
+    #[serde(default)]
+    pub alias_pairs: Vec<(String, String)>,
     /// Preprocessed source text of each input file, in parse order, with
     /// `source_files` carrying the matching file names. A `Statement`'s
     /// `Span` is a byte offset into its OWN file's preprocessed text, so
@@ -1830,6 +1835,7 @@ impl ElaboratedModule {
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
             port_aliases: HashMap::default(),
+            alias_pairs: Vec::new(),
             source_texts: Vec::new(),
             source_files: Vec::new(),
             src_file_of_module: HashMap::default(),
@@ -6112,6 +6118,43 @@ pub fn elaborate_module_with_defs(
                     }
                     elab.note_decl_site(&td.name.name.name, td.name.name.span, "task", true);
                     elab.tasks.insert(td.name.name.name.clone(), td.clone());
+                }
+            }
+            ModuleItem::AliasDecl(terms) => {
+                // §10.11: resolve each term to a flat name; widths must
+                // agree. Pairs are (first, other) — unified in the simulator.
+                let names: Vec<String> = terms
+                    .iter()
+                    .filter_map(|t| match &t.kind {
+                        ExprKind::Ident(h) => Some(
+                            h.path
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("."),
+                        ),
+                        _ => None,
+                    })
+                    .collect();
+                if names.len() != terms.len() {
+                    return Err(
+                        "alias operands must be plain nets (IEEE 1800-2017 \u{00a7}10.11)"
+                            .to_string(),
+                    );
+                }
+                let w0 = names
+                    .first()
+                    .and_then(|n| elab.signals.get(n))
+                    .map(|s| s.width);
+                for n in &names[1..] {
+                    let w = elab.signals.get(n).map(|s| s.width);
+                    if w0.is_some() && w.is_some() && w != w0 {
+                        return Err(format!(
+                            "alias operands must have identical widths ('{}': {:?} vs {:?}) — IEEE 1800-2017 \u{00a7}10.11",
+                            n, w0, w
+                        ));
+                    }
+                    elab.alias_pairs.push((names[0].clone(), n.clone()));
                 }
             }
             ModuleItem::ContinuousAssign(ca) => {

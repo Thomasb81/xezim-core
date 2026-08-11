@@ -472,6 +472,18 @@ impl Parser {
                 Some(ModuleItem::InitialConstruct(InitialConstruct { stmt: st, span: self.span_from(start), gen_scope: String::new() })) }
             TokenKind::KwFinal => { self.bump(); let st = self.parse_statement();
                 Some(ModuleItem::FinalConstruct(FinalConstruct { stmt: st, span: self.span_from(start) })) }
+            // §10.11 `alias a = b [= c ...];` — carried whole; elaboration
+            // unifies the named nets onto one signal.
+            TokenKind::KwAlias => {
+                self.bump();
+                let mut terms: Vec<Expression> = vec![self.parse_expression()];
+                while self.at(TokenKind::Assign) {
+                    self.bump();
+                    terms.push(self.parse_expression());
+                }
+                self.expect(TokenKind::Semicolon);
+                Some(ModuleItem::AliasDecl(terms))
+            }
             TokenKind::KwAssign => {
                 self.bump();
                 // Optional drive_strength `(strong1, weak0)` (§10.3.1).

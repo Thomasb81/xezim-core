@@ -126,6 +126,11 @@ pub enum ModuleItem {
     /// access to the enclosing scope's names is NOT modeled — self-contained
     /// nested modules only). Appended last for bincode index stability.
     NestedModule(Box<crate::ast::module::ModuleDeclaration>),
+    /// §10.11 `alias a = b [= c ...];` — the named nets are ONE net.
+    /// Elaboration resolves the terms to flat names and the simulator maps
+    /// them onto a single signal slot (true unification — an alias is NOT a
+    /// pair of continuous assigns; a hand-written assign cycle reads x).
+    AliasDecl(Vec<Expression>),
 }
 
 /// IEEE 1800-2023 §23.11 — `bind` directive. A lightweight, top-level form
