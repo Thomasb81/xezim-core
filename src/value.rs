@@ -3902,6 +3902,26 @@ impl Value {
 }
 
 impl Value {
+    /// Create a value with all bits set to X (§6.6.4: a never-driven `trireg`
+    /// reads x, unlike other nets' z).
+    #[inline]
+    pub fn all_x(width: u32) -> Self {
+        if width <= 64 {
+            // Inline encoding: xz_bits marks X/Z, val_bits picks Z (1) vs X (0).
+            Self {
+                storage: ValueStorage::Inline { val_bits: 0, xz_bits: Self::mask(width) },
+                width,
+                is_signed: false, is_real: false, is_fill: false,
+            }
+        } else {
+            Self {
+                storage: ValueStorage::Wide(vec![LogicBit::X; width as usize]),
+                width,
+                is_signed: false, is_real: false, is_fill: false,
+            }
+        }
+    }
+
     /// Create a value with all bits set to Z
     #[inline]
     pub fn all_z(width: u32) -> Self {

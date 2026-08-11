@@ -61,7 +61,8 @@ pub use value::Value;
 pub use elaborate::{elaborate_module, ElaboratedModule};
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x0d = \x0c + EventTrigger target expression (§15.5
+/// Version byte: \x0e = \x0d + ResolvedNetKind::ChargeStorage (§6.6.4
+/// trireg); \x0d = \x0c + EventTrigger target expression (§15.5
 /// runtime-select receivers);
 /// \x0a = \x09 + ElaboratedModule.elab_diagnostics (warm-cache
 /// diagnostic replay); \x09 = \x08 + ForeverTail StatementKind variant;
@@ -72,7 +73,7 @@ pub use elaborate::{elaborate_module, ElaboratedModule};
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x0d";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x0e";
 
 /// zstd compression level used for `.xez` artifacts. Level 3 is zstd's own
 /// default — strong compression at high throughput. Empirically shrinks

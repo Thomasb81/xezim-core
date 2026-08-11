@@ -4091,6 +4091,8 @@ pub fn elaborate_module_with_defs(
                         // fold, which overwrites this at settle.
                         NetType::Tri0 => Value::zero(w),
                         NetType::Tri1 => Value::ones(w),
+                        // §6.6.4: a never-driven trireg reads x (no charge yet).
+                        NetType::TriReg => Value::all_x(w),
                         _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(w) },
                     };
                     let sig = Signal { is_const: false,
@@ -8504,7 +8506,7 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
         // marker. It is only legal when a `default clocking` block exists —
         // a clocking block declared WITHOUT `default` does not qualify.
         EventControl::Identifier(id)
-            if id.name == "__xz_default_clocking"
+            if (id.name == "__xz_default_clocking" || id.name == "__xz_default_clocking0")
                 && !elab.clocking_blocks.values().any(|cd| cd.is_default) =>
         {
             let loc = span_location(elab, id.span)
@@ -8525,6 +8527,7 @@ fn validate_event_idents(ev: &EventControl, elab: &ElaboratedModule, locals: &Ha
                 && !elab.sequences.contains(&id.name) && !locals.contains(&id.name)
                 && !elab.clocking_blocks.contains_key(&id.name)
                 && id.name != "__xz_default_clocking"
+                && id.name != "__xz_default_clocking0"
             => {
                 let loc = span_location(elab, id.span)
                     .map(|l| format!(" at {}", l))
@@ -9075,6 +9078,8 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         // fold, which overwrites this at settle.
                         NetType::Tri0 => Value::zero(width),
                         NetType::Tri1 => Value::ones(width),
+                        // §6.6.4: a never-driven trireg reads x (no charge yet).
+                        NetType::TriReg => Value::all_x(width),
                         _ => if is_real { Value::from_f64(0.0) } else { Value::all_z(width) },
                     };
                     let sig = Signal { is_const: false,
@@ -19975,6 +19980,9 @@ pub enum ResolvedNetKind {
     Tri0,
     /// Pulls to 1 on bits no driver is driving.
     Tri1,
+    /// §6.6.4 `trireg` charge storage: bits no driver is driving HOLD the
+    /// last driven value (modeled as an implicit weak self-driver).
+    ChargeStorage,
 }
 
 impl ResolvedNetKind {
@@ -19984,6 +19992,7 @@ impl ResolvedNetKind {
             NetType::Wor | NetType::TriOr => Some(Self::Wor),
             NetType::Tri0 => Some(Self::Tri0),
             NetType::Tri1 => Some(Self::Tri1),
+            NetType::TriReg => Some(Self::ChargeStorage),
             _ => None,
         }
     }
@@ -20210,7 +20219,9 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             && elab.nets.contains(n)
             && matches!(
                 elab.resolved_net_kinds.get(n),
-                Some(ResolvedNetKind::Tri0) | Some(ResolvedNetKind::Tri1)
+                Some(ResolvedNetKind::Tri0)
+                    | Some(ResolvedNetKind::Tri1)
+                    | Some(ResolvedNetKind::ChargeStorage)
             )
         {
             multi.insert(n.clone());
@@ -20297,6 +20308,16 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 let span = acc.lhs.span;
                 acc.weak = Some(make_fill_expr(one, span));
             }
+        }
+        // §6.6.4 trireg: undriven bits HOLD the previous value — the implicit
+        // weak driver is the net's own current value. The self-reference is a
+        // fixpoint (held bits re-read unchanged), so settling converges.
+        if matches!(
+            elab.resolved_net_kinds.get(name),
+            Some(ResolvedNetKind::ChargeStorage)
+        ) && acc.weak.is_none()
+        {
+            acc.weak = Some(make_ident_expr(name));
         }
     }
     for name in order {

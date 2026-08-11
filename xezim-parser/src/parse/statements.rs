@@ -449,20 +449,37 @@ impl Parser {
                 };
                 let sp = self.span_from(start);
                 let stmt = self.parse_statement();
-                let wait_one = Statement::new(StatementKind::TimingControl {
+                let mk_wait = |name: &str| Statement::new(StatementKind::TimingControl {
                     control: TimingControl::Event(EventControl::Identifier(crate::ast::Identifier {
-                        name: "__xz_default_clocking".to_string(),
+                        name: name.to_string(),
                         span: sp,
                     })),
                     stmt: Box::new(Statement::new(StatementKind::Null, sp)),
                 }, sp);
-                let rep = Statement::new(StatementKind::Repeat {
-                    count,
-                    body: Box::new(wait_one),
-                }, sp);
+                // §14.11: a LITERAL `##0` does not wait a cycle — it
+                // SYNCHRONIZES to the clocking event (the simulator's
+                // `__xz_default_clocking0` handler is a no-op when the
+                // process already executes in that event's time slot).
+                // The waits stay FLAT in the statement stream — nesting them
+                // under an `if` would leave the suspend-aware lowering.
+                // A runtime count that evaluates to 0 keeps the repeat form
+                // (and thus waits a cycle) — a known simplification.
+                let is_lit_zero = matches!(
+                    &count.kind,
+                    ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. })
+                        if value.trim_start_matches('0').is_empty()
+                );
+                let wait_stmt = if is_lit_zero {
+                    mk_wait("__xz_default_clocking0")
+                } else {
+                    Statement::new(StatementKind::Repeat {
+                        count,
+                        body: Box::new(mk_wait("__xz_default_clocking")),
+                    }, sp)
+                };
                 Statement::new(StatementKind::SeqBlock {
                     name: None,
-                    stmts: vec![rep, stmt],
+                    stmts: vec![wait_stmt, stmt],
                 }, self.span_from(start))
             }
             // §26.3: a local `import pkg::item;` / `import pkg::*;` inside a
