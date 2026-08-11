@@ -8831,13 +8831,28 @@ fn create_implicit_nets(
     let none_active = sv_parser::default_nettype_none_seen();
     for name in implicit_names {
         if !elab.signals.contains_key(&name) && !elab.parameters.contains_key(&name) {
-            if none_active {
+            // An UNPACKED collection (array/queue/assoc/dynamic) is a genuine
+            // declaration living in its own map, not in `signals` — §6.10
+            // does not apply, so it must not error under `default_nettype
+            // none` (GitHub xezim#106: `input wire t_word din` with
+            // `typedef t_byte t_word [0:3]` was rejected as an implicit net
+            // whenever `din` appeared in a continuous assign). The port-actual
+            // pass below already had these namespace checks; this pass keeps
+            // creating its placeholder signal (downstream relies on it for an
+            // array named in an assign lvalue) but neither errors nor warns.
+            let declared_collection = elab.arrays.contains_key(&name)
+                || elab.arrays_2d.contains_key(&name)
+                || elab.arrays_nd.contains_key(&name)
+                || elab.associative_arrays.contains_key(&name)
+                || elab.dynamic_arrays.contains(&name)
+                || elab.queue_vars.contains(&name);
+            if none_active && !declared_collection {
                 return Err(format!(
                     "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
                     name
                 ));
             }
-            if crate::implicit_net_warn() {
+            if !declared_collection && crate::implicit_net_warn() {
                 crate::elab_diag(format!(
                     "[xezim][warning] implicit 1-bit net created for undeclared identifier '{}' \
                      (IEEE 1800-2017 §6.10). Add an explicit declaration to silence.",
@@ -17628,8 +17643,46 @@ fn inline_module_items(
                                 .unwrap_or(1);
                             let sig_name = format!("{}{}", inst_prefix, port.name.name);
                             let is_real = port.data_type.as_ref().map(is_type_real).unwrap_or(false);
+                            // §6.18: the port's unpacked dimensions may come
+                            // from its TYPEDEF (`typedef t_byte t_word [0:3];
+                            // input t_word din;`), not the declarator. The
+                            // TOP-module path consults typedef_unpacked_dims
+                            // for exactly this; here only `port.dimensions`
+                            // was used, so an INLINED child's typedef-array
+                            // port registered as a plain scalar — the array
+                            // never existed, its connection silently carried
+                            // nothing, and (under `default_nettype none`) the
+                            // actual was then reported as an implicit net
+                            // (GitHub xezim#106).
+                            let effective_port_dims: Vec<UnpackedDimension> =
+                                if port.dimensions.is_empty() {
+                                    match port.data_type.as_ref() {
+                                        Some(DataType::TypeReference { name, .. }) => name
+                                            .scope
+                                            .as_ref()
+                                            .and_then(|sc| {
+                                                elab.typedef_unpacked_dims.get(&format!(
+                                                    "{}::{}",
+                                                    sc.name, name.name.name
+                                                ))
+                                            })
+                                            .or_else(|| {
+                                                elab.typedef_unpacked_dims.get(&name.name.name)
+                                            })
+                                            .cloned()
+                                            .unwrap_or_default(),
+                                        _ => Vec::new(),
+                                    }
+                                } else {
+                                    port.dimensions.clone()
+                                };
+                            let effective_port_dims = normalize_unpacked_dims(
+                                &effective_port_dims,
+                                &sub_merged_params,
+                                &elab.typedef_types,
+                            );
                             let port_shape = fixed_unpacked_shape(
-                                &port.dimensions,
+                                &effective_port_dims,
                                 &sub_merged_params,
                             )
                             .unwrap_or_default();
@@ -18272,7 +18325,42 @@ fn inline_module_items(
                             for decl in &dd.declarators {
                                 let base_name = decl.name.name.clone();
                                 let sig_name = format!("{}{}", inst_prefix, base_name);
-                                let array_range = extract_array_range(&decl.dimensions, &sub_merged_params);
+                                // §6.18: unpacked dims may come from the
+                                // TYPEDEF (`typedef t_byte t_word [0:3];
+                                // t_word s;`), not the declarator — same gap
+                                // just fixed for inlined PORTS (xezim#106).
+                                // Without this the child-local variable
+                                // registered as a scalar and the whole-array
+                                // assigns through it carried nothing.
+                                let effective_decl_dims: Vec<UnpackedDimension> =
+                                    if decl.dimensions.is_empty() {
+                                        match &dd.data_type {
+                                            DataType::TypeReference { name, .. } => name
+                                                .scope
+                                                .as_ref()
+                                                .and_then(|sc| {
+                                                    elab.typedef_unpacked_dims.get(&format!(
+                                                        "{}::{}",
+                                                        sc.name, name.name.name
+                                                    ))
+                                                })
+                                                .or_else(|| {
+                                                    elab.typedef_unpacked_dims
+                                                        .get(&name.name.name)
+                                                })
+                                                .cloned()
+                                                .unwrap_or_default(),
+                                            _ => Vec::new(),
+                                        }
+                                    } else {
+                                        decl.dimensions.clone()
+                                    };
+                                let effective_decl_dims = normalize_unpacked_dims(
+                                    &effective_decl_dims,
+                                    &sub_merged_params,
+                                    &elab.typedef_types,
+                                );
+                                let array_range = extract_array_range(&effective_decl_dims, &sub_merged_params);
                                 if elab
                                     .signals
                                     .get(&sig_name)
@@ -18320,7 +18408,7 @@ fn inline_module_items(
                                 // SUBMODULE or interface decl must register
                                 // like a top-level one — `tif.q.push_back(x)`
                                 // read a phantom 64-slot fixed array before.
-                                match decl.dimensions.first() {
+                                match effective_decl_dims.first() {
                                     Some(UnpackedDimension::Unsized(_))
                                     | Some(UnpackedDimension::Queue { .. }) => {
                                         elab.dynamic_arrays.insert(sig_name.clone());
@@ -18363,7 +18451,7 @@ fn inline_module_items(
                                     // `grid[0]`/`grid[1]` instead of
                                     // `grid[i][j]`).
                                     if let Some(shape) =
-                                        fixed_unpacked_shape(&decl.dimensions, &sub_merged_params)
+                                        fixed_unpacked_shape(&effective_decl_dims, &sub_merged_params)
                                             .filter(|sh| sh.len() > 1)
                                     {
                                         register_fixed_unpacked_array(
