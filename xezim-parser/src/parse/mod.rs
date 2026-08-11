@@ -126,6 +126,27 @@ impl Parser {
 
     fn parse_description(&mut self) -> Option<Description> {
         match self.current_kind() {
+            // §23.5: `extern module <name> [#(params)] (ports);` — a PROTOTYPE
+            // for a module defined elsewhere. The definition itself is what
+            // gets elaborated; consume the prototype through its `;` and move
+            // on. (Also covers `extern primitive` and `extern interface`.)
+            TokenKind::KwExtern
+                if matches!(
+                    self.peek_kind(),
+                    TokenKind::KwModule
+                        | TokenKind::KwMacromodule
+                        | TokenKind::KwPrimitive
+                        | TokenKind::KwInterface
+                ) =>
+            {
+                self.bump(); // extern
+                self.bump(); // module/primitive/interface
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
+                self.expect(TokenKind::Semicolon);
+                self.parse_description()
+            }
             TokenKind::KwModule | TokenKind::KwMacromodule =>
                 Some(Description::Module(self.parse_module_declaration())),
             // IEEE 1800-2017 §8.26: `interface class …` is a class, not a
