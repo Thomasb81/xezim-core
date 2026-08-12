@@ -14791,11 +14791,34 @@ pub fn inline_instantiations(
                                     // has a live handle. NOTE: no-parens `new`
                                     // parses as a bare IDENT, not a Call, so
                                     // expr_has_call alone misses it.
+                                    // §6.21: a CLASS-typed package variable
+                                    // initialized from ANOTHER package
+                                    // variable (`uvm_printer uvm_default_printer
+                                    // = uvm_default_table_printer;`) carries a
+                                    // HANDLE that only exists at runtime —
+                                    // const-eval stored 0 and the alias read
+                                    // null (UVM 1.2 hello_world died on
+                                    // `uvm_default_printer.knobs`). Route any
+                                    // class-typed initializer through the
+                                    // static-init machinery; source order
+                                    // keeps the referenced var initialized
+                                    // first.
+                                    let class_typed = matches!(
+                                        &dd.data_type,
+                                        DataType::TypeReference { name, .. }
+                                            if elab.classes.contains_key(&name.name.name)
+                                                || matches!(
+                                                    definitions.get(&name.name.name),
+                                                    Some(Definition::Class(_))
+                                                )
+                                    );
                                     let init_has_call = decl.init.as_ref().is_some_and(|e| {
                                         expr_has_call(e)
                                             || matches!(&e.kind, ExprKind::Ident(h)
                                                 if h.path.len() == 1
                                                     && h.path[0].name.name == "new")
+                                            || (class_typed
+                                                && matches!(&e.kind, ExprKind::Ident(_)))
                                     });
                                     if init_has_call {
                                         if let Some(init_expr) = &decl.init {
