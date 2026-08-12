@@ -22,10 +22,14 @@ Two crates in one repo:
   `sv-parse`) — lexer, preprocessor, parser, strict-checks. Parse-only; no
   simulation or elaboration.
 
-`xezim` consumes this repo as a **git dependency** on `main` (its CI and bare
-clones fetch it via cargo). For local co-development, `xezim` developers patch
-the dependency to a local checkout — see "Co-developing with a local xezim-core"
-in `../xezim/README.md`. It is **not** a submodule. The simulators run **elaborated**
+`xezim` consumes this repo as a **git dependency pinned by `rev`** — each
+xezim revision names the exact core revision it was tested against, so bare
+clones and release tags always build the verified pair. After pushing core
+changes that xezim depends on, bump both `rev = ...` fields in
+`../xezim/Cargo.toml` in the same xezim push. For local co-development run
+`../xezim/scripts/use-local-core.sh` once (plain `cargo build` then uses the
+local checkout, no network) — see "Modifying xezim-core" in
+`../xezim/README.md`. It is **not** a submodule. The simulators run **elaborated**
 designs, so most wrong-result bugs live in `xezim`'s VM — a change here only helps
 when the symptom is parse/elaboration/formatting.
 
