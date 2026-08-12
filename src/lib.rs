@@ -1032,7 +1032,28 @@ fn parse_and_elaborate(
     // §18.5.1 $unit-scope out-of-class constraint definitions (class, name).
     let mut top_level_ooc_constraints: Vec<(String, String, Vec<ast::decl::ConstraintItem>)> =
         Vec::new();
+    // §3.14.2.3: sticky compilation-unit timeunit/timeprecision, tracked in
+    // source order through THIS loop so classes / $unit subroutines /
+    // packages pick up the scope timescale in force at their declaration
+    // (ivtest br1003a-d). Mirrors the eff_ts walk above.
+    let mut cu_ts_defs: (Option<i32>, Option<i32>) = (None, None);
     for desc in all_descriptions {
+        if let ast::Description::TimeunitsDecl(td) = &desc {
+            if let Some(u) = &td.unit {
+                cu_ts_defs.0 = Some(elaborate::time_literal_to_exp(u));
+            }
+            if let Some(p) = &td.precision {
+                cu_ts_defs.1 = Some(elaborate::time_literal_to_exp(p));
+            }
+        }
+        let cu_scope_ts: Option<(i32, i32)> =
+            if cu_ts_defs.0.is_some() || cu_ts_defs.1.is_some() {
+                let u = cu_ts_defs.0.unwrap_or(-9);
+                let p = cu_ts_defs.1.unwrap_or(u);
+                Some((u, p))
+            } else {
+                None
+            };
         match desc {
             ast::Description::Module(mut m) => {
                 // §23.4: hoist NESTED module declarations (recursively) into
@@ -1102,11 +1123,30 @@ fn parse_and_elaborate(
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Program(Rc::new(p)));
             }
-            ast::Description::Class(c) => {
+            ast::Description::Class(mut c) => {
+                if let Some((u, p)) = cu_scope_ts {
+                    elaborate::rewrite_class_time_semantics(&mut c, u, p, tick_s);
+                }
                 let name = c.name.name.clone();
                 definitions.insert(name, SourceDefinition::Class(Rc::new(c)));
             }
-            ast::Description::Package(p) => {
+            ast::Description::Package(mut p) => {
+                if let Some((u, pr)) = cu_scope_ts {
+                    for item in &mut p.items {
+                        match item {
+                            ast::decl::PackageItem::Function(f) => {
+                                elaborate::rewrite_scope_time_semantics(&mut f.items, u, pr, tick_s)
+                            }
+                            ast::decl::PackageItem::Task(t) => {
+                                elaborate::rewrite_scope_time_semantics(&mut t.items, u, pr, tick_s)
+                            }
+                            ast::decl::PackageItem::Class(c) => {
+                                elaborate::rewrite_class_time_semantics(c, u, pr, tick_s)
+                            }
+                            _ => {}
+                        }
+                    }
+                }
                 let name = p.name.name.clone();
                 definitions.insert(name, SourceDefinition::Package(Rc::new(p)));
             }
@@ -1144,10 +1184,16 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Let(l)) => {
                 top_level_lets.push(l);
             }
-            ast::Description::PackageItem(ast::decl::PackageItem::Function(f)) => {
+            ast::Description::PackageItem(ast::decl::PackageItem::Function(mut f)) => {
+                if let Some((u, p)) = cu_scope_ts {
+                    elaborate::rewrite_scope_time_semantics(&mut f.items, u, p, tick_s);
+                }
                 top_level_functions.push(f);
             }
-            ast::Description::PackageItem(ast::decl::PackageItem::Task(t)) => {
+            ast::Description::PackageItem(ast::decl::PackageItem::Task(mut t)) => {
+                if let Some((u, p)) = cu_scope_ts {
+                    elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
+                }
                 top_level_tasks.push(t);
             }
             ast::Description::PackageItem(ast::decl::PackageItem::Nettype(n)) => {

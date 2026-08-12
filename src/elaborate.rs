@@ -3175,6 +3175,60 @@ fn validate_class_constraints(
 /// package scope too. Measured exemptions: for-header declarations,
 /// initial/always block locals, no-init locals, automatic subroutines,
 /// `module automatic` scope, and class methods.
+/// §8.4/§6.20: `return null` is only meaningful for class-handle (or
+/// chandle) return types. A function whose return type is an integral
+/// vector — including the IMPLICIT logic return of `function f();` —
+/// cannot return null (ivtest br_gh440; the reference rejects it).
+fn check_non_class_null_return(fd: &crate::ast::decl::FunctionDeclaration) -> Result<(), String> {
+    let integral_ret = matches!(
+        fd.return_type,
+        DataType::Implicit { .. } | DataType::IntegerVector { .. } | DataType::IntegerAtom { .. }
+    );
+    if !integral_ret {
+        return Ok(());
+    }
+    fn walk(s: &crate::ast::stmt::Statement, fname: &str) -> Result<(), String> {
+        use crate::ast::stmt::StatementKind as SK;
+        match &s.kind {
+            SK::Return(Some(e)) if matches!(e.kind, ExprKind::Null) => Err(format!(
+                "function '{}' has a non-class return type and cannot return null (§8.4)",
+                fname
+            )),
+            SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
+                for st in stmts {
+                    walk(st, fname)?;
+                }
+                Ok(())
+            }
+            SK::If { then_stmt, else_stmt, .. } => {
+                walk(then_stmt, fname)?;
+                if let Some(e) = else_stmt {
+                    walk(e, fname)?;
+                }
+                Ok(())
+            }
+            SK::For { body, .. }
+            | SK::Foreach { body, .. }
+            | SK::While { body, .. }
+            | SK::DoWhile { body, .. }
+            | SK::Repeat { body, .. }
+            | SK::Forever { body, .. } => walk(body, fname),
+            SK::Case { items, .. } => {
+                for it in items {
+                    walk(&it.stmt, fname)?;
+                }
+                Ok(())
+            }
+            SK::TimingControl { stmt, .. } => walk(stmt, fname),
+            _ => Ok(()),
+        }
+    }
+    for st in &fd.items {
+        walk(st, &fd.name.name.name)?;
+    }
+    Ok(())
+}
+
 fn check_implicit_static_inits(stmts: &[crate::ast::stmt::Statement]) -> Result<(), String> {
     use crate::ast::stmt::StatementKind as SK;
     fn walk(s: &crate::ast::stmt::Statement) -> Result<(), String> {
@@ -3219,6 +3273,21 @@ pub fn elaborate_module_with_defs(
     seed_ooc_constraints: &[(String, String, Vec<crate::ast::decl::ConstraintItem>)],
 ) -> Result<ElaboratedModule, String> {
     let mut elab = ElaboratedModule::new(module.name().to_string());
+
+    // §24.3: a program block shall not contain module declarations —
+    // reject before elaboration runs the nested module's items (ivtest
+    // program5a; the reference errors at parse).
+    if matches!(module, Definition::Program(_)) {
+        for item in module.items() {
+            if let ModuleItem::NestedModule(nm) = item {
+                return Err(format!(
+                    "module '{}' declared inside program '{}'; programs cannot contain module declarations (§24.3)",
+                    nm.name.name,
+                    module.name()
+                ));
+            }
+        }
+    }
 
     // §18.5.1: seed $unit-scope out-of-class constraint definitions so a class's
     // `extern constraint c;` is satisfied regardless of whether the design has a
@@ -3652,6 +3721,17 @@ pub fn elaborate_module_with_defs(
                 );
                 let port_shape = fixed_unpacked_shape(&effective_port_dims, &elab.parameters)
                     .unwrap_or_default();
+                // §23.2.2.4: a port default must be a CONSTANT expression —
+                // a reference to a runtime variable is rejected (ivtest
+                // sv_default_port_value3; the reference errors identically).
+                if let Some(def) = &port.default {
+                    if !is_const_expr(def, &elab.parameters) {
+                        return Err(format!(
+                            "Value assigned to default of port '{}' must be a constant expression (§23.2.2.4)",
+                            port.name.name
+                        ));
+                    }
+                }
                 // §23.2.2.4: `output logic clk = 0` — the default on an
                 // OUTPUT (variable) port is the variable's initializer.
                 // (Input-port defaults are unconnected-port fallbacks,
@@ -4181,7 +4261,25 @@ pub fn elaborate_module_with_defs(
                                     }
                                 }
                             };
+                            // §6.8: port and net signing MERGE — signed if
+                            // EITHER declaration says signed (an explicit
+                            // `unsigned` on one side does not downgrade the
+                            // other's `signed`; ivtest br_gh540).
+                            if is_signed {
+                                existing.is_signed = true;
+                            }
                             elab.nets.insert(decl.name.name.clone());
+                            // §10.3.1: the net declaration's initializer is a
+                            // continuous assignment — it was dropped when the
+                            // name was already declared as a port, leaving
+                            // `output p; wire p = 1'b1;` undriven (z).
+                            if let Some(init_expr) = &decl.init {
+                                elab.continuous_assigns.push(ContinuousAssignment {
+                                    lhs: make_ident_expr(&decl.name.name),
+                                    rhs: init_expr.clone(),
+                                    delay: 0,
+                                });
+                            }
                             continue;
                         }
                         return Err(duplicate_decl_error(&elab, &decl.name.name, decl.name.span, "net"));
@@ -6206,6 +6304,7 @@ pub fn elaborate_module_with_defs(
                     }
                 }
                 for it in &fd.items { check_fn_fork(it)?; }
+                check_non_class_null_return(fd)?;
                 if sub_default_static
                     && fd.lifetime != Some(Lifetime::Automatic)
                     && fd.name.scope.is_none()
@@ -10377,6 +10476,157 @@ pub fn default_tick_s() -> f64 { 1e-9 }
 
 /// Public entry to pre-scale a module's delays from its timeunit to the global
 /// tick (see `rewrite_module_item_delays`).
+/// §3.14.2.3: rewrite the TIME SEMANTICS of a subroutine/class body declared
+/// in a scope with its own timescale (compilation-unit `timeunit`, class or
+/// package scope): delays become global-tick counts, VALUE-position time
+/// literals become constants in the scope's unit (`delay = 5ns` under
+/// 100ps/10ps is 50), and `$time`/`$stime`/`$realtime` become
+/// `$__xz_time_at(unit_exp)` so the runtime reports the DECLARING scope's
+/// unit regardless of the caller (ivtest br1003a-d).
+pub fn rewrite_scope_time_semantics(
+    stmts: &mut [crate::ast::stmt::Statement],
+    unit_exp: i32,
+    prec_exp: i32,
+    tick_s: f64,
+) {
+    let unit_s = exp_to_secs(unit_exp);
+    for s in stmts.iter_mut() {
+        rewrite_stmt_delays(s, unit_s, tick_s);
+    }
+    for s in stmts.iter_mut() {
+        scope_time_stmt(s, unit_exp, prec_exp);
+    }
+}
+
+/// Same rewrite over a whole class declaration (methods + nested classes).
+pub fn rewrite_class_time_semantics(
+    c: &mut crate::ast::decl::ClassDeclaration,
+    unit_exp: i32,
+    prec_exp: i32,
+    tick_s: f64,
+) {
+    use crate::ast::decl::{ClassItem, ClassMethodKind};
+    for item in &mut c.items {
+        match item {
+            ClassItem::Method(m) => match &mut m.kind {
+                ClassMethodKind::Function(fd)
+                | ClassMethodKind::PureVirtual(fd)
+                | ClassMethodKind::Extern(fd) => {
+                    rewrite_scope_time_semantics(&mut fd.items, unit_exp, prec_exp, tick_s)
+                }
+                ClassMethodKind::Task(td) => {
+                    rewrite_scope_time_semantics(&mut td.items, unit_exp, prec_exp, tick_s)
+                }
+            },
+            ClassItem::Class(nc) => rewrite_class_time_semantics(nc, unit_exp, prec_exp, tick_s),
+            _ => {}
+        }
+    }
+}
+
+fn scope_time_stmt(stmt: &mut Statement, u: i32, p: i32) {
+    // Expression fields first, then recurse into sub-statements.
+    match &mut stmt.kind {
+        StatementKind::TimingControl { stmt, .. } => scope_time_stmt(stmt, u, p),
+        StatementKind::BlockingAssign { rvalue, .. }
+        | StatementKind::NonblockingAssign { rvalue, .. } => scope_time_expr(rvalue, u, p),
+        StatementKind::Return(Some(e)) => scope_time_expr(e, u, p),
+        StatementKind::VarDecl { declarators, .. } => {
+            for d in declarators.iter_mut() {
+                if let Some(init) = d.init.as_mut() {
+                    scope_time_expr(init, u, p);
+                }
+            }
+        }
+        StatementKind::Expr(e) => scope_time_expr(e, u, p),
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            for s in stmts.iter_mut() {
+                scope_time_stmt(s, u, p);
+            }
+        }
+        StatementKind::If { condition, then_stmt, else_stmt, .. } => {
+            scope_time_expr(condition, u, p);
+            scope_time_stmt(then_stmt, u, p);
+            if let Some(e) = else_stmt {
+                scope_time_stmt(e, u, p);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body, .. } => scope_time_stmt(body, u, p),
+        StatementKind::Wait { stmt, .. } => scope_time_stmt(stmt, u, p),
+        StatementKind::Case { items, .. } => {
+            for it in items.iter_mut() {
+                scope_time_stmt(&mut it.stmt, u, p);
+            }
+        }
+        _ => {}
+    }
+}
+
+fn scope_time_expr(e: &mut Expression, u: i32, p: i32) {
+    use crate::ast::expr::NumberLiteral;
+    match &mut e.kind {
+        // VALUE-position time literal: absolute seconds, scaled to the
+        // scope's unit rounded at its precision (§5.8).
+        ExprKind::Number(NumberLiteral::Time(secs)) => {
+            let prec_s = 10f64.powi(p);
+            let ratio = 10f64.powi(u - p);
+            let v = (*secs / prec_s).round() / ratio;
+            e.kind = ExprKind::Number(NumberLiteral::Real(v));
+        }
+        ExprKind::SystemCall { name, args } => {
+            if args.is_empty()
+                && matches!(name.as_str(), "$time" | "$stime" | "$realtime")
+            {
+                let real = *name == "$realtime";
+                *name = if real {
+                    "$__xz_realtime_at".to_string()
+                } else {
+                    "$__xz_time_at".to_string()
+                };
+                args.push(Expression::new(
+                    ExprKind::Number(NumberLiteral::Real(u as f64)),
+                    e.span,
+                ));
+            } else {
+                for a in args.iter_mut() {
+                    scope_time_expr(a, u, p);
+                }
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            scope_time_expr(left, u, p);
+            scope_time_expr(right, u, p);
+        }
+        ExprKind::Unary { operand, .. } => scope_time_expr(operand, u, p),
+        ExprKind::Paren(inner) => scope_time_expr(inner, u, p),
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            scope_time_expr(condition, u, p);
+            scope_time_expr(then_expr, u, p);
+            scope_time_expr(else_expr, u, p);
+        }
+        ExprKind::Call { args, .. } => {
+            for a in args.iter_mut() {
+                scope_time_expr(a, u, p);
+            }
+        }
+        ExprKind::Concatenation(parts) => {
+            for a in parts.iter_mut() {
+                scope_time_expr(a, u, p);
+            }
+        }
+        ExprKind::Index { expr, index } => {
+            scope_time_expr(expr, u, p);
+            scope_time_expr(index, u, p);
+        }
+        _ => {}
+    }
+}
+
 pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, tick_s: f64) {
     rewrite_module_item_delays(items, unit_s, tick_s);
 }
@@ -17180,6 +17430,15 @@ fn inline_module_items(
                             continue;
                         }
                         if let Some(def) = &port.default {
+                            // §23.2.2.4: the default must be a CONSTANT
+                            // expression (ivtest sv_default_port_value3 — a
+                            // reference to a runtime variable is rejected).
+                            if !is_const_expr(def, &elab.parameters) {
+                                return Err(format!(
+                                    "Value assigned to default of port '{}' of module '{}' must be a constant expression (§23.2.2.4)",
+                                    name, sub_mod_name
+                                ));
+                            }
                             port_map.insert(name.clone(), def.clone());
                         } else if let Some(pull1) = pulled {
                             let lit = Expression::new(
