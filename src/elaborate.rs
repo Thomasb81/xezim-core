@@ -3229,39 +3229,103 @@ fn check_non_class_null_return(fd: &crate::ast::decl::FunctionDeclaration) -> Re
     Ok(())
 }
 
-fn check_implicit_static_inits(stmts: &[crate::ast::stmt::Statement]) -> Result<(), String> {
+/// §6.21 escape hatch: accept implicitly-static initializers (warn instead of
+/// erroring). Real designs carry the pattern and other simulators let it be
+/// suppressed, so a user hitting it mid-flow needs a way forward that is not
+/// "edit a vendor's source tree".
+static RELAX_IMPLICIT_STATIC: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+pub fn set_relax_implicit_static(on: bool) {
+    RELAX_IMPLICIT_STATIC.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+fn relax_implicit_static() -> bool {
+    if RELAX_IMPLICIT_STATIC.load(std::sync::atomic::Ordering::Relaxed) {
+        return true;
+    }
+    static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENV.get_or_init(|| {
+        std::env::var("XEZIM_ALLOW_IMPLICIT_STATIC").ok().as_deref() == Some("1")
+    })
+}
+
+/// Where a §6.21 violation was found, for the diagnostic.
+pub(crate) struct StaticInitScope<'a> {
+    /// "function" / "task"
+    pub kind: &'a str,
+    /// subroutine name
+    pub name: &'a str,
+    /// "package" / "module"
+    pub owner_kind: &'a str,
+    /// enclosing package / module name
+    pub owner: &'a str,
+}
+
+fn check_implicit_static_inits(
+    stmts: &[crate::ast::stmt::Statement],
+    elab: &ElaboratedModule,
+    scope: StaticInitScope<'_>,
+) -> Result<(), String> {
     use crate::ast::stmt::StatementKind as SK;
-    fn walk(s: &crate::ast::stmt::Statement) -> Result<(), String> {
+    fn walk(s: &crate::ast::stmt::Statement) -> Option<(String, Span)> {
         match &s.kind {
             SK::VarDecl { lifetime: None, declarators, .. } => {
                 for d in declarators {
                     if d.init.is_some() {
-                        return Err(format!(
-                            "Variable '{}' is implicitly static; declare it explicitly static or automatic (§6.21)",
-                            d.name.name
-                        ));
+                        return Some((d.name.name.clone(), d.name.span));
                     }
                 }
-                Ok(())
+                None
             }
             SK::SeqBlock { stmts, .. } | SK::ParBlock { stmts, .. } => {
-                for st in stmts { walk(st)?; }
-                Ok(())
+                stmts.iter().find_map(walk)
             }
-            SK::If { then_stmt, else_stmt, .. } => {
-                walk(then_stmt)?;
-                if let Some(eb) = else_stmt { walk(eb)?; }
-                Ok(())
-            }
+            SK::If { then_stmt, else_stmt, .. } => walk(then_stmt)
+                .or_else(|| else_stmt.as_ref().and_then(|eb| walk(eb))),
             SK::For { body, .. } | SK::While { body, .. } | SK::DoWhile { body, .. }
             | SK::Repeat { body, .. } | SK::Forever { body } | SK::Foreach { body, .. } => walk(body),
             SK::TimingControl { stmt, .. } | SK::Wait { stmt, .. } => walk(stmt),
-            SK::Case { items, .. } => { for it in items { walk(&it.stmt)?; } Ok(()) }
-            _ => Ok(()),
+            SK::Case { items, .. } => items.iter().find_map(|it| walk(&it.stmt)),
+            _ => None,
         }
     }
-    for s in stmts { walk(s)?; }
-    Ok(())
+    let Some((var, span)) = stmts.iter().find_map(walk) else {
+        return Ok(());
+    };
+
+    // The location is the whole point of this diagnostic: without it a user
+    // hitting the rule in a large multi-file design has no way to find the
+    // declaration. Hint the file with the OWNER (package/module), whose span
+    // space the subroutine body lives in.
+    let where_ = match span_location_of(elab, span, scope.owner) {
+        Some(loc) => format!(
+            "  in {} '{}' of {} '{}' at {}",
+            scope.kind, scope.name, scope.owner_kind, scope.owner, loc
+        ),
+        None => format!(
+            "  in {} '{}' of {} '{}'",
+            scope.kind, scope.name, scope.owner_kind, scope.owner
+        ),
+    };
+
+    if relax_implicit_static() {
+        crate::log_eprintln(&format!(
+            "[xezim][warning] variable '{}' is implicitly static (§6.21); accepted because \
+             --relax-implicit-static is in effect\n{}",
+            var, where_
+        ));
+        return Ok(());
+    }
+
+    Err(format!(
+        "Variable '{}' is implicitly static; declare it explicitly static or automatic (§6.21)\n\
+         {}\n  \
+         fix: `static <type> {} = ...;` (one copy, initialized once before time 0) or \
+         `automatic <type> {} = ...;` (a fresh copy per call)\n  \
+         or accept it as-is: --relax-implicit-static (env XEZIM_ALLOW_IMPLICIT_STATIC=1)",
+        var, where_, var, var
+    ))
 }
 
 pub fn elaborate_module_with_defs(
@@ -4055,11 +4119,21 @@ pub fn elaborate_module_with_defs(
                     crate::ast::decl::PackageItem::Function(fd)
                         if fd.lifetime != Some(Lifetime::Automatic)
                             && fd.name.scope.is_none() =>
-                        check_implicit_static_inits(&fd.items)?,
+                        check_implicit_static_inits(&fd.items, &elab, StaticInitScope {
+                            kind: "function",
+                            name: &fd.name.name.name,
+                            owner_kind: "package",
+                            owner: &pkg.name.name,
+                        })?,
                     crate::ast::decl::PackageItem::Task(td)
                         if td.lifetime != Some(Lifetime::Automatic)
                             && td.name.scope.is_none() =>
-                        check_implicit_static_inits(&td.items)?,
+                        check_implicit_static_inits(&td.items, &elab, StaticInitScope {
+                            kind: "task",
+                            name: &td.name.name.name,
+                            owner_kind: "package",
+                            owner: &pkg.name.name,
+                        })?,
                     _ => {}
                 }
             }
@@ -6309,7 +6383,13 @@ pub fn elaborate_module_with_defs(
                     && fd.lifetime != Some(Lifetime::Automatic)
                     && fd.name.scope.is_none()
                 {
-                    check_implicit_static_inits(&fd.items)?;
+                    let mod_name = elab.name.clone();
+                    check_implicit_static_inits(&fd.items, &elab, StaticInitScope {
+                        kind: "function",
+                        name: &fd.name.name.name,
+                        owner_kind: "module",
+                        owner: &mod_name,
+                    })?;
                 }
                 // Out-of-class method definitions (`function Class::method`)
                 // have `scope.is_some()` — they belong in the class, not in
@@ -6325,7 +6405,13 @@ pub fn elaborate_module_with_defs(
                     && td.lifetime != Some(Lifetime::Automatic)
                     && td.name.scope.is_none()
                 {
-                    check_implicit_static_inits(&td.items)?;
+                    let mod_name = elab.name.clone();
+                    check_implicit_static_inits(&td.items, &elab, StaticInitScope {
+                        kind: "task",
+                        name: &td.name.name.name,
+                        owner_kind: "module",
+                        owner: &mod_name,
+                    })?;
                 }
                 fn check_no_return_in_fork(s: &crate::ast::stmt::Statement, in_fork: bool) -> Result<(), String> {
                     use crate::ast::stmt::StatementKind as SK;
@@ -20749,7 +20835,24 @@ pub fn span_location_unhinted(elab: &ElaboratedModule, span: Span) -> Option<Str
     span_location_impl(elab, span, false)
 }
 
+/// As `span_location`, but hinting with the file of a NAMED definition
+/// (a package, module or interface) instead of the module being elaborated.
+/// A package subroutine's span is an offset into the PACKAGE's file, so
+/// hinting with the elaboration root would name the wrong file.
+pub fn span_location_of(elab: &ElaboratedModule, span: Span, owner: &str) -> Option<String> {
+    span_location_impl_owned(elab, span, true, Some(owner))
+}
+
 fn span_location_impl(elab: &ElaboratedModule, span: Span, hint: bool) -> Option<String> {
+    span_location_impl_owned(elab, span, hint, None)
+}
+
+fn span_location_impl_owned(
+    elab: &ElaboratedModule,
+    span: Span,
+    hint: bool,
+    owner: Option<&str>,
+) -> Option<String> {
     if span.start == 0 && span.end == 0 {
         return None; // Span::dummy() — synthesized, no source
     }
@@ -20759,14 +20862,15 @@ fn span_location_impl(elab: &ElaboratedModule, span: Span, hint: bool) -> Option
     // give up" scan therefore reported NOTHING for any multi-file design,
     // which is every real one. Prefer the file that actually defines this
     // module and fall back to the scan only when it is unknown.
-    let preferred: Option<usize> = if !hint || elab.name.is_empty() {
+    let hint_name: &str = owner.unwrap_or(elab.name.as_str());
+    let preferred: Option<usize> = if !hint || hint_name.is_empty() {
         None
     } else {
         elab.src_file_of_module
-            .get(&elab.name)
+            .get(hint_name)
             .copied()
             .or_else(|| {
-                ELAB_MODULE_FILES_TLS.with(|c| c.borrow().get(&elab.name).copied())
+                ELAB_MODULE_FILES_TLS.with(|c| c.borrow().get(hint_name).copied())
             })
             .map(|i| i as usize)
     };

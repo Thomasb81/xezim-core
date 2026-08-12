@@ -784,6 +784,11 @@ pub fn parse_and_elaborate_multi(
                 ast::Description::PackageItem(ast::decl::PackageItem::Checker(c)) => {
                     Some(&c.name.name)
                 }
+                // Packages too: a diagnostic about a package subroutine
+                // resolves its file:line by hinting with the PACKAGE name
+                // (see `span_location_of`); without this entry a package
+                // span is ambiguous across files and reports no location.
+                ast::Description::Package(p) => Some(&p.name.name),
                 _ => None,
             };
             if let Some(name) = name {
