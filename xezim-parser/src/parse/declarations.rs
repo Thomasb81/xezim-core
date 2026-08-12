@@ -763,8 +763,24 @@ impl Parser {
                 if matches!(next_after, TokenKind::Identifier) {
                     self.parse_data_type()
                 } else {
-                    let type_name = self.parse_identifier();
-                    DataType::TypeReference { name: TypeName { scope: None, name: type_name, span: self.span_from(start) }, dimensions: Vec::new(), type_args: Vec::new(), span: self.span_from(start) }
+                    // Implicit-typed port name with UNPACKED dims —
+                    // `function parity(input bit_array[3:0])` (ivtest
+                    // br1015b): the identifier is the PORT NAME, the
+                    // brackets its unpacked dimension. Handle the whole
+                    // port inline, mirroring the `name [$]` arm above.
+                    let name = self.parse_identifier();
+                    let dimensions = self.parse_unpacked_dimensions();
+                    let data_type = DataType::Implicit {
+                        signing: None,
+                        dimensions: Vec::new(),
+                        span: self.span_from(start),
+                    };
+                    let default = if self.eat(TokenKind::Assign).is_some() {
+                        Some(self.parse_expression())
+                    } else { None };
+                    ports.push(FunctionPort { direction, var_kw, data_type, name, dimensions, default, span: self.span_from(start) });
+                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    continue;
                 }
             } else if self.at(TokenKind::LBracket) {
                 let dims = self.parse_packed_dimensions();

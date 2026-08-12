@@ -5923,9 +5923,18 @@ pub fn elaborate_module_with_defs(
                             // §5.7.1: the value's SIGNEDNESS comes with its
                             // width — a sized literal is unsigned unless it
                             // carries `s`, so `parameter P = 8'hF0;` is 240,
-                            // not -16 (and `P > 100` is true).
+                            // not -16 (and `P > 100` is true). But an EXPLICIT
+                            // `signed`/`unsigned` keyword wins over the value
+                            // (§6.20.2): `localparam signed s = 4'd15` is a
+                            // signed 4-bit -1 (ivtest localparam_type2 snv15).
                             if let Some(init) = &assign.init {
-                                current_signed = untyped_param_is_signed(init);
+                                let declared_signing = matches!(
+                                    data_type,
+                                    DataType::Implicit { signing: Some(_), .. }
+                                );
+                                if !declared_signing {
+                                    current_signed = untyped_param_is_signed(init);
+                                }
                             }
                         }
 
@@ -10064,7 +10073,12 @@ fn elaborate_generate_for(gf: &GenerateFor, elab: &mut ElaboratedModule, all_def
     let mut iter_count = 0u32;
     let mut hit_cap = true;
     for _ in 0..10000 {
-        params_insert_traced(&mut elab.parameters, line!(), var.clone(), Value::from_u64(i as u64, 32));
+        // §27.4: a genvar is a signed integer — a down-counting loop
+        // (`for (i = 3; i >= 0; i--)`) must see -1 as negative, not
+        // 0xFFFFFFFF, or the condition never goes false (ivtest br_gh568).
+        let mut gv = Value::from_u64(i as u64 as u32 as u64, 32);
+        gv.is_signed = true;
+        params_insert_traced(&mut elab.parameters, line!(), var.clone(), gv);
         let cond_val = eval_const_expr(&gf.cond, &elab.parameters);
         if cond_val == 0 {
             hit_cap = false;
@@ -12706,6 +12720,10 @@ fn sized_literal_width(init: &Expression) -> Option<u32> {
     loop {
         match &cur.kind {
             ExprKind::Paren(inner) => cur = inner,
+            // §11.4.3/§11.6.1: unary +/- keeps the operand's size, so
+            // `localparam P = -4'sd1` is a 4-bit parameter (ivtest
+            // localparam_type2 nnvm1/snvm1 — the reference sizes them 4).
+            ExprKind::Unary { op: UnaryOp::Plus | UnaryOp::Minus, operand } => cur = operand,
             ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { size: Some(s), .. }) => return Some(*s),
             _ => return None,
         }
