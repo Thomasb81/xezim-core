@@ -112,8 +112,17 @@ impl Parser {
                     let declarators: Vec<VarDeclarator> = assignments.into_iter().map(|a| {
                         VarDeclarator { name: a.name, dimensions: a.dimensions, init: a.init, span: a.span }
                     }).collect();
+                    // §6.20.4: a block-scope localparam/parameter is a
+                    // CONSTANT — mark the lowered decl `static` so the §6.21
+                    // implicitly-static check (which targets variables with
+                    // initializers) does not fire on it. A localparam MUST
+                    // carry an initializer; the reference accepts it inside
+                    // static tasks (customer testbench task-body
+                    // `localparam int MIN = 24;` was wrongly rejected).
                     return Statement::new(StatementKind::VarDecl {
-                        data_type, lifetime: None, declarators,
+                        data_type,
+                        lifetime: Some(crate::ast::types::Lifetime::Static),
+                        declarators,
                     }, span);
                 }
                 return Statement::new(StatementKind::Null, span);
