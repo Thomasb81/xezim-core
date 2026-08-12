@@ -17078,6 +17078,7 @@ fn explain_conn_width(actual: &Expression, elab: &ElaboratedModule, parent_def: 
     }
     // A packed struct's per-field widths are the payload of this diagnostic:
     // a row of 1-bit fields beside a much wider port names the culprit type.
+    let mut collapsed = false;
     if let Some(fields) = elab.packed_struct_fields.get(&name) {
         if !fields.is_empty() {
             let mut items: Vec<String> = fields
@@ -17086,14 +17087,99 @@ fn explain_conn_width(actual: &Expression, elab: &ElaboratedModule, parent_def: 
                 .collect();
             items.reverse(); // stored LSB-first; print in declaration order
             out.push_str(&format!("\n  its packed fields are: {}", items.join(" ")));
-            if fields.iter().filter(|(_, _, w)| *w == 1).count() >= 2 {
-                out.push_str(
-                    "\n  NOTE: several fields are 1 bit wide — a `[P:0]`/`[P-1:0]` field whose \
-                     parameter P resolved to 0 collapses to 1 bit. Re-run with \
-                     XEZIM_TRACE_PARAM=<param> to see where that parameter was resolved.",
+            collapsed = fields.iter().any(|(_, _, w)| *w == 1);
+        }
+    }
+    // For every 1-bit field of the connection's struct TYPE, name the
+    // identifiers its range expression reads and their resolved values —
+    // this is the parameter the user has to trace, printed so they never
+    // have to open the typedef. (A field that is genuinely `logic f;` has
+    // no range identifiers and prints nothing.)
+    let type_name = elab
+        .signals
+        .get(&name)
+        .and_then(|s| s.type_name.clone())
+        .or_else(|| elab.var_decl_types.get(&name).and_then(get_type_name));
+    if let Some(tn) = type_name {
+        let chain_root = elab
+            .typedef_types
+            .get(&tn)
+            .map(|dt| resolve_typedef_chain(dt, &elab.typedef_types));
+        if let Some(DataType::Struct(su)) = chain_root {
+            let mut named_any = false;
+            for m in &su.members {
+                let w = resolve_type_width(
+                    &m.data_type,
+                    Some(&elab.parameters),
+                    Some(&elab.typedefs),
                 );
+                let mut idents: Vec<String> = Vec::new();
+                if let DataType::IntegerVector { dimensions, .. } = &m.data_type {
+                    for d in dimensions {
+                        if let PackedDimension::Range { left, right, .. } = d {
+                            collect_ident_names(left, &mut idents);
+                            collect_ident_names(right, &mut idents);
+                        }
+                    }
+                }
+                idents.dedup();
+                if idents.is_empty() {
+                    continue;
+                }
+                // Suspicious = the field collapsed to 1-2 bits, or any
+                // identifier in its range resolved to <= 0 (an `[N-1:0]`
+                // underflow) or did not resolve at all. A healthy
+                // parameter-sized field prints nothing.
+                let mut vals: Vec<String> = Vec::new();
+                let mut suspicious = w <= 2;
+                for id in &idents {
+                    match elab
+                        .parameters
+                        .get(id)
+                        .cloned()
+                        .or_else(|| param_fallback_get(id))
+                        .and_then(|v| v.to_i64())
+                    {
+                        Some(v) => {
+                            if v <= 0 {
+                                suspicious = true;
+                            }
+                            vals.push(format!("{} = {}", id, v));
+                        }
+                        None => {
+                            suspicious = true;
+                            vals.push(format!("{} = <UNRESOLVED — evaluates as 0>", id));
+                        }
+                    }
+                }
+                if !suspicious {
+                    continue;
+                }
+                for decl in &m.declarators {
+                    out.push_str(&format!(
+                        "\n  field '{}' resolved to {} bit(s); its range reads: {}",
+                        decl.name.name,
+                        w,
+                        vals.join(", ")
+                    ));
+                    named_any = true;
+                }
+            }
+            if named_any {
+                out.push_str(
+                    "\n  trace the parameter above with XEZIM_TRACE_PARAM=<name> --compile \
+                     to see every write to it and where the resolution went wrong.",
+                );
+                collapsed = false; // the specific note supersedes the generic one
             }
         }
+    }
+    if collapsed {
+        out.push_str(
+            "\n  NOTE: several fields are 1 bit wide — a `[P:0]`/`[P-1:0]` field whose \
+             parameter P resolved to 0 collapses to 1 bit. Re-run with \
+             XEZIM_TRACE_PARAM=<param> to see where that parameter was resolved.",
+        );
     }
     out
 }
