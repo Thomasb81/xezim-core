@@ -13094,6 +13094,19 @@ fn struct_typedef_self_reference(
         typedef_types: &HashMap<String, DataType>,
         visited: &mut Vec<String>,
     ) -> Option<String> {
+        // §6.18/§6.19: an ENUM whose BASE type resolves back to the name
+        // being defined (`typedef T; typedef enum T {A,B} T;`) is the same
+        // circular definition — undetected, every later resolver recursed
+        // until the stack overflowed (ivtest sv_typedef_fwd_enum_fail
+        // aborted with SIGABRT instead of erroring).
+        if let DataType::Enum(e) = dt {
+            if let Some(base) = e.base_type.as_deref() {
+                if let Some(cycle) = walk(target, base, typedef_types, visited) {
+                    return Some(cycle);
+                }
+            }
+            return None;
+        }
         let su = match dt {
             DataType::Struct(su) => su,
             // §6.18: the definition can reach the struct THROUGH a typedef
@@ -16977,27 +16990,112 @@ fn warn_port_width_mismatch(
     formal_w: u32,
     actual_w: u32,
     inst_prefix: &str,
-    span_off: usize,
+    actual: &Expression,
+    elab: &ElaboratedModule,
+    parent_def: &str,
 ) {
     use std::sync::{Mutex, OnceLock};
     static SEEN: OnceLock<Mutex<std::collections::HashSet<(String, String)>>> = OnceLock::new();
     let seen = SEEN.get_or_init(|| Mutex::new(std::collections::HashSet::new()));
     let key = (sub_mod_name.to_string(), port.to_string());
     let first = seen.lock().map(|mut g| g.insert(key)).unwrap_or(false);
-    if first {
-        crate::elab_diag(format!(
-            "[xezim][warning] port width mismatch: module '{}' port '{}' is {} bit(s) but the \
-             connection is {} bit(s) — instance '{}' (connection at source offset {}); the value \
-             is truncated/extended per IEEE 1800-2017 §23.3.3. Further instances of this \
-             (module, port) pair are not reported.",
-            sub_mod_name,
-            port,
-            formal_w,
-            actual_w,
-            inst_prefix.trim_end_matches('.'),
-            span_off
-        ));
+    if !first {
+        return;
     }
+    // The connection expression lives in the PARENT module's file — the file
+    // of the module being elaborated (the root) would misreport whenever the
+    // root file is large enough for the offset to fit it too.
+    let where_ = match span_location_of(elab, actual.span, parent_def) {
+        Some(loc) => format!("at {}", loc),
+        None => format!("at source offset {}", actual.span.start),
+    };
+    crate::elab_diag(format!(
+        "[xezim][warning] port width mismatch: module '{}' port '{}' is {} bit(s) but the \
+         connection is {} bit(s) — instance '{}' (connection {}); the value \
+         is truncated/extended per IEEE 1800-2017 §23.3.3. Further instances of this \
+         (module, port) pair are not reported.{}",
+        sub_mod_name,
+        port,
+        formal_w,
+        actual_w,
+        inst_prefix.trim_end_matches('.'),
+        where_,
+        explain_conn_width(actual, elab, parent_def),
+    ));
+}
+
+/// Explain HOW a port connection reached its width. A bare "the connection is
+/// 86 bit(s)" leaves a user with no way to find the under-sized declaration —
+/// on a real design the answer is usually one struct whose fields were sized
+/// by a parameter that resolved to 0 (each `[P:0]` field collapsing to 1 bit),
+/// which is obvious the moment the field widths are printed next to each other.
+fn explain_conn_width(actual: &Expression, elab: &ElaboratedModule, parent_def: &str) -> String {
+    fn conn_root(expr: &Expression) -> Option<String> {
+        match &expr.kind {
+            ExprKind::Ident(h) => Some(
+                h.path.iter().map(|s| s.name.name.as_str()).collect::<Vec<_>>().join("."),
+            ),
+            ExprKind::MemberAccess { expr, .. } | ExprKind::Index { expr, .. } => conn_root(expr),
+            ExprKind::RangeSelect { expr, .. } => conn_root(expr),
+            _ => None,
+        }
+    }
+    let mut out = String::new();
+    // A concatenation's width is the sum of its parts; name the parts.
+    if let ExprKind::Concatenation(parts) = &actual.kind {
+        let mut items: Vec<String> = Vec::new();
+        for p in parts {
+            let w = port_conn_width(p, elab);
+            let n = conn_root(p).unwrap_or_else(|| "<expr>".to_string());
+            items.push(match w {
+                Some(w) => format!("{}:{}", n, w),
+                None => format!("{}:?", n),
+            });
+        }
+        if !items.is_empty() {
+            out.push_str(&format!("\n  connection is a concatenation of: {}", items.join(" ")));
+        }
+    }
+    let Some(name) = conn_root(actual) else {
+        return out;
+    };
+    if let Some(sig) = elab.signals.get(&name) {
+        let ty = sig.type_name.clone().unwrap_or_else(|| "<anonymous>".to_string());
+        out.push_str(&format!(
+            "\n  connection '{}' is declared as '{}' ({} bit(s))",
+            name, ty, sig.width
+        ));
+        let leaf = name.rsplit('.').next().unwrap_or(&name);
+        if let Some(decl) = elab
+            .decl_sites
+            .get(&name)
+            .or_else(|| elab.decl_sites.get(leaf))
+        {
+            if let Some(loc) = span_location_of(elab, decl.0, parent_def) {
+                out.push_str(&format!(", declared at {}", loc));
+            }
+        }
+    }
+    // A packed struct's per-field widths are the payload of this diagnostic:
+    // a row of 1-bit fields beside a much wider port names the culprit type.
+    if let Some(fields) = elab.packed_struct_fields.get(&name) {
+        if !fields.is_empty() {
+            let mut items: Vec<String> = fields
+                .iter()
+                .map(|(f, _off, w)| format!("{}:{}", f, w))
+                .collect();
+            items.reverse(); // stored LSB-first; print in declaration order
+            out.push_str(&format!("\n  its packed fields are: {}", items.join(" ")));
+            if fields.iter().filter(|(_, _, w)| *w == 1).count() >= 2 {
+                out.push_str(
+                    "\n  NOTE: several fields are 1 bit wide — a `[P:0]`/`[P-1:0]` field whose \
+                     parameter P resolved to 0 collapses to 1 bit. Re-run with \
+                     XEZIM_TRACE_PARAM=<param> to see where that parameter was resolved.",
+                );
+            }
+        }
+    }
+    out
 }
 
 /// Extract the dotted instance/parameter path of a `defparam` LHS
@@ -19507,7 +19605,9 @@ fn inline_module_items(
                             formal,
                             actual_w,
                             &inst_prefix,
-                            actual.span.start,
+                            actual,
+                            elab,
+                            source_def.name(),
                         );
                     }
                 }
@@ -19946,6 +20046,46 @@ fn inline_module_items(
                 iprof_add("subitem_loop", __td.elapsed());
                 iprof_add("per_hi_prelude", __th.elapsed());
                 let __te = std::time::Instant::now();
+                // §23.10/§27: a recursive instantiation whose terminating
+                // generate branch never fires expands the hierarchy forever —
+                // ivtest pr2728812b reached 37 GB RSS before the kernel killed
+                // the process. Commercial tools cap the depth and error (the
+                // originating test expects failure "after 100 loops"). Depth =
+                // instance-path segments; real hierarchies sit far below the
+                // cap. XEZIM_MAX_INST_DEPTH overrides.
+                {
+                    static MAX_DEPTH: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+                    let cap = *MAX_DEPTH.get_or_init(|| {
+                        std::env::var("XEZIM_MAX_INST_DEPTH")
+                            .ok()
+                            .and_then(|v| v.parse().ok())
+                            .unwrap_or(200)
+                    });
+                    let depth = inst_prefix.matches('.').count();
+                    if depth > cap {
+                        // A 200-segment path is unreadable; head + tail is
+                        // enough to recognise the repeating cycle.
+                        let path = inst_prefix.trim_end_matches('.');
+                        let segs: Vec<&str> = path.split('.').collect();
+                        let shown = if segs.len() > 8 {
+                            format!(
+                                "{} ... {}",
+                                segs[..4].join("."),
+                                segs[segs.len() - 4..].join(".")
+                            )
+                        } else {
+                            path.to_string()
+                        };
+                        return Err(format!(
+                            "instantiation depth exceeds {} at instance '{}' (module '{}') — \
+                             unbounded recursive instantiation? A generate-based recursion \
+                             needs a terminating branch (IEEE 1800-2017 §27.3); raise the \
+                             limit with XEZIM_MAX_INST_DEPTH if the hierarchy is genuinely \
+                             this deep",
+                            cap, shown, sub_mod_name
+                        ));
+                    }
+                }
                 inline_module_items(elab, sub_mod, &inst_prefix, definitions, &mut sub_interface_map, &sub_merged_params, cache, &sub_defparams)?;
                 iprof_add("recursion", __te.elapsed());
 
