@@ -83,6 +83,19 @@ struct IfdefState {
     active: bool,
 }
 
+
+/// §22.5.1: a compiler directive matches as a WHOLE word — a user macro is
+/// allowed to merely START with a directive keyword (`include_default_...`,
+/// `undefined_x`, `ifdef_guard_y`). Prefix matching swallowed such macro
+/// invocations as (malformed) directives, failing preprocessing outright.
+fn directive_word(line: &str, kw: &str) -> bool {
+    line.starts_with(kw)
+        && line[kw.len()..]
+            .chars()
+            .next()
+            .is_none_or(|c| !c.is_alphanumeric() && c != '_' && c != '$')
+}
+
 impl Preprocessor {
     /// Seed the predefined `$coverage_control` constants (IEEE 1800-2023
     /// §39.6). Called by `new()` and again by `undefineall` so the
@@ -532,7 +545,7 @@ impl Preprocessor {
         let mut in_define_cont = false;
         for line in source.lines() {
             let trimmed = line.trim_start();
-            if in_define_cont || trimmed.starts_with("`define") {
+            if in_define_cont || directive_word(trimmed, "`define") {
                 in_define_cont = line.trim_end().ends_with('\\');
                 out.push_str(line);
                 out.push('\n');
@@ -623,7 +636,7 @@ impl Preprocessor {
                 continue;
             }
 
-            if trimmed.starts_with("`define") {
+            if directive_word(trimmed, "`define") {
                 // Join backslash-continuation lines (IEEE 1800-2017 §22.5.1)
                 let mut consumed_lines = 1;
                 
@@ -680,7 +693,7 @@ impl Preprocessor {
             // IEEE 1800-2023 §22.5.2: `undefineall — clear every user-defined
             // macro. Predefined `SV_COV_*` system constants stay (re-seeded).
             // Check BEFORE `undef so the longer name wins token match.
-            if trimmed.starts_with("`undefineall") {
+            if directive_word(trimmed, "`undefineall") {
                 if ifdef_stack.iter().all(|s| s.active) {
                     self.defines.clear();
                     Self::seed_predefined(&mut self.defines);
@@ -689,7 +702,7 @@ impl Preprocessor {
                 continue;
             }
 
-            if trimmed.starts_with("`undef") {
+            if directive_word(trimmed, "`undef") {
                 if ifdef_stack.iter().all(|s| s.active) {
                     let name = trimmed[6..].trim().to_string();
                     self.defines.remove(&name);
@@ -698,7 +711,7 @@ impl Preprocessor {
                 continue;
             }
 
-            if trimmed.starts_with("`ifdef") {
+            if directive_word(trimmed, "`ifdef") {
                 let name = trimmed[6..].trim();
                 // Strip trailing // comments from ifdef macro name
                 let name = name.split_whitespace().next().unwrap_or(name);
@@ -709,7 +722,7 @@ impl Preprocessor {
                 continue;
             }
 
-            if trimmed.starts_with("`ifndef") {
+            if directive_word(trimmed, "`ifndef") {
                 let name = trimmed[7..].trim();
                 let name = name.split_whitespace().next().unwrap_or(name);
                 let parent_active = ifdef_stack.iter().all(|s| s.active);
@@ -719,7 +732,7 @@ impl Preprocessor {
                 continue;
             }
 
-            if trimmed.starts_with("`elsif") {
+            if directive_word(trimmed, "`elsif") {
                 let name = trimmed[6..].trim();
                 let name = name.split_whitespace().next().unwrap_or(name);
                 if let Some(last) = ifdef_stack.last_mut() {
@@ -737,7 +750,7 @@ impl Preprocessor {
                 continue;
             }
 
-            if trimmed.starts_with("`else") {
+            if directive_word(trimmed, "`else") {
                 if let Some(last) = ifdef_stack.last_mut() {
                     let active = last.parent_active && !last.branch_taken;
                     last.active = active;
@@ -747,7 +760,7 @@ impl Preprocessor {
                 continue;
             }
 
-            if trimmed.starts_with("`endif") {
+            if directive_word(trimmed, "`endif") {
                 ifdef_stack.pop();
                 output.push('\n');
                 continue;
@@ -767,7 +780,7 @@ impl Preprocessor {
             }
 
             // Handle `include — read and recursively preprocess the included file
-            if trimmed.starts_with("`include") {
+            if directive_word(trimmed, "`include") {
                 // §22.4: the filename may come from a text macro
                 // (`include `DEFINED_PATH). Silently dropping the line left
                 // the file un-included and everything downstream undefined.
@@ -840,7 +853,7 @@ impl Preprocessor {
             // §22.9 `unconnected_drive pull0|pull1 ... `nounconnected_drive:
             // record the region; modules declared inside get their
             // unconnected INPUT ports pulled instead of Z.
-            if trimmed.starts_with("`unconnected_drive") {
+            if directive_word(trimmed, "`unconnected_drive") {
                 let arg = trimmed["`unconnected_drive".len()..].trim();
                 match arg.split_whitespace().next() {
                     Some("pull1") => self.unconnected_pull = Some(true),
@@ -857,12 +870,12 @@ impl Preprocessor {
                 output.push('\n');
                 continue;
             }
-            if trimmed.starts_with("`nounconnected_drive") {
+            if directive_word(trimmed, "`nounconnected_drive") {
                 self.unconnected_pull = None;
                 output.push('\n');
                 continue;
             }
-            if trimmed.starts_with("`default_nettype") {
+            if directive_word(trimmed, "`default_nettype") {
                 let rest = trimmed.trim_start_matches("`default_nettype").trim();
                 if rest.starts_with("none") {
                     crate::set_default_nettype_none_seen(true);
@@ -876,7 +889,7 @@ impl Preprocessor {
             // visible. Active-set switching for the lexer is future work; for
             // now this just enforces well-formedness and avoids silently
             // accepting typos in the version string.
-            if trimmed.starts_with("`begin_keywords") {
+            if directive_word(trimmed, "`begin_keywords") {
                 if ifdef_stack.iter().all(|s| s.active) {
                     let rest = trimmed.trim_start_matches("`begin_keywords").trim();
                     let ver = rest.trim_matches(|c: char| c == '"' || c.is_whitespace());
@@ -905,7 +918,7 @@ impl Preprocessor {
                 output.push('\n');
                 continue;
             }
-            if trimmed.starts_with("`end_keywords") {
+            if directive_word(trimmed, "`end_keywords") {
                 if ifdef_stack.iter().all(|s| s.active) {
                     if self.keywords_stack.pop().is_none() {
                         eprintln!(
@@ -1028,8 +1041,8 @@ impl Preprocessor {
 
             // Skip other compiler directives that don't affect simulation
             // semantics (kept silent — no warning).
-            if trimmed.starts_with("`celldefine") || trimmed.starts_with("`endcelldefine")
-                || trimmed.starts_with("`nounconnected_drive") || trimmed.starts_with("`unconnected_drive")
+            if directive_word(trimmed, "`celldefine") || directive_word(trimmed, "`endcelldefine")
+                || directive_word(trimmed, "`nounconnected_drive") || directive_word(trimmed, "`unconnected_drive")
             {
                 output.push('\n');
                 continue;
@@ -1165,7 +1178,7 @@ impl Preprocessor {
 
     fn parse_define(&mut self, line: &str) {
         let trimmed = line.trim();
-        if !trimmed.starts_with("`define") { return; }
+        if !directive_word(trimmed, "`define") { return; }
         let rest = trimmed[7..].trim(); // after `define
         // Find name
         let name_end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
@@ -1730,14 +1743,14 @@ impl Preprocessor {
         text.lines().any(|line| {
             matches!(
                 line.trim_start(),
-                trimmed if trimmed.starts_with("`ifdef")
-                    || trimmed.starts_with("`ifndef")
-                    || trimmed.starts_with("`elsif")
-                    || trimmed.starts_with("`else")
-                    || trimmed.starts_with("`endif")
-                    || trimmed.starts_with("`include")
-                    || trimmed.starts_with("`undef")
-                    || trimmed.starts_with("`define")
+                trimmed if directive_word(trimmed, "`ifdef")
+                    || directive_word(trimmed, "`ifndef")
+                    || directive_word(trimmed, "`elsif")
+                    || directive_word(trimmed, "`else")
+                    || directive_word(trimmed, "`endif")
+                    || directive_word(trimmed, "`include")
+                    || directive_word(trimmed, "`undef")
+                    || directive_word(trimmed, "`define")
             )
         })
     }
