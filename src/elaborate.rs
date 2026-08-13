@@ -2838,9 +2838,24 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         // every later resolution agrees).
         let bound_dt = prebind_type_dims(&td.data_type, elab);
         let eff_dt: &DataType = bound_dt.as_ref().unwrap_or(&td.data_type);
-        let w = resolve_type_width(eff_dt, Some(&elab.parameters), Some(&elab.typedefs));
-        typedefs_insert_traced(&mut elab.typedefs, "insert:process_typedef", td.name.name.clone(), w);
-        elab.typedef_types.insert(td.name.name.clone(), eff_dt.clone());
+        // A `typedef class foo_pool;` is parsed as a Void placeholder with
+        // `forward:false` (a forward CLASS declaration — §6.18). When the same
+        // name is later/more-specifically defined as a REAL typedef alias to a
+        // parameterized class (`typedef base#(args) foo_pool;`), this Void
+        // placeholder must not CLOBBER the resolved typedef. If we already have
+        // a non-Void value under this name, preserve it.
+        if matches!(eff_dt, DataType::Void(_))
+            && elab
+                .typedef_types
+                .get(&td.name.name)
+                .is_some_and(|prev| !matches!(prev, DataType::Void(_)))
+        {
+            // preserve the resolved typedef — placeholder Void, no override
+        } else {
+            let w = resolve_type_width(eff_dt, Some(&elab.parameters), Some(&elab.typedefs));
+            typedefs_insert_traced(&mut elab.typedefs, "insert:process_typedef", td.name.name.clone(), w);
+            elab.typedef_types.insert(td.name.name.clone(), eff_dt.clone());
+        }
     }
     // §6.18/§7.4: record any unpacked dimensions on the typedef
     // (`typedef logic [7:0] A [0:3];`) so a variable `A v;` inherits them.
