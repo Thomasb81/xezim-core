@@ -200,6 +200,14 @@ pub struct ContinuousAssignment {
     pub lhs: Expression,
     pub rhs: Expression,
     pub delay: u64,
+    /// §23.3.3: this assign is an instance PORT CONNECTION emitted at
+    /// inline time — its RHS names live in the PARENT scope by
+    /// construction. The simulator must not apply the child scope hint to
+    /// them: an actual like `.d(d ^ 1)` whose operand shares the FORMAL's
+    /// name otherwise resolved to the child's own port net (`u1.d = u1.d
+    /// ^ 1`, a self-loop that read x forever).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rhs_parent_scoped: bool,
 }
 
 /// IEEE 1800-2017 §29 User-Defined Primitive instance, flattened during
@@ -350,6 +358,10 @@ pub struct PendingContAssign {
 impl PendingAlways {
     /// Run the rewrite once and produce the owned AlwaysBlock. Drops self.
     pub fn materialize(self) -> AlwaysBlock {
+        if std::env::var("XZ_PEND_DBG").is_ok() {
+            eprintln!("[PEND-MAT] prefix={:?} keys={:?}", self.ctx.prefix,
+                self.ctx.port_map.keys().collect::<Vec<_>>());
+        }
         let stmt = rewrite_stmt(
             &self.source,
             &self.ctx.prefix,
@@ -414,7 +426,7 @@ impl PendingContAssign {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        ContinuousAssignment { lhs, rhs, delay: 0 }
+        ContinuousAssignment { lhs, rhs, delay: 0, rhs_parent_scoped: false }
     }
 }
 
@@ -4408,7 +4420,7 @@ pub fn elaborate_module_with_defs(
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: init_expr.clone(),
                                     delay: 0,
-                                });
+                                 rhs_parent_scoped: false, });
                             }
                             continue;
                         }
@@ -4615,11 +4627,25 @@ pub fn elaborate_module_with_defs(
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
                             delay: 0,
-                        });
+                         rhs_parent_scoped: false, });
                     }
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                // Beyond-cap declarations referenced nowhere are elided (see
+                // filter_dead_giant_declarators): no phantom allocation, no
+                // width-cap warning — matching the reference's silent DCE.
+                let dd_filtered;
+                let dd = match filter_dead_giant_declarators(dd, &elab, all_defs) {
+                    Some(f) => {
+                        dd_filtered = f;
+                        &dd_filtered
+                    }
+                    None => dd,
+                };
+                if dd.declarators.is_empty() {
+                    continue;
+                }
                 // Anonymous enum on a variable decl
                 // (`enum logic { A, B } var_name;`): the typedef path
                 // registers member constants, but the bare variable form
@@ -6577,7 +6603,7 @@ pub fn elaborate_module_with_defs(
                         rhs.clone()
                     };
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false });
                     }
                 }
             }
@@ -6593,6 +6619,9 @@ pub fn elaborate_module_with_defs(
                 // If this always block was inside a generate block, ac.gen_scope
                 // contains the generate block's scope name and should be included
                 // in the block's scope.
+                if std::env::var("XZ_PEND_DBG").is_ok() {
+                    eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
+                }
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: ac.gen_scope.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
@@ -6746,7 +6775,7 @@ pub fn elaborate_module_with_defs(
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
                         delay: 0,
-                    });
+                     rhs_parent_scoped: false, });
                 }
             }
             ModuleItem::ModuleInstantiation(inst) => {
@@ -6837,7 +6866,7 @@ pub fn elaborate_module_with_defs(
                         span,
                     };
                 }
-                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0 });
+                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0, rhs_parent_scoped: false });
             }
             elab.continuous_assigns = kept;
         }
@@ -9605,11 +9634,23 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
                             delay: 0,
-                        });
+                         rhs_parent_scoped: false, });
                     }
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                // See the main-path arm: beyond-cap dead declarations elide.
+                let dd_filtered;
+                let dd = match filter_dead_giant_declarators(dd, elab, all_defs) {
+                    Some(f) => {
+                        dd_filtered = f;
+                        &dd_filtered
+                    }
+                    None => dd,
+                };
+                if dd.declarators.is_empty() {
+                    continue;
+                }
                 register_anonymous_enum_members(&dd.data_type, elab);
                 // Packed multi-D (`logic [N-1:0][W-1:0] mem;`) — record the
                 // per-element width under the bare declarator name so
@@ -9932,7 +9973,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         rhs.clone()
                     };
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false });
                     }
                 }
             }
@@ -9941,6 +9982,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
             ModuleItem::AlwaysConstruct(ac) => {
                 // §21.2.1.7: include generate block scope in the instance path for %m.
+                if std::env::var("XZ_PEND_DBG").is_ok() {
+                    eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
+                }
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: ac.gen_scope.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
@@ -10093,7 +10137,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
                         delay: 0,
-                    });
+                     rhs_parent_scoped: false, });
                 }
             }
             ModuleItem::FunctionDeclaration(fd) => {
@@ -10470,12 +10514,177 @@ pub const SANE_MAX_PACKED_WIDTH: u32 = 1 << 20;
 /// config the const-evaluator could not resolve, but free.
 const UNDERFLOW_WIDTH_PLACEHOLDER: u32 = 1;
 
+
+/// Quiet width probe for the dead-declaration elision below: mirrors
+/// `resolve_type_width`'s IntegerVector/TypeReference math WITHOUT the
+/// clamp-and-warn side effects. Unresolvable dimensions yield 0 ("don't
+/// know" — never elide on a guess).
+fn quiet_packed_width_probe(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedef_widths: &HashMap<String, u32>,
+) -> u64 {
+    let dims_product = |dims: &[PackedDimension]| -> Option<u64> {
+        let mut total = 1u64;
+        for dim in dims {
+            let PackedDimension::Range { left, right, .. } = dim else {
+                return None;
+            };
+            let l = const_eval_i64_with_params(left, Some(params))?;
+            let r = const_eval_i64_with_params(right, Some(params))?;
+            total = total.saturating_mul(((l - r).abs() + 1) as u64);
+        }
+        Some(total)
+    };
+    match dt {
+        DataType::IntegerVector { dimensions, .. } => {
+            if dimensions.is_empty() {
+                return 1;
+            }
+            dims_product(dimensions).unwrap_or(0)
+        }
+        DataType::TypeReference { name, dimensions, .. } => {
+            let base = name
+                .scope
+                .as_ref()
+                .and_then(|sc| typedef_widths.get(&format!("{}::{}", sc.name, name.name.name)))
+                .copied()
+                .or_else(|| typedef_widths.get(&name.name.name).copied())
+                .unwrap_or(0) as u64;
+            if base == 0 {
+                return 0;
+            }
+            match dims_product(dimensions) {
+                Some(p) => base.saturating_mul(p),
+                None => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Serialize every definition's AST for the byte-level reference probe. A
+/// genuine reference to a name — expression ident, hierarchical segment,
+/// port connection, even a DPI/`uvm_hdl` path STRING — necessarily carries
+/// the name's exact bytes in this stream, so an occurrence count of ONE
+/// (the declarator itself) proves the declaration dead. Substring
+/// collisions only inflate the count, which merely KEEPS a dead variable —
+/// the safe direction. Only runs for beyond-cap declarations, so ordinary
+/// designs never pay for it.
+fn design_ast_blob(all_defs: &HashMap<String, Definition>) -> Vec<u8> {
+    let mut blob: Vec<u8> = Vec::new();
+    for def in all_defs.values() {
+        let bytes = match def {
+            Definition::Module(m) => bincode::serialize(m),
+            Definition::Interface(i) => bincode::serialize(i),
+            Definition::Program(p) => bincode::serialize(p),
+            Definition::Class(c) => bincode::serialize(c),
+            Definition::Covergroup(cg) => bincode::serialize(cg),
+            Definition::Package(p) => bincode::serialize(p),
+            Definition::Typedef(t) => bincode::serialize(t),
+            Definition::Udp(u) => bincode::serialize(u),
+        };
+        if let Ok(b) = bytes {
+            blob.extend_from_slice(&b);
+        }
+    }
+    blob
+}
+
+fn count_byte_occurrences(blob: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || blob.len() < needle.len() {
+        return 0;
+    }
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i + needle.len() <= blob.len() {
+        if &blob[i..i + needle.len()] == needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// Over-cap dead-declaration elision: the reference simulator silently
+/// drops variables referenced nowhere, so a leftover multi-megabit debug
+/// array (a real customer-BFM pattern) neither warns nor allocates there.
+/// Returns Some(filtered copy) when at least one declarator was elided.
+/// Guards: packed width beyond `SANE_MAX_PACKED_WIDTH` (probed QUIETLY, so
+/// the kept path still warns exactly as before), no initializer, no
+/// unpacked dimensions, and the name's serialized-AST occurrence count is
+/// exactly the declarator itself.
+fn filter_dead_giant_declarators(
+    dd: &crate::ast::decl::DataDeclaration,
+    elab: &ElaboratedModule,
+    all_defs: Option<&HashMap<String, Definition>>,
+) -> Option<crate::ast::decl::DataDeclaration> {
+    let Some(defs) = all_defs else { return None };
+    let w = quiet_packed_width_probe(&dd.data_type, &elab.parameters, &elab.typedefs);
+    if w <= SANE_MAX_PACKED_WIDTH as u64 {
+        return None;
+    }
+    let candidates: Vec<usize> = dd
+        .declarators
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.init.is_none() && d.dimensions.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let blob = design_ast_blob(defs);
+    let mut elide: Vec<usize> = Vec::new();
+    for &i in &candidates {
+        let name = &dd.declarators[i].name.name;
+        if count_byte_occurrences(&blob, name.as_bytes()) == 1 {
+            crate::elab_diag(format!(
+                "[xezim][note] eliding dead {}-bit declaration '{}' (referenced \
+                 nowhere in the design; commercial simulators drop it silently)",
+                w, name
+            ));
+            elide.push(i);
+        }
+    }
+    if elide.is_empty() {
+        return None;
+    }
+    let mut filtered = dd.clone();
+    let mut idx = 0usize;
+    filtered.declarators.retain(|_| {
+        let keep = !elide.contains(&idx);
+        idx += 1;
+        keep
+    });
+    Some(filtered)
+}
+
 /// Combine packed-dimension widths with saturating math and clamp the result to
 /// `SANE_MAX_PACKED_WIDTH`, warning once PER DISTINCT DETAIL when an absurd
 /// width is suppressed. `detail` carries whatever identity the call site can
 /// cheaply assemble (offending range bounds, parameter names + resolved
 /// values, source byte offset) so the user can find the declaration — a bare
 /// "somewhere a width underflowed" was unactionable on customer designs.
+thread_local! {
+    /// Pre-elaboration scans (xezim's should-fail lint) resolve widths on the
+    /// RAW AST — before dead-declaration elision has decided anything — so
+    /// their clamp calls must not emit user-facing warnings. Elaboration
+    /// proper re-resolves every KEPT declaration and warns there.
+    static SUPPRESS_WIDTH_WARNINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scoped suppression of `clamp_packed_width` warnings (clamping itself is
+/// unaffected). Used by pre-elaboration width scans; see the thread-local.
+pub fn with_width_warnings_suppressed<R>(f: impl FnOnce() -> R) -> R {
+    SUPPRESS_WIDTH_WARNINGS.with(|c| c.set(true));
+    let r = f();
+    SUPPRESS_WIDTH_WARNINGS.with(|c| c.set(false));
+    r
+}
+
 fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
     if w > SANE_MAX_PACKED_WIDTH as u64 {
         use std::sync::{Mutex, OnceLock};
@@ -10504,6 +10713,9 @@ fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
         } else {
             SANE_MAX_PACKED_WIDTH
         };
+        if SUPPRESS_WIDTH_WARNINGS.with(|c| c.get()) {
+            return replacement;
+        }
         let key = format!("{}|{}", ctx, detail);
         if seen.lock().map(|mut g| g.insert(key)).unwrap_or(false) {
             let detail_part = if detail.is_empty() {
@@ -10957,6 +11169,8 @@ pub fn resolve_type_width(
             if dimensions.is_empty() { return 1; }
             let mut total = 1u64;
             let mut culprit: Option<String> = None;
+            let mut dims_desc = String::new();
+            let mut first_span: Option<u32> = None;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
                     let lv = const_eval_i64_with_params(left, params);
@@ -10966,9 +11180,24 @@ pub fn resolve_type_width(
                         if w > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
                             culprit = Some(describe_packed_range(left, right, l, r, params));
                         }
+                        dims_desc.push_str(&format!("[{}:{}]", l, r));
+                        if first_span.is_none() {
+                            first_span = Some(left.span.start as u32);
+                        }
                         total = total.saturating_mul(w);
                     }
                 }
+            }
+            // A PRODUCT of sane dims can still exceed the cap
+            // (`[2047:0][2047:0]`); name the dims and the source byte offset
+            // so the offending declaration is findable (grep the
+            // --dump-merged-sv output at that offset).
+            if total > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
+                culprit = Some(format!(
+                    "dims {} at byte {}",
+                    dims_desc,
+                    first_span.unwrap_or(0)
+                ));
             }
             clamp_packed_width(total, "IntegerVector", culprit.as_deref().unwrap_or(""))
         }
@@ -11030,7 +11259,11 @@ pub fn resolve_type_width(
                         }
                     }
                 }
-                base_width = clamp_packed_width(total, "TypeReference", "");
+                let detail = format!(
+                    "type '{}' at byte {}",
+                    name.name.name, name.span.start
+                );
+                base_width = clamp_packed_width(total, "TypeReference", &detail);
             }
             if traced {
                 type_trace(
@@ -17695,7 +17928,13 @@ fn inline_module_items(
                             if let PortConnection::Named { name, expr, implicit } = conn {
                                 explicit.insert(name.name.clone());
                                 if let Some(e) = expr {
-                                    let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    let mut rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    // Whole-net identity actuals keep the plain
+                                    // substitution machinery (port_aliases &
+                                    // friends key on un-rooted idents).
+                                    if whole_net_ident_name(&rewritten_e).is_none() {
+                                        mark_actual_rooted(&mut rewritten_e);
+                                    }
                                     if sub_iface_ports.contains(&name.name) {
                                         if let Some(if_full_path) =
                                             iface_conn_path(&rewritten_e, local_params, definitions)
@@ -17748,7 +17987,11 @@ fn inline_module_items(
                         for (i, conn) in hi.connections.iter().enumerate() {
                             if let PortConnection::Ordered(expr) = conn {
                                 if let Some(e) = expr {
-                                    let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    let mut rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    // See the named-connection site above.
+                                    if whole_net_ident_name(&rewritten_e).is_none() {
+                                        mark_actual_rooted(&mut rewritten_e);
+                                    }
                                     if let Some(port) = sub_mod.ports().get(i) {
                                         let port_name = port.name();
                                         if sub_iface_ports.contains(port_name) {
@@ -17837,7 +18080,7 @@ fn inline_module_items(
                             lhs: clk_out_expr,
                             rhs: clk_in_expr,
                             delay: 0,
-                        });
+                         rhs_parent_scoped: false, });
                         continue;
                     }
                 }
@@ -19624,6 +19867,7 @@ fn inline_module_items(
                                         lhs: sub_expr,
                                         rhs: parent_elem,
                                         delay: 0,
+                                        rhs_parent_scoped: true,
                                     });
                                 }
                                 Some(PortDirection::Output) => {
@@ -19631,6 +19875,7 @@ fn inline_module_items(
                                         lhs: parent_elem,
                                         rhs: sub_expr,
                                         delay: 0,
+                                        rhs_parent_scoped: false,
                                     });
                                 }
                                 _ => {}
@@ -19690,15 +19935,17 @@ fn inline_module_items(
                             }
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: sub_expr, rhs, delay: 0,
+                                rhs_parent_scoped: true,
                             });
                         }
                         Some(PortDirection::Output) => {                            elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: parent_expr.clone(), rhs: sub_expr, delay: 0,
-                            });
+                             rhs_parent_scoped: false, });
                         }
                         _ => {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
+                                rhs_parent_scoped: true,
                             });
                         }
                     }
@@ -20146,7 +20393,7 @@ fn inline_module_items(
                                 lhs,
                                 rhs,
                                 delay: 0,
-                            });
+                             rhs_parent_scoped: false, });
                         }
                     }
                     if matches!(sub_item, ModuleItem::AlwaysConstruct(_)) {
@@ -21429,7 +21676,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 (None, Some(wk)) => wk,
                 (None, None) => make_z_expr(span),
             };
-            elab.continuous_assigns.push(ContinuousAssignment { lhs: acc.lhs, rhs, delay: acc.delay });
+            elab.continuous_assigns.push(ContinuousAssignment { lhs: acc.lhs, rhs, delay: acc.delay, rhs_parent_scoped: false });
         }
     }
 }
@@ -21505,12 +21752,12 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
                 span,
             ),
             delay: 0,
-        });
+         rhs_parent_scoped: false, });
         elab.continuous_assigns.push(ContinuousAssignment {
             lhs: term_b,
             rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
             delay: 0,
-        });
+         rhs_parent_scoped: false, });
     }
 }
 
@@ -21591,7 +21838,7 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
                 }
             }
         }
-        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay });
+        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay, rhs_parent_scoped: false });
     }
 }
 
@@ -21820,7 +22067,7 @@ pub fn whole_array_assign_parts(
                 lhs: make_index_expr(ln, llo + k),
                 rhs: make_index_expr(rn, rlo + k),
                 delay,
-            })
+             rhs_parent_scoped: false, })
             .collect(),
     )
 }
@@ -21880,6 +22127,83 @@ fn whole_net_ident_name(expr: &Expression) -> Option<String> {
 
 pub fn rewrite_expr(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {
     rewrite_expr_impl(expr, prefix, port_map, local_names, interface_map)
+}
+
+/// Mark every identifier in an EXPRESSION port actual as parent-rooted
+/// (`root = Some("$root")`). The actual's names were rewritten in the parent's
+/// context; once the expression is pasted into the CHILD's body by port-map
+/// substitution, its bare idents would otherwise re-resolve child-first under
+/// the child's scope hint — `.d(d ^ 1)` with a child port also named `d` read
+/// the child's own `u1.d` and applied the map to its own output (issue #48).
+/// A rooted ident is skipped by `rewrite_expr_impl` (no re-prefixing, no
+/// re-substitution) and resolved absolutely by the simulator.
+fn mark_actual_rooted(e: &mut Expression) {
+    match &mut e.kind {
+        ExprKind::Ident(h) => {
+            if h.root.is_none() {
+                h.root = Some("$root".to_string());
+            }
+            for seg in &mut h.path {
+                for sel in &mut seg.selects {
+                    mark_actual_rooted(sel);
+                }
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            mark_actual_rooted(left);
+            mark_actual_rooted(right);
+        }
+        ExprKind::Unary { operand, .. } => mark_actual_rooted(operand),
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            mark_actual_rooted(condition);
+            mark_actual_rooted(then_expr);
+            mark_actual_rooted(else_expr);
+        }
+        ExprKind::Paren(inner) => mark_actual_rooted(inner),
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                mark_actual_rooted(p);
+            }
+        }
+        ExprKind::Replication { count, exprs } => {
+            mark_actual_rooted(count);
+            for p in exprs {
+                mark_actual_rooted(p);
+            }
+        }
+        ExprKind::Call { func, args } => {
+            // The callee name is not a net reference — leave it resolvable
+            // through the normal function tables; its selects/args are values.
+            if let ExprKind::Ident(h) = &mut func.kind {
+                for seg in &mut h.path {
+                    for sel in &mut seg.selects {
+                        mark_actual_rooted(sel);
+                    }
+                }
+            } else {
+                mark_actual_rooted(func);
+            }
+            for a in args {
+                mark_actual_rooted(a);
+            }
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args {
+                mark_actual_rooted(a);
+            }
+        }
+        ExprKind::Index { expr, index } => {
+            mark_actual_rooted(expr);
+            mark_actual_rooted(index);
+        }
+        ExprKind::RangeSelect { expr, left, right, .. } => {
+            mark_actual_rooted(expr);
+            mark_actual_rooted(left);
+            mark_actual_rooted(right);
+        }
+        ExprKind::MemberAccess { expr, .. } => mark_actual_rooted(expr),
+        _ => {}
+    }
 }
 
 fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {
