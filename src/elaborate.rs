@@ -6582,11 +6582,12 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     }
-                    let rhs_final = if ca.strength.as_deref().map(strength_is_weak).unwrap_or(false) {
+                    let mut rhs_final = if ca.strength.as_deref().map(strength_is_weak).unwrap_or(false) {
                         make_syscall("$__pull", vec![rhs.clone()], rhs.span)
                     } else {
                         rhs.clone()
                     };
+                    root_mark_hier_ca_rhs(lhs, &mut rhs_final);
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
                         elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false });
                     }
@@ -9952,11 +9953,12 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             }
                         }
                     }
-                    let rhs_final = if ca.strength.as_deref().map(strength_is_weak).unwrap_or(false) {
+                    let mut rhs_final = if ca.strength.as_deref().map(strength_is_weak).unwrap_or(false) {
                         make_syscall("$__pull", vec![rhs.clone()], rhs.span)
                     } else {
                         rhs.clone()
                     };
+                    root_mark_hier_ca_rhs(lhs, &mut rhs_final);
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
                         elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false });
                     }
@@ -22107,6 +22109,36 @@ fn whole_net_ident_name(expr: &Expression) -> Option<String> {
             )
         }
         _ => None,
+    }
+}
+
+
+/// A continuous assign whose LHS names a HIERARCHICAL target writes into a
+/// foreign scope, but its RHS names are lexical to the WRITING scope. The
+/// simulator infers a resolution hint from the write target, so a bare RHS
+/// name colliding with a net INSIDE the target scope resolved target-first:
+/// a TB `assign dut.deep.rst_in = grst_l` silently read the DUT's own dead
+/// `grst_l` and forwarded x forever (while a sibling clock assign whose RHS
+/// had no deep twin worked — the asymmetry that hid this). Root-mark the
+/// RHS so its names resolve absolutely (top-level lexical names ARE the
+/// absolute names); anything unresolvable falls through to the normal path.
+fn root_mark_hier_ca_rhs(lhs: &Expression, rhs: &mut Expression) {
+    fn hier_lhs(e: &Expression) -> bool {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                h.path.len() > 1
+                    || h.path.first().is_some_and(|s| s.name.name.contains('.'))
+            }
+            // `tb.uut.u_core.sig = x` parses the LHS as a MemberAccess chain,
+            // not a multi-segment Ident.
+            ExprKind::MemberAccess { expr, .. }
+            | ExprKind::Index { expr, .. }
+            | ExprKind::RangeSelect { expr, .. } => hier_lhs(expr),
+            _ => false,
+        }
+    }
+    if hier_lhs(lhs) {
+        mark_actual_rooted(rhs);
     }
 }
 
