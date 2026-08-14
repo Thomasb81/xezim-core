@@ -200,6 +200,14 @@ pub struct ContinuousAssignment {
     pub lhs: Expression,
     pub rhs: Expression,
     pub delay: u64,
+    /// §23.3.3: this assign is an instance PORT CONNECTION emitted at
+    /// inline time — its RHS names live in the PARENT scope by
+    /// construction. The simulator must not apply the child scope hint to
+    /// them: an actual like `.d(d ^ 1)` whose operand shares the FORMAL's
+    /// name otherwise resolved to the child's own port net (`u1.d = u1.d
+    /// ^ 1`, a self-loop that read x forever).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub rhs_parent_scoped: bool,
 }
 
 /// IEEE 1800-2017 §29 User-Defined Primitive instance, flattened during
@@ -350,6 +358,10 @@ pub struct PendingContAssign {
 impl PendingAlways {
     /// Run the rewrite once and produce the owned AlwaysBlock. Drops self.
     pub fn materialize(self) -> AlwaysBlock {
+        if std::env::var("XZ_PEND_DBG").is_ok() {
+            eprintln!("[PEND-MAT] prefix={:?} keys={:?}", self.ctx.prefix,
+                self.ctx.port_map.keys().collect::<Vec<_>>());
+        }
         let stmt = rewrite_stmt(
             &self.source,
             &self.ctx.prefix,
@@ -414,7 +426,7 @@ impl PendingContAssign {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        ContinuousAssignment { lhs, rhs, delay: 0 }
+        ContinuousAssignment { lhs, rhs, delay: 0, rhs_parent_scoped: false }
     }
 }
 
@@ -4393,7 +4405,7 @@ pub fn elaborate_module_with_defs(
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: init_expr.clone(),
                                     delay: 0,
-                                });
+                                 rhs_parent_scoped: false, });
                             }
                             continue;
                         }
@@ -4600,7 +4612,7 @@ pub fn elaborate_module_with_defs(
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
                             delay: 0,
-                        });
+                         rhs_parent_scoped: false, });
                     }
                 }
             }
@@ -6562,7 +6574,7 @@ pub fn elaborate_module_with_defs(
                         rhs.clone()
                     };
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false });
                     }
                 }
             }
@@ -6578,6 +6590,9 @@ pub fn elaborate_module_with_defs(
                 // If this always block was inside a generate block, ac.gen_scope
                 // contains the generate block's scope name and should be included
                 // in the block's scope.
+                if std::env::var("XZ_PEND_DBG").is_ok() {
+                    eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
+                }
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: ac.gen_scope.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
@@ -6731,7 +6746,7 @@ pub fn elaborate_module_with_defs(
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
                         delay: 0,
-                    });
+                     rhs_parent_scoped: false, });
                 }
             }
             ModuleItem::ModuleInstantiation(inst) => {
@@ -6822,7 +6837,7 @@ pub fn elaborate_module_with_defs(
                         span,
                     };
                 }
-                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0 });
+                kept.push(ContinuousAssignment { lhs: make_ident_expr(&name), rhs: acc, delay: 0, rhs_parent_scoped: false });
             }
             elab.continuous_assigns = kept;
         }
@@ -9590,7 +9605,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
                             delay: 0,
-                        });
+                         rhs_parent_scoped: false, });
                     }
                 }
             }
@@ -9917,7 +9932,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         rhs.clone()
                     };
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
-                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay });
+                        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs: rhs_final, delay, rhs_parent_scoped: false });
                     }
                 }
             }
@@ -9926,6 +9941,9 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
             ModuleItem::AlwaysConstruct(ac) => {
                 // §21.2.1.7: include generate block scope in the instance path for %m.
+                if std::env::var("XZ_PEND_DBG").is_ok() {
+                    eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
+                }
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: ac.gen_scope.clone() });
             }
             ModuleItem::InitialConstruct(ic) => {
@@ -10078,7 +10096,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
                         delay: 0,
-                    });
+                     rhs_parent_scoped: false, });
                 }
             }
             ModuleItem::FunctionDeclaration(fd) => {
@@ -10942,6 +10960,8 @@ pub fn resolve_type_width(
             if dimensions.is_empty() { return 1; }
             let mut total = 1u64;
             let mut culprit: Option<String> = None;
+            let mut dims_desc = String::new();
+            let mut first_span: Option<u32> = None;
             for dim in dimensions {
                 if let PackedDimension::Range { left, right, .. } = dim {
                     let lv = const_eval_i64_with_params(left, params);
@@ -10951,9 +10971,24 @@ pub fn resolve_type_width(
                         if w > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
                             culprit = Some(describe_packed_range(left, right, l, r, params));
                         }
+                        dims_desc.push_str(&format!("[{}:{}]", l, r));
+                        if first_span.is_none() {
+                            first_span = Some(left.span.start as u32);
+                        }
                         total = total.saturating_mul(w);
                     }
                 }
+            }
+            // A PRODUCT of sane dims can still exceed the cap
+            // (`[2047:0][2047:0]`); name the dims and the source byte offset
+            // so the offending declaration is findable (grep the
+            // --dump-merged-sv output at that offset).
+            if total > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
+                culprit = Some(format!(
+                    "dims {} at byte {}",
+                    dims_desc,
+                    first_span.unwrap_or(0)
+                ));
             }
             clamp_packed_width(total, "IntegerVector", culprit.as_deref().unwrap_or(""))
         }
@@ -11015,7 +11050,11 @@ pub fn resolve_type_width(
                         }
                     }
                 }
-                base_width = clamp_packed_width(total, "TypeReference", "");
+                let detail = format!(
+                    "type '{}' at byte {}",
+                    name.name.name, name.span.start
+                );
+                base_width = clamp_packed_width(total, "TypeReference", &detail);
             }
             if traced {
                 type_trace(
@@ -17822,7 +17861,7 @@ fn inline_module_items(
                             lhs: clk_out_expr,
                             rhs: clk_in_expr,
                             delay: 0,
-                        });
+                         rhs_parent_scoped: false, });
                         continue;
                     }
                 }
@@ -19609,6 +19648,7 @@ fn inline_module_items(
                                         lhs: sub_expr,
                                         rhs: parent_elem,
                                         delay: 0,
+                                        rhs_parent_scoped: true,
                                     });
                                 }
                                 Some(PortDirection::Output) => {
@@ -19616,6 +19656,7 @@ fn inline_module_items(
                                         lhs: parent_elem,
                                         rhs: sub_expr,
                                         delay: 0,
+                                        rhs_parent_scoped: false,
                                     });
                                 }
                                 _ => {}
@@ -19675,15 +19716,17 @@ fn inline_module_items(
                             }
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: sub_expr, rhs, delay: 0,
+                                rhs_parent_scoped: true,
                             });
                         }
                         Some(PortDirection::Output) => {                            elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: parent_expr.clone(), rhs: sub_expr, delay: 0,
-                            });
+                             rhs_parent_scoped: false, });
                         }
                         _ => {
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 lhs: sub_expr, rhs: parent_expr.clone(), delay: 0,
+                                rhs_parent_scoped: true,
                             });
                         }
                     }
@@ -20131,7 +20174,7 @@ fn inline_module_items(
                                 lhs,
                                 rhs,
                                 delay: 0,
-                            });
+                             rhs_parent_scoped: false, });
                         }
                     }
                     if matches!(sub_item, ModuleItem::AlwaysConstruct(_)) {
@@ -21414,7 +21457,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 (None, Some(wk)) => wk,
                 (None, None) => make_z_expr(span),
             };
-            elab.continuous_assigns.push(ContinuousAssignment { lhs: acc.lhs, rhs, delay: acc.delay });
+            elab.continuous_assigns.push(ContinuousAssignment { lhs: acc.lhs, rhs, delay: acc.delay, rhs_parent_scoped: false });
         }
     }
 }
@@ -21490,12 +21533,12 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
                 span,
             ),
             delay: 0,
-        });
+         rhs_parent_scoped: false, });
         elab.continuous_assigns.push(ContinuousAssignment {
             lhs: term_b,
             rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
             delay: 0,
-        });
+         rhs_parent_scoped: false, });
     }
 }
 
@@ -21576,7 +21619,7 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
                 }
             }
         }
-        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay });
+        elab.continuous_assigns.push(ContinuousAssignment { lhs: lhs.clone(), rhs, delay, rhs_parent_scoped: false });
     }
 }
 
@@ -21805,7 +21848,7 @@ pub fn whole_array_assign_parts(
                 lhs: make_index_expr(ln, llo + k),
                 rhs: make_index_expr(rn, rlo + k),
                 delay,
-            })
+             rhs_parent_scoped: false, })
             .collect(),
     )
 }
