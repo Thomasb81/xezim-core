@@ -101,6 +101,60 @@ impl Parser {
         imports
     }
 
+    /// §16.5/§16.6: consume an SVA property/sequence port list and return
+    /// the FORMAL NAMES in declaration order. Each top-level comma-separated
+    /// segment may carry `local`/direction keywords, a type, and a default
+    /// (`= expr`); the port name is the last identifier before the default
+    /// (or before the segment end). Called with the cursor ON the `(`.
+    fn parse_sva_port_names(&mut self) -> Vec<Identifier> {
+        let mut ports: Vec<Identifier> = Vec::new();
+        self.bump(); // (
+        let mut depth: i32 = 1;
+        let mut last_ident: Option<Identifier> = None;
+        let mut in_default = false;
+        while depth > 0 && !self.at(TokenKind::Eof) {
+            match self.current_kind() {
+                TokenKind::LParen | TokenKind::LBracket => {
+                    depth += 1;
+                    self.bump();
+                }
+                TokenKind::RParen | TokenKind::RBracket => {
+                    depth -= 1;
+                    if depth == 0 {
+                        if let Some(id) = last_ident.take() {
+                            ports.push(id);
+                        }
+                    }
+                    self.bump();
+                }
+                TokenKind::Comma if depth == 1 => {
+                    if let Some(id) = last_ident.take() {
+                        ports.push(id);
+                    }
+                    in_default = false;
+                    self.bump();
+                }
+                TokenKind::Assign if depth == 1 => {
+                    // default value: the name is already in last_ident;
+                    // idents inside the default must not overwrite it.
+                    in_default = true;
+                    self.bump();
+                }
+                TokenKind::Identifier | TokenKind::EscapedIdentifier => {
+                    if !in_default {
+                        last_ident = Some(self.parse_identifier());
+                    } else {
+                        self.bump();
+                    }
+                }
+                _ => {
+                    self.bump();
+                }
+            }
+        }
+        ports
+    }
+
     pub(super) fn parse_package_declaration(&mut self) -> PackageDeclaration {
         let start = self.current().span.start;
         self.expect(TokenKind::KwPackage);
@@ -840,7 +894,11 @@ impl Parser {
             TokenKind::KwProperty => {
                 let start = self.current().span.start; self.bump();
                 let name = self.parse_identifier();
-                if self.at(TokenKind::LParen) { self.bump(); while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) { self.bump(); } self.expect(TokenKind::RParen); }
+                let ports = if self.at(TokenKind::LParen) {
+                    self.parse_sva_port_names()
+                } else {
+                    Vec::new()
+                };
                 self.expect(TokenKind::Semicolon);
                 // LRM §16.6 — capture the property body when it matches
                 // the common `@(<event>) <expr>;` shape. Re-uses the
@@ -901,12 +959,16 @@ impl Parser {
                 self.expect(TokenKind::KwEndproperty);
                 let endlabel = self.parse_end_label();
                 let items = Vec::new();
-                Some(ModuleItem::PropertyDeclaration(PropertyDeclaration { name, items, body: body_expr, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::PropertyDeclaration(PropertyDeclaration { name, ports, items, body: body_expr, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwSequence => {
                 let start = self.current().span.start; self.bump();
                 let name = self.parse_identifier();
-                if self.at(TokenKind::LParen) { self.bump(); while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) { self.bump(); } self.expect(TokenKind::RParen); }
+                let ports = if self.at(TokenKind::LParen) {
+                    self.parse_sva_port_names()
+                } else {
+                    Vec::new()
+                };
                 self.expect(TokenKind::Semicolon);
                 // LRM §16.5 — capture the sequence body when it matches
                 // the common `@(<event>) <expr>;` shape, mirroring the
@@ -944,7 +1006,7 @@ impl Parser {
                 self.expect(TokenKind::KwEndsequence);
                 let endlabel = self.parse_end_label();
                 let items = Vec::new();
-                Some(ModuleItem::SequenceDeclaration(SequenceDeclaration { name, items, body: body_expr, endlabel, span: self.span_from(start) }))
+                Some(ModuleItem::SequenceDeclaration(SequenceDeclaration { name, ports, items, body: body_expr, endlabel, span: self.span_from(start) }))
             }
             TokenKind::KwCovergroup => {
                 Some(ModuleItem::CovergroupDeclaration(self.parse_covergroup_declaration()))

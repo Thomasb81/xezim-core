@@ -1486,6 +1486,10 @@ pub struct ElaboratedModule {
     /// parser). Used by `assert property (p_name)` to inline the body.
     #[serde(default)]
     pub property_decls: HashMap<String, crate::ast::expr::Expression>,
+    /// §16.6: formal port NAMES of each named property/sequence, keyed like
+    /// `property_decls`. Empty vec for portless declarations.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub property_params: HashMap<String, Vec<String>>,
     /// LRM §8.4: for an array-of-class-handles (`T arr[N]`,
     /// `T arr[];`), record the element's class name so runtime
     /// `arr[i] = new(...)` can construct an instance of that class.
@@ -1840,6 +1844,7 @@ impl ElaboratedModule {
             interfaces: HashSet::default(),
             checker_decls: HashMap::default(),
             property_decls: HashMap::default(),
+            property_params: HashMap::default(),
             array_elem_class: HashMap::default(),
             assoc_key_type_names: HashMap::default(),
             arrays_nd: HashMap::default(),
@@ -2393,6 +2398,42 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
     // resolved against that 0 until the import path healed it, too late for
     // module signal widths. Same registration shape as the import path
     // (bare or_insert + qualified insert), so ordering can't change outcomes.
+    // §26.2: hoist package-scope named properties/sequences into the same
+    // maps a module-level declaration populates, so an importing module's
+    // `assert property (p(...))` resolves them.
+    for p in &pkgs {
+        for item in &p.items {
+            match item {
+                crate::ast::decl::PackageItem::Property(pd) => {
+                    elab.sequences.insert(pd.name.name.clone());
+                    if let Some(body) = &pd.body {
+                        elab.property_decls
+                            .entry(pd.name.name.clone())
+                            .or_insert_with(|| body.clone());
+                        elab.property_params
+                            .entry(pd.name.name.clone())
+                            .or_insert_with(|| {
+                                pd.ports.iter().map(|p| p.name.clone()).collect()
+                            });
+                    }
+                }
+                crate::ast::decl::PackageItem::Sequence(sd) => {
+                    elab.sequences.insert(sd.name.name.clone());
+                    if let Some(body) = &sd.body {
+                        elab.property_decls
+                            .entry(sd.name.name.clone())
+                            .or_insert_with(|| body.clone());
+                        elab.property_params
+                            .entry(sd.name.name.clone())
+                            .or_insert_with(|| {
+                                sd.ports.iter().map(|p| p.name.clone()).collect()
+                            });
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
     for p in &pkgs {
         for item in &p.items {
             let crate::ast::decl::PackageItem::Function(f) = item else { continue };
@@ -6643,6 +6684,10 @@ pub fn elaborate_module_with_defs(
                     // `assert property (s)` style references.
                     elab.property_decls
                         .insert(sd.name.name.clone(), body.clone());
+                    elab.property_params.insert(
+                        sd.name.name.clone(),
+                        sd.ports.iter().map(|p| p.name.clone()).collect(),
+                    );
                 }
             }
             ModuleItem::PropertyDeclaration(pd) => {
@@ -6650,6 +6695,10 @@ pub fn elaborate_module_with_defs(
                 if let Some(body) = &pd.body {
                     elab.property_decls
                         .insert(pd.name.name.clone(), body.clone());
+                    elab.property_params.insert(
+                        pd.name.name.clone(),
+                        pd.ports.iter().map(|p| p.name.clone()).collect(),
+                    );
                 }
             }
             // LRM §17.2 — register the checker name and store its
@@ -9987,6 +10036,10 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                     // `assert property (s)` style references.
                     elab.property_decls
                         .insert(sd.name.name.clone(), body.clone());
+                    elab.property_params.insert(
+                        sd.name.name.clone(),
+                        sd.ports.iter().map(|p| p.name.clone()).collect(),
+                    );
                 }
             }
             ModuleItem::PropertyDeclaration(pd) => {
@@ -9994,6 +10047,10 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 if let Some(body) = &pd.body {
                     elab.property_decls
                         .insert(pd.name.name.clone(), body.clone());
+                    elab.property_params.insert(
+                        pd.name.name.clone(),
+                        pd.ports.iter().map(|p| p.name.clone()).collect(),
+                    );
                 }
             }
             // LRM §17 — register the checker name AND inline its body
@@ -21806,7 +21863,7 @@ fn whole_net_ident_name(expr: &Expression) -> Option<String> {
     }
 }
 
-fn rewrite_expr(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {
+pub fn rewrite_expr(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {
     rewrite_expr_impl(expr, prefix, port_map, local_names, interface_map)
 }
 

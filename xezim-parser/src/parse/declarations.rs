@@ -871,6 +871,21 @@ impl Parser {
                     Some(PackageItem::Let(l))
                 } else { None }
             }
+            // §26.2: named property / sequence declarations at package
+            // scope. Without these arms `property` was read as a type name
+            // and every token after it derailed the whole package.
+            TokenKind::KwProperty => {
+                match self.parse_module_item() {
+                    Some(ModuleItem::PropertyDeclaration(pd)) => Some(PackageItem::Property(pd)),
+                    _ => Some(PackageItem::Null),
+                }
+            }
+            TokenKind::KwSequence => {
+                match self.parse_module_item() {
+                    Some(ModuleItem::SequenceDeclaration(sd)) => Some(PackageItem::Sequence(sd)),
+                    _ => Some(PackageItem::Null),
+                }
+            }
             TokenKind::KwNettype => {
                 if let Some(ModuleItem::NettypeDeclaration(n)) = self.parse_module_item() {
                     Some(PackageItem::Nettype(n))

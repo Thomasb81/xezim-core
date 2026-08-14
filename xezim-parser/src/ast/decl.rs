@@ -397,6 +397,10 @@ pub struct CrossBin {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct PropertyDeclaration {
     pub name: Identifier,
+    /// §16.6 formal port names, in declaration order. Captured so
+    /// `assert property (p(actuals))` can substitute formals→actuals.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ports: Vec<Identifier>,
     pub items: Vec<super::stmt::Statement>, // Approximate property body as statements for parsing
     /// LRM §16.6 property body, captured when it matches the common
     /// `@(clk_event) <expr>` shape. Used by `assert property (p_name)`
@@ -414,6 +418,10 @@ pub struct PropertyDeclaration {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SequenceDeclaration {
     pub name: Identifier,
+    /// §16.5 formal port names, in declaration order (see
+    /// PropertyDeclaration::ports).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub ports: Vec<Identifier>,
     pub items: Vec<super::stmt::Statement>, // Approximate sequence body as statements
     /// LRM §16.5 — sequence body when it matches the common
     /// `@(clk) <expr>` shape (an `SvaClocked` wrapper). Used for
@@ -1002,6 +1010,11 @@ pub enum PackageItem {
     Checker(CheckerDeclaration),
     Let(LetDeclaration),
     Nettype(NettypeDeclaration),
+    /// §26.2: package_item includes concurrent_assertion_item_declaration,
+    /// so a package may declare named properties/sequences (hoisted into
+    /// importing modules like package subroutines are).
+    Property(PropertyDeclaration),
+    Sequence(SequenceDeclaration),
     /// Placeholder for package items that the parser consumed but does not
     /// model (e.g. non-DPI `export pkg::*;` re-exports). Lets
     /// `parse_package_declaration`'s item loop consume them without falling
