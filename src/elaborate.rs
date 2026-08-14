@@ -4617,6 +4617,20 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                // Beyond-cap declarations referenced nowhere are elided (see
+                // filter_dead_giant_declarators): no phantom allocation, no
+                // width-cap warning — matching the reference's silent DCE.
+                let dd_filtered;
+                let dd = match filter_dead_giant_declarators(dd, &elab, all_defs) {
+                    Some(f) => {
+                        dd_filtered = f;
+                        &dd_filtered
+                    }
+                    None => dd,
+                };
+                if dd.declarators.is_empty() {
+                    continue;
+                }
                 // Anonymous enum on a variable decl
                 // (`enum logic { A, B } var_name;`): the typedef path
                 // registers member constants, but the bare variable form
@@ -9610,6 +9624,18 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 }
             }
             ModuleItem::DataDeclaration(dd) => {
+                // See the main-path arm: beyond-cap dead declarations elide.
+                let dd_filtered;
+                let dd = match filter_dead_giant_declarators(dd, elab, all_defs) {
+                    Some(f) => {
+                        dd_filtered = f;
+                        &dd_filtered
+                    }
+                    None => dd,
+                };
+                if dd.declarators.is_empty() {
+                    continue;
+                }
                 register_anonymous_enum_members(&dd.data_type, elab);
                 // Packed multi-D (`logic [N-1:0][W-1:0] mem;`) — record the
                 // per-element width under the bare declarator name so
@@ -10473,12 +10499,177 @@ pub const SANE_MAX_PACKED_WIDTH: u32 = 1 << 20;
 /// config the const-evaluator could not resolve, but free.
 const UNDERFLOW_WIDTH_PLACEHOLDER: u32 = 1;
 
+
+/// Quiet width probe for the dead-declaration elision below: mirrors
+/// `resolve_type_width`'s IntegerVector/TypeReference math WITHOUT the
+/// clamp-and-warn side effects. Unresolvable dimensions yield 0 ("don't
+/// know" — never elide on a guess).
+fn quiet_packed_width_probe(
+    dt: &DataType,
+    params: &HashMap<String, Value>,
+    typedef_widths: &HashMap<String, u32>,
+) -> u64 {
+    let dims_product = |dims: &[PackedDimension]| -> Option<u64> {
+        let mut total = 1u64;
+        for dim in dims {
+            let PackedDimension::Range { left, right, .. } = dim else {
+                return None;
+            };
+            let l = const_eval_i64_with_params(left, Some(params))?;
+            let r = const_eval_i64_with_params(right, Some(params))?;
+            total = total.saturating_mul(((l - r).abs() + 1) as u64);
+        }
+        Some(total)
+    };
+    match dt {
+        DataType::IntegerVector { dimensions, .. } => {
+            if dimensions.is_empty() {
+                return 1;
+            }
+            dims_product(dimensions).unwrap_or(0)
+        }
+        DataType::TypeReference { name, dimensions, .. } => {
+            let base = name
+                .scope
+                .as_ref()
+                .and_then(|sc| typedef_widths.get(&format!("{}::{}", sc.name, name.name.name)))
+                .copied()
+                .or_else(|| typedef_widths.get(&name.name.name).copied())
+                .unwrap_or(0) as u64;
+            if base == 0 {
+                return 0;
+            }
+            match dims_product(dimensions) {
+                Some(p) => base.saturating_mul(p),
+                None => 0,
+            }
+        }
+        _ => 0,
+    }
+}
+
+/// Serialize every definition's AST for the byte-level reference probe. A
+/// genuine reference to a name — expression ident, hierarchical segment,
+/// port connection, even a DPI/`uvm_hdl` path STRING — necessarily carries
+/// the name's exact bytes in this stream, so an occurrence count of ONE
+/// (the declarator itself) proves the declaration dead. Substring
+/// collisions only inflate the count, which merely KEEPS a dead variable —
+/// the safe direction. Only runs for beyond-cap declarations, so ordinary
+/// designs never pay for it.
+fn design_ast_blob(all_defs: &HashMap<String, Definition>) -> Vec<u8> {
+    let mut blob: Vec<u8> = Vec::new();
+    for def in all_defs.values() {
+        let bytes = match def {
+            Definition::Module(m) => bincode::serialize(m),
+            Definition::Interface(i) => bincode::serialize(i),
+            Definition::Program(p) => bincode::serialize(p),
+            Definition::Class(c) => bincode::serialize(c),
+            Definition::Covergroup(cg) => bincode::serialize(cg),
+            Definition::Package(p) => bincode::serialize(p),
+            Definition::Typedef(t) => bincode::serialize(t),
+            Definition::Udp(u) => bincode::serialize(u),
+        };
+        if let Ok(b) = bytes {
+            blob.extend_from_slice(&b);
+        }
+    }
+    blob
+}
+
+fn count_byte_occurrences(blob: &[u8], needle: &[u8]) -> usize {
+    if needle.is_empty() || blob.len() < needle.len() {
+        return 0;
+    }
+    let mut n = 0usize;
+    let mut i = 0usize;
+    while i + needle.len() <= blob.len() {
+        if &blob[i..i + needle.len()] == needle {
+            n += 1;
+            i += needle.len();
+        } else {
+            i += 1;
+        }
+    }
+    n
+}
+
+/// Over-cap dead-declaration elision: the reference simulator silently
+/// drops variables referenced nowhere, so a leftover multi-megabit debug
+/// array (a real customer-BFM pattern) neither warns nor allocates there.
+/// Returns Some(filtered copy) when at least one declarator was elided.
+/// Guards: packed width beyond `SANE_MAX_PACKED_WIDTH` (probed QUIETLY, so
+/// the kept path still warns exactly as before), no initializer, no
+/// unpacked dimensions, and the name's serialized-AST occurrence count is
+/// exactly the declarator itself.
+fn filter_dead_giant_declarators(
+    dd: &crate::ast::decl::DataDeclaration,
+    elab: &ElaboratedModule,
+    all_defs: Option<&HashMap<String, Definition>>,
+) -> Option<crate::ast::decl::DataDeclaration> {
+    let Some(defs) = all_defs else { return None };
+    let w = quiet_packed_width_probe(&dd.data_type, &elab.parameters, &elab.typedefs);
+    if w <= SANE_MAX_PACKED_WIDTH as u64 {
+        return None;
+    }
+    let candidates: Vec<usize> = dd
+        .declarators
+        .iter()
+        .enumerate()
+        .filter(|(_, d)| d.init.is_none() && d.dimensions.is_empty())
+        .map(|(i, _)| i)
+        .collect();
+    if candidates.is_empty() {
+        return None;
+    }
+    let blob = design_ast_blob(defs);
+    let mut elide: Vec<usize> = Vec::new();
+    for &i in &candidates {
+        let name = &dd.declarators[i].name.name;
+        if count_byte_occurrences(&blob, name.as_bytes()) == 1 {
+            crate::elab_diag(format!(
+                "[xezim][note] eliding dead {}-bit declaration '{}' (referenced \
+                 nowhere in the design; commercial simulators drop it silently)",
+                w, name
+            ));
+            elide.push(i);
+        }
+    }
+    if elide.is_empty() {
+        return None;
+    }
+    let mut filtered = dd.clone();
+    let mut idx = 0usize;
+    filtered.declarators.retain(|_| {
+        let keep = !elide.contains(&idx);
+        idx += 1;
+        keep
+    });
+    Some(filtered)
+}
+
 /// Combine packed-dimension widths with saturating math and clamp the result to
 /// `SANE_MAX_PACKED_WIDTH`, warning once PER DISTINCT DETAIL when an absurd
 /// width is suppressed. `detail` carries whatever identity the call site can
 /// cheaply assemble (offending range bounds, parameter names + resolved
 /// values, source byte offset) so the user can find the declaration — a bare
 /// "somewhere a width underflowed" was unactionable on customer designs.
+thread_local! {
+    /// Pre-elaboration scans (xezim's should-fail lint) resolve widths on the
+    /// RAW AST — before dead-declaration elision has decided anything — so
+    /// their clamp calls must not emit user-facing warnings. Elaboration
+    /// proper re-resolves every KEPT declaration and warns there.
+    static SUPPRESS_WIDTH_WARNINGS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Scoped suppression of `clamp_packed_width` warnings (clamping itself is
+/// unaffected). Used by pre-elaboration width scans; see the thread-local.
+pub fn with_width_warnings_suppressed<R>(f: impl FnOnce() -> R) -> R {
+    SUPPRESS_WIDTH_WARNINGS.with(|c| c.set(true));
+    let r = f();
+    SUPPRESS_WIDTH_WARNINGS.with(|c| c.set(false));
+    r
+}
+
 fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
     if w > SANE_MAX_PACKED_WIDTH as u64 {
         use std::sync::{Mutex, OnceLock};
@@ -10507,6 +10698,9 @@ fn clamp_packed_width(w: u64, ctx: &str, detail: &str) -> u32 {
         } else {
             SANE_MAX_PACKED_WIDTH
         };
+        if SUPPRESS_WIDTH_WARNINGS.with(|c| c.get()) {
+            return replacement;
+        }
         let key = format!("{}|{}", ctx, detail);
         if seen.lock().map(|mut g| g.insert(key)).unwrap_or(false) {
             let detail_part = if detail.is_empty() {
