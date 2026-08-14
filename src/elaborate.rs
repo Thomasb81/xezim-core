@@ -17719,7 +17719,13 @@ fn inline_module_items(
                             if let PortConnection::Named { name, expr, implicit } = conn {
                                 explicit.insert(name.name.clone());
                                 if let Some(e) = expr {
-                                    let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    let mut rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    // Whole-net identity actuals keep the plain
+                                    // substitution machinery (port_aliases &
+                                    // friends key on un-rooted idents).
+                                    if whole_net_ident_name(&rewritten_e).is_none() {
+                                        mark_actual_rooted(&mut rewritten_e);
+                                    }
                                     if sub_iface_ports.contains(&name.name) {
                                         if let Some(if_full_path) =
                                             iface_conn_path(&rewritten_e, local_params, definitions)
@@ -17772,7 +17778,11 @@ fn inline_module_items(
                         for (i, conn) in hi.connections.iter().enumerate() {
                             if let PortConnection::Ordered(expr) = conn {
                                 if let Some(e) = expr {
-                                    let rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    let mut rewritten_e = rewrite_expr(e, prefix, &HashMap::default(), parent_local_names, interface_map);
+                                    // See the named-connection site above.
+                                    if whole_net_ident_name(&rewritten_e).is_none() {
+                                        mark_actual_rooted(&mut rewritten_e);
+                                    }
                                     if let Some(port) = sub_mod.ports().get(i) {
                                         let port_name = port.name();
                                         if sub_iface_ports.contains(port_name) {
@@ -21908,6 +21918,83 @@ fn whole_net_ident_name(expr: &Expression) -> Option<String> {
 
 pub fn rewrite_expr(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {
     rewrite_expr_impl(expr, prefix, port_map, local_names, interface_map)
+}
+
+/// Mark every identifier in an EXPRESSION port actual as parent-rooted
+/// (`root = Some("$root")`). The actual's names were rewritten in the parent's
+/// context; once the expression is pasted into the CHILD's body by port-map
+/// substitution, its bare idents would otherwise re-resolve child-first under
+/// the child's scope hint — `.d(d ^ 1)` with a child port also named `d` read
+/// the child's own `u1.d` and applied the map to its own output (issue #48).
+/// A rooted ident is skipped by `rewrite_expr_impl` (no re-prefixing, no
+/// re-substitution) and resolved absolutely by the simulator.
+fn mark_actual_rooted(e: &mut Expression) {
+    match &mut e.kind {
+        ExprKind::Ident(h) => {
+            if h.root.is_none() {
+                h.root = Some("$root".to_string());
+            }
+            for seg in &mut h.path {
+                for sel in &mut seg.selects {
+                    mark_actual_rooted(sel);
+                }
+            }
+        }
+        ExprKind::Binary { left, right, .. } => {
+            mark_actual_rooted(left);
+            mark_actual_rooted(right);
+        }
+        ExprKind::Unary { operand, .. } => mark_actual_rooted(operand),
+        ExprKind::Conditional { condition, then_expr, else_expr } => {
+            mark_actual_rooted(condition);
+            mark_actual_rooted(then_expr);
+            mark_actual_rooted(else_expr);
+        }
+        ExprKind::Paren(inner) => mark_actual_rooted(inner),
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                mark_actual_rooted(p);
+            }
+        }
+        ExprKind::Replication { count, exprs } => {
+            mark_actual_rooted(count);
+            for p in exprs {
+                mark_actual_rooted(p);
+            }
+        }
+        ExprKind::Call { func, args } => {
+            // The callee name is not a net reference — leave it resolvable
+            // through the normal function tables; its selects/args are values.
+            if let ExprKind::Ident(h) = &mut func.kind {
+                for seg in &mut h.path {
+                    for sel in &mut seg.selects {
+                        mark_actual_rooted(sel);
+                    }
+                }
+            } else {
+                mark_actual_rooted(func);
+            }
+            for a in args {
+                mark_actual_rooted(a);
+            }
+        }
+        ExprKind::SystemCall { args, .. } => {
+            for a in args {
+                mark_actual_rooted(a);
+            }
+        }
+        ExprKind::Index { expr, index } => {
+            mark_actual_rooted(expr);
+            mark_actual_rooted(index);
+        }
+        ExprKind::RangeSelect { expr, left, right, .. } => {
+            mark_actual_rooted(expr);
+            mark_actual_rooted(left);
+            mark_actual_rooted(right);
+        }
+        ExprKind::MemberAccess { expr, .. } => mark_actual_rooted(expr),
+        _ => {}
+    }
 }
 
 fn rewrite_expr_impl(expr: &Expression, prefix: &str, port_map: &HashMap<String, Expression>, local_names: &std::collections::HashSet<String>, interface_map: &HashMap<String, String>) -> Expression {
