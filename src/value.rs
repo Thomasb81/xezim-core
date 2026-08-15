@@ -615,6 +615,178 @@ impl Value {
     }
 
     #[inline(always)]
+    /// (value, xz) bits of the ≤64-bit slice `[lo +: w]`, SWAR-chunked over
+    /// the repr(u8) Wide layout (val bit = code bit0, xz bit = code bit1).
+    /// Out-of-range positions read 0/0 — callers bound `lo..lo+w` themselves
+    /// or treat the zeros as their existing get_bit loop did.
+    pub fn slice_bits_swar(&self, lo: usize, w: usize) -> (u64, u64) {
+        let w = w.min(64);
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let mask = if w >= 64 { u64::MAX } else { (1u64 << w) - 1 };
+                ((val_bits >> lo) & mask, (xz_bits >> lo) & mask)
+            }
+            ValueStorage::Wide(bits) => {
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(bits.as_ptr() as *const u8, bits.len())
+                };
+                if lo >= bytes.len() {
+                    return (0, 0);
+                }
+                let end = (lo + w).min(bytes.len());
+                let mut rv = 0u64;
+                let mut rx = 0u64;
+                let mut off = lo;
+                let mut out = 0usize;
+                while off < end {
+                    let take = (end - off).min(8);
+                    let mut c8 = [0u8; 8];
+                    c8[..take].copy_from_slice(&bytes[off..off + take]);
+                    let x = u64::from_le_bytes(c8);
+                    let val = (x & 0x0101_0101_0101_0101)
+                        .wrapping_mul(0x0102_0408_1020_4080)
+                        >> 56;
+                    let xz = ((x >> 1) & 0x0101_0101_0101_0101)
+                        .wrapping_mul(0x0102_0408_1020_4080)
+                        >> 56;
+                    rv |= val << out;
+                    rx |= xz << out;
+                    off += take;
+                    out += take;
+                }
+                (rv, rx)
+            }
+        }
+    }
+
+    /// Two-state word extraction for widths ≤ 128 (P5 wide islands):
+    /// fills `v` with the value bits and returns true iff the value is
+    /// X/Z-free (and representable: not fill, not real). The word layout is
+    /// little-endian: v[0] = bits 63..0, v[1] = bits 127..64.
+    pub fn words128_if_clean(&self, v: &mut [u64; 2]) -> bool {
+        if self.is_fill || self.is_real || self.width > 128 {
+            return false;
+        }
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                if *xz_bits != 0 {
+                    return false;
+                }
+                v[0] = *val_bits;
+                v[1] = 0;
+                true
+            }
+            ValueStorage::Wide(bits) => {
+                // SWAR over the repr(u8) byte layout (see LogicBit): 8 bits
+                // per u64 chunk. Any X/Z byte (code >= 2) fails the clean
+                // check; the multiply gathers each byte's low bit into the
+                // top byte (unique power per output bit, no carries).
+                let bytes: &[u8] = unsafe {
+                    std::slice::from_raw_parts(bits.as_ptr() as *const u8, bits.len())
+                };
+                let mut w = [0u64; 2];
+                for (ci, chunk) in bytes.chunks(8).enumerate().take(16) {
+                    let mut c8 = [0u8; 8];
+                    c8[..chunk.len()].copy_from_slice(chunk);
+                    let x = u64::from_le_bytes(c8);
+                    if x & !0x0101_0101_0101_0101u64 != 0 {
+                        return false;
+                    }
+                    let packed = x.wrapping_mul(0x0102_0408_1020_4080u64) >> 56;
+                    w[ci >> 3] |= packed << ((ci & 7) * 8);
+                }
+                *v = w;
+                true
+            }
+        }
+    }
+
+    /// Two-state word writeback for widths ≤ 128 (P5 wide islands): sets the
+    /// value to exactly `v` (X/Z cleared) at the CURRENT width, preserving
+    /// the storage kind. Returns true when the stored value CHANGED. Bits of
+    /// `v` above the width must already be masked by the caller.
+    pub fn set_words128(&mut self, v: [u64; 2]) -> bool {
+        match &mut self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let changed = *val_bits != v[0] || *xz_bits != 0;
+                *val_bits = v[0];
+                *xz_bits = 0;
+                changed
+            }
+            ValueStorage::Wide(bits) => {
+                // Chunked expansion via a 256-entry LUT (bit i of the index
+                // becomes byte i, 0 or 1) — one u64 compare + store per 8
+                // bits instead of a byte loop.
+                const fn build_expand() -> [u64; 256] {
+                    let mut t = [0u64; 256];
+                    let mut b = 0usize;
+                    while b < 256 {
+                        let mut w = 0u64;
+                        let mut i = 0;
+                        while i < 8 {
+                            if (b >> i) & 1 != 0 {
+                                w |= 1u64 << (i * 8);
+                            }
+                            i += 1;
+                        }
+                        t[b] = w;
+                        b += 1;
+                    }
+                    t
+                }
+                static EXPAND: [u64; 256] = build_expand();
+                let n = bits.len().min(128);
+                let bytes: &mut [u8] = unsafe {
+                    std::slice::from_raw_parts_mut(bits.as_mut_ptr() as *mut u8, bits.len())
+                };
+                let mut changed = false;
+                let mut ci = 0usize;
+                let mut off = 0usize;
+                while off + 8 <= n {
+                    let want = EXPAND[((v[ci >> 3] >> ((ci & 7) * 8)) & 0xFF) as usize];
+                    let mut c8 = [0u8; 8];
+                    c8.copy_from_slice(&bytes[off..off + 8]);
+                    if u64::from_le_bytes(c8) != want {
+                        bytes[off..off + 8].copy_from_slice(&want.to_le_bytes());
+                        changed = true;
+                    }
+                    ci += 1;
+                    off += 8;
+                }
+                while off < n {
+                    let nb = ((v[off >> 6] >> (off & 63)) & 1) as u8;
+                    if bytes[off] != nb {
+                        bytes[off] = nb;
+                        changed = true;
+                    }
+                    off += 1;
+                }
+                changed
+            }
+        }
+    }
+
+    /// Construct a two-state value of `width` (65..=128 uses Wide storage)
+    /// from little-endian words. Bits above `width` must be pre-masked.
+    pub fn from_words128(v: [u64; 2], width: u32) -> Value {
+        if width <= 64 {
+            return Value::from_u64(v[0], width);
+        }
+        let mut bits = vec![LogicBit::Zero; width as usize];
+        for (i, b) in bits.iter_mut().enumerate() {
+            if (v[i >> 6] >> (i & 63)) & 1 != 0 {
+                *b = LogicBit::One;
+            }
+        }
+        Value {
+            storage: ValueStorage::Wide(bits),
+            width,
+            is_signed: false,
+            is_real: false,
+            is_fill: false,
+        }
+    }
+
     pub fn has_xz(&self) -> bool {
         match &self.storage {
             ValueStorage::Inline { xz_bits, .. } => *xz_bits != 0,
