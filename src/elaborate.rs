@@ -353,6 +353,12 @@ pub struct PendingContAssign {
     pub lhs_source: std::rc::Rc<Expression>,
     pub rhs_source: std::rc::Rc<Expression>,
     pub ctx: std::rc::Rc<RewriteCtx>,
+    /// `assign #N ...` delay expression, unevaluated: parameters it names
+    /// resolve per-instance, so it is rewritten with `ctx` and evaluated at
+    /// materialize time against the flattened parameter table. Dropping it
+    /// (the old behavior) silently ran every inlined delayed assign with
+    /// zero delay — a `#3` clock echo inside a DUT tracked undelayed.
+    pub delay_source: Option<std::rc::Rc<Expression>>,
 }
 
 impl PendingAlways {
@@ -411,7 +417,7 @@ impl PendingInitial {
 }
 
 impl PendingContAssign {
-    pub fn materialize(self) -> ContinuousAssignment {
+    pub fn materialize(self, params: &HashMap<String, Value>) -> ContinuousAssignment {
         let lhs = rewrite_expr(
             &self.lhs_source,
             &self.ctx.prefix,
@@ -426,7 +432,21 @@ impl PendingContAssign {
             &self.ctx.local_names,
             &self.ctx.interface_map,
         );
-        ContinuousAssignment { lhs, rhs, delay: 0, rhs_parent_scoped: false }
+        let delay = self
+            .delay_source
+            .as_ref()
+            .map(|d| {
+                let d = rewrite_expr(
+                    d,
+                    &self.ctx.prefix,
+                    &self.ctx.port_map,
+                    &self.ctx.local_names,
+                    &self.ctx.interface_map,
+                );
+                eval_const_expr(&d, params)
+            })
+            .unwrap_or(0);
+        ContinuousAssignment { lhs, rhs, delay, rhs_parent_scoped: false }
     }
 }
 
@@ -1907,7 +1927,7 @@ impl ElaboratedModule {
         }
         let pending_ca = std::mem::take(&mut self.pending_cont_assign);
         for p in pending_ca {
-            let ca = p.materialize();
+            let ca = p.materialize(&self.parameters);
             // A sub-module's `assign dst = src;` between unpacked arrays
             // arrives here (inlined bodies bypass the ModuleItem path), so it
             // needs the same per-element expansion — otherwise an array OUTPUT
@@ -1938,7 +1958,7 @@ impl ElaboratedModule {
     pub fn drain_pending_cont_assign_for_each<F: FnMut(ContinuousAssignment)>(&mut self, mut f: F) {
         let pending = std::mem::take(&mut self.pending_cont_assign);
         for p in pending {
-            let ca = p.materialize();
+            let ca = p.materialize(&self.parameters);
             // Same unpacked-array expansion the eager drain does; this is the
             // path the bytecode compiler takes, and a sub-module's
             // `assign dst = src;` between arrays reaches only one of the two.
@@ -20295,13 +20315,15 @@ fn inline_module_items(
                                 .insert(new_cd.name.name.clone(), new_cd);
                         }
                     }
-                    if matches!(sub_item, ModuleItem::ContinuousAssign(_)) {
+                    if let ModuleItem::ContinuousAssign(ca_item) = sub_item {
                         // #7: Rc-share source ASTs across sibling instances.
+                        let delay_rc = ca_item.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
                         if let BodySource::ContAssign(pairs) = body_src {                            for (lhs_rc, rhs_rc) in pairs {
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    delay_source: delay_rc.clone(),
                                 });
                             }
                         }
@@ -20324,6 +20346,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    delay_source: None,
                                 });
                             }
                         }
@@ -20337,6 +20360,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::new(new_lhs),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
+                                    delay_source: None,
                                 });
                             }
                         }
@@ -21570,7 +21594,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         let pending = std::mem::take(&mut elab.pending_cont_assign);
         for (p, name) in pending.into_iter().zip(pending_lhs) {
             if name.is_some_and(|n| multi.contains(&n)) {
-                let ca = p.materialize();
+                let ca = p.materialize(&elab.parameters);
                 elab.continuous_assigns.push(ca);
             } else {
                 elab.pending_cont_assign.push(p);
@@ -21678,7 +21702,8 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
     // Only designs that actually contain a switch pay for this.
     let pending = std::mem::take(&mut elab.pending_cont_assign);
     for p in pending {
-        elab.continuous_assigns.push(p.materialize());
+        let ca = p.materialize(&elab.parameters);
+        elab.continuous_assigns.push(ca);
     }
     // A cross-module terminal names the top module explicitly; signals and
     // driver lvalues are keyed without that root.
