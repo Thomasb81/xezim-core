@@ -1329,6 +1329,100 @@ impl Parser {
                     self.span_from(start),
                 )
             }
+            TokenKind::KwFirst_match => {
+                // LRM §16.9.7 `first_match(sequence_expr [, sequence_match_item…])`.
+                // The operator restricts a sequence to its FIRST match, which
+                // matters only when a later operator would otherwise see the
+                // sequence's other matches. The SVA executor here is already
+                // approximate about multi-match sequences — §16.8 cycle-delay
+                // RANGES are collapsed to their lower bound a few arms below —
+                // so the match restriction is a no-op against this engine and
+                // the operand is returned directly. That keeps the assertion
+                // PARSING and EVALUATING instead of failing elaboration, which
+                // is what `first_match(##[0:500] $fell(tx))` used to do.
+                let start = self.current().span.start;
+                self.bump();
+                if self.eat(TokenKind::LParen).is_none() {
+                    self.error("expected '(' after first_match".to_string());
+                    return Expression::new(
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                            size: None, signed: false,
+                            base: crate::ast::expr::NumberBase::Decimal,
+                            value: "1".to_string(),
+                            cached_val: std::cell::Cell::new(None),
+                        }), self.span_from(start));
+                }
+                let seq = self.parse_expr_bp(0);
+                // Optional `, sequence_match_item` list (§16.10 local-variable
+                // assignments). Nothing here consumes them; skip to the close
+                // paren so the rest of the property still parses.
+                let mut depth = 0usize;
+                while !self.at(TokenKind::Eof) {
+                    match self.current_kind() {
+                        TokenKind::LParen => { depth += 1; let _ = self.bump(); }
+                        TokenKind::RParen if depth == 0 => break,
+                        TokenKind::RParen => { depth -= 1; let _ = self.bump(); }
+                        _ => { let _ = self.bump(); }
+                    }
+                }
+                let _ = self.eat(TokenKind::RParen);
+                seq
+            }
+            TokenKind::KwIf => {
+                // LRM §16.12.7 `if (expression_or_dist) property_expr
+                // [else property_expr]`. The LRM defines it by equivalence, so
+                // lower it to exactly that and no new evaluator is needed:
+                //     if (b) p1           ==  b |-> p1
+                //     if (b) p1 else p2   ==  (b |-> p1) and (!b |-> p2)
+                let start = self.current().span.start;
+                self.bump();
+                if self.eat(TokenKind::LParen).is_none() {
+                    self.error("expected '(' after property if".to_string());
+                    return Expression::new(
+                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                            size: None, signed: false,
+                            base: crate::ast::expr::NumberBase::Decimal,
+                            value: "1".to_string(),
+                            cached_val: std::cell::Cell::new(None),
+                        }), self.span_from(start));
+                }
+                let cond = self.parse_expr_bp(0);
+                let _ = self.eat(TokenKind::RParen);
+                let then_p = self.parse_expr_bp(3);
+                let then_arm = Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::OrMinusArrow,
+                        left: Box::new(cond.clone()),
+                        right: Box::new(then_p),
+                    },
+                    self.span_from(start),
+                );
+                if !self.at(TokenKind::KwElse) {
+                    return then_arm;
+                }
+                self.bump();
+                let else_p = self.parse_expr_bp(3);
+                let not_cond = Expression::new(
+                    ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(cond) },
+                    self.span_from(start),
+                );
+                let else_arm = Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::OrMinusArrow,
+                        left: Box::new(not_cond),
+                        right: Box::new(else_p),
+                    },
+                    self.span_from(start),
+                );
+                Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::SeqAnd,
+                        left: Box::new(then_arm),
+                        right: Box::new(else_arm),
+                    },
+                    self.span_from(start),
+                )
+            }
             TokenKind::HashHash => {
                 // LRM §16.8: `##N <rest>` — a cycle-delay sequence
                 // operator. Parse the cycle count, then the following
@@ -1367,9 +1461,18 @@ impl Parser {
                 // following sub-expression at low precedence — same as
                 // the `|->` body — so chains like `a |-> ##1 b ##2 c`
                 // associate left-to-right inside the implication.
+                // §16.9.2: what may FOLLOW the delay is a sequence_expr, and
+                // its first token can be a sampled-value system function —
+                // `##[0:16] $rose(ready)` is the single most common shape in
+                // real bus assertions. `SystemIdentifier` was missing here, so
+                // the delay became a bare Unary{HashHash} and the `$rose` was
+                // left for the CALLER to choke on: inside parentheses that
+                // surfaced as "expected RParen, found $rose", which is why
+                // `(##[0:N] $rose(x))` failed while `(##[0:N] x)` parsed.
                 let allow_rhs = matches!(
                     self.current_kind(),
                     TokenKind::Identifier
+                        | TokenKind::SystemIdentifier
                         | TokenKind::LParen
                         | TokenKind::IntegerLiteral
                         | TokenKind::HashHash
