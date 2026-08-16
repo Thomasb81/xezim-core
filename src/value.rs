@@ -936,6 +936,69 @@ impl Value {
         }
     }
 
+    /// Copy a contiguous bit slice into this value and report whether any bit
+    /// changed. Bounds are clipped to both values. Wide-to-wide transfers use
+    /// slice operations instead of dispatching once per bit.
+    pub fn copy_bits_from(
+        &mut self,
+        dst_start: usize,
+        source: &Value,
+        src_start: usize,
+        count: usize,
+    ) -> bool {
+        let count = count
+            .min((self.width as usize).saturating_sub(dst_start))
+            .min((source.width as usize).saturating_sub(src_start));
+        if count == 0 {
+            return false;
+        }
+        match (&mut self.storage, &source.storage) {
+            (
+                ValueStorage::Inline {
+                    val_bits: dst_v,
+                    xz_bits: dst_x,
+                },
+                ValueStorage::Inline {
+                    val_bits: src_v,
+                    xz_bits: src_x,
+                },
+            ) => {
+                let low_mask = if count >= 64 {
+                    u64::MAX
+                } else {
+                    (1u64 << count) - 1
+                };
+                let mask = low_mask << dst_start;
+                let next_v = (*dst_v & !mask) | (((*src_v >> src_start) & low_mask) << dst_start);
+                let next_x = (*dst_x & !mask) | (((*src_x >> src_start) & low_mask) << dst_start);
+                let changed = next_v != *dst_v || next_x != *dst_x;
+                *dst_v = next_v;
+                *dst_x = next_x;
+                changed
+            }
+            (ValueStorage::Wide(dst), ValueStorage::Wide(src)) => {
+                let target = &mut dst[dst_start..dst_start + count];
+                let source = &src[src_start..src_start + count];
+                if target == source {
+                    false
+                } else {
+                    target.copy_from_slice(source);
+                    true
+                }
+            }
+            _ => {
+                let mut changed = false;
+                for offset in 0..count {
+                    changed |= self.set_bit_code(
+                        dst_start + offset,
+                        source.get_bit_code(src_start + offset),
+                    );
+                }
+                changed
+            }
+        }
+    }
+
     /// Convert to `u64`, treating X/Z as 0.
     ///
     /// **Returns the LOW 64 bits for wide values**: any bits at positions
@@ -2661,6 +2724,29 @@ mod tests {
         assert_eq!(a.sub(&b).to_u64(), Some(2));
         assert_eq!(a.bitwise_and(&b).to_u64(), Some(1));
         assert_eq!(a.bitwise_or(&b).to_u64(), Some(7));
+    }
+
+    #[test]
+    fn contiguous_bit_copy_reports_changes() {
+        let source = Value::from_u64(0b1010, 4);
+        let mut target = Value::from_u64(0xffff, 16);
+        assert!(target.copy_bits_from(5, &source, 0, 4));
+        assert_eq!(target.to_u64(), Some(0xff5f));
+        assert!(!target.copy_bits_from(5, &source, 0, 4));
+
+        let mut wide_source = Value::zero(128);
+        wide_source.set_bit(0, LogicBit::One);
+        wide_source.set_bit(1, LogicBit::X);
+        wide_source.set_bit(2, LogicBit::Z);
+        wide_source.set_bit(127, LogicBit::One);
+        let mut wide_target = Value::zero(256);
+        assert!(wide_target.copy_bits_from(32, &wide_source, 0, 128));
+        for offset in 0..128 {
+            assert_eq!(wide_target.get_bit(32 + offset), wide_source.get_bit(offset));
+        }
+        assert_eq!(wide_target.get_bit(31), LogicBit::Zero);
+        assert_eq!(wide_target.get_bit(160), LogicBit::Zero);
+        assert!(!wide_target.copy_bits_from(32, &wide_source, 0, 128));
     }
 
     #[test]
