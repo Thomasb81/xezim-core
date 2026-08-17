@@ -290,8 +290,14 @@ impl Parser {
                     && matches!(self.peek_kind(),
                         TokenKind::Identifier | TokenKind::DoubleColon
                         | TokenKind::Hash | TokenKind::LBracket);
+                // §A.2.1.3: a data_declaration may carry an explicit LIFETIME
+                // (`static int n = 0;`). `parse_data_declaration` already eats
+                // it, but this guard did not admit one, so a $unit-scope
+                // `static`/`automatic` declaration — the usual way a testbench
+                // keeps a shared failure counter — died as "unexpected token".
                 if self.is_data_type_keyword() || self.at(TokenKind::KwVar)
                     || self.at(TokenKind::KwConst) || is_user_type_decl
+                    || self.at(TokenKind::KwStatic) || self.at(TokenKind::KwAutomatic)
                 {
                     let before = self.pos;
                     let decl = self.parse_data_declaration();
