@@ -919,12 +919,26 @@ fn parse_and_elaborate(
                 unit_scope_ts.1 = Some(elaborate::time_literal_to_exp(p));
             }
         }
-        if let ast::Description::Module(m) = desc {
-            let name = &m.name.name;
+        // §3.14.2: a `timescale governs every design element it precedes, not
+        // just modules. An INTERFACE's tasks (a BFM's drive/sample routines)
+        // and a PROGRAM's blocks carry `#` delays and read `$realtime` exactly
+        // like module items do, but only modules were ever entered into the
+        // effective-timescale map — so an interface's delays stayed raw ticks
+        // and its `$realtime` reported the wrong unit. The preprocessor already
+        // records interfaces and programs in `module_timescales`
+        // (`design_element_name` covers module/interface/program/package), so
+        // they only had to be walked here.
+        let ts_target: Option<(&String, &Vec<ast::decl::ModuleItem>)> = match desc {
+            ast::Description::Module(m) => Some((&m.name.name, &m.items)),
+            ast::Description::Interface(i) => Some((&i.name.name, &i.items)),
+            ast::Description::Program(p) => Some((&p.name.name, &p.items)),
+            _ => None,
+        };
+        if let Some((name, ts_items)) = ts_target {
             // Explicit source-level declarations.
             let mut local_u: Option<i32> = None;
             let mut local_p: Option<i32> = None;
-            for it in &m.items {
+            for it in ts_items {
                 if let ast::decl::ModuleItem::TimeunitsDecl(td) = it {
                     if let Some(u) = &td.unit {
                         local_u = Some(elaborate::time_literal_to_exp(u));
@@ -1121,6 +1135,12 @@ fn parse_and_elaborate(
             }
             ast::Description::Interface(i) => {
                 let name = i.name.name.clone();
+                // Interface items ARE `ModuleItem`s, so the module walker
+                // applies unchanged; the effective timescale now exists for
+                // interfaces too (see the ts_target walk above).
+                let unit_s = eff_ts.get(&name).map(|&(u, _)| u).unwrap_or(tick_s);
+                let mut i = i;
+                elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, tick_s);
                 definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
             ast::Description::Program(p) => {
