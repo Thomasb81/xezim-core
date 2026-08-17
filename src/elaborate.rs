@@ -11029,6 +11029,31 @@ pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, tick_s: 
 /// `unit_s / tick_s`; a *time literal* `#10ns` is absolute seconds, so it
 /// becomes `seconds / tick_s`. With no finer timescale anywhere (tick_s = unit_s
 /// = 1 ns) both are identities, so behaviour is unchanged. LRM §22.7 / §3.14.
+/// Scale every delay in a class's method bodies (and nested classes).
+fn rewrite_class_delays(cd: &mut ClassDeclaration, unit_s: f64, tick_s: f64) {
+    for item in cd.items.iter_mut() {
+        match item {
+            ClassItem::Method(m) => match &mut m.kind {
+                ClassMethodKind::Task(td) => {
+                    for st in td.items.iter_mut() {
+                        rewrite_stmt_delays(st, unit_s, tick_s);
+                    }
+                }
+                // A function cannot consume time, but `#0` is legal inside one
+                // and must still be tick-denominated for the executor.
+                ClassMethodKind::Function(f) => {
+                    for st in f.items.iter_mut() {
+                        rewrite_stmt_delays(st, unit_s, tick_s);
+                    }
+                }
+                _ => {}
+            },
+            ClassItem::Class(inner) => rewrite_class_delays(inner, unit_s, tick_s),
+            _ => {}
+        }
+    }
+}
+
 fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64) {
     for item in items.iter_mut() {
         match item {
@@ -11061,6 +11086,15 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
                     rewrite_delay_expr(d, unit_s, tick_s);
                 }
             }
+            // A class METHOD body carries delays exactly like a task body, and
+            // for the same reason (§3.14.3): a bare `#5` counts the enclosing
+            // scope's timeunit. Classes were the one construct this pass never
+            // walked, so a `#5` inside a class task stayed a raw 5-TICK delay
+            // while the identical `#5` in a module task was unit-scaled — in a
+            // 1ns/1ps scope the class delay ran 1000x too short. That is
+            // invisible in a pure-RTL design and breaks every class-based
+            // testbench that paces itself with `#`.
+            ModuleItem::ClassDeclaration(cd) => rewrite_class_delays(cd, unit_s, tick_s),
             ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, tick_s),
             ModuleItem::GenerateIf(gi) => {
                 for (_c, items) in gi.branches.iter_mut() {
