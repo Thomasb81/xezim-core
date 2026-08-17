@@ -1125,6 +1125,45 @@ pub fn elaborate_class_with_params(
         if let ClassItem::Parameter(pd) = item {
             if let crate::ast::decl::ParameterKind::Data { data_type, assignments, .. } = &pd.kind {
                 for a in assignments {
+                    // §6.20.2: a class-scope `localparam`/`parameter` carrying an
+                    // UNPACKED dimension is a constant ARRAY, not a scalar. The
+                    // dimension used to be dropped here, collapsing the whole
+                    // array into a single element-width scalar — so `Arr[i]` was
+                    // a BIT select (reading 0), `$size` reported the bit width
+                    // (32 for `int`, 96 for a 3-deep one), and `foreach` had no
+                    // shape at all: the sync path ran one iteration, the async
+                    // path ran none, both silently. Register it exactly the way a
+                    // `const` array PROPERTY is registered — declared bounds plus
+                    // a re-evaluable initializer — which every downstream consumer
+                    // (element read, `$size`, both `foreach` paths) already
+                    // handles correctly.
+                    if !a.dimensions.is_empty() {
+                        if let Some((lo, hi)) =
+                            const_unpacked_bounds(&a.dimensions, unpacked_params)
+                        {
+                            let ew =
+                                resolve_type_width(data_type, Some(&const_scope), None).max(1);
+                            array_properties
+                                .insert(a.name.name.clone(), (lo, hi, ew));
+                            if let Some(init) = &a.init {
+                                property_inits.insert(a.name.name.clone(), init.clone());
+                            }
+                            properties.insert(
+                                a.name.name.clone(),
+                                Signal {
+                                    is_const: true,
+                                    name: a.name.name.clone(),
+                                    width: ew,
+                                    is_signed: is_type_signed(data_type),
+                                    is_real: false,
+                                    direction: None,
+                                    value: Value::zero(ew),
+                                    type_name: get_type_name(data_type),
+                                },
+                            );
+                            continue;
+                        }
+                    }
                     param_defaults.push((a.name.name.clone(), a.init.clone()));
                     static_properties.insert(a.name.name.clone());
                     // Evaluate the initial value for the property against the
@@ -11580,6 +11619,41 @@ fn ceil_log2(n: u64) -> u64 {
     let mut t = n - 1;
     while t > 0 { t >>= 1; res += 1; }
     res
+}
+
+/// The first UNPACKED dimension of a declarator as inclusive `(lo, hi)` bounds,
+/// when both ends const-evaluate. `[N]` is `0..N-1`; `[l:r]` is normalized
+/// ascending so the result matches `ElaboratedClass::array_properties`, which
+/// stores `(l.min(r), l.max(r), width)`.
+fn const_unpacked_bounds(
+    dims: &[UnpackedDimension],
+    params: Option<&HashMap<String, Value>>,
+) -> Option<(i64, i64)> {
+    match dims.first()? {
+        UnpackedDimension::Expression { expr, .. } => {
+            match const_eval_i64_with_params(expr, params) {
+                Some(n) if n > 0 => Some((0, n - 1)),
+                _ => None,
+            }
+        }
+        UnpackedDimension::Range { left, right, .. } => {
+            let l = const_eval_i64_with_params(left, params)?;
+            let r = const_eval_i64_with_params(right, params)?;
+            Some((l.min(r), l.max(r)))
+        }
+        // `[N]` with a bare identifier is grammatically ambiguous: a TYPE name
+        // makes it associative, a CONSTANT makes it a size. The parser cannot
+        // decide and always yields `Associative`. Inside a `localparam` array
+        // the name is a size whenever it evaluates in the class constant scope
+        // — an associative localparam has no meaning, since it could not be
+        // positionally initialized by the `'{...}` it is required to carry.
+        UnpackedDimension::Associative { data_type: Some(dt), .. } => {
+            let nm = get_type_name(dt)?;
+            let n = params?.get(&nm)?.to_u64()? as i64;
+            if n > 0 { Some((0, n - 1)) } else { None }
+        }
+        _ => None,
+    }
 }
 
 pub fn const_eval_i64_with_params(expr: &Expression, params: Option<&HashMap<String, Value>>) -> Option<i64> {
