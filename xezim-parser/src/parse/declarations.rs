@@ -655,13 +655,21 @@ impl Parser {
         let mut ports = Vec::new();
         if self.eat(TokenKind::LParen).is_none() { return ports; }
         if self.at(TokenKind::RParen) { self.bump(); return ports; }
+        // §13.5.2: a formal whose direction is omitted takes the direction of
+        // the PREVIOUS formal; only the first defaults to input. Defaulting
+        // every one to input made `output logic [7:0] r0, r1, r2, r3` declare
+        // r1..r3 as INPUTS — their copy-out silently vanished, so a caller saw
+        // only the first result of a multi-output helper (an AES MixColumns
+        // updated one byte per column and nothing else).
+        let mut prev_direction = PortDirection::Input;
         loop {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
             let start = self.current().span.start;
             let mut var_kw = self.eat(TokenKind::KwVar).is_some();
             let _const_kw = self.eat(TokenKind::KwConst).is_some();
             if !var_kw && self.at(TokenKind::KwVar) { var_kw = self.eat(TokenKind::KwVar).is_some(); } // Handle var after const
-            let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
+            let direction = self.parse_optional_direction().unwrap_or(prev_direction);
+            prev_direction = direction;
             // §13.3: `input var int x` — `var` may follow the direction too.
             if !var_kw && self.at(TokenKind::KwVar) { var_kw = self.eat(TokenKind::KwVar).is_some(); }
 
