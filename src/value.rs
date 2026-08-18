@@ -2114,9 +2114,14 @@ impl Value {
             return a.casez_eq(&b);
         }
         let w = self.width.max(other.width) as usize;
+        let both_signed = self.is_signed && other.is_signed;
+        let sign_a = both_signed && (self.width as usize) < w;
+        let sign_b = both_signed && (other.width as usize) < w;
+        let top_a = if self.width > 0 { self.get_bit((self.width - 1) as usize) } else { LogicBit::Zero };
+        let top_b = if other.width > 0 { other.get_bit((other.width - 1) as usize) } else { LogicBit::Zero };
         for i in 0..w {
-            let a = self.get_bit(i);
-            let b = other.get_bit(i);
+            let a = if i < self.width as usize { self.get_bit(i) } else if sign_a { top_a } else { LogicBit::Zero };
+            let b = if i < other.width as usize { other.get_bit(i) } else if sign_b { top_b } else { LogicBit::Zero };
             if a == LogicBit::Z || b == LogicBit::Z { continue; }
             if a != b { return Value::from_u64(0, 1); }
         }
@@ -2143,9 +2148,14 @@ impl Value {
             return a.casex_eq(&b);
         }
         let w = self.width.max(other.width) as usize;
+        let both_signed = self.is_signed && other.is_signed;
+        let sign_a = both_signed && (self.width as usize) < w;
+        let sign_b = both_signed && (other.width as usize) < w;
+        let top_a = if self.width > 0 { self.get_bit((self.width - 1) as usize) } else { LogicBit::Zero };
+        let top_b = if other.width > 0 { other.get_bit((other.width - 1) as usize) } else { LogicBit::Zero };
         for i in 0..w {
-            let a = self.get_bit(i);
-            let b = other.get_bit(i);
+            let a = if i < self.width as usize { self.get_bit(i) } else if sign_a { top_a } else { LogicBit::Zero };
+            let b = if i < other.width as usize { other.get_bit(i) } else if sign_b { top_b } else { LogicBit::Zero };
             if matches!(a, LogicBit::X | LogicBit::Z) || matches!(b, LogicBit::X | LogicBit::Z) { continue; }
             if a != b { return Value::from_u64(0, 1); }
         }
@@ -2170,13 +2180,38 @@ impl Value {
         let (bv, bx) = other.inline_bits()?;
         let am = Self::mask(self.width);
         let bm = Self::mask(other.width);
-        Some((
-            av & am,
-            ax & am,
-            bv & bm,
-            bx & bm,
-            Self::mask(self.width.max(other.width)),
-        ))
+        let (mut av, mut ax) = (av & am, ax & am);
+        let (mut bv, mut bx) = (bv & bm, bx & bm);
+        let w = self.width.max(other.width);
+        let m = Self::mask(w);
+        // §11.6.1 as applied by §12.5: operands of unequal width extend to
+        // the common width, sign-replicated only when BOTH are signed. The
+        // sign bit is replicated in both planes, so an X/Z sign bit extends
+        // as X/Z — for casez that turns a Z sign bit into wildcard fill,
+        // exactly what the per-bit reference loop produces.
+        if self.is_signed && other.is_signed {
+            if self.width > 0 && self.width < w {
+                let ext = m & !am;
+                let sign = 1u64 << (self.width - 1);
+                if av & sign != 0 {
+                    av |= ext;
+                }
+                if ax & sign != 0 {
+                    ax |= ext;
+                }
+            }
+            if other.width > 0 && other.width < w {
+                let ext = m & !bm;
+                let sign = 1u64 << (other.width - 1);
+                if bv & sign != 0 {
+                    bv |= ext;
+                }
+                if bx & sign != 0 {
+                    bx |= ext;
+                }
+            }
+        }
+        Some((av, ax, bv, bx, m))
     }
 
     /// The per-bit loops keep a position when it is a wildcard on either side
@@ -2198,10 +2233,17 @@ impl Value {
         // position is NOT a wildcard — it makes the result x, unless some
         // other position definitely mismatches (which forces 0).
         let w = self.width.max(other.width) as usize;
+        // §11.4.6 extends operands like the equality operators: sign-replicate
+        // only when BOTH are signed (an X/Z sign bit replicates as itself).
+        let both_signed = self.is_signed && other.is_signed;
+        let sign_l = both_signed && (self.width as usize) < w;
+        let sign_r = both_signed && (other.width as usize) < w;
+        let top_l = if self.width > 0 { self.get_bit((self.width - 1) as usize) } else { LogicBit::Zero };
+        let top_r = if other.width > 0 { other.get_bit((other.width - 1) as usize) } else { LogicBit::Zero };
         let mut saw_unknown = false;
         for i in 0..w {
-            let l = self.get_bit(i);
-            let r = other.get_bit(i);
+            let l = if i < self.width as usize { self.get_bit(i) } else if sign_l { top_l } else { LogicBit::Zero };
+            let r = if i < other.width as usize { other.get_bit(i) } else if sign_r { top_r } else { LogicBit::Zero };
             if matches!(r, LogicBit::X | LogicBit::Z) {
                 continue; // wildcard position — excluded from comparison
             }
