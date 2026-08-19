@@ -29,7 +29,7 @@ thread_local! {
 }
 fn iprof_enabled() -> bool {
     static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XZ_INST_PROF").is_ok())
+    *ON.get_or_init(|| std::env::var("XEZIM_INST_PROF").is_ok())
 }
 fn iprof_add(k: &'static str, d: std::time::Duration) {
     if !iprof_enabled() {
@@ -364,7 +364,7 @@ pub struct PendingContAssign {
 impl PendingAlways {
     /// Run the rewrite once and produce the owned AlwaysBlock. Drops self.
     pub fn materialize(self) -> AlwaysBlock {
-        if std::env::var("XZ_PEND_DBG").is_ok() {
+        if std::env::var("XEZIM_PEND_DBG").is_ok() {
             eprintln!("[PEND-MAT] prefix={:?} keys={:?}", self.ctx.prefix,
                 self.ctx.port_map.keys().collect::<Vec<_>>());
         }
@@ -6679,7 +6679,7 @@ pub fn elaborate_module_with_defs(
                 // If this always block was inside a generate block, ac.gen_scope
                 // contains the generate block's scope name and should be included
                 // in the block's scope.
-                if std::env::var("XZ_PEND_DBG").is_ok() {
+                if std::env::var("XEZIM_PEND_DBG").is_ok() {
                     eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
                 }
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: ac.gen_scope.clone() });
@@ -10043,7 +10043,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
             }
             ModuleItem::AlwaysConstruct(ac) => {
                 // §21.2.1.7: include generate block scope in the instance path for %m.
-                if std::env::var("XZ_PEND_DBG").is_ok() {
+                if std::env::var("XEZIM_PEND_DBG").is_ok() {
                     eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
                 }
                 elab.always_blocks.push(AlwaysBlock { kind: ac.kind, stmt: ac.stmt.clone(), scope: ac.gen_scope.clone() });
