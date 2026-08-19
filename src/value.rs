@@ -2984,9 +2984,23 @@ mod tests {
     /// Zero regardless of signedness.
     fn case_wildcard_reference(a: &Value, b: &Value, casex: bool) -> Value {
         let w = a.width.max(b.width) as usize;
+        // §11.4.6 via §11.8.2: with BOTH operands signed, the narrower one
+        // sign-extends to the comparison width (its top bit repeats, X/Z
+        // included); any unsigned operand makes the context unsigned and
+        // everything zero-extends. Mirrors `casez_eq_slow`, which was
+        // verified against a reference simulator.
+        let both_signed = a.is_signed && b.is_signed;
+        let ext = |v: &Value| -> LogicBit {
+            if both_signed && (v.width as usize) < w && v.width > 0 {
+                v.get_bit((v.width - 1) as usize)
+            } else {
+                LogicBit::Zero
+            }
+        };
+        let (ext_a, ext_b) = (ext(a), ext(b));
         for i in 0..w {
-            let x = a.get_bit(i);
-            let y = b.get_bit(i);
+            let x = if i < a.width as usize { a.get_bit(i) } else { ext_a };
+            let y = if i < b.width as usize { b.get_bit(i) } else { ext_b };
             let wild = if casex {
                 matches!(x, LogicBit::X | LogicBit::Z) || matches!(y, LogicBit::X | LogicBit::Z)
             } else {
