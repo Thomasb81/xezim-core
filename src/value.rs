@@ -581,6 +581,23 @@ impl Value {
     /// `#[inline(always)]` so the Inline arm collapses to a direct
     /// (u64,u64) load with no enum match in the caller's frame.
     #[inline(always)]
+    /// Both planes when storage is `Inline`, else None — the cheap
+    /// discriminant check fast paths need without exposing the storage enum.
+    #[inline]
+    pub fn inline_planes(&self) -> Option<(u64, u64)> {
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => Some((*val_bits, *xz_bits)),
+            ValueStorage::Wide(_) => None,
+        }
+    }
+
+    /// Overwrite both planes in place. Caller guarantees the storage is
+    /// already `Inline` and the bits are masked to `self.width`.
+    #[inline]
+    pub fn set_inline_planes(&mut self, v: u64, x: u64) {
+        self.storage = ValueStorage::Inline { val_bits: v, xz_bits: x };
+    }
+
     pub fn raw_bits(&self) -> (u64, u64) {
         match &self.storage {
             ValueStorage::Inline { val_bits, xz_bits } => (*val_bits, *xz_bits),
