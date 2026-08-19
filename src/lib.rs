@@ -1958,12 +1958,22 @@ fn resolve_library_modules(
     };
 
     let mut files: Vec<(std::path::PathBuf, bool)> = Vec::new();
+    // `-y` semantics are ON-DEMAND (§33.3 / every commercial tool and
+    // iverilog): a directory supplies `<module>.<ext>` when `module` is
+    // unresolved — nothing else in it is ever read. Eager-parsing the whole
+    // directory both poisoned runs with unrelated files' parse errors
+    // (Verilator's test_regress `t/` holds ~9400 files, many deliberately
+    // broken) and cost multi-GB RSS on big trees. Collect candidates only;
+    // parsing happens lazily in the adoption loop below, with a one-time
+    // full-scan fallback for libraries whose file names do not match their
+    // module names (the historical xezim behavior).
+    let mut pending: Vec<std::path::PathBuf> = Vec::new();
     for dir in &lib_cli.lib_dirs {
         let path = std::path::Path::new(dir);
         if path.is_dir() {
             let mut found = Vec::new();
             collect_sv_files(path, &exts, &mut found)?;
-            files.extend(found.into_iter().map(|path| (path, false)));
+            pending.extend(found);
         }
     }
     // `-v <file>`: an explicit library FILE (any extension). Indexed like a
@@ -1990,12 +2000,24 @@ fn resolve_library_modules(
     let mut parse_issue_files: Vec<std::path::PathBuf> = Vec::new();
     let mut lib_origins: crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)> =
         Default::default();
-    for (path, explicit_v) in files {
+    #[allow(clippy::too_many_arguments)]
+    fn index_library_file(
+        path: std::path::PathBuf,
+        explicit_v: bool,
+        include_dirs: &[String],
+        lib_defines: &std::collections::HashMap<String, preprocessor::MacroDef>,
+        lib_cli: &LibraryCli,
+        lib: &mut crate::hasher::HashMap<String, SourceDefinition>,
+        lib_typedefs: &mut Vec<Rc<ast::decl::TypedefDeclaration>>,
+        scanned_paths: &mut Vec<std::path::PathBuf>,
+        parse_issue_files: &mut Vec<std::path::PathBuf>,
+        lib_origins: &mut crate::hasher::HashMap<String, (std::path::PathBuf, bool, &'static str)>,
+    ) {
         let source = match std::fs::read_to_string(&path) {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("Warning: library file '{}' unreadable: {}", path.display(), e);
-                continue;
+                return;
             }
         };
         scanned_paths.push(path.clone());
@@ -2162,7 +2184,15 @@ fn resolve_library_modules(
         }
     }
 
-    // Instantiated module/interface/program names inside a definition's body.
+    for (path, explicit_v) in files {
+        index_library_file(
+            path, explicit_v, include_dirs, lib_defines, lib_cli,
+            &mut lib, &mut lib_typedefs, &mut scanned_paths,
+            &mut parse_issue_files, &mut lib_origins,
+        );
+    }
+
+    // Instantiated module/interface/program names inside a definition's body.    // Instantiated module/interface/program names inside a definition's body.
     fn instantiations(def: &SourceDefinition, out: &mut std::collections::HashSet<String>) {
         let items = match def {
             SourceDefinition::Module(m) => &m.items,
@@ -2196,9 +2226,42 @@ fn resolve_library_modules(
     let mut work: Vec<String> = seed.into_iter().collect();
     let mut unresolved: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
     let mut adopted_from_v = 0usize;
+    let mut full_scan_done = false;
     while let Some(name) = work.pop() {
         if definitions.contains_key(&name) {
             continue;
+        }
+        // Lazy `-y` resolution: try `<dir>/<name>.<ext>` first — the one
+        // file the flag's contract says may define this module. Only when
+        // that misses does the (one-time) full directory scan run, which
+        // keeps name-mismatched libraries working at the old cost.
+        if !lib.contains_key(&name) && !pending.is_empty() {
+            let mut hit: Vec<std::path::PathBuf> = Vec::new();
+            for dir in &lib_cli.lib_dirs {
+                for ext in &exts {
+                    let cand = std::path::Path::new(dir).join(format!("{name}.{ext}"));
+                    if let Some(pos) = pending.iter().position(|p| p == &cand) {
+                        hit.push(pending.remove(pos));
+                    }
+                }
+            }
+            for path in hit {
+                index_library_file(
+                    path, false, include_dirs, lib_defines, lib_cli,
+                    &mut lib, &mut lib_typedefs, &mut scanned_paths,
+                    &mut parse_issue_files, &mut lib_origins,
+                );
+            }
+            if !lib.contains_key(&name) && !full_scan_done {
+                full_scan_done = true;
+                for path in std::mem::take(&mut pending) {
+                    index_library_file(
+                        path, false, include_dirs, lib_defines, lib_cli,
+                        &mut lib, &mut lib_typedefs, &mut scanned_paths,
+                        &mut parse_issue_files, &mut lib_origins,
+                    );
+                }
+            }
         }
         if let Some(def) = lib.get(&name) {
             if let Some((path, from_v, kind)) = lib_origins.get(&name) {
@@ -2317,6 +2380,21 @@ fn resolve_library_modules(
 
     // §6.18: fill a forward typedef the primary design declared (`typedef
     // name;`) from a library file's real typedef — only those, never blanket.
+    // A forward typedef in the design may be filled by a `-y` file that no
+    // unresolved module ever pulled in. If any remain unfilled and unscanned
+    // candidates exist, do the full scan now — old behavior, but only paid
+    // when this actually matters.
+    if !pending.is_empty()
+        && definitions.values().any(|d| matches!(d, SourceDefinition::Typedef(e) if e.forward))
+    {
+        for path in std::mem::take(&mut pending) {
+            index_library_file(
+                path, false, include_dirs, lib_defines, lib_cli,
+                &mut lib, &mut lib_typedefs, &mut scanned_paths,
+                &mut parse_issue_files, &mut lib_origins,
+            );
+        }
+    }
     for t in lib_typedefs {
         let name = t.name.name.clone();
         let replace_forward = matches!(

@@ -1136,6 +1136,25 @@ impl Parser {
                     }
                     return Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
                 }
+                // §10.9.2 TYPED assignment pattern: `some_t'{ a: ..., default: ... }`.
+                // The lexer folds `'{` into one token, so the cast branch above
+                // never sees it. The pattern's member layout is resolved from the
+                // ASSIGNMENT CONTEXT downstream (same as the untyped form), so the
+                // type prefix is dropped here — correct whenever the prefix names
+                // the context's own type, which is what real code writes (the
+                // pulp-platform AXI sources use this on every W/AW/AR beat).
+                if self.at(TokenKind::ApostropheLBrace)
+                    && matches!(&expr.kind, ExprKind::Ident(h)
+                        if h.path.len() == 1 && h.path[0].selects.is_empty())
+                {
+                    self.bump();
+                    let items = self.parse_assignment_pattern_items();
+                    self.expect(TokenKind::RBrace);
+                    return Expression::new(
+                        ExprKind::AssignmentPattern(items),
+                        self.span_from(start),
+                    );
+                }
                 // Check for function call
                 if self.at(TokenKind::LParen) {
                     let args = self.parse_call_args();

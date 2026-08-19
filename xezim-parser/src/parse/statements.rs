@@ -29,6 +29,19 @@ impl Parser {
                     | TokenKind::KwCasez | TokenKind::KwFor | TokenKind::KwForeach
                     | TokenKind::KwWhile | TokenKind::KwDo | TokenKind::KwRepeat
                     | TokenKind::KwForever
+                    // §9.3.5 allows a label on ANY statement_item. In
+                    // statement position `ident :` has no other legal
+                    // reading (case-arm colons are consumed by the case
+                    // parser before the body is parsed), so the plain
+                    // starters are accepted too: a labelled task enable
+                    // (`proc_mst_r : mon_slv_port_r();` — every pulp AXI
+                    // monitor fork), assignment, system task, timing
+                    // control, wait or disable.
+                    | TokenKind::Identifier | TokenKind::EscapedIdentifier
+                    | TokenKind::SystemIdentifier | TokenKind::Hash
+                    | TokenKind::At | TokenKind::KwWait | TokenKind::KwDisable
+                    | TokenKind::KwVoid | TokenKind::KwReturn
+                    | TokenKind::KwBreak | TokenKind::KwContinue
             );
             if stmt_starter {
                 let label = self.parse_identifier();

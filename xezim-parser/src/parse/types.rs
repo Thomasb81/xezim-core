@@ -142,8 +142,36 @@ impl Parser {
                 // Parse optional parameterized type list #(...). Collect
                 // the positional arguments as expressions; named (.NAME(expr))
                 // args are captured by value only (name discarded for now).
-                let mut type_args: Vec<crate::ast::expr::Expression> = Vec::new();
-                if self.eat(TokenKind::Hash).is_some() {
+                let type_args = self.parse_type_args_hash(start);
+                if name.scope.is_none() && self.at(TokenKind::Dot) {
+                    self.bump();
+                    let modport = Some(self.parse_identifier());
+                    let _dimensions = self.parse_packed_dimensions();
+                    DataType::Interface { name: name.name, modport, span: self.span_from(start) }
+                } else {
+                    let dimensions = self.parse_packed_dimensions();
+                    DataType::TypeReference { name, dimensions, type_args, span: self.span_from(start) }
+                }
+            }
+            // Implicit data type that begins with a packed dimension, e.g.
+            // `var [7:0] y;` or `wire [3:0] w;` reached via a `data_type`
+            // context. Consume the dimensions so the declarator list parses.
+            TokenKind::LBracket => {
+                let dimensions = self.parse_packed_dimensions();
+                DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
+            }
+            _ => DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+        }
+    }
+
+    /// The optional `#(...)` specialization after a (possibly scoped) type
+    /// name — shared between `parse_data_type`'s Identifier arm and the
+    /// module-item path for `pkg::class #(...) var = new;` declarations,
+    /// which previously never consumed the `#` and died with
+    /// "expected identifier, found Hash".
+    pub(super) fn parse_type_args_hash(&mut self, start: usize) -> Vec<crate::ast::expr::Expression> {
+        let mut type_args: Vec<crate::ast::expr::Expression> = Vec::new();
+        if self.eat(TokenKind::Hash).is_some() {
                     if self.eat(TokenKind::LParen).is_some() {
                         if !self.at(TokenKind::RParen) {
                             loop {
@@ -239,25 +267,7 @@ impl Parser {
                         self.expect(TokenKind::RParen);
                     }
                 }
-                if name.scope.is_none() && self.at(TokenKind::Dot) {
-                    self.bump();
-                    let modport = Some(self.parse_identifier());
-                    let _dimensions = self.parse_packed_dimensions();
-                    DataType::Interface { name: name.name, modport, span: self.span_from(start) }
-                } else {
-                    let dimensions = self.parse_packed_dimensions();
-                    DataType::TypeReference { name, dimensions, type_args, span: self.span_from(start) }
-                }
-            }
-            // Implicit data type that begins with a packed dimension, e.g.
-            // `var [7:0] y;` or `wire [3:0] w;` reached via a `data_type`
-            // context. Consume the dimensions so the declarator list parses.
-            TokenKind::LBracket => {
-                let dimensions = self.parse_packed_dimensions();
-                DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
-            }
-            _ => DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
-        }
+        type_args
     }
 
     pub(super) fn parse_type_name(&mut self) -> TypeName {

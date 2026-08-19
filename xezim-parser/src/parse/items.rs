@@ -1706,11 +1706,15 @@ impl Parser {
         if self.at(TokenKind::DoubleColon) {
             self.bump();
             let second_name = self.parse_identifier();
+            // `pkg::cls #(.P(v)) var = new;` — scoped PARAMETERIZED class
+            // as the declaration type (§8.25). The specialization was never
+            // consumed here, so the declarator parser saw `#`.
+            let type_args = self.parse_type_args_hash(start);
             let dimensions = self.parse_packed_dimensions();
             let dt = DataType::TypeReference {
                 name: TypeName { scope: Some(first_name), name: second_name, span: self.span_from(start) },
                 dimensions,
-                type_args: Vec::new(),
+                type_args,
                 span: self.span_from(start),
             };
             let decls = self.parse_var_declarator_list();
@@ -1725,6 +1729,35 @@ impl Parser {
             });
         }
         if self.eat(TokenKind::Colon).is_some() { return self.parse_module_item().unwrap_or(ModuleItem::Null); }
+        // §25.5: non-ANSI body port declaration with a MODPORT-qualified
+        // interface type — `counter_if.counter_mp c_data;`. The lookahead is
+        // `. ident ident` with a `;`/`,` after: nothing else at item level
+        // has that shape (an instantiation would be `type name (…)`). ANSI
+        // headers already route through parse_data_type's Interface arm;
+        // this body form died on the dot ("expected identifier, found Dot").
+        if self.at(TokenKind::Dot)
+            && self.peek_kind() == TokenKind::Identifier
+            && self.peek_kind_n(2) == TokenKind::Identifier
+            && matches!(self.peek_kind_n(3), TokenKind::Semicolon | TokenKind::Comma)
+        {
+            self.bump(); // .
+            let modport = self.parse_identifier();
+            let dt = DataType::Interface {
+                name: first_name.clone(),
+                modport: Some(modport),
+                span: self.span_from(start),
+            };
+            let decls = self.parse_var_declarator_list();
+            self.expect(TokenKind::Semicolon);
+            return ModuleItem::DataDeclaration(DataDeclaration {
+                const_kw: false,
+                var_kw: false,
+                lifetime: None,
+                data_type: dt,
+                declarators: decls,
+                span: self.span_from(start),
+            });
+        }
         let params = if self.at(TokenKind::Hash) {
             self.bump();
             if self.eat(TokenKind::LParen).is_some() {
