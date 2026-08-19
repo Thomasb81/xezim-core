@@ -673,7 +673,7 @@ fn install_ooc_constraint_body(
     if items.is_empty() {
         return;
     }
-    if let Some(cd) = elab.classes.get_mut(class_name) {
+    if let Some(cd) = elab.classes.get_mut(class_name).map(std::sync::Arc::make_mut) {
         if let Some(existing) = cd.constraints.get_mut(constraint_name) {
             existing.items = items.to_vec();
             existing.has_body = true;
@@ -1392,7 +1392,7 @@ pub struct ElaboratedModule {
     #[serde(default)]
     pub assoc_index_widths: HashMap<String, (u32, bool)>,
     /// Class definitions: name -> elaborated class.
-    pub classes: HashMap<String, ElaboratedClass>,
+    pub classes: HashMap<String, std::sync::Arc<ElaboratedClass>>,
     /// Covergroup definitions: name -> AST declaration.
     pub covergroups: HashMap<String, CovergroupDeclaration>,
     /// Module-level function declarations.
@@ -3543,7 +3543,7 @@ pub fn elaborate_module_with_defs(
                     register_class_enum_members(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
-                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                        std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
                     );
                     // §18.5.1: a `constraint Class::name {...}` written at
                     // $unit scope fills this class's extern prototype.
@@ -3600,7 +3600,7 @@ pub fn elaborate_module_with_defs(
                                 // of `elab` while `elab.classes` is borrowed.
                                 let params_snapshot = elab.parameters.clone();
                                 elab.classes.entry(c.name.name.clone())
-                                    .or_insert_with(|| elaborate_class_with_params(c, Some(&params_snapshot)));
+                                    .or_insert_with(|| std::sync::Arc::new(elaborate_class_with_params(c, Some(&params_snapshot))));
                             }
                             // Hoist package typedefs (loads enum members + typedef
                             // widths) so an explicit scoped reference `pkg::CONST`
@@ -4068,7 +4068,7 @@ pub fn elaborate_module_with_defs(
                     register_class_enum_members(c, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
-                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                        std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
                     );
                 }
                 crate::ast::decl::PackageItem::Let(l) => {
@@ -6775,7 +6775,7 @@ pub fn elaborate_module_with_defs(
                 register_class_enum_members(cd, &mut elab);
                 elab.classes.insert(
                     cd.name.name.clone(),
-                    elaborate_class_with_params(cd, Some(&elab.parameters)),
+                    std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
                 );
             }
             ModuleItem::LetDeclaration(ld) => {
@@ -7167,7 +7167,7 @@ pub fn link_extern_methods(
                       method_name: String,
                       kind: ClassMethodKind,
                       span: _| {
-        if let Some(cls) = elab.classes.get_mut(&class_name) {
+        if let Some(cls) = elab.classes.get_mut(&class_name).map(std::sync::Arc::make_mut) {
             if let Some(existing) = cls.methods.get_mut(&method_name) {
                 existing.kind = kind;
             } else {
@@ -10112,7 +10112,7 @@ fn elaborate_items(items: &[ModuleItem], elab: &mut ElaboratedModule, all_defs: 
                 register_class_enum_members(cd, elab);
                 elab.classes.insert(
                     cd.name.name.clone(),
-                    elaborate_class_with_params(cd, Some(&elab.parameters)),
+                    std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
                 );
             }
             ModuleItem::ClockingDeclaration(cd) => {
@@ -15058,6 +15058,7 @@ fn register_nested_classes(
             let mut cls = elaborate_class_with_params(inner, Some(&elab.parameters));
             cls.enclosing = Some(outer.to_string());
             let scoped = format!("{}::{}", outer, inner.name.name);
+            let cls = std::sync::Arc::new(cls);
             elab.classes.insert(scoped.clone(), cls.clone());
             elab.classes.entry(inner.name.name.clone()).or_insert(cls);
             register_nested_classes(inner, &scoped, elab);
@@ -15076,7 +15077,7 @@ pub fn inline_instantiations(
             Definition::Class(c) => {
                 register_class_enum_members(c, elab);
                 let cls = elaborate_class_with_params(c, Some(&elab.parameters));
-                elab.classes.insert(name.clone(), cls);
+                elab.classes.insert(name.clone(), std::sync::Arc::new(cls));
                 register_nested_classes(c, name, elab);
             }
             Definition::Covergroup(cg) => { elab.covergroups.insert(name.clone(), (*cg).clone()); }
@@ -15172,7 +15173,7 @@ pub fn inline_instantiations(
                             register_class_enum_members(c, elab);
                             elab.classes.insert(
                         c.name.name.clone(),
-                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                        std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
                     );
                         }
                         crate::ast::decl::PackageItem::Typedef(td) => {
@@ -20367,7 +20368,7 @@ fn inline_module_items(
                         register_class_enum_members(cd, elab);
                         elab.classes.insert(
                             cd.name.name.clone(),
-                            elaborate_class_with_params(cd, Some(&elab.parameters)),
+                            std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters))),
                         );
                     }
                     if let ModuleItem::ClockingDeclaration(cd) = sub_item {
@@ -23568,7 +23569,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                                 register_class_enum_members(c, elab);
                                 elab.classes.insert(
                         c.name.name.clone(),
-                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                        std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
                     );
                                 found = true;
                             }
@@ -23769,7 +23770,7 @@ fn process_import(imp: &ImportDeclaration, elab: &mut ElaboratedModule, defs: &H
                             register_class_enum_members(c, elab);
                             elab.classes.insert(
                         c.name.name.clone(),
-                        elaborate_class_with_params(c, Some(&elab.parameters)),
+                        std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
                     );
                         }
                         PackageItem::Data(dd) => {

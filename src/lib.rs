@@ -1808,7 +1808,10 @@ fn parse_and_elaborate(
                         elaborate::register_class_enum_members(cd, &mut elab);
                         elab.classes.insert(
                             cd.name.name.clone(),
-                            elaborate::elaborate_class_with_params(cd, Some(&elab.parameters)),
+                            std::sync::Arc::new(elaborate::elaborate_class_with_params(
+                                cd,
+                                Some(&elab.parameters),
+                            )),
                         );
                     }
                     ast::decl::ModuleItem::TypedefDeclaration(td) => {
