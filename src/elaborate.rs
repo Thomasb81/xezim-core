@@ -1371,6 +1371,10 @@ pub struct ElaboratedModule {
     pub parameters: HashMap<String, Value>,
     /// Typedef name -> width mapping for user-defined types.
     pub typedefs: HashMap<String, u32>,
+    /// §7.4.1: for a typedef whose target is a packed array of packed
+    /// elements (`typedef u8_t [15:0] vec_t`), the ELEMENT width (8 here).
+    /// Lets downstream compilers slice `local[i]` on typedef-typed locals.
+    pub typedef_elem_widths: HashMap<String, u32>,
     pub typedef_types: HashMap<String, DataType>,
     /// Array declarations: base_name -> (lo_index, hi_index, element_width)
     pub arrays: HashMap<String, (i64, i64, u32)>,
@@ -1908,6 +1912,7 @@ impl ElaboratedModule {
             var_decl_types: HashMap::default(),
             struct_members: HashMap::default(),
             packed_signal_elem_widths: HashMap::default(),
+            typedef_elem_widths: HashMap::default(),
             packed_full_dims: HashMap::default(),
             string_signals: HashSet::default(),
             modport_member_dirs: HashMap::default(),
@@ -2925,6 +2930,11 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         } else {
             let w = resolve_type_width(eff_dt, Some(&elab.parameters), Some(&elab.typedefs));
             typedefs_insert_traced(&mut elab.typedefs, "insert:process_typedef", td.name.name.clone(), w);
+            if let Some(ew) =
+                packed_inner_elem_width(eff_dt, &elab.parameters, &elab.typedefs)
+            {
+                elab.typedef_elem_widths.insert(td.name.name.clone(), ew);
+            }
             elab.typedef_types.insert(td.name.name.clone(), eff_dt.clone());
         }
     }
@@ -19352,6 +19362,25 @@ fn inline_module_items(
                             typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef", td.name.name.clone(), w);
                             // Instance-scoped key — see the enum branch above.
                             typedefs_insert_traced(&mut elab.typedefs, "insert:submodule_typedef_scoped", format!("{}{}", inst_prefix, td.name.name), w);
+                            // Packed ELEMENT width, both keys, mirroring the
+                            // width entries: the bytecode compiler's packed
+                            // element splice/extract on typedef'd locals
+                            // resolves through this table, and a submodule
+                            // typedef recorded only its total width, so a
+                            // `y[i] = …` on a packed-of-packed local bailed
+                            // to the 1-bit select path.
+                            if let Some(ew) = packed_inner_elem_width(
+                                &td.data_type,
+                                &sub_merged_params,
+                                &elab.typedefs,
+                            ) {
+                                elab.typedef_elem_widths
+                                    .insert(td.name.name.clone(), ew);
+                                elab.typedef_elem_widths.insert(
+                                    format!("{}{}", inst_prefix, td.name.name),
+                                    ew,
+                                );
+                            }
                             // Register the TYPE too (not just its width) so a
                             // struct/union member access (`s.m0`) on a submodule
                             // variable of this typedef can resolve to its bit
