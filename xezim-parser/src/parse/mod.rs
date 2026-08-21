@@ -82,6 +82,35 @@ impl Parser {
         let start_byte = self.current().span.start;
         let restart = self.pos;
         let target = self.parse_identifier();
+        // §23.11 bind_target_instance: a dotted instance path selects ONE
+        // instance instead of every instance of a module. The colon form
+        // (`bind <mod> : <path> [, <path>]* <binder> ...`) lists explicit
+        // target instances of that module.
+        let mut target_path: Vec<crate::ast::Identifier> = Vec::new();
+        let mut extra_paths: Vec<Vec<crate::ast::Identifier>> = Vec::new();
+        if self.at(TokenKind::Dot) {
+            target_path.push(target.clone());
+            while self.eat(TokenKind::Dot).is_some() {
+                target_path.push(self.parse_identifier());
+            }
+        } else if self.at(TokenKind::Colon) {
+            self.bump();
+            loop {
+                let mut path: Vec<crate::ast::Identifier> = Vec::new();
+                path.push(self.parse_identifier());
+                while self.eat(TokenKind::Dot).is_some() {
+                    path.push(self.parse_identifier());
+                }
+                if target_path.is_empty() {
+                    target_path = path;
+                } else {
+                    extra_paths.push(path);
+                }
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+        }
         let bind_mod = self.parse_identifier();
         if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
             let inst_start = self.current().span.start;
@@ -105,6 +134,8 @@ impl Parser {
                 };
                 return Some(crate::ast::decl::BindDirective {
                     target_module: target,
+                    target_path,
+                    extra_paths,
                     instantiation,
                     span,
                 });

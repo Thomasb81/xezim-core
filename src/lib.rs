@@ -1281,12 +1281,61 @@ fn parse_and_elaborate(
     // instantiation to its target module's items. This runs before
     // top_level_functions/tasks/nettypes injection so a bound monitor module
     // sees the same top-level helpers as native modules.
+    // A bind whose target is a hierarchical INSTANCE path attaches to that
+    // one instance only: the definitions along the path spine are cloned
+    // under "__bind<N>" names bottom-up and each parent's instantiation is
+    // rewritten to the clone, so sibling instances of the same definitions
+    // (decoys) never see the bound module.
+    // Module-name binds FIRST: a path bind clones its target definition, so
+    // every module-wide bound instantiation must already be in the base
+    // definition or the specialized instance would miss it (the reference
+    // applies module binds to path-specialized instances too).
+    let mut bind_spec_counter = 0usize;
     for b in &top_level_binds {
+        if b.target_path.len() >= 2 {
+            continue;
+        }
         let tname = b.target_module.name.clone();
         let Some(def) = definitions.get_mut(&tname) else { continue };
         if let SourceDefinition::Module(m) = def {
             let m = Rc::make_mut(m);
             m.items.push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
+        }
+    }
+    for b in &top_level_binds {
+        if b.target_path.len() >= 2 {
+            apply_instance_bind(&mut definitions, b, &b.target_path, &mut bind_spec_counter);
+            for extra in &b.extra_paths {
+                apply_instance_bind(&mut definitions, b, extra, &mut bind_spec_counter);
+            }
+        } else if !b.target_path.is_empty() {
+            // Colon form with a SINGLE-segment instance name: an instance of
+            // <target_module> directly in the top module. Resolve it under
+            // every top-level module definition that instantiates it.
+            for extra in std::iter::once(&b.target_path).chain(b.extra_paths.iter()) {
+                let full = extra.clone();
+                apply_instance_bind(&mut definitions, b, &full, &mut bind_spec_counter);
+            }
+        }
+    }
+    // The effective-timescale walk ran BEFORE bind application, so the
+    // "__bind<N>" specialization clones have no entries — copy the base
+    // definition's (a missing entry silently defaults the clone's timescale
+    // and shifts every #delay inside it).
+    if bind_spec_counter > 0 {
+        let spec_names: Vec<String> = definitions
+            .keys()
+            .filter(|k| bind_spec_base(k) != k.as_str())
+            .cloned()
+            .collect();
+        for nm in spec_names {
+            let base = bind_spec_base(&nm).to_string();
+            if let Some(v) = eff_ts.get(&base).copied() {
+                eff_ts.insert(nm.clone(), v);
+            }
+            if let Some(v) = module_timescale_exp.get(&base).copied() {
+                module_timescale_exp.insert(nm.clone(), v);
+            }
         }
     }
     if !top_level_functions.is_empty() || !top_level_tasks.is_empty()
@@ -1865,6 +1914,153 @@ fn parse_and_elaborate(
         try_size("specify_delays   ", opts.serialize(&elab.specify_delays));
     }
     Ok((definitions, elab))
+}
+
+/// Base definition name of a §23.11 per-instance-bind specialization clone:
+/// strips one trailing `__bind<digits>` suffix; ordinary names pass through.
+/// The simulator's §23.8 upward-name walk uses this so hierarchical
+/// references from inside a bound module still match the specialized host's
+/// original module name.
+pub fn bind_spec_base(name: &str) -> &str {
+    if let Some(pos) = name.rfind("__bind") {
+        let tail = &name[pos + 6..];
+        if !tail.is_empty() && tail.bytes().all(|b| b.is_ascii_digit()) {
+            return &name[..pos];
+        }
+    }
+    name
+}
+
+/// §23.11 per-instance bind: `bind top.a.b.inst bound_mod m ();`.
+///
+/// Walks the definition tree along `target_path` (first segment must name a
+/// module DEFINITION — the top the path is rooted at), recording at each
+/// level which instantiation carries the next path segment. The target
+/// definition is cloned with the bound instantiation appended, then every
+/// definition on the spine (except the root, edited in place) is cloned with
+/// its child instantiation retargeted at the clone below — giving exactly one
+/// instance the bound module while all other instances of the same
+/// definitions keep the original, unbound definitions.
+///
+/// The clone names carry a reserved "__bind<N>" suffix; the simulator's §23.8
+/// upward-name walk strips it when matching a first segment against a module
+/// definition name, so `target_dut.sig` references from inside the bound
+/// module still resolve against the specialized host.
+fn apply_instance_bind(
+    definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
+    b: &ast::decl::BindDirective,
+    path: &[ast::Identifier],
+    counter: &mut usize,
+) {
+    let segs: Vec<&str> = path.iter().map(|i| i.name.as_str()).collect();
+    let root = segs[0];
+    if !matches!(definitions.get(root), Some(SourceDefinition::Module(_))) {
+        eprintln!(
+            "[elab] bind target path '{}' does not start at a module definition; bind ignored",
+            segs.join(".")
+        );
+        return;
+    }
+    // Resolve the spine: (parent_def_name, instance_name, child_def_name).
+    let mut spine: Vec<(String, String, String)> = Vec::new();
+    let mut cur = root.to_string();
+    for seg in &segs[1..] {
+        let Some(SourceDefinition::Module(m)) = definitions.get(&cur) else {
+            eprintln!(
+                "[elab] bind target path '{}': '{}' is not a module; bind ignored",
+                segs.join("."),
+                cur
+            );
+            return;
+        };
+        let child = m.items.iter().find_map(|it| match it {
+            ast::decl::ModuleItem::ModuleInstantiation(mi)
+                if mi.instances.iter().any(|i| i.name.name == **seg) =>
+            {
+                Some(mi.module_name.name.clone())
+            }
+            _ => None,
+        });
+        let Some(child) = child else {
+            eprintln!(
+                "[elab] bind target path '{}': no instance '{}' in module '{}'; bind ignored",
+                segs.join("."),
+                seg,
+                cur
+            );
+            return;
+        };
+        spine.push((cur.clone(), (*seg).to_string(), child.clone()));
+        cur = child;
+    }
+    // Clone the TARGET definition with the bound instantiation appended.
+    let n = *counter;
+    *counter += 1;
+    let target_def = cur;
+    let spec_of = |base: &str| format!("{base}__bind{n}");
+    let Some(SourceDefinition::Module(tm)) = definitions.get(&target_def) else {
+        return;
+    };
+    let mut tclone = (**tm).clone();
+    tclone.name.name = spec_of(&target_def);
+    tclone
+        .items
+        .push(ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()));
+    definitions.insert(tclone.name.name.clone(), SourceDefinition::Module(Rc::new(tclone)));
+    // Rewrite parents bottom-up. Retargeting an instantiation that declares
+    // several comma-listed instances must split the named one out, so the
+    // siblings keep the original definition.
+    let mut child_spec = spec_of(&target_def);
+    for (level, (parent, inst_name, child_def)) in spine.iter().enumerate().rev() {
+        let is_root = level == 0;
+        let Some(SourceDefinition::Module(pm)) = definitions.get(parent) else {
+            return;
+        };
+        let mut pclone = (**pm).clone();
+        if !is_root {
+            pclone.name.name = spec_of(parent);
+        }
+        let mut done = false;
+        let mut new_items: Vec<ast::decl::ModuleItem> = Vec::with_capacity(pclone.items.len());
+        for it in pclone.items.into_iter() {
+            match it {
+                ast::decl::ModuleItem::ModuleInstantiation(mut mi)
+                    if !done
+                        && mi.module_name.name == *child_def
+                        && mi.instances.iter().any(|i| i.name.name == *inst_name) =>
+                {
+                    done = true;
+                    if mi.instances.len() == 1 {
+                        mi.module_name.name = child_spec.clone();
+                        new_items.push(ast::decl::ModuleItem::ModuleInstantiation(mi));
+                    } else {
+                        let pos = mi
+                            .instances
+                            .iter()
+                            .position(|i| i.name.name == *inst_name)
+                            .unwrap();
+                        let picked = mi.instances.remove(pos);
+                        let split = ast::decl::ModuleInstantiation {
+                            module_name: ast::Identifier {
+                                name: child_spec.clone(),
+                                span: mi.module_name.span,
+                            },
+                            params: mi.params.clone(),
+                            instances: vec![picked],
+                            span: mi.span,
+                        };
+                        new_items.push(ast::decl::ModuleItem::ModuleInstantiation(mi));
+                        new_items.push(ast::decl::ModuleItem::ModuleInstantiation(split));
+                    }
+                }
+                other => new_items.push(other),
+            }
+        }
+        pclone.items = new_items;
+        let key = pclone.name.name.clone();
+        definitions.insert(key.clone(), SourceDefinition::Module(Rc::new(pclone)));
+        child_spec = key;
+    }
 }
 
 fn collect_instantiated_modules(items: &[ast::decl::ModuleItem], set: &mut std::collections::HashSet<String>) {
