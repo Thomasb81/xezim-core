@@ -1104,9 +1104,10 @@ fn parse_and_elaborate(
                             nname
                         ));
                     }
-                    let unit_s = eff_ts.get(&nname).map(|&(u, _)| u).unwrap_or(tick_s);
+                    let (unit_s, prec_s) =
+                        eff_ts.get(&nname).copied().unwrap_or((tick_s, tick_s));
                     let mut n = n;
-                    elaborate::rewrite_module_delays_pub(&mut n.items, unit_s, tick_s);
+                    elaborate::rewrite_module_delays_pub(&mut n.items, unit_s, prec_s, tick_s);
                     definitions.insert(nname, SourceDefinition::Module(Rc::new(n)));
                 }
                 let name = m.name.name.clone();
@@ -1128,8 +1129,9 @@ fn parse_and_elaborate(
                 // consumes tick-denominated delays. A module with no effective
                 // timescale uses the tick unit, making the rewrite a numeric
                 // no-op but still converting the delay form.
-                let unit_s = eff_ts.get(&name).map(|&(u, _)| u).unwrap_or(tick_s);
-                elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
+                let (unit_s, prec_s) =
+                    eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
+                elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, prec_s, tick_s);
                 top_module = Some(name.clone());
                 definitions.insert(name, SourceDefinition::Module(Rc::new(m)));
             }
@@ -1138,9 +1140,10 @@ fn parse_and_elaborate(
                 // Interface items ARE `ModuleItem`s, so the module walker
                 // applies unchanged; the effective timescale now exists for
                 // interfaces too (see the ts_target walk above).
-                let unit_s = eff_ts.get(&name).map(|&(u, _)| u).unwrap_or(tick_s);
+                let (unit_s, prec_s) =
+                    eff_ts.get(&name).copied().unwrap_or((tick_s, tick_s));
                 let mut i = i;
-                elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, tick_s);
+                elaborate::rewrite_module_delays_pub(&mut i.items, unit_s, prec_s, tick_s);
                 definitions.insert(name, SourceDefinition::Interface(Rc::new(i)));
             }
             ast::Description::Program(p) => {
@@ -1502,10 +1505,10 @@ fn parse_and_elaborate(
                 let ts = cli.named.get(&name).copied().or(cli.global);
                 let Some((u, p)) = ts else { continue };
                 let unit_s = elaborate::exp_to_secs(u);
-                let _ = p; // precision folds into the global tick, already fixed
+                let prec_s = elaborate::exp_to_secs(p);
                 if let Some(SourceDefinition::Module(rc)) = definitions.get_mut(&name) {
                     let m = Rc::make_mut(rc);
-                    elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, tick_s);
+                    elaborate::rewrite_module_delays_pub(&mut m.items, unit_s, prec_s, tick_s);
                     module_timescale_exp
                         .insert(name.clone(), (elaborate::secs_to_exp(unit_s), elaborate::secs_to_exp(elaborate::exp_to_secs(p))));
                 }

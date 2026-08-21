@@ -10931,8 +10931,9 @@ pub fn rewrite_scope_time_semantics(
     tick_s: f64,
 ) {
     let unit_s = exp_to_secs(unit_exp);
+    let prec_s = exp_to_secs(prec_exp);
     for s in stmts.iter_mut() {
-        rewrite_stmt_delays(s, unit_s, tick_s);
+        rewrite_stmt_delays(s, unit_s, prec_s, tick_s);
     }
     for s in stmts.iter_mut() {
         scope_time_stmt(s, unit_exp, prec_exp);
@@ -11068,8 +11069,8 @@ fn scope_time_expr(e: &mut Expression, u: i32, p: i32) {
     }
 }
 
-pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, tick_s: f64) {
-    rewrite_module_item_delays(items, unit_s, tick_s);
+pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, prec_s: f64, tick_s: f64) {
+    rewrite_module_item_delays(items, unit_s, prec_s, tick_s);
 }
 
 /// Rewrite every delay expression inside a module's items so it is expressed in
@@ -11079,43 +11080,43 @@ pub fn rewrite_module_delays_pub(items: &mut [ModuleItem], unit_s: f64, tick_s: 
 /// becomes `seconds / tick_s`. With no finer timescale anywhere (tick_s = unit_s
 /// = 1 ns) both are identities, so behaviour is unchanged. LRM §22.7 / §3.14.
 /// Scale every delay in a class's method bodies (and nested classes).
-fn rewrite_class_delays(cd: &mut ClassDeclaration, unit_s: f64, tick_s: f64) {
+fn rewrite_class_delays(cd: &mut ClassDeclaration, unit_s: f64, prec_s: f64, tick_s: f64) {
     for item in cd.items.iter_mut() {
         match item {
             ClassItem::Method(m) => match &mut m.kind {
                 ClassMethodKind::Task(td) => {
                     for st in td.items.iter_mut() {
-                        rewrite_stmt_delays(st, unit_s, tick_s);
+                        rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
                     }
                 }
                 // A function cannot consume time, but `#0` is legal inside one
                 // and must still be tick-denominated for the executor.
                 ClassMethodKind::Function(f) => {
                     for st in f.items.iter_mut() {
-                        rewrite_stmt_delays(st, unit_s, tick_s);
+                        rewrite_stmt_delays(st, unit_s, prec_s, tick_s);
                     }
                 }
                 _ => {}
             },
-            ClassItem::Class(inner) => rewrite_class_delays(inner, unit_s, tick_s),
+            ClassItem::Class(inner) => rewrite_class_delays(inner, unit_s, prec_s, tick_s),
             _ => {}
         }
     }
 }
 
-fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64) {
+fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64, tick_s: f64) {
     for item in items.iter_mut() {
         match item {
-            ModuleItem::AlwaysConstruct(ac) => rewrite_stmt_delays(&mut ac.stmt, unit_s, tick_s),
-            ModuleItem::InitialConstruct(ic) => rewrite_stmt_delays(&mut ic.stmt, unit_s, tick_s),
-            ModuleItem::FinalConstruct(fc) => rewrite_stmt_delays(&mut fc.stmt, unit_s, tick_s),
+            ModuleItem::AlwaysConstruct(ac) => rewrite_stmt_delays(&mut ac.stmt, unit_s, prec_s, tick_s),
+            ModuleItem::InitialConstruct(ic) => rewrite_stmt_delays(&mut ic.stmt, unit_s, prec_s, tick_s),
+            ModuleItem::FinalConstruct(fc) => rewrite_stmt_delays(&mut fc.stmt, unit_s, prec_s, tick_s),
             // Task bodies carry delays too (`task pulse; #1 clk = 1; ...`).
             // Without this a task-body `#1` stayed a raw 1-tick delay while
             // the caller's `#1` was unit-scaled — a 1ns/1ps module's task
             // delays silently ran 1000x too fast (§3.14.3).
             ModuleItem::TaskDeclaration(td) => {
                 for s in td.items.iter_mut() {
-                    rewrite_stmt_delays(s, unit_s, tick_s);
+                    rewrite_stmt_delays(s, unit_s, prec_s, tick_s);
                 }
             }
             // `assign #5 y = a;` — the cont-assign delay counts module
@@ -11123,16 +11124,16 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
             // (5 ps in a 1ns/1ps module instead of 5 ns).
             ModuleItem::ContinuousAssign(ca) => {
                 if let Some(d) = ca.delay.as_mut() {
-                    rewrite_delay_expr(d, unit_s, tick_s);
+                    rewrite_delay_expr(d, unit_s, prec_s, tick_s);
                 }
             }
             // `buf #(4) g(y, a);` — gate delays likewise count timeunits.
             ModuleItem::GateInstantiation(gi) => {
                 if let Some(d) = gi.delay.as_mut() {
-                    rewrite_delay_expr(d, unit_s, tick_s);
+                    rewrite_delay_expr(d, unit_s, prec_s, tick_s);
                 }
                 if let Some(d) = gi.delay_fall.as_mut() {
-                    rewrite_delay_expr(d, unit_s, tick_s);
+                    rewrite_delay_expr(d, unit_s, prec_s, tick_s);
                 }
             }
             // A class METHOD body carries delays exactly like a task body, and
@@ -11143,17 +11144,17 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
             // 1ns/1ps scope the class delay ran 1000x too short. That is
             // invisible in a pure-RTL design and breaks every class-based
             // testbench that paces itself with `#`.
-            ModuleItem::ClassDeclaration(cd) => rewrite_class_delays(cd, unit_s, tick_s),
-            ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, tick_s),
+            ModuleItem::ClassDeclaration(cd) => rewrite_class_delays(cd, unit_s, prec_s, tick_s),
+            ModuleItem::GenerateFor(gf) => rewrite_module_item_delays(&mut gf.items, unit_s, prec_s, tick_s),
             ModuleItem::GenerateIf(gi) => {
                 for (_c, items) in gi.branches.iter_mut() {
-                    rewrite_module_item_delays(items, unit_s, tick_s);
+                    rewrite_module_item_delays(items, unit_s, prec_s, tick_s);
                 }
             }
-            ModuleItem::GenerateRegion(gr) => rewrite_module_item_delays(&mut gr.items, unit_s, tick_s),
+            ModuleItem::GenerateRegion(gr) => rewrite_module_item_delays(&mut gr.items, unit_s, prec_s, tick_s),
             ModuleItem::GenerateCase(gc) => {
                 for arm in gc.arms.iter_mut() {
-                    rewrite_module_item_delays(&mut arm.items, unit_s, tick_s);
+                    rewrite_module_item_delays(&mut arm.items, unit_s, prec_s, tick_s);
                 }
             }
             _ => {}
@@ -11162,24 +11163,51 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, tick_s: f64
 }
 
 /// Replace a single delay expression with its tick-count equivalent.
-fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, tick_s: f64) {
+fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64) {
     use crate::ast::expr::NumberLiteral;
-    if let ExprKind::Number(NumberLiteral::Time(s)) = &d.kind {
-        // Absolute time literal → ticks.
-        let ticks = *s / tick_s;
-        *d = Expression::new(ExprKind::Number(NumberLiteral::Real(ticks)), d.span);
-    } else {
-        // Bare delay (count of the module timeunit) → ticks.
-        let scale = unit_s / tick_s;
-        if (scale - 1.0).abs() > f64::EPSILON {
-            let span = d.span;
-            let inner = std::mem::replace(d, Expression::new(ExprKind::Null, span));
-            *d = Expression::new(ExprKind::Binary {
-                op: BinaryOp::Mul,
-                left: Box::new(inner),
-                right: Box::new(Expression::new(
-                    ExprKind::Number(NumberLiteral::Real(scale)), span)),
-            }, span);
+    // §3.14.3: a delay rounds to the DECLARING scope's time precision.
+    // CONSTANT delays quantize here, where the declaring module is
+    // unambiguous — the runtime fallback resolves the scope from execution
+    // context and gets it wrong on some task-call paths (a `#0.002` in a
+    // 1ns/1ns BFM kept a real 2 ps duration when called hierarchically
+    // from a 1 ps-precision testbench, phase-shifting delay-paced loops
+    // off the clock grid for the rest of the run).
+    let q = prec_s / tick_s;
+    let quant = |ticks: f64| -> f64 {
+        if q > 1.0 + f64::EPSILON {
+            let x = (ticks / q) * (1.0 + 1e-12);
+            (x.round() * q).round()
+        } else {
+            ticks
+        }
+    };
+    match &d.kind {
+        ExprKind::Number(NumberLiteral::Time(s)) => {
+            // Absolute time literal → ticks, on the precision grid.
+            let ticks = quant(*s / tick_s);
+            *d = Expression::new(ExprKind::Number(NumberLiteral::Real(ticks)), d.span);
+        }
+        // A FRACTIONAL bare delay is the only bare form the precision grid
+        // can move (an integer count of timeunits is always on it): fold
+        // and quantize now. Integer and non-constant delays keep the
+        // multiply-by-scale form (+ runtime quantization).
+        ExprKind::Number(NumberLiteral::Real(r)) => {
+            let ticks = quant(*r * (unit_s / tick_s));
+            *d = Expression::new(ExprKind::Number(NumberLiteral::Real(ticks)), d.span);
+        }
+        _ => {
+            // Bare delay (count of the module timeunit) → ticks.
+            let scale = unit_s / tick_s;
+            if (scale - 1.0).abs() > f64::EPSILON {
+                let span = d.span;
+                let inner = std::mem::replace(d, Expression::new(ExprKind::Null, span));
+                *d = Expression::new(ExprKind::Binary {
+                    op: BinaryOp::Mul,
+                    left: Box::new(inner),
+                    right: Box::new(Expression::new(
+                        ExprKind::Number(NumberLiteral::Real(scale)), span)),
+                }, span);
+            }
         }
     }
 }
@@ -11188,48 +11216,48 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, tick_s: f64) {
 /// `$__xz_intra_delay(d, rhs)` marker calls (see xezim's intra_delay pass);
 /// their first arg is a delay in module timeunits and must be scaled like
 /// any other delay.
-fn rewrite_intra_marker_delay(e: &mut Expression, unit_s: f64, tick_s: f64) {
+fn rewrite_intra_marker_delay(e: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64) {
     if let ExprKind::SystemCall { name, args } = &mut e.kind {
         if name == "$__xz_intra_delay" && args.len() == 2 {
-            rewrite_delay_expr(&mut args[0], unit_s, tick_s);
+            rewrite_delay_expr(&mut args[0], unit_s, prec_s, tick_s);
         }
     }
 }
 
-fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, tick_s: f64) {
+fn rewrite_stmt_delays(stmt: &mut Statement, unit_s: f64, prec_s: f64, tick_s: f64) {
     match &mut stmt.kind {
         StatementKind::TimingControl { control, stmt } => {
             if let TimingControl::Delay(d) = control {
-                rewrite_delay_expr(d, unit_s, tick_s);
+                rewrite_delay_expr(d, unit_s, prec_s, tick_s);
             }
-            rewrite_stmt_delays(stmt, unit_s, tick_s);
+            rewrite_stmt_delays(stmt, unit_s, prec_s, tick_s);
         }
         StatementKind::BlockingAssign { rvalue, .. } => {
-            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
+            rewrite_intra_marker_delay(rvalue, unit_s, prec_s, tick_s);
         }
         StatementKind::NonblockingAssign { delay: Some(d), rvalue, .. } => {
-            rewrite_delay_expr(d, unit_s, tick_s);
-            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
+            rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+            rewrite_intra_marker_delay(rvalue, unit_s, prec_s, tick_s);
         }
         StatementKind::NonblockingAssign { rvalue, .. } => {
-            rewrite_intra_marker_delay(rvalue, unit_s, tick_s);
+            rewrite_intra_marker_delay(rvalue, unit_s, prec_s, tick_s);
         }
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
-            for s in stmts.iter_mut() { rewrite_stmt_delays(s, unit_s, tick_s); }
+            for s in stmts.iter_mut() { rewrite_stmt_delays(s, unit_s, prec_s, tick_s); }
         }
         StatementKind::If { then_stmt, else_stmt, .. } => {
-            rewrite_stmt_delays(then_stmt, unit_s, tick_s);
-            if let Some(e) = else_stmt { rewrite_stmt_delays(e, unit_s, tick_s); }
+            rewrite_stmt_delays(then_stmt, unit_s, prec_s, tick_s);
+            if let Some(e) = else_stmt { rewrite_stmt_delays(e, unit_s, prec_s, tick_s); }
         }
         StatementKind::For { body, .. }
         | StatementKind::Foreach { body, .. }
         | StatementKind::While { body, .. }
         | StatementKind::DoWhile { body, .. }
         | StatementKind::Repeat { body, .. }
-        | StatementKind::Forever { body, .. } => rewrite_stmt_delays(body, unit_s, tick_s),
-        StatementKind::Wait { stmt, .. } => rewrite_stmt_delays(stmt, unit_s, tick_s),
+        | StatementKind::Forever { body, .. } => rewrite_stmt_delays(body, unit_s, prec_s, tick_s),
+        StatementKind::Wait { stmt, .. } => rewrite_stmt_delays(stmt, unit_s, prec_s, tick_s),
         StatementKind::Case { items, .. } => {
-            for it in items.iter_mut() { rewrite_stmt_delays(&mut it.stmt, unit_s, tick_s); }
+            for it in items.iter_mut() { rewrite_stmt_delays(&mut it.stmt, unit_s, prec_s, tick_s); }
         }
         _ => {}
     }
