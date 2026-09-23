@@ -1919,7 +1919,10 @@ impl Parser {
         } else if self.eat(TokenKind::KwEdge).is_some() {
             2
         } else {
-            0
+            // §9.4.2 / §16.5: an event expression without an edge
+            // (`@(clk)`, `@clk`) fires on any change of its value, not
+            // on the rising edge only.
+            2
         };
         let parsed = self.parse_expression();
         // `clk iff g` arrives as `Binary(Iff, clk, g)`: peel it apart.
