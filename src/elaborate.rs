@@ -19717,16 +19717,24 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             r
         }
         ExprKind::Replication { count, exprs } => {
-            let n = eval_const_expr_val(count, params).to_u64().unwrap_or(1) as usize;
+            // §11.4.12.1: the count is a non-negative constant. A signed
+            // count is read as signed, so `{$bits(T) - 1{1'b1}}` with an
+            // unresolved `T` replicates nothing instead of wrapping to
+            // ~4 G copies (built one concatenation at a time, it never
+            // finished elaborating).
+            let cv = eval_const_expr_val(count, params);
+            let n = if cv.has_xz() {
+                0
+            } else if cv.is_signed {
+                cv.to_i64().unwrap_or(0).max(0) as usize
+            } else {
+                cv.to_u64().unwrap_or(1) as usize
+            };
             let mut inner = Value::zero(0);
             for p in exprs.iter().rev() {
                 inner = eval_const_expr_val(p, params).concat_with(&inner);
             }
-            let mut r = Value::zero(0);
-            for _ in 0..n {
-                r = inner.clone().concat_with(&r);
-            }
-            r
+            inner.replicate(n)
         }
         // SystemVerilog `for (j = 0; j < N; j = j+1)` parses the increment
         // as an `AssignExpr { lvalue: j, rvalue: j+1 }`. As a const-eval
