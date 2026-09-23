@@ -31972,15 +31972,25 @@ fn rewrite_expr_impl(
             edge,
             iff,
             body,
-        } => ExprKind::SvaClocked {
-            clock: Box::new(rewrite_expr_impl(
-                clock,
-                prefix,
-                port_map,
-                local_names,
-                interface_map,
-            )),
-            edge: *edge,
+        } => {
+            let clock = rewrite_expr_impl(clock, prefix, port_map, local_names, interface_map);
+            // §17.2: `@clk` on a checker event formal bound to `posedge x`
+            // (carried as `$__posedge(x)`, see the port-actual parser)
+            // clocks on that edge of `x`.
+            let (clock, edge) = match &clock.kind {
+                ExprKind::SystemCall { name, args } if *edge == 2 && args.len() == 1 => {
+                    match name.as_str() {
+                        "$__posedge" => (args[0].clone(), 0u8),
+                        "$__negedge" => (args[0].clone(), 1u8),
+                        "$__edge" => (args[0].clone(), 2u8),
+                        _ => (clock.clone(), *edge),
+                    }
+                }
+                _ => (clock.clone(), *edge),
+            };
+            ExprKind::SvaClocked {
+            clock: Box::new(clock),
+            edge,
             iff: iff.as_ref().map(|g| {
                 Box::new(rewrite_expr_impl(
                     g,
@@ -31997,7 +32007,8 @@ fn rewrite_expr_impl(
                 local_names,
                 interface_map,
             )),
-        },
+        }
+        }
         // §10.9.2: an assignment pattern is an EXPRESSION, and its items name
         // parameters and signals of the module it was written in. Falling
         // through to `other.clone()` left every one of them unprefixed, so once

@@ -2027,6 +2027,24 @@ impl Parser {
         }
     }
 
+    /// One actual of an instance connection. §17.2: a checker's event
+    /// formal takes an event expression (`chk u(v, posedge clk)`), which
+    /// is not an ordinary expression; it is carried as the internal
+    /// `$__posedge(e)` / `$__negedge(e)` / `$__edge(e)` call and folded
+    /// into the clocking event when the checker body is instantiated.
+    fn parse_port_actual(&mut self) -> Expression {
+        let name = match self.current().kind {
+            TokenKind::KwPosedge => "$__posedge",
+            TokenKind::KwNegedge => "$__negedge",
+            TokenKind::KwEdge => "$__edge",
+            _ => return self.parse_expression(),
+        };
+        let start = self.current().span.start;
+        self.bump();
+        let e = self.parse_expression();
+        Expression::new(ExprKind::SystemCall { name: name.to_string(), args: vec![e] }, self.span_from(start))
+    }
+
     pub(super) fn parse_port_connections(&mut self) -> Vec<PortConnection> {
         let mut conns = Vec::new();
         if self.eat(TokenKind::LParen).is_none() { return conns; }
@@ -2044,12 +2062,12 @@ impl Parser {
                 else {
                     let nm = self.parse_identifier();
                     let (ex, had_parens) = if self.eat(TokenKind::LParen).is_some() {
-                        let e = if !self.at(TokenKind::RParen) { Some(self.parse_expression()) } else { None };
+                        let e = if !self.at(TokenKind::RParen) { Some(self.parse_port_actual()) } else { None };
                         self.expect(TokenKind::RParen); (e, true)
                     } else { (None, false) };
                     conns.push(PortConnection::Named { name: nm, expr: ex, implicit: !had_parens });
                 }
-            } else { conns.push(PortConnection::Ordered(Some(self.parse_expression()))); }
+            } else { conns.push(PortConnection::Ordered(Some(self.parse_port_actual()))); }
             if self.eat(TokenKind::Comma).is_none() { break; }
             // Trailing empty positional connection: `dut(result, )`.
             if self.at(TokenKind::RParen) { conns.push(PortConnection::Ordered(None)); break; }
