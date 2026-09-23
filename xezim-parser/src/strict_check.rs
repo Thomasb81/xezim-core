@@ -13,6 +13,7 @@
 
 use std::collections::{HashMap, HashSet};
 use crate::ast::Description;
+use crate::ast::stmt::{Statement, StatementKind};
 use crate::ast::decl::{
     ModuleItem, PackageItem, ClassItem, ClassMethodKind, ParameterKind, ParamConnection,
     FunctionDeclaration, TaskDeclaration, FunctionPort, ParameterDeclaration,
@@ -116,6 +117,21 @@ fn walk_module_items(items: &[ModuleItem], out: &mut Vec<String>) {
             ModuleItem::FunctionDeclaration(fd) => check_function(fd, out),
             ModuleItem::TaskDeclaration(td) => check_task(td, out),
             ModuleItem::ClassDeclaration(c) => walk_class_items(&c.items, out),
+            ModuleItem::InitialConstruct(ic) => check_decl_order_stmt(&ic.stmt, out),
+            ModuleItem::AlwaysConstruct(ac) => check_decl_order_stmt(&ac.stmt, out),
+            ModuleItem::FinalConstruct(fc) => check_decl_order_stmt(&fc.stmt, out),
+            ModuleItem::GenerateRegion(g) => walk_module_items(&g.items, out),
+            ModuleItem::GenerateFor(g) => walk_module_items(&g.items, out),
+            ModuleItem::GenerateIf(g) => {
+                for (_, items) in &g.branches {
+                    walk_module_items(items, out);
+                }
+            }
+            ModuleItem::GenerateCase(g) => {
+                for arm in &g.arms {
+                    walk_module_items(&arm.items, out);
+                }
+            }
             _ => {}
         }
     }
@@ -151,10 +167,80 @@ fn walk_class_items(items: &[ClassItem], out: &mut Vec<String>) {
 
 fn check_function(fd: &FunctionDeclaration, out: &mut Vec<String>) {
     check_dup_ports("function", &fd.name.name.name, &fd.ports, &fd.strict_body_ports, out);
+    check_decl_order_list(&fd.items, out);
 }
 
 fn check_task(td: &TaskDeclaration, out: &mut Vec<String>) {
     check_dup_ports("task", &td.name.name.name, &td.ports, &td.strict_body_ports, out);
+    check_decl_order_list(&td.items, out);
+}
+
+/// §9.3.1 / §9.3.2 / §13: in a `begin`-`end` or `fork`-`join` block and in a
+/// subroutine body, every block item declaration precedes the first
+/// statement. A null statement does not end the declaration region here (a
+/// stray `;` between declarations is common and harmless), nor do the
+/// parser's internal lowering nodes.
+fn check_decl_order_list(stmts: &[Statement], out: &mut Vec<String>) {
+    let mut seen_stmt = false;
+    for st in stmts {
+        match &st.kind {
+            StatementKind::VarDecl { declarators, .. } => {
+                if seen_stmt {
+                    let name = declarators
+                        .first()
+                        .map(|d| d.name.name.as_str())
+                        .unwrap_or("");
+                    out.push(format!(
+                        "declaration of '{name}' follows a statement; block item declarations must precede the statements of a block (§9.3.1)"
+                    ));
+                }
+            }
+            StatementKind::Typedef(_) => {
+                if seen_stmt {
+                    out.push(
+                        "typedef follows a statement; block item declarations must precede the statements of a block (§9.3.1)"
+                            .to_string(),
+                    );
+                }
+            }
+            StatementKind::Null
+            | StatementKind::ScopePop
+            | StatementKind::LoopStep
+            | StatementKind::ForeachTail { .. }
+            | StatementKind::ForeverTail { .. } => {}
+            _ => seen_stmt = true,
+        }
+        check_decl_order_stmt(st, out);
+    }
+}
+
+fn check_decl_order_stmt(st: &Statement, out: &mut Vec<String>) {
+    match &st.kind {
+        StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
+            check_decl_order_list(stmts, out)
+        }
+        StatementKind::If { then_stmt, else_stmt, .. } => {
+            check_decl_order_stmt(then_stmt, out);
+            if let Some(e) = else_stmt {
+                check_decl_order_stmt(e, out);
+            }
+        }
+        StatementKind::Case { items, .. } => {
+            for it in items {
+                check_decl_order_stmt(&it.stmt, out);
+            }
+        }
+        StatementKind::For { body, .. }
+        | StatementKind::Foreach { body, .. }
+        | StatementKind::While { body, .. }
+        | StatementKind::DoWhile { body, .. }
+        | StatementKind::Repeat { body, .. }
+        | StatementKind::Forever { body } => check_decl_order_stmt(body, out),
+        StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
+            check_decl_order_stmt(stmt, out)
+        }
+        _ => {}
+    }
 }
 
 /// §13.3/§13.4: a subroutine must not declare the same port twice. Combines the
