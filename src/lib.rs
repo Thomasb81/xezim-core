@@ -1668,6 +1668,8 @@ fn parse_and_elaborate(
     // definition or the specialized instance would miss it (the reference
     // applies module binds to path-specialized instances too).
     let mut bind_spec_counter = 0usize;
+    // Item count of each bind host before its first module-name bind.
+    let mut bind_host_len: crate::hasher::HashMap<String, usize> = Default::default();
     // A bind whose target definition is not in `definitions` YET is deferred,
     // not dropped: `-v`/`-y` library modules are adopted further below
     // (`resolve_library_modules`), so a bind reaching THROUGH a library module
@@ -1689,7 +1691,7 @@ fn parse_and_elaborate(
             deferred_module_binds.push(b);
             continue;
         };
-        push_bound_instantiation(def, b);
+        push_bound_instantiation(def, b, &mut bind_host_len);
     }
     for b in &top_level_binds {
         if b.target_path.len() >= 2 {
@@ -1957,7 +1959,7 @@ fn parse_and_elaborate(
         let tname = b.target_module.name.clone();
         if !definitions
             .get_mut(&tname)
-            .is_some_and(|def| push_bound_instantiation(def, b))
+            .is_some_and(|def| push_bound_instantiation(def, b, &mut bind_host_len))
         {
             eprintln!(
                 "[elab] bind target module '{}' is not a module definition; bind ignored",
@@ -2514,19 +2516,28 @@ pub fn bind_spec_base(name: &str) -> &str {
     name
 }
 
-/// §23.11: append a module-name bind's instantiation to its target
-/// definition. The target may be a module or an interface (a monitor BFM
-/// interface is the usual host of bound assertion interfaces); anything else
-/// is not a bind target.
-fn push_bound_instantiation(def: &mut SourceDefinition, b: &ast::decl::BindDirective) -> bool {
+/// §23.11: add a module-name bind's instantiation to its target definition,
+/// after the host's own items. The target may be a module or an interface (a
+/// monitor BFM interface is the usual host of bound assertion interfaces);
+/// anything else is not a bind target. Several binds into one host elaborate
+/// in reverse bind order, as in the reference simulator, so each goes ahead
+/// of the ones bound before it.
+fn push_bound_instantiation(
+    def: &mut SourceDefinition,
+    b: &ast::decl::BindDirective,
+    host_len: &mut crate::hasher::HashMap<String, usize>,
+) -> bool {
+    let name = def.name();
     let items = match def {
         SourceDefinition::Module(m) => &mut Rc::make_mut(m).items,
         SourceDefinition::Interface(i) => &mut Rc::make_mut(i).items,
         _ => return false,
     };
-    items.push(ast::decl::ModuleItem::ModuleInstantiation(
-        b.instantiation.clone(),
-    ));
+    let at = *host_len.entry(name).or_insert(items.len());
+    items.insert(
+        at,
+        ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone()),
+    );
     true
 }
 

@@ -29245,6 +29245,9 @@ fn inline_module_items(
                     parent: prefix.trim_end_matches('.').to_string(),
                     src_pos: hi.span.start.max(item_floor),
                 });
+                // Keep later items strictly after this one: bound
+                // instantiations carry spans from elsewhere.
+                items_end = items_end.max(hi.span.start.max(item_floor) + 1);
 
                 // Recurse into sub-module instantiations
                 iprof_add("subitem_loop", __td.elapsed());
