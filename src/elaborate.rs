@@ -11454,15 +11454,10 @@ fn validate_expr_idents(
                 {
                     return Ok(());
                 }
-                // A built-in type keyword captured as an Ident — only the parser's
-                // `$bits(<type>)` / `$size(<type>)` type-argument path produces
-                // these (a bare keyword can't appear in normal expression
-                // position), so it's a type reference, not an undeclared signal.
-                if matches!(name.as_str(),
-                    "integer" | "int" | "shortint" | "longint" | "byte" | "time"
-                    | "bit" | "logic" | "reg" | "real" | "shortreal" | "realtime"
-                    | "string" | "chandle" | "void")
-                {
+                // A built-in type keyword captured as an Ident — only the
+                // parser's `$bits(<type>)` / `$size(<type>)` type-argument path
+                // produces these, so it's a type reference, not a signal.
+                if is_builtin_type_keyword(name) || name == "void" {
                     return Ok(());
                 }
                 if !elab.signals.contains_key(name) && !elab.parameters.contains_key(name) &&
@@ -21657,6 +21652,7 @@ fn validate_inlined_bodies(
                             name,
                             "new" | "super" | "this" | "randomize" | "std" | "process" | "null"
                         )
+                        || is_builtin_type_keyword(name)
                         || (name.starts_with("genblk")
                             && name.len() > 6
                             && name[6..].chars().all(|c| c.is_ascii_digit()))
