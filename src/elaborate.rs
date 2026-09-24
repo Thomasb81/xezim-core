@@ -34410,8 +34410,13 @@ fn process_import(
                                             (it.package.name == "*" || it.package.name == ii2.package.name)
                                                 && it.item.as_ref().is_some_and(|i| i.name == *sym_name)))
                                     });
+                                    // An explicit `import Src::sym` actually imports
+                                    // the name (§26.3); a wildcard import only makes
+                                    // it a candidate until it is referenced.
                                     let wild_ok = package_exports(pkg, &ii2.package.name, None)
-                                        && package_referenced_names(pkg).contains(sym_name.as_str());
+                                        && (ii2.item.is_some()
+                                            || package_referenced_names(pkg)
+                                                .contains(sym_name.as_str()));
                                     if !explicit && !wild_ok { continue; }
                                     let synth = ImportDeclaration {
                                         items: vec![ImportItem {
