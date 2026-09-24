@@ -28586,6 +28586,14 @@ fn inline_module_items(
                                     elab.var_decl_types
                                         .entry(sig_name.clone())
                                         .or_insert_with(|| dd.data_type.clone());
+                                    // §6.11.1: a 2-state scalar drops x/z on
+                                    // every write, as at top level.
+                                    if is_type_two_state_resolved(
+                                        &dd.data_type,
+                                        &elab.typedef_types,
+                                    ) {
+                                        elab.two_state_signals.insert(sig_name.clone());
+                                    }
                                     signals_insert_traced(
                                         &mut elab.signals,
                                         line!(),
