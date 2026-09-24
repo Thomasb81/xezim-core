@@ -16084,6 +16084,17 @@ pub fn const_eval_i64_with_params(
                 }
             }
             "$unsigned" | "$signed" => const_eval_i64_with_params(args.first()?, params),
+            // §6.24.1 casts (`int'(e)`, `N'(e)`, `T'(e)`) — the value
+            // evaluator applies the cast width as the operand's context. A
+            // cast in a dimension (`logic [int'(A + B) - 1:0]`) left the range
+            // unresolved.
+            "$__xz_size_cast" | "$__xz_type_cast" | "$__xz_named_cast" => {
+                let v = eval_const_expr_val(expr, params?);
+                if v.is_real || v.has_xz() {
+                    return None;
+                }
+                v.to_i64()
+            }
             // LRM §20.9 bit-introspection system functions.
             // `$countones(x)` — Hamming weight (count of 1 bits).
             // `$onehot(x)` — 1 iff exactly one bit set.
@@ -19633,14 +19644,8 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 .unwrap_or(32)
                 .max(1) as u32;
             // §6.24.1: the cast width is the operand's evaluation CONTEXT —
-            // `5'(3'd7 + 3'd6)` is 13, not the 3-bit-wrapped 5. The i64
-            // evaluator computes unwrapped, which is the context semantics
-            // for casts up to 64 bits; the Value path (which wraps at the
-            // operands' own widths) stays as the fallback.
-            if let Some(iv) = const_eval_i64_with_params(&args[1], Some(params)) {
-                return Value::from_u64(iv as u64, 64).resize(n);
-            }
-            let v = eval_const_expr_val(&args[1], params);
+            // `5'(3'd7 + 3'd6)` is 13, not the 3-bit-wrapped 5.
+            let v = eval_const_expr_val_ctx(&args[1], params, n);
             if v.is_real {
                 let f = v.to_f64();
                 let r = if f >= 0.0 {
@@ -19668,23 +19673,30 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     .or_else(|| param_fallback_get(&nm).and_then(|v| v.to_u64()))
                 {
                     let w = (w.max(1)) as u32;
-                    if let Some(iv) = const_eval_i64_with_params(&args[1], Some(params)) {
-                        let mut out = Value::from_u64(iv as u64, 64).resize(w);
-                        out.is_signed = false;
-                        return out;
-                    }
-                    let mut out = eval_const_expr_val(&args[1], params).resize(w);
+                    let mut out = eval_const_expr_val_ctx(&args[1], params, w).resize(w);
                     out.is_signed = false;
                     return out;
+                }
+                // §6.24.1 TYPE cast through a typedef: the target is the
+                // operand's context, as for a keyword type cast below. Only an
+                // operator expression can observe a context, and the width
+                // table cannot tell an integral typedef from a string one, so
+                // a bare operand keeps its pass-through.
+                let td =
+                    TYPEDEFS_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(&nm).copied()));
+                if let Some(w) = td.filter(|&w| w > 0 && is_context_operator(&args[1])) {
+                    let v = eval_const_expr_val_ctx(&args[1], params, w);
+                    if !v.is_real {
+                        return v.resize(w);
+                    }
                 }
             }
             eval_const_expr_val(&args[1], params)
         }
         ExprKind::SystemCall { name, args } if name == "$__xz_type_cast" && args.len() == 2 => {
-            let v = eval_const_expr_val(&args[1], params);
             if let ExprKind::TypeLiteral(dt) = &args[0].kind {
                 if is_type_real(dt) {
-                    return Value::from_f64(v.to_f64());
+                    return Value::from_f64(eval_const_expr_val(&args[1], params).to_f64());
                 }
                 let w = TYPEDEFS_TLS
                     .with(|c| {
@@ -19692,6 +19704,16 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                         resolve_type_width(dt, Some(params), b.as_ref())
                     })
                     .max(1);
+                // §6.24.1: an integral target is the operand's context width.
+                let integral = matches!(
+                    dt.as_ref(),
+                    DataType::IntegerAtom { .. } | DataType::IntegerVector { .. }
+                );
+                let v = if integral {
+                    eval_const_expr_val_ctx(&args[1], params, w)
+                } else {
+                    eval_const_expr_val(&args[1], params)
+                };
                 let mut out = if v.is_real {
                     // §6.24.1: real-to-int conversion ROUNDS (away from zero).
                     let f = v.to_f64();
@@ -19707,7 +19729,7 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 out.is_signed = is_type_signed(dt);
                 out
             } else {
-                v
+                eval_const_expr_val(&args[1], params)
             }
         }
         ExprKind::SystemCall { name, args } if name == "$unsigned" || name == "$signed" => {
@@ -20050,6 +20072,152 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
     };
     // eprintln!("[DEBUG] eval_const_expr_val: {:?} -> {}", expr, res.to_dec_string());
     res
+}
+
+/// §11.6.1 / §6.24.1: evaluate a constant expression in an ASSIGNMENT-LIKE
+/// context of `ctx_w` bits — the operand of a cast. Context-determined
+/// operands (arithmetic and bitwise operators, unary `-`/`~`, the `?:` arms,
+/// a shift's or power's left operand) are extended to max(`ctx_w`, the
+/// expression's own width) BEFORE the operator applies, zero- or
+/// sign-extended per the expression's signedness (§11.8.1). So `int'(A + B)`
+/// over 8-bit parameters is 300, not the 8-bit-wrapped 44, and in
+/// `4'((A + B) / 3)` the sum is taken at the 32 bits the literal brings.
+fn eval_const_expr_val_ctx(
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    ctx_w: u32,
+) -> Value {
+    let own = eval_const_expr_val(expr, params);
+    if own.is_real || own.is_fill || !is_context_operator(expr) {
+        return own;
+    }
+    const_ctx_fold(expr, params, ctx_w.max(own.width), own.is_signed).unwrap_or(own)
+}
+
+/// True for an expression whose operands a surrounding context widens — an
+/// arithmetic, bitwise, shift or power operator, unary `-`/`~`, or `?:`.
+fn is_context_operator(expr: &Expression) -> bool {
+    match &expr.kind {
+        ExprKind::Paren(inner) => is_context_operator(inner),
+        ExprKind::Binary { op, .. } => matches!(
+            op,
+            BinaryOp::Add
+                | BinaryOp::Sub
+                | BinaryOp::Mul
+                | BinaryOp::Div
+                | BinaryOp::Mod
+                | BinaryOp::BitAnd
+                | BinaryOp::BitOr
+                | BinaryOp::BitXor
+                | BinaryOp::BitXnor
+                | BinaryOp::ShiftLeft
+                | BinaryOp::ArithShiftLeft
+                | BinaryOp::ShiftRight
+                | BinaryOp::ArithShiftRight
+                | BinaryOp::Power
+        ),
+        ExprKind::Unary { op, .. } => {
+            matches!(op, UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot)
+        }
+        ExprKind::Conditional { .. } => true,
+        _ => false,
+    }
+}
+
+/// The context fold behind `eval_const_expr_val_ctx`: `None` when a
+/// sub-expression cannot take part (a real leaf, an unknown `?:` condition),
+/// and the caller keeps the self-determined value.
+fn const_ctx_fold(
+    expr: &Expression,
+    params: &HashMap<String, Value>,
+    w: u32,
+    signed: bool,
+) -> Option<Value> {
+    Some(match &expr.kind {
+        ExprKind::Paren(inner) => const_ctx_fold(inner, params, w, signed)?,
+        ExprKind::Binary { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::Add
+                    | BinaryOp::Sub
+                    | BinaryOp::Mul
+                    | BinaryOp::Div
+                    | BinaryOp::Mod
+                    | BinaryOp::BitAnd
+                    | BinaryOp::BitOr
+                    | BinaryOp::BitXor
+                    | BinaryOp::BitXnor
+            ) =>
+        {
+            let l = const_ctx_fold(left, params, w, signed)?;
+            let r = const_ctx_fold(right, params, w, signed)?;
+            match op {
+                BinaryOp::Add => l.add(&r),
+                BinaryOp::Sub => l.sub(&r),
+                BinaryOp::Mul => l.mul(&r),
+                BinaryOp::Div => l.div(&r),
+                BinaryOp::Mod => l.modulo(&r),
+                BinaryOp::BitAnd => l.bitwise_and(&r),
+                BinaryOp::BitOr => l.bitwise_or(&r),
+                BinaryOp::BitXor => l.bitwise_xor(&r),
+                _ => l.bitwise_xor(&r).bitwise_not(),
+            }
+        }
+        // The shift amount and the exponent stay self-determined.
+        ExprKind::Binary { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::ShiftLeft
+                    | BinaryOp::ArithShiftLeft
+                    | BinaryOp::ShiftRight
+                    | BinaryOp::ArithShiftRight
+                    | BinaryOp::Power
+            ) =>
+        {
+            let l = const_ctx_fold(left, params, w, signed)?;
+            let r = eval_const_expr_val(right, params);
+            match op {
+                BinaryOp::ShiftLeft | BinaryOp::ArithShiftLeft => l.shift_left(&r),
+                BinaryOp::ShiftRight => l.shift_right(&r),
+                BinaryOp::ArithShiftRight => l.arith_shift_right(&r),
+                _ => l.power(&r),
+            }
+        }
+        ExprKind::Unary {
+            op: op @ (UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot),
+            operand,
+        } => {
+            let v = const_ctx_fold(operand, params, w, signed)?;
+            match op {
+                UnaryOp::Minus => v.negate(),
+                UnaryOp::BitNot => v.bitwise_not(),
+                _ => v,
+            }
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            let c = eval_const_expr_val(condition, params);
+            if c.has_xz() {
+                return None;
+            }
+            let arm = if c.is_true() { then_expr } else { else_expr };
+            const_ctx_fold(arm, params, w, signed)?
+        }
+        // Self-determined leaf: extend it into the context.
+        _ => {
+            let mut v = eval_const_expr_val(expr, params);
+            if v.is_real {
+                return None;
+            }
+            if !signed {
+                v.is_signed = false;
+            }
+            v.resize_for_assign(w)
+        }
+    })
 }
 
 /// Inline module instantiations: replace instances with their continuous assigns and always blocks.
