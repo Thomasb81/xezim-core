@@ -4829,8 +4829,17 @@ pub fn elaborate_module_with_defs(
                             width,
                         )
                     };
-                    if signed {
-                        v.is_signed = true;
+                    // §6.20.2: an EXPLICIT type's signedness is authoritative.
+                    // Only setting it when signed let a signed init literal
+                    // leak through, so `parameter bit [7:0] P = 200` read -56
+                    // (the body-item path already assigns it).
+                    if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                    {
+                        if signed {
+                            v.is_signed = true;
+                        }
+                    } else if !v.is_real {
+                        v.is_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
                     }
                     v
                 } else {
