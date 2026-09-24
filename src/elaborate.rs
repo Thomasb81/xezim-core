@@ -23522,11 +23522,11 @@ fn ai_expand_instances(
         };
         let rmin = lo.min(hi_idx);
         let rmax = lo.max(hi_idx);
+        // §23.3.3: a one-element array (`bus_if b[1]`) still names its
+        // element `b[0]`. Leaving it unexpanded registered the instance as a
+        // plain `b`, so `b[0]` bound to nothing: a module port connected to it
+        // read x, and every edge wait on its members completed at once.
         let n = (rmax - rmin + 1) as u32;
-        if n <= 1 {
-            out.push(hi.clone());
-            continue;
-        }
         for j in rmin..=rmax {
             let k = (j - rmin) as u32;
             let new_conns = hi
