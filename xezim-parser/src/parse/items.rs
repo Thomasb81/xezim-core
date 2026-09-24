@@ -507,6 +507,12 @@ impl Parser {
             // §23.4 nested module declaration — parsed whole and hoisted to
             // the definitions map by the top-level pipeline.
             TokenKind::KwModule | TokenKind::KwMacromodule => {
+                if self.generate_depth > 0 && crate::strict_checks() {
+                    self.error(
+                        "a module declaration is not allowed inside a generate block \
+                         (IEEE 1800-2017 §23.4, §27)",
+                    );
+                }
                 return Some(ModuleItem::NestedModule(Box::new(
                     self.parse_module_declaration(),
                 )));
@@ -655,6 +661,12 @@ impl Parser {
             // §6.20.5 specparam — parse-accept (xezim doesn't model specify
             // timing); consume through the terminating ';'.
             TokenKind::KwSpecparam => {
+                if self.generate_depth > 0 && crate::strict_checks() {
+                    self.error(
+                        "a specparam declaration is not allowed inside a generate block \
+                         (IEEE 1800-2017 §6.20.5, §27)",
+                    );
+                }
                 // §6.20.5: a specparam is a module-scoped elaboration-time
                 // constant, and §23.3.3 makes it reachable by hierarchical
                 // name. The whole declaration used to be skipped to the `;`
@@ -832,7 +844,9 @@ impl Parser {
             }
             TokenKind::KwGenerate => {
                 self.bump();
+                self.generate_depth += 1;
                 let items = self.parse_module_items_until(TokenKind::KwEndgenerate);
+                self.generate_depth -= 1;
                 self.expect(TokenKind::KwEndgenerate);
                 Some(ModuleItem::GenerateRegion(GenerateRegion {
                     items,
@@ -2670,7 +2684,8 @@ impl Parser {
     /// Like `parse_generate_branch_items` but also returns the optional
     /// `begin : <label>` block name (needed to namespace generate-for renames).
     fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>) {
-        if self.eat(TokenKind::KwBegin).is_some() {
+        self.generate_depth += 1;
+        let r = if self.eat(TokenKind::KwBegin).is_some() {
             let label = self.parse_end_label().map(|id| id.name);
             let items = self.parse_module_items_until(TokenKind::KwEnd);
             self.expect(TokenKind::KwEnd);
@@ -2678,7 +2693,9 @@ impl Parser {
             (items, label)
         } else {
             (self.parse_module_item().into_iter().collect(), None)
-        }
+        };
+        self.generate_depth -= 1;
+        r
     }
 
     /// Convert a `#(...)` parameter VALUE into a TYPE-ARG expression when it

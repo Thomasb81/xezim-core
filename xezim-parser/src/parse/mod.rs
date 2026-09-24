@@ -41,6 +41,10 @@ pub struct Parser {
     /// Extra module items produced while parsing another one (a `specparam`
     /// inside a specify block), appended right after it by the item loops.
     pub(super) pending_module_items: Vec<ModuleItem>,
+    /// Nesting depth of generate regions/blocks being parsed. A generate item
+    /// is a `module_or_generate_item` (§A.1.4), which excludes `specparam`
+    /// and module declarations.
+    pub(super) generate_depth: u32,
 }
 
 impl Parser {
@@ -54,6 +58,7 @@ impl Parser {
             in_constraint: false,
             pending_paren_dist: Vec::new(),
             pending_module_items: Vec::new(),
+            generate_depth: 0,
         }
     }
 
