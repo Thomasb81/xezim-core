@@ -250,9 +250,17 @@ pub const TIMING_NEGEDGE: u16 =
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct SpecifyPath {
-    pub src: Identifier,
-    pub dst: Identifier,
-    pub delay: Expression,
+    /// Input terminals (base names; a bit/part select is not kept).
+    pub srcs: Vec<Identifier>,
+    /// Output terminals (base names).
+    pub dsts: Vec<Identifier>,
+    /// §30.4.4 `if (cond)` of a state-dependent path.
+    pub cond: Option<Expression>,
+    /// §30.4.4.3 `ifnone`.
+    pub ifnone: bool,
+    /// §30.5.1 delay list: 1, 2, 3, 6 or 12 values, each already the
+    /// min/typ/max selection.
+    pub delays: Vec<Expression>,
     pub span: Span,
 }
 

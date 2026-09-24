@@ -290,6 +290,136 @@ pub fn timing_check_flag_args(name: &str) -> &'static [usize] {
     }
 }
 
+/// One §30.4 module path into a destination net, flattened.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct ModulePath {
+    /// §30.5 delay per output transition, in ticks, in Table 30-3 order:
+    /// 0->1, 1->0, 0->z, z->1, 1->z, z->0, 0->x, x->1, 1->x, x->0, x->z,
+    /// z->x (see `path_transition_index`).
+    pub delays: [u64; 12],
+    /// Input terminals, flat names.
+    pub srcs: Vec<String>,
+    /// §30.4.4 condition in the flat namespace; `None` = always enabled.
+    pub cond: Option<Expression>,
+    /// §30.4.4.3 `ifnone`: enabled only while no conditional path from the
+    /// same input is.
+    pub ifnone: bool,
+}
+
+/// Index into `ModulePath::delays` of the transition between two levels
+/// (0, 1, 2 = x, 3 = z); `None` when the level does not change.
+pub fn path_transition_index(from: u8, to: u8) -> Option<usize> {
+    Some(match (from, to) {
+        (0, 1) => 0,
+        (1, 0) => 1,
+        (0, 3) => 2,
+        (3, 1) => 3,
+        (1, 3) => 4,
+        (3, 0) => 5,
+        (0, 2) => 6,
+        (2, 1) => 7,
+        (1, 2) => 8,
+        (2, 0) => 9,
+        (2, 3) => 10,
+        (3, 2) => 11,
+        _ => return None,
+    })
+}
+
+/// §30.5.1 Table 30-3: the twelve transition delays of a 1, 2, 3, 6 or 12
+/// value delay list. Short of twelve, the x transitions follow §30.5.2 —
+/// to x the smallest, from x the largest of the delays they could stand for.
+pub fn path_transition_delays(d: &[u64]) -> [u64; 12] {
+    let g = |i: usize| d.get(i).copied().unwrap_or(0);
+    let (t01, t10, t0z, tz1, t1z, tz0) = match d.len() {
+        0 => (0, 0, 0, 0, 0, 0),
+        1 => (g(0), g(0), g(0), g(0), g(0), g(0)),
+        2 => (g(0), g(1), g(0), g(0), g(1), g(1)),
+        3..=5 => (g(0), g(1), g(2), g(0), g(2), g(1)),
+        _ => (g(0), g(1), g(2), g(3), g(4), g(5)),
+    };
+    if d.len() >= 12 {
+        return [
+            t01,
+            t10,
+            t0z,
+            tz1,
+            t1z,
+            tz0,
+            g(6),
+            g(7),
+            g(8),
+            g(9),
+            g(10),
+            g(11),
+        ];
+    }
+    [
+        t01,
+        t10,
+        t0z,
+        tz1,
+        t1z,
+        tz0,
+        t01.min(t0z),
+        t01.max(tz1),
+        t10.min(t1z),
+        t10.max(tz0),
+        t0z.max(t1z),
+        tz1.min(tz0),
+    ]
+}
+
+/// Flatten one specify block's §30.4 module paths into `elab.module_paths`
+/// (and the per-net `specify_delays` summary: the largest delay, which marks
+/// the net as path-delayed). `params` evaluates the delays in the instance's
+/// own parameter scope; `rewrite` maps a module-local expression into the
+/// flat namespace. The delays were scaled to ticks by the module-delay
+/// rewrite.
+fn elaborate_module_paths(
+    elab: &mut ElaboratedModule,
+    paths: &[crate::ast::decl::SpecifyPath],
+    params: &HashMap<String, Value>,
+    rewrite: &dyn Fn(&Expression) -> Expression,
+) {
+    let flat = |id: &Identifier| -> Option<String> {
+        match rewrite(&make_ident_expr(&id.name)).kind {
+            ExprKind::Ident(h) => Some(
+                h.path
+                    .iter()
+                    .map(|s| s.name.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join("."),
+            ),
+            _ => None,
+        }
+    };
+    for p in paths {
+        let vals: Vec<u64> = p
+            .delays
+            .iter()
+            .map(|d| eval_const_expr(d, params))
+            .collect();
+        let delays = path_transition_delays(&vals);
+        let srcs: Vec<String> = p.srcs.iter().filter_map(|s| flat(s)).collect();
+        let cond = p.cond.as_ref().map(rewrite);
+        let most = delays.iter().copied().max().unwrap_or(0);
+        for dst in &p.dsts {
+            let Some(name) = flat(dst) else {
+                continue;
+            };
+            let d = elab.specify_delays.entry(name.clone()).or_insert(0);
+            *d = (*d).max(most);
+            elab.module_paths.entry(name).or_default().push(ModulePath {
+                delays,
+                srcs: srcs.clone(),
+                cond: cond.clone(),
+                ifnone: p.ifnone,
+            });
+        }
+    }
+}
+
 /// Flatten one specify block's timing checks into `elab.timing_checks`.
 /// `params` evaluates the limits in the instance's own parameter scope;
 /// `rewrite` maps a module-local expression into the flat namespace.
@@ -2041,8 +2171,12 @@ pub struct ElaboratedModule {
     pub modport_views: HashMap<String, HashMap<String, PortDirection>>,
     /// Clocking block signals: block name -> (signal -> direction).
     pub clocking_signal_dirs: HashMap<String, HashMap<String, PortDirection>>,
-    /// Specify path delays: destination signal name -> delay (time units).
+    /// Specify path delays: destination signal name -> the largest delay
+    /// of its module paths, in ticks (marks the net as path-delayed).
     pub specify_delays: HashMap<String, u64>,
+    /// §30.4 module paths by destination signal name.
+    #[serde(default)]
+    pub module_paths: HashMap<String, Vec<ModulePath>>,
     /// §31 timing checks, one entry per check per instance.
     #[serde(default)]
     pub timing_checks: Vec<TimingCheckInstance>,
@@ -2586,6 +2720,7 @@ impl ElaboratedModule {
             modport_views: HashMap::default(),
             clocking_signal_dirs: HashMap::default(),
             specify_delays: HashMap::default(),
+            module_paths: HashMap::default(),
             timing_checks: Vec::new(),
             resolved_net_kinds: HashMap::default(),
             gate_fall_delays: HashMap::default(),
@@ -8897,10 +9032,8 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::SpecifyBlock(sb) => {
-                for p in &sb.paths {
-                    let d = eval_const_expr(&p.delay, &elab.parameters);
-                    elab.specify_delays.insert(p.dst.name.clone(), d);
-                }
+                let params = elab.parameters.clone();
+                elaborate_module_paths(&mut elab, &sb.paths, &params, &|e| e.clone());
                 // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
                 // so a top-level cell's functional path through them works.
                 for (delayed, source) in &sb.delayed_nets {
@@ -13635,10 +13768,8 @@ fn elaborate_items(
                 elaborate_items(&body, elab, all_defs)?;
             }
             ModuleItem::SpecifyBlock(sb) => {
-                for p in &sb.paths {
-                    let d = eval_const_expr(&p.delay, &elab.parameters);
-                    elab.specify_delays.insert(p.dst.name.clone(), d);
-                }
+                let params = elab.parameters.clone();
+                elaborate_module_paths(elab, &sb.paths, &params, &|e| e.clone());
                 // §15.6 delayed nets: `assign delayed_net = source` (zero delay)
                 // so a top-level cell's functional path through them works.
                 for (delayed, source) in &sb.delayed_nets {
@@ -14946,8 +15077,15 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
             // invisible in a pure-RTL design and breaks every class-based
             // testbench that paces itself with `#`.
             ModuleItem::ClassDeclaration(cd) => rewrite_class_delays(cd, unit_s, prec_s, tick_s),
-            // §31 timing check limits count the module's time unit too.
+            // §30.4 module path delays and §31 timing check limits count
+            // the module's time unit too. Unscaled, `(a => y) = 5;` in a
+            // 1ns/1ps module delayed 5 ps instead of 5 ns.
             ModuleItem::SpecifyBlock(sb) => {
+                for p in sb.paths.iter_mut() {
+                    for d in p.delays.iter_mut() {
+                        rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+                    }
+                }
                 for tc in sb.timing_checks.iter_mut() {
                     for &i in timing_check_limit_args(&tc.name) {
                         if let Some(Some(arg)) = tc.args.get_mut(i) {
@@ -29788,25 +29926,18 @@ fn inline_module_items(
                         }
                     }
                     if let ModuleItem::SpecifyBlock(sb) = sub_item {
-                        for p in &sb.paths {
-                            let dst_expr = rewrite_expr(
-                                &make_ident_expr(&p.dst.name),
+                        // Delays evaluate in the INSTANCE's parameter scope:
+                        // a specparam-valued delay (`(a => y) = tpd;`) read
+                        // the flat map, missed its bare name and became 0.
+                        elaborate_module_paths(elab, &sb.paths, &sub_merged_params, &|e| {
+                            rewrite_expr(
+                                e,
                                 &inst_prefix,
                                 &rewrite_port_map,
                                 &prepared_sub.local_names,
                                 &sub_interface_map,
-                            );
-                            if let ExprKind::Ident(hier) = &dst_expr.kind {
-                                let dst_name = hier
-                                    .path
-                                    .iter()
-                                    .map(|s| s.name.name.as_str())
-                                    .collect::<Vec<_>>()
-                                    .join(".");
-                                let d = eval_const_expr(&p.delay, &elab.parameters);
-                                elab.specify_delays.insert(dst_name, d);
-                            }
-                        }
+                            )
+                        });
                         // §15.6 delayed nets: drive `delayed_net = source` as a
                         // zero-delay continuous assign in the instance scope so
                         // the cell's functional clock/data path (which reads

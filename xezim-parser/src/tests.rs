@@ -155,6 +155,66 @@ fn test_semaphores() {
     assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
 }
 
+/// §30.4 module path forms: parallel and full connections with polarity,
+/// edge-sensitive paths with a data source, `if`/`ifnone`, selects on the
+/// terminals, and 1/2/6/12-value delay lists with or without parentheses.
+#[test]
+fn test_specify_module_paths() {
+    let source = "
+        module c(input a, b, clk, input [1:0] d, output y, q, output [1:0] z);
+          specify
+            (a => y) = 5;
+            (a, b *> y, q) = (1, 2);
+            (a +=> y) = 1, 2;
+            (d[0], d[1] -*> z[1:0]) = (1, 2, 3, 4, 5, 6);
+            (posedge clk => (q +: b)) = (1:2:3, 4);
+            (negedge clk *> (q : 1'b0)) = 1;
+            if (a && !b) (a => y) = (1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12);
+            ifnone (a => y) = 7;
+            showcancelled y;
+          endspecify
+        endmodule
+    ";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+    let Some(Description::Module(m)) = result.source.descriptions.first() else {
+        panic!("module expected");
+    };
+    let sb = m
+        .items
+        .iter()
+        .find_map(|i| match i {
+            ModuleItem::SpecifyBlock(sb) => Some(sb),
+            _ => None,
+        })
+        .expect("specify block");
+    let names =
+        |ids: &[crate::ast::Identifier]| ids.iter().map(|i| i.name.clone()).collect::<Vec<_>>();
+    let p = &sb.paths;
+    assert_eq!(p.len(), 8);
+    assert_eq!(
+        (names(&p[0].srcs), names(&p[0].dsts)),
+        (vec!["a".into()], vec!["y".into()])
+    );
+    assert_eq!(p[0].delays.len(), 1);
+    assert_eq!(names(&p[1].srcs), vec!["a", "b"]);
+    assert_eq!(names(&p[1].dsts), vec!["y", "q"]);
+    assert_eq!(p[1].delays.len(), 2);
+    assert_eq!(p[2].delays.len(), 2);
+    assert_eq!(names(&p[3].srcs), vec!["d", "d"]);
+    assert_eq!(names(&p[3].dsts), vec!["z"]);
+    assert_eq!(p[3].delays.len(), 6);
+    assert_eq!(
+        (names(&p[4].srcs), names(&p[4].dsts)),
+        (vec!["clk".into()], vec!["q".into()])
+    );
+    assert_eq!(p[4].delays.len(), 2);
+    assert_eq!(names(&p[5].dsts), vec!["q"]);
+    assert!(p[6].cond.is_some() && !p[6].ifnone);
+    assert_eq!(p[6].delays.len(), 12);
+    assert!(p[7].cond.is_none() && p[7].ifnone);
+}
+
 /// §31 timing checks: edge controls (keyword and descriptor list), `&&&`
 /// conditions, omitted arguments, and a specify-block `specparam` hoisted
 /// to a module-level localparam.

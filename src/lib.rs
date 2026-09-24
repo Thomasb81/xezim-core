@@ -79,6 +79,8 @@ pub use value::Value;
 /// signing precedence, signed genvars, tf-port implicit-name unpacked dims)
 /// — cached parses/elaborations from \x13 carry the old results;
 /// \x09 = \x08 + ForeverTail StatementKind variant;
+/// \x1a = \x19 + SpecifyPath terminal lists/condition/delay list and
+/// ElaboratedModule.module_paths (§30.4 module paths);
 /// \x19 = \x18 + SpecifyBlock.timing_checks and
 /// ElaboratedModule.timing_checks (§31 timing checks);
 /// \x18 = \x17 + DataType::Interface type_args (virtual-interface

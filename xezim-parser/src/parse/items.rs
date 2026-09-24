@@ -1854,21 +1854,21 @@ impl Parser {
                 self.parse_gate_instantiation(),
             )),
             TokenKind::KwSpecify => {
-                // §28.2 specify block. The path grammar is rich (`=>`/`*>`
-                // parallel/full, edge-sensitive, state-dependent, `if (...)`
-                // conditional). We parse only the common SIMPLE module path —
-                // `( src => dst ) = ( d {, d} ) ;` (or a bare delay) with
-                // plain-identifier endpoints — into a SpecifyPath so the
-                // elaborator can model its delay, plus the §31 timing checks
-                // and `specparam`s. Every other form is skipped to the next
-                // `;`, preserving the prior robust whole-block skip behavior.
+                // §30 specify block: module paths (every §30.4 form) into
+                // SpecifyPaths so the elaborator can model their delays, plus
+                // the §31 timing checks and `specparam`s. Anything else
+                // (`pulsestyle_*`, `showcancelled`, ...) is skipped to the
+                // next `;`.
                 self.bump();
                 let mut paths = Vec::new();
                 let mut delayed_nets: Vec<(String, String)> = Vec::new();
                 let mut timing_checks = Vec::new();
                 while !self.at(TokenKind::KwEndspecify) && !self.at(TokenKind::Eof) {
-                    if self.at(TokenKind::LParen) {
-                        if let Some(p) = self.try_parse_simple_specify_path() {
+                    if matches!(
+                        self.current_kind(),
+                        TokenKind::LParen | TokenKind::KwIf | TokenKind::KwIfnone
+                    ) {
+                        if let Some(p) = self.try_parse_specify_path() {
                             paths.push(p);
                             continue;
                         }
@@ -2591,51 +2591,134 @@ impl Parser {
         }
     }
 
-    fn try_parse_simple_specify_path(&mut self) -> Option<SpecifyPath> {
+    /// §30.4 module path declaration: parallel `=>` or full `*>`, with an
+    /// optional polarity, edge identifier and data source (§30.4.3), under an
+    /// optional `if (cond)` / `ifnone` (§30.4.4), and a delay list of 1, 2,
+    /// 3, 6 or 12 values (§30.5.1) with or without parentheses. Each value
+    /// may be a min:typ:max triplet — the element chosen by
+    /// `+mindelays`/`+typdelays`/`+maxdelays` (default typ) is kept. Returns
+    /// `None` (position restored) for anything else, which the caller skips.
+    fn try_parse_specify_path(&mut self) -> Option<SpecifyPath> {
         let start_pos = self.pos;
+        let diag_len = self.diagnostics.len();
         let sp_start = self.current().span.start;
-        let is_ident = |p: &Self| {
-            matches!(
-                p.current().kind,
-                TokenKind::Identifier | TokenKind::EscapedIdentifier
-            )
+        let p = self.parse_specify_path_inner(sp_start);
+        if p.is_none() || self.diagnostics.len() != diag_len {
+            self.diagnostics.truncate(diag_len);
+            self.pos = start_pos;
+            return None;
+        }
+        p
+    }
+
+    fn parse_specify_path_inner(&mut self, sp_start: usize) -> Option<SpecifyPath> {
+        let mut cond = None;
+        let mut ifnone = false;
+        if self.eat(TokenKind::KwIf).is_some() {
+            self.eat(TokenKind::LParen)?;
+            cond = Some(self.parse_expression());
+            self.eat(TokenKind::RParen)?;
+        } else if self.eat(TokenKind::KwIfnone).is_some() {
+            ifnone = true;
+        }
+        self.eat(TokenKind::LParen)?;
+        let edge = matches!(
+            self.current_kind(),
+            TokenKind::KwPosedge | TokenKind::KwNegedge | TokenKind::KwEdge
+        );
+        if edge {
+            self.bump();
+        }
+        let srcs = self.parse_specify_terminals()?;
+        // Parallel `=>` or full `*>` connection with optional polarity (a
+        // per-net delay model needs neither). The lexer splits `+=>` into
+        // `+=` `>` and `*>` into `*` `>`.
+        if matches!(
+            self.current_kind(),
+            TokenKind::PlusAssign | TokenKind::MinusAssign
+        ) {
+            self.bump();
+            self.eat(TokenKind::Gt)?;
+        } else {
+            if matches!(self.current_kind(), TokenKind::Plus | TokenKind::Minus) {
+                self.bump();
+            }
+            if self.at(TokenKind::FatArrow) && self.current().text == "=>" {
+                self.bump();
+            } else if self.at(TokenKind::Star) && self.peek_kind() == TokenKind::Gt {
+                self.bump();
+                self.bump();
+            } else {
+                return None;
+            }
+        }
+        let dsts = if self.eat(TokenKind::LParen).is_some() {
+            // Edge-sensitive `( dst [+|-] : data_source )`.
+            let dsts = self.parse_specify_terminals()?;
+            match self.current_kind() {
+                TokenKind::PlusColon | TokenKind::MinusColon | TokenKind::Colon => {
+                    self.bump();
+                }
+                TokenKind::Plus | TokenKind::Minus if self.peek_kind() == TokenKind::Colon => {
+                    self.bump();
+                    self.bump();
+                }
+                _ => return None,
+            }
+            let _ = self.parse_expression();
+            self.eat(TokenKind::RParen)?;
+            dsts
+        } else {
+            self.parse_specify_terminals()?
         };
-        if !self.at(TokenKind::LParen) {
-            return None;
+        self.eat(TokenKind::RParen)?;
+        self.eat(TokenKind::Assign)?;
+        let delays = self.parse_path_delay_value()?;
+        self.eat(TokenKind::Semicolon)?;
+        Some(SpecifyPath {
+            srcs,
+            dsts,
+            cond,
+            ifnone,
+            delays,
+            span: self.span_from(sp_start),
+        })
+    }
+
+    /// `name [ [range] ] {, name [ [range] ]}` — the base names; a bit or
+    /// part select only narrows the path to part of the net.
+    fn parse_specify_terminals(&mut self) -> Option<Vec<Identifier>> {
+        let mut out = Vec::new();
+        loop {
+            if !matches!(
+                self.current_kind(),
+                TokenKind::Identifier | TokenKind::EscapedIdentifier
+            ) {
+                return None;
+            }
+            out.push(self.parse_identifier());
+            if self.eat(TokenKind::LBracket).is_some() {
+                let _ = self.parse_expression();
+                if matches!(
+                    self.current_kind(),
+                    TokenKind::Colon | TokenKind::PlusColon | TokenKind::MinusColon
+                ) {
+                    self.bump();
+                    let _ = self.parse_expression();
+                }
+                self.eat(TokenKind::RBracket)?;
+            }
+            if self.eat(TokenKind::Comma).is_none() {
+                return Some(out);
+            }
         }
-        self.bump();
-        if !is_ident(self) {
-            self.pos = start_pos;
-            return None;
-        }
-        let src = self.parse_identifier();
-        // Only the parallel-connection `=>` with a bare-identifier source.
-        if !self.at(TokenKind::FatArrow) {
-            self.pos = start_pos;
-            return None;
-        }
-        self.bump();
-        if !is_ident(self) {
-            self.pos = start_pos;
-            return None;
-        }
-        let dst = self.parse_identifier();
-        if !self.at(TokenKind::RParen) {
-            self.pos = start_pos;
-            return None;
-        }
-        self.bump();
-        if !self.at(TokenKind::Assign) {
-            self.pos = start_pos;
-            return None;
-        }
-        self.bump();
-        // Delay: `( d {, d} )` (use the first) or a bare expression. Each `d`
-        // may be a min:typ:max triplet (`2:5:9`) — pick the element chosen by
-        // `+mindelays`/`+typdelays`/`+maxdelays` (default typ, the commercial
-        // default). Previously a triplet derailed the parse and silently
-        // dropped the WHOLE path delay to zero.
-        let mut parse_delay_entry = |p: &mut Self| -> Expression {
+    }
+
+    /// §30.5.1 `path_delay_value`: a list of delay values, parenthesized or
+    /// not. A parenthesized form followed by anything but `;` was a bare
+    /// expression that merely starts with `(`.
+    fn parse_path_delay_value(&mut self) -> Option<Vec<Expression>> {
+        let entry = |p: &mut Self| -> Expression {
             let first = p.parse_expression();
             if !p.at(TokenKind::Colon) {
                 return first;
@@ -2654,31 +2737,22 @@ impl Parser {
                 _ => typ,
             }
         };
-        let delay = if self.at(TokenKind::LParen) {
-            self.bump();
-            let d = parse_delay_entry(self);
-            while self.at(TokenKind::Comma) {
-                self.bump();
-                let _ = parse_delay_entry(self);
+        let list = |p: &mut Self| -> Vec<Expression> {
+            let mut v = vec![entry(p)];
+            while p.eat(TokenKind::Comma).is_some() {
+                v.push(entry(p));
             }
-            if !self.at(TokenKind::RParen) {
-                self.pos = start_pos;
-                return None;
-            }
-            self.bump();
-            d
-        } else {
-            self.parse_expression()
+            v
         };
-        if self.at(TokenKind::Semicolon) {
-            self.bump();
+        let start = self.pos;
+        if self.eat(TokenKind::LParen).is_some() {
+            let v = list(self);
+            if self.eat(TokenKind::RParen).is_some() && self.at(TokenKind::Semicolon) {
+                return Some(v);
+            }
+            self.pos = start;
         }
-        Some(SpecifyPath {
-            src,
-            dst,
-            delay,
-            span: self.span_from(sp_start),
-        })
+        Some(list(self))
     }
 
     /// Like `parse_generate_branch_items` but also returns the optional
