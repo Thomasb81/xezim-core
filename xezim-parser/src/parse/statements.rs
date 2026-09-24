@@ -1913,8 +1913,11 @@ impl Parser {
             _ => AssertionKind::Assert,
         };
         // Handle `assert final` and `assert #0`
-        self.eat(TokenKind::KwFinal);
+        let mut deferred = self
+            .eat(TokenKind::KwFinal)
+            .map(|_| crate::ast::stmt::DeferredAssertion::Final);
         if self.at(TokenKind::Hash) {
+            deferred = Some(crate::ast::stmt::DeferredAssertion::Observed);
             self.bump();
             // Skip delay value (could be `#0` or `#(0)`)
             if self.at(TokenKind::LParen) {
@@ -2012,6 +2015,7 @@ impl Parser {
             action,
             else_action,
             is_property,
+            deferred,
             span: self.span_from(start),
         }
     }

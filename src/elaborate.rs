@@ -34718,6 +34718,7 @@ fn rewrite_stmt(
                     ))
                 }),
                 is_property: a.is_property,
+                deferred: a.deferred,
                 span: a.span,
             })
         }

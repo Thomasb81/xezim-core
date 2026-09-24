@@ -350,7 +350,20 @@ pub struct AssertionStatement {
     /// discarded; this field surfaces it for the executor).
     #[cfg_attr(feature = "serde", serde(default))]
     pub is_property: bool,
+    /// §16.4 deferred immediate assertion: `assert #0` / `assert final`.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub deferred: Option<DeferredAssertion>,
     pub span: Span,
+}
+
+/// §16.4: when a deferred immediate assertion's report matures.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum DeferredAssertion {
+    /// `#0`: the Observed region.
+    Observed,
+    /// `final`: the Postponed region.
+    Final,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]

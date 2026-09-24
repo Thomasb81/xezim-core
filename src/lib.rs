@@ -62,7 +62,9 @@ pub use sv_parser::{self, ParseResult, ast, diagnostics, lexer, parse, preproces
 pub use value::Value;
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x1b = \x1a + SpecifyPath terminal lists/condition/delay
+/// Version byte: \x1c = \x1b + AssertionStatement.deferred (§16.4 deferred
+/// assertions);
+/// \x1b = \x1a + SpecifyPath terminal lists/condition/delay
 /// list and ElaboratedModule.module_paths (§30.4 module paths);
 /// \x1a = \x19 + ElabInstance.src_pos (time-0 process order);
 /// \x13 = \x12 + ExprKind::ShallowCopy, ForeachTail.key_type,
@@ -92,7 +94,7 @@ pub use value::Value;
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1b";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1c";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
