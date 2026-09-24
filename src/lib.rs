@@ -424,16 +424,46 @@ pub fn strict_top() -> bool {
     STRICT_TOP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
-/// Command-line parameter overrides (`-gNAME=VALUE`), in order: the module a
-/// `/<top>/NAME` path names (None: every module), the parameter, the value.
-static PARAM_OVERRIDES: std::sync::Mutex<Vec<(Option<String>, String, String)>> =
-    std::sync::Mutex::new(Vec::new());
+/// One command-line parameter override: `-gNAME=VALUE`, or `-GNAME=VALUE`
+/// (`force`).
+#[derive(Clone, Debug)]
+pub struct ParamOverride {
+    /// The module a `/<top>/NAME` path names; None: every module.
+    pub module: Option<String>,
+    pub name: String,
+    /// Value text: a constant expression, or plain text for a `string`
+    /// parameter.
+    pub value: String,
+    /// Also beats a value given at an instantiation or by `defparam`.
+    pub force: bool,
+}
 
-/// Install the command-line parameter overrides; replaces any earlier set.
-/// Each value becomes the parameter's declared default, so a value given at
-/// an instantiation or by `defparam` still wins.
-pub fn set_param_overrides(overrides: Vec<(Option<String>, String, String)>) {
+static PARAM_OVERRIDES: std::sync::Mutex<Vec<ParamOverride>> = std::sync::Mutex::new(Vec::new());
+static FORCED_PARAM_NAMES: std::sync::Mutex<Vec<String>> = std::sync::Mutex::new(Vec::new());
+static ANY_FORCED_PARAM: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Install the command-line parameter overrides, in command-line order;
+/// replaces any earlier set. Each value becomes the parameter's declared
+/// default, so a value given at an instantiation or by `defparam` still wins
+/// unless the override is forced.
+pub fn set_param_overrides(overrides: Vec<ParamOverride>) {
+    let forced: Vec<String> = overrides
+        .iter()
+        .filter(|o| o.force && o.module.is_none())
+        .map(|o| o.name.clone())
+        .collect();
+    ANY_FORCED_PARAM.store(!forced.is_empty(), std::sync::atomic::Ordering::Relaxed);
+    *FORCED_PARAM_NAMES.lock().unwrap() = forced;
     *PARAM_OVERRIDES.lock().unwrap() = overrides;
+}
+
+/// Parameters a forced override (`-GNAME=VALUE`) set in every module: an
+/// instance's own value for one of them is dropped so the default applies.
+pub(crate) fn forced_param_names() -> Vec<String> {
+    if !ANY_FORCED_PARAM.load(std::sync::atomic::Ordering::Relaxed) {
+        return Vec::new();
+    }
+    FORCED_PARAM_NAMES.lock().unwrap().clone()
 }
 
 /// `--verbose`: per-file compile progress — which file is being parsed and
@@ -1048,23 +1078,22 @@ pub fn parse_and_elaborate_multi(
 }
 
 /// Where the overridable value parameter `name` of a module, interface or
-/// program is declared: a parameter-port-list entry, or a body `parameter`
-/// when there is no port list (§6.20.1 makes body parameters local
-/// otherwise). Returns (in the port list, declaration index, assignment
-/// index, declared `string`).
+/// program is declared: a non-local parameter-port-list entry or a body
+/// `parameter` — the set an instantiation can override in the elaborator.
+/// Returns (in the port list, declaration index, assignment index, declared
+/// `string`).
 fn find_overridable_param(
     params: &[ast::decl::ParameterDeclaration],
     items: &[ast::decl::ModuleItem],
     name: &str,
 ) -> Option<(bool, usize, usize, bool)> {
     use ast::decl::{ModuleItem, ParameterKind};
-    let header = !params.is_empty();
     let decls = params
         .iter()
         .enumerate()
         .map(|(i, pd)| (true, i, pd))
         .chain(items.iter().enumerate().filter_map(|(i, it)| match it {
-            ModuleItem::ParameterDeclaration(pd) if !header => Some((false, i, pd)),
+            ModuleItem::ParameterDeclaration(pd) => Some((false, i, pd)),
             _ => None,
         }));
     for (in_header, di, pd) in decls {
@@ -1148,23 +1177,32 @@ fn parse_override_value(text: &str) -> Option<ast::expr::Expression> {
     })
 }
 
-/// Apply the `-g` overrides (see `set_param_overrides`) to the parsed
-/// definitions. A `string` parameter takes an unquoted value as its text.
+/// Apply the command-line overrides (see `set_param_overrides`) to the
+/// parsed definitions, except those named in `skip`. Returns how many
+/// definitions each override changed. A `string` parameter takes an
+/// unquoted value as its text.
 fn apply_param_overrides(
     definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
-) -> Result<(), String> {
+    skip: Option<&std::collections::HashSet<String>>,
+) -> Result<Vec<usize>, String> {
     let overrides = PARAM_OVERRIDES.lock().unwrap().clone();
-    for (module, name, text) in &overrides {
-        let expr = parse_override_value(text);
-        let mut applied = 0usize;
+    let mut hits = vec![0usize; overrides.len()];
+    for (o, hit) in overrides.iter().zip(hits.iter_mut()) {
+        let expr = parse_override_value(&o.value);
         for (dname, def) in definitions.iter_mut() {
-            if module.as_ref().is_some_and(|m| m != dname) {
+            if o.module.as_ref().is_some_and(|m| m != dname)
+                || skip.is_some_and(|s| s.contains(dname))
+            {
                 continue;
             }
             let found = match def {
-                SourceDefinition::Module(m) => find_overridable_param(&m.params, &m.items, name),
-                SourceDefinition::Interface(m) => find_overridable_param(&m.params, &m.items, name),
-                SourceDefinition::Program(m) => find_overridable_param(&m.params, &m.items, name),
+                SourceDefinition::Module(m) => find_overridable_param(&m.params, &m.items, &o.name),
+                SourceDefinition::Interface(m) => {
+                    find_overridable_param(&m.params, &m.items, &o.name)
+                }
+                SourceDefinition::Program(m) => {
+                    find_overridable_param(&m.params, &m.items, &o.name)
+                }
                 _ => None,
             };
             let Some((in_header, di, ai, is_string)) = found else {
@@ -1177,13 +1215,16 @@ fn apply_param_overrides(
                     e.clone()
                 }
                 _ if is_string => ast::expr::Expression::new(
-                    ast::expr::ExprKind::StringLiteral(text.clone()),
+                    ast::expr::ExprKind::StringLiteral(o.value.clone()),
                     ast::Span::dummy(),
                 ),
                 _ => {
                     return Err(format!(
-                        "-g{}={}: '{}' is not a valid parameter value",
-                        name, text, text
+                        "-{}{}={}: '{}' is not a valid parameter value",
+                        if o.force { 'G' } else { 'g' },
+                        o.name,
+                        o.value,
+                        o.value
                     ));
                 }
             };
@@ -1203,27 +1244,36 @@ fn apply_param_overrides(
                 }
                 _ => {}
             }
-            applied += 1;
-        }
-        if applied == 0 {
-            let path = module
-                .as_ref()
-                .map(|m| format!("/{}/", m))
-                .unwrap_or_default();
-            eprintln!(
-                "[xezim][warning] -g{}{}={}: no {} declares an overridable parameter '{}'; ignored",
-                path,
-                name,
-                text,
-                module
-                    .as_ref()
-                    .map(|m| format!("module '{}'", m))
-                    .unwrap_or_else(|| "module".to_string()),
-                name
-            );
+            *hit += 1;
         }
     }
-    Ok(())
+    Ok(hits)
+}
+
+/// Warn about each command-line override no definition declared.
+fn warn_unapplied_param_overrides(hits: &[usize]) {
+    let overrides = PARAM_OVERRIDES.lock().unwrap().clone();
+    for (o, _) in overrides.iter().zip(hits).filter(|(_, h)| **h == 0) {
+        let path = o
+            .module
+            .as_ref()
+            .map(|m| format!("/{}/", m))
+            .unwrap_or_default();
+        let owner = o
+            .module
+            .as_ref()
+            .map(|m| format!("module '{}'", m))
+            .unwrap_or_else(|| "module".to_string());
+        eprintln!(
+            "[xezim][warning] -{}{}{}={}: no {} declares an overridable parameter '{}'; ignored",
+            if o.force { 'G' } else { 'g' },
+            path,
+            o.name,
+            o.value,
+            owner,
+            o.name
+        );
+    }
 }
 
 /// Every name a module declares in its OWN scope: ports, nets, variables,
@@ -1818,7 +1868,7 @@ fn parse_and_elaborate(
 
     // Before binds clone any definition, so a specialized clone carries the
     // overridden default too.
-    apply_param_overrides(&mut definitions)?;
+    let mut param_override_hits = apply_param_overrides(&mut definitions, None)?;
 
     // §23.11: a `bind` written as a module item (not at compilation-unit
     // scope) is applied identically. Lift every `ModuleItem::Bind` out of the
@@ -2111,6 +2161,10 @@ fn parse_and_elaborate(
     let lib_cli = library_cli_cell().lock().unwrap().clone();
     if !lib_cli.lib_dirs.is_empty() || !lib_cli.lib_files.is_empty() {
         resolve_library_modules(&mut definitions, include_dirs, lib_defines, &lib_cli)?;
+        let lib_hits = apply_param_overrides(&mut definitions, Some(&explicit_def_names))?;
+        for (h, n) in param_override_hits.iter_mut().zip(lib_hits) {
+            *h += n;
+        }
 
         // A `-v`/`-y` library module is adopted AFTER the primary-source delay
         // rewrite (above), so it never received a timescale — its `#delay`s
@@ -2146,6 +2200,8 @@ fn parse_and_elaborate(
             }
         }
     }
+
+    warn_unapplied_param_overrides(&param_override_hits);
 
     // §23.11 + §23.3.2: apply the binds deferred above. Their targets may
     // only have become visible with the `-v`/`-y` library modules adopted

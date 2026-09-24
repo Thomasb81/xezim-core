@@ -27088,6 +27088,15 @@ fn inline_module_items(
                     }
                 }
 
+                // A forced command-line override (`-GNAME=VALUE`) beats this
+                // instance's own `#(…)`/defparam value: drop it so the
+                // overridden default applies.
+                for name in crate::forced_param_names() {
+                    if overridable.contains(name.as_str()) {
+                        sub_params.remove(&name);
+                    }
+                }
+
                 // Internal parameter map for resolving default parameters that depend on each other.
                 // Moved (was clone): sub_params is not used after this line.
                 let mut sub_local_params = sub_params;
