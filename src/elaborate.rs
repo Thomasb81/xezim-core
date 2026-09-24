@@ -21003,14 +21003,21 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
         }
     }
     fn param(p: &ParameterDeclaration, out: &mut HashSet<String>) {
-        if let ParameterKind::Data {
-            data_type,
-            assignments,
-        } = &p.kind
-        {
-            data_type_names(data_type, out);
-            for a in assignments {
-                out.insert(a.name.name.clone());
+        match &p.kind {
+            ParameterKind::Data {
+                data_type,
+                assignments,
+            } => {
+                data_type_names(data_type, out);
+                for a in assignments {
+                    out.insert(a.name.name.clone());
+                }
+            }
+            // `parameter type T` — `$bits(T)` names it like a value.
+            ParameterKind::Type { assignments } => {
+                for a in assignments {
+                    out.insert(a.name.name.clone());
+                }
             }
         }
     }
@@ -21063,6 +21070,10 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
                 CI::Class(inner) => class_items(inner, out),
                 CI::Covergroup(cg) => {
                     out.insert(cg.name.name.clone());
+                }
+                // `c_addr.constraint_mode(0)` inside a method.
+                CI::Constraint(c) => {
+                    out.insert(c.name.name.clone());
                 }
                 _ => {}
             }
@@ -21164,6 +21175,21 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
                     ports(&m.ports, out);
                     module_items(&m.items, out);
                 }
+                ModuleItem::ModportDeclaration(md) => {
+                    for mi in &md.items {
+                        out.insert(mi.name.name.clone());
+                    }
+                }
+                ModuleItem::CheckerDeclaration(cd) => {
+                    out.insert(cd.name.name.clone());
+                    ports(&cd.ports, out);
+                    module_items(&cd.items, out);
+                }
+                ModuleItem::Bind(b) => {
+                    for hi in &b.instantiation.instances {
+                        out.insert(hi.name.name.clone());
+                    }
+                }
                 _ => {}
             }
         }
@@ -21231,9 +21257,18 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
 fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<String>) {
     use crate::ast::stmt::StatementKind as K;
     match &stmt.kind {
-        K::VarDecl { declarators, .. } => {
+        K::VarDecl {
+            data_type,
+            declarators,
+            ..
+        } => {
             for d in declarators {
                 out.insert(d.name.name.clone());
+            }
+            if let DataType::Enum(e) = data_type {
+                for m in &e.members {
+                    out.insert(m.name.name.clone());
+                }
             }
         }
         K::For { init, body, .. } => {
@@ -21265,10 +21300,17 @@ fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<String>) {
             collect_stmt_declared_names(body, out);
         }
         K::If {
+            condition,
             then_stmt,
             else_stmt,
             ..
         } => {
+            // §12.6.2: `if (e matches tagged Valid .n)` declares `n`.
+            if let ExprKind::Matches { pattern, .. } = &condition.kind {
+                let mut bound = Vec::new();
+                collect_pattern_bindings(pattern, &mut bound);
+                out.extend(bound);
+            }
             collect_stmt_declared_names(then_stmt, out);
             if let Some(e) = else_stmt {
                 collect_stmt_declared_names(e, out);
@@ -21276,6 +21318,12 @@ fn collect_stmt_declared_names(stmt: &Statement, out: &mut HashSet<String>) {
         }
         K::Case { items, .. } => {
             for it in items {
+                // §12.6.1: a `case … matches` item's `.v` bindings.
+                if let Some(pat) = &it.pattern {
+                    let mut bound = Vec::new();
+                    collect_pattern_bindings(pat, &mut bound);
+                    out.extend(bound);
+                }
                 collect_stmt_declared_names(&it.stmt, out);
             }
         }
@@ -21816,12 +21864,6 @@ fn validate_inlined_bodies(
     elab: &ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
-    if elab.pending_always.is_empty()
-        && elab.pending_initial.is_empty()
-        && elab.pending_cont_assign.is_empty()
-    {
-        return Ok(());
-    }
     let mut known = collect_design_declared_names(definitions);
     // Leaf of every scoped elaboration key: `c.x`, `top.u.arr[3]` → `x`, `arr`.
     let mut add_key = |k: &str| {
@@ -21981,7 +22023,324 @@ fn validate_inlined_bodies(
             .unwrap_or_default();
         return Err(format!("Undeclared identifier '{}'{}", name, loc));
     }
+    validate_subroutine_bodies(elab, definitions, &known)
+}
+
+/// One task/function body to check.
+struct SubroutineBody<'a> {
+    /// Definition it lives in, for the source location.
+    owner: &'a str,
+    /// Class whose members it may name bare: the enclosing class of a method,
+    /// or the `C` of an out-of-class `C::m` body; empty otherwise.
+    class: &'a str,
+    /// The subroutine's own name (a function's return variable).
+    name: &'a str,
+    ports: &'a [crate::ast::decl::FunctionPort],
+    items: &'a [Statement],
+}
+
+impl<'a> SubroutineBody<'a> {
+    fn task(owner: &'a str, class: &'a str, t: &'a TaskDeclaration) -> Self {
+        let class = t.name.scope.as_ref().map_or(class, |s| s.name.as_str());
+        SubroutineBody {
+            owner,
+            class,
+            name: &t.name.name.name,
+            ports: &t.ports,
+            items: &t.items,
+        }
+    }
+
+    fn function(owner: &'a str, class: &'a str, f: &'a FunctionDeclaration) -> Self {
+        let class = f.name.scope.as_ref().map_or(class, |s| s.name.as_str());
+        SubroutineBody {
+            owner,
+            class,
+            name: &f.name.name.name,
+            ports: &f.ports,
+            items: &f.items,
+        }
+    }
+}
+
+/// §13.3/§13.4 (and §8.6 class methods): the same "declared nowhere" bar for
+/// task and function BODIES — module, interface and program subroutines of
+/// every definition the design instantiates, package subroutines, and class
+/// methods wherever the class is declared. No validator ever walked them, so
+/// `task t; undeclared_x = 1; endtask` elaborated and ran silently, while the
+/// reference simulator rejects it at compile time.
+///
+/// A method is skipped when its class derives (directly or not) from a class
+/// the design does not declare — `extends mailbox #(T)` or a type-parameter
+/// base — since the members it may name bare are then unknown.
+fn validate_subroutine_bodies(
+    elab: &ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+    known: &HashSet<String>,
+) -> Result<(), String> {
+    use crate::ast::decl::{ClassItem, ClassMethodKind, PackageItem};
+
+    /// Module-level items of every generate branch, flattened.
+    fn flat_items<'a>(items: &'a [ModuleItem], out: &mut Vec<&'a ModuleItem>) {
+        for it in items {
+            match it {
+                ModuleItem::GenerateRegion(gr) => flat_items(&gr.items, out),
+                ModuleItem::GenerateFor(gf) => flat_items(&gf.items, out),
+                ModuleItem::GenerateIf(gi) => {
+                    for (_, b) in &gi.branches {
+                        flat_items(b, out);
+                    }
+                }
+                ModuleItem::GenerateCase(gc) => {
+                    for arm in &gc.arms {
+                        flat_items(&arm.items, out);
+                    }
+                }
+                _ => out.push(it),
+            }
+        }
+    }
+    fn class_bodies<'a>(
+        owner: &'a str,
+        c: &'a ClassDeclaration,
+        out: &mut Vec<SubroutineBody<'a>>,
+    ) {
+        for it in &c.items {
+            match it {
+                ClassItem::Method(m) => match &m.kind {
+                    ClassMethodKind::Function(f) => {
+                        out.push(SubroutineBody::function(owner, &c.name.name, f))
+                    }
+                    ClassMethodKind::Task(t) => {
+                        out.push(SubroutineBody::task(owner, &c.name.name, t))
+                    }
+                    _ => {}
+                },
+                ClassItem::Class(inner) => class_bodies(owner, inner, out),
+                _ => {}
+            }
+        }
+    }
+    fn all_classes<'a>(c: &'a ClassDeclaration, out: &mut HashMap<&'a str, &'a ClassDeclaration>) {
+        out.insert(c.name.name.as_str(), c);
+        for it in &c.items {
+            if let ClassItem::Class(inner) = it {
+                all_classes(inner, out);
+            }
+        }
+    }
+
+    // Definitions the elaborated design instantiates (binds were already
+    // folded into their targets as plain instantiations).
+    let mut used: HashSet<&str> = HashSet::default();
+    let mut stack: Vec<&str> = vec![elab.name.as_str()];
+    while let Some(n) = stack.pop() {
+        let Some((key, def)) = definitions.get_key_value(n) else {
+            continue;
+        };
+        if !used.insert(key.as_str()) {
+            continue;
+        }
+        let mut items = Vec::new();
+        flat_items(def.items(), &mut items);
+        for it in items {
+            if let ModuleItem::ModuleInstantiation(mi) = it {
+                stack.push(&mi.module_name.name);
+            }
+        }
+    }
+
+    let mut names: Vec<&String> = definitions.keys().collect();
+    names.sort();
+    let mut classes: HashMap<&str, &ClassDeclaration> = HashMap::default();
+    let mut bodies: Vec<SubroutineBody> = Vec::new();
+    for name in names {
+        let def = &definitions[name];
+        match def {
+            Definition::Module(_) | Definition::Interface(_) | Definition::Program(_) => {
+                let mut items = Vec::new();
+                flat_items(def.items(), &mut items);
+                let checked = used.contains(name.as_str());
+                for it in items {
+                    match it {
+                        ModuleItem::ClassDeclaration(c) => {
+                            all_classes(c, &mut classes);
+                            if checked {
+                                class_bodies(name, c, &mut bodies);
+                            }
+                        }
+                        ModuleItem::TaskDeclaration(t) if checked => {
+                            bodies.push(SubroutineBody::task(name, "", t))
+                        }
+                        ModuleItem::FunctionDeclaration(f) if checked => {
+                            bodies.push(SubroutineBody::function(name, "", f))
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Definition::Package(p) => {
+                for it in &p.items {
+                    match it {
+                        PackageItem::Task(t) => bodies.push(SubroutineBody::task(name, "", t)),
+                        PackageItem::Function(f) => {
+                            bodies.push(SubroutineBody::function(name, "", f))
+                        }
+                        PackageItem::Class(c) => {
+                            all_classes(c, &mut classes);
+                            class_bodies(name, c, &mut bodies);
+                        }
+                        _ => {}
+                    }
+                }
+            }
+            Definition::Class(c) => {
+                all_classes(c, &mut classes);
+                class_bodies(name, c, &mut bodies);
+            }
+            _ => {}
+        }
+    }
+    let bases_declared = |class: &str| -> bool {
+        let mut cur = class;
+        for _ in 0..64 {
+            let Some(cd) = classes.get(cur) else {
+                return false;
+            };
+            match &cd.extends {
+                None => return true,
+                Some(ext) => cur = ext.name.name.as_str(),
+            }
+        }
+        false
+    };
+    for body in &bodies {
+        if !body.class.is_empty() && !bases_declared(body.class) {
+            continue;
+        }
+        if let Some((name, span)) = first_undeclared_in_subroutine(body, known) {
+            return Err(span_error_of(
+                elab,
+                span,
+                body.owner,
+                &format!("Undeclared identifier '{}'", name),
+            ));
+        }
+    }
     Ok(())
+}
+
+/// The first bare identifier (or called name) in a subroutine body that is
+/// neither local to it — a formal, the function's own name, a body-local
+/// declaration, a `with` iterator — nor declared anywhere in the design.
+fn first_undeclared_in_subroutine(
+    body: &SubroutineBody,
+    known: &HashSet<String>,
+) -> Option<(String, Span)> {
+    let mut locals: HashSet<String> = HashSet::default();
+    locals.insert(body.name.to_string());
+    for p in body.ports {
+        locals.insert(p.name.name.clone());
+    }
+    for s in body.items {
+        collect_stmt_declared_names(s, &mut locals);
+    }
+    // §7.12: `arr.find(x) with (x > 0)` binds `x` (default `item`).
+    locals.insert("item".to_string());
+    for s in body.items {
+        for_each_stmt_expr(s, &mut |e| {
+            for_each_sub_expr(e, &mut |x| {
+                if let ExprKind::WithClause { expr, .. } = &x.kind {
+                    if let ExprKind::Call { args, .. } = &expr.kind {
+                        for a in args {
+                            if let ExprKind::Ident(h) = &a.kind {
+                                if h.path.len() == 1 {
+                                    locals.insert(h.path[0].name.name.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            })
+        });
+    }
+    let mut first: Option<(String, Span)> = None;
+    for s in body.items {
+        for_each_stmt_expr(s, &mut |e| {
+            for_each_sub_expr(e, &mut |x| {
+                if first.is_some() {
+                    return;
+                }
+                let h = match &x.kind {
+                    ExprKind::Ident(h) => h,
+                    ExprKind::Call { func, .. } => match &func.kind {
+                        ExprKind::Ident(h) => h,
+                        _ => return,
+                    },
+                    _ => return,
+                };
+                if h.root.is_some() || h.path.len() != 1 {
+                    return;
+                }
+                let raw = h.path[0].name.name.as_str();
+                let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+                if name.starts_with('$')
+                    || name.contains('.')
+                    || locals.contains(name)
+                    || known.contains(name)
+                    || is_builtin_bare_name(name)
+                {
+                    return;
+                }
+                first = Some((name.to_string(), x.span));
+            })
+        });
+        if first.is_some() {
+            break;
+        }
+    }
+    first
+}
+
+/// Names legal as a bare identifier without any declaration: `this`/`super`,
+/// the built-in `std` package and `process` class, the §18 built-in class
+/// methods callable unqualified inside a method, the implicit `genblk<N>`
+/// generate-scope names, and built-in type keywords (`$bits(int)`).
+fn is_builtin_bare_name(name: &str) -> bool {
+    matches!(
+        name,
+        "new"
+            | "super"
+            | "this"
+            | "null"
+            | "std"
+            | "process"
+            | "randomize"
+            | "srandom"
+            | "get_randstate"
+            | "set_randstate"
+            | "rand_mode"
+            | "constraint_mode"
+            | "pre_randomize"
+            | "post_randomize"
+            | "integer"
+            | "int"
+            | "shortint"
+            | "longint"
+            | "byte"
+            | "time"
+            | "bit"
+            | "logic"
+            | "reg"
+            | "real"
+            | "shortreal"
+            | "realtime"
+            | "string"
+            | "chandle"
+            | "void"
+    ) || (name.starts_with("genblk")
+        && name.len() > 6
+        && name[6..].chars().all(|c| c.is_ascii_digit()))
 }
 
 /// Handles recursive/multi-level hierarchies by walking all levels depth-first.
@@ -30963,7 +31322,22 @@ fn published_span_location(span: Span) -> String {
 /// `file:line:col:` header, the source line and a caret under the span.
 /// Without a location it is just the message.
 pub fn span_error(elab: &ElaboratedModule, span: Span, message: &str) -> String {
-    match span_locate_owned(elab, span, true, None) {
+    span_error_impl(elab, span, None, message)
+}
+
+/// As `span_error`, for a span inside the NAMED definition `owner` (a
+/// package or another module), whose file is not the elaboration root's.
+pub fn span_error_of(elab: &ElaboratedModule, span: Span, owner: &str, message: &str) -> String {
+    span_error_impl(elab, span, Some(owner), message)
+}
+
+fn span_error_impl(
+    elab: &ElaboratedModule,
+    span: Span,
+    owner: Option<&str>,
+    message: &str,
+) -> String {
+    match span_locate_owned(elab, span, true, owner) {
         Some(SpanLoc::Mapped(loc)) => sv_parser::diagnostics::render("error", message, &loc),
         Some(SpanLoc::Plain(s)) => format!("{} at {}", message, s),
         None => message.to_string(),
