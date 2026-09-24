@@ -13863,7 +13863,8 @@ fn elaborate_generate_if(
         .and_then(|l| l.as_ref())
     {
         Some(label) => {
-            let renamed = rename_decls_in_iter(items, &GenRename::Scope(label));
+            let mut renamed = rename_decls_in_iter(items, &GenRename::Scope(label));
+            alias_labelled_subroutines(&mut renamed, label);
             elaborate_items(&renamed, elab, all_defs)
         }
         None => elaborate_items(items, elab, all_defs),
@@ -13929,11 +13930,50 @@ fn elaborate_generate_case_arm(
 ) -> Result<(), String> {
     match &arm.label {
         Some(label) => {
-            let renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label));
+            let mut renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label));
+            alias_labelled_subroutines(&mut renamed, label);
             elaborate_items(&renamed, elab, all_defs)
         }
         None => elaborate_items(&arm.items, elab, all_defs),
     }
+}
+
+/// §27.6: a subroutine declared in the labelled generate-if/case branch `blk`
+/// is `blk.f` from outside the branch. The branch's items are elaborated into
+/// the enclosing module under their own names (so the branch's own bare calls
+/// keep resolving), so also register each subroutine under the labelled name:
+/// `blk.f(0)` — or `u.blk.f(0)` once the module is instantiated as `u` — then
+/// finds its body through the ordinary hierarchical-name lookup instead of
+/// silently returning 0. A function's result variable is its name, so the
+/// alias body assigns `blk.f`.
+fn alias_labelled_subroutines(items: &mut Vec<ModuleItem>, label: &str) {
+    let no_local = std::collections::HashSet::default();
+    let no_iface = HashMap::default();
+    let aliases: Vec<ModuleItem> = items
+        .iter()
+        .filter_map(|it| match it {
+            ModuleItem::FunctionDeclaration(fd) => {
+                let mut a = fd.clone();
+                let alias = format!("{}.{}", label, fd.name.name.name);
+                let mut result_var = HashMap::default();
+                result_var.insert(fd.name.name.name.clone(), make_ident_expr(&alias));
+                a.items = fd
+                    .items
+                    .iter()
+                    .map(|st| rewrite_stmt(st, "", &result_var, &no_local, &no_iface))
+                    .collect();
+                a.name.name.name = alias;
+                Some(ModuleItem::FunctionDeclaration(a))
+            }
+            ModuleItem::TaskDeclaration(td) => {
+                let mut a = td.clone();
+                a.name.name.name = format!("{}.{}", label, td.name.name.name);
+                Some(ModuleItem::TaskDeclaration(a))
+            }
+            _ => None,
+        })
+        .collect();
+    items.extend(aliases);
 }
 
 fn scope_generated_subroutines(items: &mut [ModuleItem], scope: &str) {
@@ -23584,6 +23624,9 @@ fn collect_effective_items_scoped(
                             None => branch_items,
                         };
                         let mut inner = collect_effective_items(branch_items, params);
+                        if let Some(l) = label {
+                            alias_labelled_subroutines(&mut inner, l);
+                        }
                         prefix_gen_scope(&mut inner, &scope);
                         result.extend(inner);
                         matched = true;
@@ -23621,6 +23664,9 @@ fn collect_effective_items_scoped(
                         None => &arm.items,
                     };
                     let mut inner = collect_effective_items(arm_items, params);
+                    if let Some(l) = &arm.label {
+                        alias_labelled_subroutines(&mut inner, l);
+                    }
                     prefix_gen_scope(&mut inner, &scope);
                     result.extend(inner);
                 }
