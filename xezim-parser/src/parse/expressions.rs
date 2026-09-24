@@ -1,11 +1,11 @@
 //! Expression parsing (IEEE 1800-2017 §A.8) with Pratt precedence climbing.
 
 use super::Parser;
-use crate::ast::expr::*;
-use crate::ast::Span;
 use crate::ast::Identifier;
-use crate::lexer::token::TokenKind;
+use crate::ast::Span;
+use crate::ast::expr::*;
 use crate::diagnostics::Diagnostic;
+use crate::lexer::token::TokenKind;
 use std::cell::Cell;
 
 impl Parser {
@@ -30,70 +30,118 @@ impl Parser {
                 if self.eat(TokenKind::Colon).is_some() {
                     let right = self.parse_expression();
                     self.expect(TokenKind::RBracket);
-                    lval = Expression::new(ExprKind::RangeSelect {
-                        expr: Box::new(lval), kind: RangeKind::Constant,
-                        left: Box::new(idx), right: Box::new(right),
-                    }, self.span_from(s));
+                    lval = Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(lval),
+                            kind: RangeKind::Constant,
+                            left: Box::new(idx),
+                            right: Box::new(right),
+                        },
+                        self.span_from(s),
+                    );
                 } else if self.eat(TokenKind::PlusColon).is_some() {
                     let width = self.parse_expression();
                     self.expect(TokenKind::RBracket);
-                    lval = Expression::new(ExprKind::RangeSelect {
-                        expr: Box::new(lval), kind: RangeKind::IndexedUp,
-                        left: Box::new(idx), right: Box::new(width),
-                    }, self.span_from(s));
+                    lval = Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(lval),
+                            kind: RangeKind::IndexedUp,
+                            left: Box::new(idx),
+                            right: Box::new(width),
+                        },
+                        self.span_from(s),
+                    );
                 } else if self.eat(TokenKind::MinusColon).is_some() {
                     let width = self.parse_expression();
                     self.expect(TokenKind::RBracket);
-                    lval = Expression::new(ExprKind::RangeSelect {
-                        expr: Box::new(lval), kind: RangeKind::IndexedDown,
-                        left: Box::new(idx), right: Box::new(width),
-                    }, self.span_from(s));
+                    lval = Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(lval),
+                            kind: RangeKind::IndexedDown,
+                            left: Box::new(idx),
+                            right: Box::new(width),
+                        },
+                        self.span_from(s),
+                    );
                 } else {
                     self.expect(TokenKind::RBracket);
-                    lval = Expression::new(ExprKind::Index {
-                        expr: Box::new(lval), index: Box::new(idx),
-                    }, self.span_from(s));
+                    lval = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(lval),
+                            index: Box::new(idx),
+                        },
+                        self.span_from(s),
+                    );
                 }
             } else if self.at(TokenKind::Dot) {
                 let s = self.current().span.start;
                 self.bump();
-                let member = if matches!(self.current().kind,
-                    TokenKind::KwNew | TokenKind::KwAnd | TokenKind::KwOr | TokenKind::KwXor
-                    | TokenKind::KwUnique
+                let member = if matches!(
+                    self.current().kind,
+                    TokenKind::KwNew
+                        | TokenKind::KwAnd
+                        | TokenKind::KwOr
+                        | TokenKind::KwXor
+                        | TokenKind::KwUnique
                 ) {
                     let tok = self.bump();
-                    Identifier { name: tok.text.clone(), span: Span { start: tok.span.start, end: tok.span.end } }
+                    Identifier {
+                        name: tok.text.clone(),
+                        span: Span {
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        },
+                    }
                 } else {
                     self.parse_identifier()
                 };
-                lval = Expression::new(ExprKind::MemberAccess {
-                    expr: Box::new(lval), member,
-                }, self.span_from(s));
+                lval = Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(lval),
+                        member,
+                    },
+                    self.span_from(s),
+                );
             } else if self.at(TokenKind::DoubleColon) {
                 let s = self.current().span.start;
                 self.bump();
                 let member = if self.at(TokenKind::KwNew) {
                     let tok = self.bump();
-                    crate::ast::Identifier { name: "new".to_string(), span: tok.span }
+                    crate::ast::Identifier {
+                        name: "new".to_string(),
+                        span: tok.span,
+                    }
                 } else {
                     self.parse_identifier()
                 };
-                lval = Expression::new(ExprKind::MemberAccess {
-                    expr: Box::new(lval), member,
-                }, self.span_from(s));
+                lval = Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(lval),
+                        member,
+                    },
+                    self.span_from(s),
+                );
             } else {
                 break;
             }
         }
 
         // If followed by `<=` or `=` or compound assign, this is likely an lvalue
-        if self.at(TokenKind::Leq) || self.at(TokenKind::Assign) || self.at_any(&[
-            TokenKind::PlusAssign, TokenKind::MinusAssign,
-            TokenKind::StarAssign, TokenKind::SlashAssign,
-            TokenKind::PercentAssign, TokenKind::AndAssign,
-            TokenKind::OrAssign, TokenKind::XorAssign,
-            TokenKind::ShiftLeftAssign, TokenKind::ShiftRightAssign,
-        ]) {
+        if self.at(TokenKind::Leq)
+            || self.at(TokenKind::Assign)
+            || self.at_any(&[
+                TokenKind::PlusAssign,
+                TokenKind::MinusAssign,
+                TokenKind::StarAssign,
+                TokenKind::SlashAssign,
+                TokenKind::PercentAssign,
+                TokenKind::AndAssign,
+                TokenKind::OrAssign,
+                TokenKind::XorAssign,
+                TokenKind::ShiftLeftAssign,
+                TokenKind::ShiftRightAssign,
+            ])
+        {
             return lval;
         }
 
@@ -115,8 +163,10 @@ impl Parser {
         if self.eat(TokenKind::KwTagged).is_some() {
             let tag = self.parse_identifier();
             // Optional member sub-pattern.
-            let inner = if matches!(self.current_kind(),
-                TokenKind::ApostropheLBrace | TokenKind::KwTagged | TokenKind::Dot) {
+            let inner = if matches!(
+                self.current_kind(),
+                TokenKind::ApostropheLBrace | TokenKind::KwTagged | TokenKind::Dot
+            ) {
                 Some(Box::new(self.parse_pattern()))
             } else {
                 None
@@ -136,10 +186,14 @@ impl Parser {
         } else if self.eat(TokenKind::ApostropheLBrace).is_some() {
             let mut members = Vec::new();
             loop {
-                if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+                if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
+                    break;
+                }
                 // optional `name:` member tag
-                let name = if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
-                    && self.peek_kind() == TokenKind::Colon {
+                let name = if (self.at(TokenKind::Identifier)
+                    || self.at(TokenKind::EscapedIdentifier))
+                    && self.peek_kind() == TokenKind::Colon
+                {
                     let id = self.parse_identifier();
                     self.bump(); // :
                     Some(id)
@@ -147,7 +201,9 @@ impl Parser {
                     None
                 };
                 members.push((name, self.parse_pattern()));
-                if self.eat(TokenKind::Comma).is_none() { break; }
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
             }
             self.expect(TokenKind::RBrace);
             Pattern::Struct(members)
@@ -167,7 +223,9 @@ impl Parser {
             // the pattern and yield a placeholder boolean (the match semantics
             // are not modelled).
             if self.at(TokenKind::KwMatches) {
-                if 15 < min_bp { break; }
+                if 15 < min_bp {
+                    break;
+                }
                 self.bump();
                 let pattern = self.parse_pattern();
                 lhs = Expression::new(
@@ -182,12 +240,16 @@ impl Parser {
             // inside operator: expr inside { range_list }
             // Binding power 15 (same as relational)
             if self.at(TokenKind::KwInside) {
-                if 15 < min_bp { break; }
+                if 15 < min_bp {
+                    break;
+                }
                 self.bump();
                 self.expect(TokenKind::LBrace);
                 let mut ranges = Vec::new();
                 loop {
-                    if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+                    if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
+                        break;
+                    }
                     // Handle [lo:hi] ranges
                     if self.at(TokenKind::LBracket) {
                         self.bump();
@@ -223,11 +285,14 @@ impl Parser {
                                 };
                                 self.bump();
                                 let rhs = self.parse_expr_bp(20);
-                                center = Expression::new(ExprKind::Binary {
-                                    op,
-                                    left: Box::new(center),
-                                    right: Box::new(rhs),
-                                }, self.span_from(start));
+                                center = Expression::new(
+                                    ExprKind::Binary {
+                                        op,
+                                        left: Box::new(center),
+                                        right: Box::new(rhs),
+                                    },
+                                    self.span_from(start),
+                                );
                             }
                             center
                         } else {
@@ -247,83 +312,136 @@ impl Parser {
                             && self.peek_kind() == TokenKind::Percent
                             && self.peek_kind_n(2) == TokenKind::Minus;
                         if is_tol_abs || is_tol_pct {
-                            self.bump(); self.bump(); self.bump();
+                            self.bump();
+                            self.bump();
+                            self.bump();
                             let delta = self.parse_expression();
                             self.expect(TokenKind::RBracket);
                             let (lo, hi) = if is_tol_abs {
-                                let lo = Expression::new(ExprKind::Binary {
-                                    op: BinaryOp::Sub,
-                                    left: Box::new(center.clone()),
-                                    right: Box::new(delta.clone()),
-                                }, self.span_from(start));
-                                let hi = Expression::new(ExprKind::Binary {
-                                    op: BinaryOp::Add,
-                                    left: Box::new(center),
-                                    right: Box::new(delta),
-                                }, self.span_from(start));
-                                (lo, hi)
-                            } else {
-                                let hundred = || Expression::new(
-                                    ExprKind::Number(NumberLiteral::Integer {
-                                        signed: false,
-                                        size: None,
-                                        base: NumberBase::Decimal,
-                                        value: "100".into(),
-                                        cached_val: Cell::new(None),
-                                    }),
+                                let lo = Expression::new(
+                                    ExprKind::Binary {
+                                        op: BinaryOp::Sub,
+                                        left: Box::new(center.clone()),
+                                        right: Box::new(delta.clone()),
+                                    },
                                     self.span_from(start),
                                 );
-                                let make = |sign_neg: bool, c: Expression, d: Expression| {
-                                    let op = if sign_neg { BinaryOp::Sub } else { BinaryOp::Add };
-                                    let pm = Expression::new(ExprKind::Binary {
-                                        op,
-                                        left: Box::new(hundred()),
-                                        right: Box::new(d),
-                                    }, c.span);
-                                    let mul = Expression::new(ExprKind::Binary {
-                                        op: BinaryOp::Mul,
-                                        left: Box::new(c),
-                                        right: Box::new(pm),
-                                    }, self.span_from(start));
-                                    Expression::new(ExprKind::Binary {
-                                        op: BinaryOp::Div,
-                                        left: Box::new(mul),
-                                        right: Box::new(hundred()),
-                                    }, self.span_from(start))
+                                let hi = Expression::new(
+                                    ExprKind::Binary {
+                                        op: BinaryOp::Add,
+                                        left: Box::new(center),
+                                        right: Box::new(delta),
+                                    },
+                                    self.span_from(start),
+                                );
+                                (lo, hi)
+                            } else {
+                                let hundred = || {
+                                    Expression::new(
+                                        ExprKind::Number(NumberLiteral::Integer {
+                                            signed: false,
+                                            size: None,
+                                            base: NumberBase::Decimal,
+                                            value: "100".into(),
+                                            cached_val: Cell::new(None),
+                                        }),
+                                        self.span_from(start),
+                                    )
                                 };
-                                (make(true, center.clone(), delta.clone()),
-                                 make(false, center, delta))
+                                let make = |sign_neg: bool, c: Expression, d: Expression| {
+                                    let op = if sign_neg {
+                                        BinaryOp::Sub
+                                    } else {
+                                        BinaryOp::Add
+                                    };
+                                    let pm = Expression::new(
+                                        ExprKind::Binary {
+                                            op,
+                                            left: Box::new(hundred()),
+                                            right: Box::new(d),
+                                        },
+                                        c.span,
+                                    );
+                                    let mul = Expression::new(
+                                        ExprKind::Binary {
+                                            op: BinaryOp::Mul,
+                                            left: Box::new(c),
+                                            right: Box::new(pm),
+                                        },
+                                        self.span_from(start),
+                                    );
+                                    Expression::new(
+                                        ExprKind::Binary {
+                                            op: BinaryOp::Div,
+                                            left: Box::new(mul),
+                                            right: Box::new(hundred()),
+                                        },
+                                        self.span_from(start),
+                                    )
+                                };
+                                (
+                                    make(true, center.clone(), delta.clone()),
+                                    make(false, center, delta),
+                                )
                             };
-                            ranges.push(Expression::new(ExprKind::Range(Box::new(lo), Box::new(hi)), self.span_from(start)));
+                            ranges.push(Expression::new(
+                                ExprKind::Range(Box::new(lo), Box::new(hi)),
+                                self.span_from(start),
+                            ));
                         } else {
                             self.expect(TokenKind::Colon);
                             let hi = self.parse_expression();
                             self.expect(TokenKind::RBracket);
-                            ranges.push(Expression::new(ExprKind::Range(Box::new(center), Box::new(hi)), self.span_from(start)));
+                            ranges.push(Expression::new(
+                                ExprKind::Range(Box::new(center), Box::new(hi)),
+                                self.span_from(start),
+                            ));
                         }
                     } else {
                         ranges.push(self.parse_expression());
                     }
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::RBrace);
-                lhs = Expression::new(ExprKind::Inside { expr: Box::new(lhs), ranges }, self.span_from(start));
+                lhs = Expression::new(
+                    ExprKind::Inside {
+                        expr: Box::new(lhs),
+                        ranges,
+                    },
+                    self.span_from(start),
+                );
                 continue;
             }
 
             // Check for postfix: ++ --
             if self.at(TokenKind::Increment) || self.at(TokenKind::Decrement) {
-                let op = if self.at(TokenKind::Increment) { UnaryOp::PostIncr } else { UnaryOp::PostDecr };
+                let op = if self.at(TokenKind::Increment) {
+                    UnaryOp::PostIncr
+                } else {
+                    UnaryOp::PostDecr
+                };
                 let (l_bp, _) = postfix_bp();
-                if l_bp < min_bp { break; }
+                if l_bp < min_bp {
+                    break;
+                }
                 self.bump();
-                lhs = Expression::new(ExprKind::Unary { op, operand: Box::new(lhs) }, self.span_from(start));
+                lhs = Expression::new(
+                    ExprKind::Unary {
+                        op,
+                        operand: Box::new(lhs),
+                    },
+                    self.span_from(start),
+                );
                 continue;
             }
 
             // Binary/ternary operators
             if let Some((op, l_bp, r_bp)) = self.infix_bp() {
-                if l_bp < min_bp { break; }
+                if l_bp < min_bp {
+                    break;
+                }
                 self.bump();
 
                 // Ternary operator
@@ -347,39 +465,55 @@ impl Parser {
                         self.parse_prefix()
                     };
                     let rhs = self.parse_expr_bp(r_bp);
-                    let delayed = Expression::new(ExprKind::Binary {
-                        op: BinaryOp::HashHash,
-                        left: Box::new(count_expr),
-                        right: Box::new(rhs),
-                    }, self.span_from(start));
-                    lhs = Expression::new(ExprKind::Binary {
-                        op: BinaryOp::SeqAnd,
-                        left: Box::new(lhs),
-                        right: Box::new(delayed),
-                    }, self.span_from(start));
+                    let delayed = Expression::new(
+                        ExprKind::Binary {
+                            op: BinaryOp::HashHash,
+                            left: Box::new(count_expr),
+                            right: Box::new(rhs),
+                        },
+                        self.span_from(start),
+                    );
+                    lhs = Expression::new(
+                        ExprKind::Binary {
+                            op: BinaryOp::SeqAnd,
+                            left: Box::new(lhs),
+                            right: Box::new(delayed),
+                        },
+                        self.span_from(start),
+                    );
                     continue;
                 }
 
                 let rhs = self.parse_expr_bp(r_bp);
-                lhs = Expression::new(ExprKind::Binary {
-                    op, left: Box::new(lhs), right: Box::new(rhs),
-                }, self.span_from(start));
+                lhs = Expression::new(
+                    ExprKind::Binary {
+                        op,
+                        left: Box::new(lhs),
+                        right: Box::new(rhs),
+                    },
+                    self.span_from(start),
+                );
                 continue;
             }
 
             // Ternary: ? :
             if self.at(TokenKind::Question) {
                 let (l_bp, _) = ternary_bp();
-                if l_bp < min_bp { break; }
+                if l_bp < min_bp {
+                    break;
+                }
                 self.bump();
                 let then_expr = self.parse_expr_bp(0);
                 self.expect(TokenKind::Colon);
                 let else_expr = self.parse_expr_bp(l_bp);
-                lhs = Expression::new(ExprKind::Conditional {
-                    condition: Box::new(lhs),
-                    then_expr: Box::new(then_expr),
-                    else_expr: Box::new(else_expr),
-                }, self.span_from(start));
+                lhs = Expression::new(
+                    ExprKind::Conditional {
+                        condition: Box::new(lhs),
+                        then_expr: Box::new(then_expr),
+                        else_expr: Box::new(else_expr),
+                    },
+                    self.span_from(start),
+                );
                 continue;
             }
 
@@ -387,33 +521,54 @@ impl Parser {
             if self.at(TokenKind::Dot) {
                 self.bump();
                 // Allow 'new'/'and'/'or'/'xor'/'unique' as member names (e.g. arr.and, arr.unique)
-                let member = if matches!(self.current().kind,
-                    TokenKind::KwNew | TokenKind::KwAnd | TokenKind::KwOr | TokenKind::KwXor
-                    | TokenKind::KwUnique
+                let member = if matches!(
+                    self.current().kind,
+                    TokenKind::KwNew
+                        | TokenKind::KwAnd
+                        | TokenKind::KwOr
+                        | TokenKind::KwXor
+                        | TokenKind::KwUnique
                 ) {
                     let tok = self.bump();
-                    Identifier { name: tok.text.clone(), span: Span { start: tok.span.start, end: tok.span.end } }
+                    Identifier {
+                        name: tok.text.clone(),
+                        span: Span {
+                            start: tok.span.start,
+                            end: tok.span.end,
+                        },
+                    }
                 } else {
                     self.parse_identifier()
                 };
                 // Method call: .method(args)
                 if self.at(TokenKind::LParen) {
-                    let member_expr = Expression::new(ExprKind::MemberAccess {
-                        expr: Box::new(lhs), member,
-                    }, self.span_from(start));
+                    let member_expr = Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(lhs),
+                            member,
+                        },
+                        self.span_from(start),
+                    );
                     let args = self.parse_call_args();
-                    let mut call_expr = Expression::new(ExprKind::Call {
-                        func: Box::new(member_expr), args,
-                    }, self.span_from(start));
+                    let mut call_expr = Expression::new(
+                        ExprKind::Call {
+                            func: Box::new(member_expr),
+                            args,
+                        },
+                        self.span_from(start),
+                    );
                     if self.eat(TokenKind::KwWith).is_some() {
                         if self.at(TokenKind::LParen) {
                             self.expect(TokenKind::LParen);
                             let filter = self.parse_expression();
                             self.expect(TokenKind::RParen);
-                            call_expr = Expression::new(ExprKind::WithClause {
-                                expr: Box::new(call_expr),
-                                filter: Box::new(filter),
-                            }, self.span_from(start));
+                            call_expr = Expression::new(
+                                ExprKind::WithClause {
+                                    expr: Box::new(call_expr),
+                                    filter: Box::new(filter),
+                                },
+                                self.span_from(start),
+                            );
                         }
                         // Inline constraint block `with { ... }`
                         // (randomize-with). Parse it into ConstraintItems so
@@ -427,17 +582,24 @@ impl Parser {
                                 constraints.push(self.parse_constraint_item());
                             }
                             self.expect(TokenKind::RBrace);
-                            call_expr = Expression::new(ExprKind::RandomizeWith {
-                                call: Box::new(call_expr),
-                                constraints,
-                            }, self.span_from(start));
+                            call_expr = Expression::new(
+                                ExprKind::RandomizeWith {
+                                    call: Box::new(call_expr),
+                                    constraints,
+                                },
+                                self.span_from(start),
+                            );
                         }
                     }
                     lhs = call_expr;
                 } else {
-                    lhs = Expression::new(ExprKind::MemberAccess {
-                        expr: Box::new(lhs), member,
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::MemberAccess {
+                            expr: Box::new(lhs),
+                            member,
+                        },
+                        self.span_from(start),
+                    );
                 }
                 continue;
             }
@@ -448,7 +610,10 @@ impl Parser {
                 // §8.8: `Class::new` typed-constructor reference.
                 let member = if self.at(TokenKind::KwNew) {
                     let tok = self.bump();
-                    crate::ast::Identifier { name: "new".to_string(), span: tok.span }
+                    crate::ast::Identifier {
+                        name: "new".to_string(),
+                        span: tok.span,
+                    }
                 } else {
                     self.parse_identifier()
                 };
@@ -459,9 +624,13 @@ impl Parser {
                 // be consumed here too. Capture the canonical param-list text so
                 // a `Specialization` node can key per-specialization statics
                 // (PURE_SV_LRM); the simulator treats it as `base` otherwise.
-                let mut member_expr = Expression::new(ExprKind::MemberAccess {
-                    expr: Box::new(lhs), member,
-                }, self.span_from(start));
+                let mut member_expr = Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(lhs),
+                        member,
+                    },
+                    self.span_from(start),
+                );
                 if self.at(TokenKind::Hash) && self.peek_kind() == TokenKind::LParen {
                     self.bump(); // #
                     self.bump(); // (
@@ -474,15 +643,20 @@ impl Parser {
                             _ => {}
                         }
                         if depth > 0 {
-                            if !text.is_empty() { text.push(' '); }
+                            if !text.is_empty() {
+                                text.push(' ');
+                            }
                             text.push_str(&self.current().text);
                         }
                         self.bump();
                     }
-                    member_expr = Expression::new(ExprKind::Specialization {
-                        base: Box::new(member_expr),
-                        type_args_text: text,
-                    }, self.span_from(start));
+                    member_expr = Expression::new(
+                        ExprKind::Specialization {
+                            base: Box::new(member_expr),
+                            type_args_text: text,
+                        },
+                        self.span_from(start),
+                    );
                 }
                 lhs = member_expr;
                 continue;
@@ -491,18 +665,25 @@ impl Parser {
             // Function call: (args)
             if self.at(TokenKind::LParen) {
                 let args = self.parse_call_args();
-                let mut call_expr = Expression::new(ExprKind::Call {
-                    func: Box::new(lhs), args,
-                }, self.span_from(start));
+                let mut call_expr = Expression::new(
+                    ExprKind::Call {
+                        func: Box::new(lhs),
+                        args,
+                    },
+                    self.span_from(start),
+                );
                 if self.eat(TokenKind::KwWith).is_some() {
                     if self.at(TokenKind::LParen) {
                         self.expect(TokenKind::LParen);
                         let filter = self.parse_expression();
                         self.expect(TokenKind::RParen);
-                        call_expr = Expression::new(ExprKind::WithClause {
-                            expr: Box::new(call_expr),
-                            filter: Box::new(filter),
-                        }, self.span_from(start));
+                        call_expr = Expression::new(
+                            ExprKind::WithClause {
+                                expr: Box::new(call_expr),
+                                filter: Box::new(filter),
+                            },
+                            self.span_from(start),
+                        );
                     }
                     // Inline constraint block `with { ... }` (randomize-with).
                     // Parse it into constraint items so the simulator can honor
@@ -513,10 +694,13 @@ impl Parser {
                             constraints.push(self.parse_constraint_item());
                         }
                         self.expect(TokenKind::RBrace);
-                        call_expr = Expression::new(ExprKind::RandomizeWith {
-                            call: Box::new(call_expr),
-                            constraints,
-                        }, self.span_from(start));
+                        call_expr = Expression::new(
+                            ExprKind::RandomizeWith {
+                                call: Box::new(call_expr),
+                                constraints,
+                            },
+                            self.span_from(start),
+                        );
                     }
                 }
                 lhs = call_expr;
@@ -532,7 +716,10 @@ impl Parser {
                 // can't begin a normal index expression, so this is
                 // unambiguous. Kept as `$sva_rep_<kind>(operand, lo, hi)`;
                 // `[*]` is `[*0:$]`, `[+]` is `[*1:$]`, a lone `[*n]` is `n:n`.
-                if self.at(TokenKind::Star) || self.at(TokenKind::Assign) || self.at(TokenKind::Arrow) {
+                if self.at(TokenKind::Star)
+                    || self.at(TokenKind::Assign)
+                    || self.at(TokenKind::Arrow)
+                {
                     let kind = match self.current_kind() {
                         TokenKind::Star => "$sva_rep_consec",
                         TokenKind::Assign => "$sva_rep_noncon",
@@ -540,19 +727,28 @@ impl Parser {
                     };
                     self.bump();
                     let mk_num = |this: &Self, v: &str| {
-                        Expression::new(ExprKind::Number(
-                            crate::ast::expr::NumberLiteral::Integer {
-                                size: None, signed: false,
+                        Expression::new(
+                            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                                size: None,
+                                signed: false,
                                 base: crate::ast::expr::NumberBase::Decimal,
                                 value: v.to_string(),
                                 cached_val: std::cell::Cell::new(None),
-                            }), this.span_from(start))
+                            }),
+                            this.span_from(start),
+                        )
                     };
                     let (lo, hi) = if self.at(TokenKind::RBracket) {
-                        (mk_num(self, "0"), Expression::new(ExprKind::Dollar, self.span_from(start)))
+                        (
+                            mk_num(self, "0"),
+                            Expression::new(ExprKind::Dollar, self.span_from(start)),
+                        )
                     } else if self.at(TokenKind::Plus) {
                         self.bump();
-                        (mk_num(self, "1"), Expression::new(ExprKind::Dollar, self.span_from(start)))
+                        (
+                            mk_num(self, "1"),
+                            Expression::new(ExprKind::Dollar, self.span_from(start)),
+                        )
                     } else {
                         let lo = self.parse_expr_bp(0);
                         let hi = if self.eat(TokenKind::Colon).is_some() {
@@ -574,47 +770,64 @@ impl Parser {
                 // Special case: new[size] for dynamic arrays
                 let is_new = if let ExprKind::Ident(ref hier) = lhs.kind {
                     hier.path.len() == 1 && hier.path[0].name.name == "new"
-                } else { false };
+                } else {
+                    false
+                };
 
                 if is_new {
                     self.expect(TokenKind::RBracket);
-                    lhs = Expression::new(ExprKind::Call {
-                        func: Box::new(lhs),
-                        args: vec![idx],
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::Call {
+                            func: Box::new(lhs),
+                            args: vec![idx],
+                        },
+                        self.span_from(start),
+                    );
                 } else if self.eat(TokenKind::Colon).is_some() {
                     let right = self.parse_expression();
                     self.expect(TokenKind::RBracket);
-                    lhs = Expression::new(ExprKind::RangeSelect {
-                        expr: Box::new(lhs),
-                        kind: RangeKind::Constant,
-                        left: Box::new(idx),
-                        right: Box::new(right),
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(lhs),
+                            kind: RangeKind::Constant,
+                            left: Box::new(idx),
+                            right: Box::new(right),
+                        },
+                        self.span_from(start),
+                    );
                 } else if self.eat(TokenKind::PlusColon).is_some() {
                     let width = self.parse_expression();
                     self.expect(TokenKind::RBracket);
-                    lhs = Expression::new(ExprKind::RangeSelect {
-                        expr: Box::new(lhs),
-                        kind: RangeKind::IndexedUp,
-                        left: Box::new(idx),
-                        right: Box::new(width),
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(lhs),
+                            kind: RangeKind::IndexedUp,
+                            left: Box::new(idx),
+                            right: Box::new(width),
+                        },
+                        self.span_from(start),
+                    );
                 } else if self.eat(TokenKind::MinusColon).is_some() {
                     let width = self.parse_expression();
                     self.expect(TokenKind::RBracket);
-                    lhs = Expression::new(ExprKind::RangeSelect {
-                        expr: Box::new(lhs),
-                        kind: RangeKind::IndexedDown,
-                        left: Box::new(idx),
-                        right: Box::new(width),
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::RangeSelect {
+                            expr: Box::new(lhs),
+                            kind: RangeKind::IndexedDown,
+                            left: Box::new(idx),
+                            right: Box::new(width),
+                        },
+                        self.span_from(start),
+                    );
                 } else {
                     self.expect(TokenKind::RBracket);
-                    lhs = Expression::new(ExprKind::Index {
-                        expr: Box::new(lhs),
-                        index: Box::new(idx),
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::Index {
+                            expr: Box::new(lhs),
+                            index: Box::new(idx),
+                        },
+                        self.span_from(start),
+                    );
                 }
                 continue;
             }
@@ -628,8 +841,10 @@ impl Parser {
                 self.bump(); // [
                 let _lo = self.parse_expression();
                 // optional `: hi` / `+: width` / `-: width`
-                if self.at(TokenKind::Colon) || self.at(TokenKind::PlusColon)
-                    || self.at(TokenKind::MinusColon) {
+                if self.at(TokenKind::Colon)
+                    || self.at(TokenKind::PlusColon)
+                    || self.at(TokenKind::MinusColon)
+                {
                     self.bump();
                     let _hi = self.parse_expression();
                 }
@@ -642,10 +857,13 @@ impl Parser {
                 self.expect(TokenKind::LParen);
                 let filter = self.parse_expression();
                 self.expect(TokenKind::RParen);
-                lhs = Expression::new(ExprKind::WithClause {
-                    expr: Box::new(lhs),
-                    filter: Box::new(filter),
-                }, self.span_from(start));
+                lhs = Expression::new(
+                    ExprKind::WithClause {
+                        expr: Box::new(lhs),
+                        filter: Box::new(filter),
+                    },
+                    self.span_from(start),
+                );
                 continue;
             }
 
@@ -663,19 +881,25 @@ impl Parser {
                 // Non-literal casting types (pkg::type'(v), id'(v)) stay a
                 // pass-through width/type hint as before.
                 if matches!(lhs.kind, ExprKind::Number(_)) {
-                    lhs = Expression::new(ExprKind::SystemCall {
-                        name: "$__xz_size_cast".to_string(),
-                        args: vec![lhs, inner],
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::SystemCall {
+                            name: "$__xz_size_cast".to_string(),
+                            args: vec![lhs, inner],
+                        },
+                        self.span_from(start),
+                    );
                 } else if matches!(lhs.kind, ExprKind::TypeLiteral(_)) {
                     // §6.24.1 TYPE cast `int'(2.7)` / `real'(3)` — it CONVERTS
                     // (a real to int rounds; an int to real widens). It used
                     // to be a pass-through, so the operand kept its own type
                     // and only an assignment to a typed target coerced it.
-                    lhs = Expression::new(ExprKind::SystemCall {
-                        name: "$__xz_type_cast".to_string(),
-                        args: vec![lhs, inner],
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::SystemCall {
+                            name: "$__xz_type_cast".to_string(),
+                            args: vec![lhs, inner],
+                        },
+                        self.span_from(start),
+                    );
                 } else if matches!(&lhs.kind, ExprKind::Ident(h)
                     if h.path.len() == 1 && h.path[0].selects.is_empty())
                 {
@@ -686,10 +910,13 @@ impl Parser {
                     // named-cast intrinsic that carries the identifier. Formerly
                     // this dropped the cast entirely (`size1'(x)` kept x's width,
                     // `my_t'(x)` skipped the conversion).
-                    lhs = Expression::new(ExprKind::SystemCall {
-                        name: "$__xz_named_cast".to_string(),
-                        args: vec![lhs, inner],
-                    }, self.span_from(start));
+                    lhs = Expression::new(
+                        ExprKind::SystemCall {
+                            name: "$__xz_named_cast".to_string(),
+                            args: vec![lhs, inner],
+                        },
+                        self.span_from(start),
+                    );
                 } else {
                     lhs = Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
                 }
@@ -704,20 +931,38 @@ impl Parser {
 
     /// The `DataType` a cast keyword denotes (`int'(x)`, `byte'(x)`, …).
     fn cast_keyword_type(kw: TokenKind, span: crate::ast::Span) -> crate::ast::types::DataType {
-        use crate::ast::types::{DataType, IntegerAtomType, IntegerVectorType, RealType, SimpleType};
-        let atom = |k| DataType::IntegerAtom { kind: k, signing: None, span };
-        let vec_ = |k| DataType::IntegerVector { kind: k, signing: None, dimensions: Vec::new(), span };
+        use crate::ast::types::{
+            DataType, IntegerAtomType, IntegerVectorType, RealType, SimpleType,
+        };
+        let atom = |k| DataType::IntegerAtom {
+            kind: k,
+            signing: None,
+            span,
+        };
+        let vec_ = |k| DataType::IntegerVector {
+            kind: k,
+            signing: None,
+            dimensions: Vec::new(),
+            span,
+        };
         match kw {
             TokenKind::KwInt => atom(IntegerAtomType::Int),
             TokenKind::KwByte => atom(IntegerAtomType::Byte),
             TokenKind::KwShortint => atom(IntegerAtomType::ShortInt),
             TokenKind::KwLongint => atom(IntegerAtomType::LongInt),
             TokenKind::KwInteger => atom(IntegerAtomType::Integer),
-            TokenKind::KwReal | TokenKind::KwRealtime => {
-                DataType::Real { kind: RealType::Real, span }
-            }
-            TokenKind::KwShortreal => DataType::Real { kind: RealType::ShortReal, span },
-            TokenKind::KwString => DataType::Simple { kind: SimpleType::String, span },
+            TokenKind::KwReal | TokenKind::KwRealtime => DataType::Real {
+                kind: RealType::Real,
+                span,
+            },
+            TokenKind::KwShortreal => DataType::Real {
+                kind: RealType::ShortReal,
+                span,
+            },
+            TokenKind::KwString => DataType::Simple {
+                kind: SimpleType::String,
+                span,
+            },
             TokenKind::KwBit => vec_(IntegerVectorType::Bit),
             TokenKind::KwReg => vec_(IntegerVectorType::Reg),
             _ => vec_(IntegerVectorType::Logic),
@@ -744,9 +989,17 @@ impl Parser {
                 let mut clk = Expression::new(ExprKind::Null, self.span_from(start));
                 if self.eat(TokenKind::LParen).is_some() {
                     match self.current_kind() {
-                        TokenKind::KwPosedge => { edge_code = 1; self.bump(); }
-                        TokenKind::KwNegedge => { edge_code = 2; self.bump(); }
-                        TokenKind::KwEdge => { self.bump(); }
+                        TokenKind::KwPosedge => {
+                            edge_code = 1;
+                            self.bump();
+                        }
+                        TokenKind::KwNegedge => {
+                            edge_code = 2;
+                            self.bump();
+                        }
+                        TokenKind::KwEdge => {
+                            self.bump();
+                        }
                         _ => {}
                     }
                     clk = self.parse_expression();
@@ -788,18 +1041,138 @@ impl Parser {
                 self.parse_expr_bp(0)
             }
             // Unary operators
-            TokenKind::Plus => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::Plus, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::Minus => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::Minus, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::LogNot => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::BitNot => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::BitNot, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::BitAnd => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::BitAnd, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::BitOr => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::BitOr, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::BitXor => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::BitXor, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::BitNand => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::BitNand, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::BitNor => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::BitNor, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::BitXnor => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::BitXnor, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::Increment => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::PreIncr, operand: Box::new(e) }, self.span_from(start)) }
-            TokenKind::Decrement => { self.bump(); let e = self.parse_expr_bp(prefix_bp()); Expression::new(ExprKind::Unary { op: UnaryOp::PreDecr, operand: Box::new(e) }, self.span_from(start)) }
+            TokenKind::Plus => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::Plus,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::Minus => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::Minus,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::LogNot => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::LogNot,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::BitNot => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::BitNot,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::BitAnd => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::BitAnd,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::BitOr => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::BitOr,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::BitXor => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::BitXor,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::BitNand => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::BitNand,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::BitNor => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::BitNor,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::BitXnor => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::BitXnor,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::Increment => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::PreIncr,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
+            TokenKind::Decrement => {
+                self.bump();
+                let e = self.parse_expr_bp(prefix_bp());
+                Expression::new(
+                    ExprKind::Unary {
+                        op: UnaryOp::PreDecr,
+                        operand: Box::new(e),
+                    },
+                    self.span_from(start),
+                )
+            }
 
             // Parenthesized expression or mintypmax — also handles
             // assignment-as-expression like `(a = b)` or `(a += 1)`.
@@ -812,11 +1185,12 @@ impl Parser {
                 // outside constraint context `dist` here stays an error.
                 if self.in_constraint && self.at(TokenKind::KwDist) {
                     let dspan = self.current().span;
-                    self.diagnostics.push(crate::diagnostics::Diagnostic::warning(
-                        "parenthesized 'dist' constraint is nonstandard (accepted for \
+                    self.diagnostics
+                        .push(crate::diagnostics::Diagnostic::warning(
+                            "parenthesized 'dist' constraint is nonstandard (accepted for \
                          compatibility)",
-                        dspan,
-                    ));
+                            dspan,
+                        ));
                     self.bump();
                     let body = self.parse_dist_body();
                     self.pending_paren_dist.push(body);
@@ -824,32 +1198,130 @@ impl Parser {
                     return inner;
                 }
                 let inner = if self.at_any(&[
-                    TokenKind::Assign, TokenKind::PlusAssign, TokenKind::MinusAssign,
-                    TokenKind::StarAssign, TokenKind::SlashAssign, TokenKind::PercentAssign,
-                    TokenKind::AndAssign, TokenKind::OrAssign, TokenKind::XorAssign,
-                    TokenKind::ShiftLeftAssign, TokenKind::ShiftRightAssign,
-                    TokenKind::ArithShiftLeftAssign, TokenKind::ArithShiftRightAssign,
+                    TokenKind::Assign,
+                    TokenKind::PlusAssign,
+                    TokenKind::MinusAssign,
+                    TokenKind::StarAssign,
+                    TokenKind::SlashAssign,
+                    TokenKind::PercentAssign,
+                    TokenKind::AndAssign,
+                    TokenKind::OrAssign,
+                    TokenKind::XorAssign,
+                    TokenKind::ShiftLeftAssign,
+                    TokenKind::ShiftRightAssign,
+                    TokenKind::ArithShiftLeftAssign,
+                    TokenKind::ArithShiftRightAssign,
                 ]) {
                     let op_kind = self.current().kind.clone();
                     self.bump();
                     let rhs = self.parse_expression();
                     let span = self.span_from(start);
                     let rvalue = match op_kind {
-                        TokenKind::PlusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Add, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::MinusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Sub, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::StarAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mul, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::SlashAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Div, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::PercentAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mod, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::AndAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitAnd, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::OrAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitOr, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::XorAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitXor, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::ShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftLeft, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::ShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftRight, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::ArithShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftLeft, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::ArithShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftRight, left: Box::new(inner.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::PlusAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Add,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::MinusAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Sub,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::StarAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Mul,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::SlashAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Div,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::PercentAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Mod,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::AndAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitAnd,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::OrAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitOr,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::XorAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitXor,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::ShiftLeftAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ShiftLeft,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::ShiftRightAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ShiftRight,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::ArithShiftLeftAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ArithShiftLeft,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::ArithShiftRightAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ArithShiftRight,
+                                left: Box::new(inner.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
                         _ => rhs,
                     };
-                    Expression::new(ExprKind::AssignExpr { lvalue: Box::new(inner), rvalue: Box::new(rvalue) }, span)
+                    Expression::new(
+                        ExprKind::AssignExpr {
+                            lvalue: Box::new(inner),
+                            rvalue: Box::new(rvalue),
+                        },
+                        span,
+                    )
                 } else {
                     inner
                 };
@@ -873,13 +1345,17 @@ impl Parser {
                         TokenKind::RParen => depth -= 1,
                         _ => {}
                     }
-                    if depth == 0 { break; }
+                    if depth == 0 {
+                        break;
+                    }
                     self.bump();
                 }
                 self.expect(TokenKind::RParen);
                 Expression::new(
                     ExprKind::Number(NumberLiteral::Integer {
-                        size: Some(1), signed: false, base: NumberBase::Binary,
+                        size: Some(1),
+                        signed: false,
+                        base: NumberBase::Binary,
                         value: "0".to_string(),
                         cached_val: std::cell::Cell::new(Some((0u64, 0u64, 1u32))),
                     }),
@@ -896,11 +1372,15 @@ impl Parser {
             // assignment pattern `'{ ... }` parsed by the shared item loop.
             TokenKind::KwTagged => {
                 self.bump();
-                let tag = if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
+                let tag = if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier)
+                {
                     self.parse_identifier()
                 } else {
                     // Synthesize an empty tag
-                    crate::ast::Identifier { name: String::new(), span: self.span_from(start) }
+                    crate::ast::Identifier {
+                        name: String::new(),
+                        span: self.span_from(start),
+                    }
                 };
                 let inner = if self.eat(TokenKind::LParen).is_some() {
                     let e = self.parse_expression();
@@ -963,10 +1443,13 @@ impl Parser {
                     // §6.24.1: a literal casting size RESIZES the operand —
                     // lowered to an internal resize call (the width was
                     // dropped before, so `4'(8'hAB)` kept all 8 bits).
-                    Expression::new(ExprKind::SystemCall {
-                        name: "$__xz_size_cast".to_string(),
-                        args: vec![expr, inner],
-                    }, self.span_from(start))
+                    Expression::new(
+                        ExprKind::SystemCall {
+                            name: "$__xz_size_cast".to_string(),
+                            args: vec![expr, inner],
+                        },
+                        self.span_from(start),
+                    )
                 } else {
                     expr
                 }
@@ -974,13 +1457,16 @@ impl Parser {
             TokenKind::UnbasedUnsizedLiteral => {
                 let tok = self.bump();
                 let ch = tok.text.chars().last().unwrap_or('0');
-                Expression::new(ExprKind::Number(NumberLiteral::UnbasedUnsized(ch)), self.span_from(start))
+                Expression::new(
+                    ExprKind::Number(NumberLiteral::UnbasedUnsized(ch)),
+                    self.span_from(start),
+                )
             }
 
             // String literal
             TokenKind::StringLiteral => {
                 let tok = self.bump();
-                let (s, diags) = decode_string_escapes_checked(&tok.text[1..tok.text.len()-1]);
+                let (s, diags) = decode_string_escapes_checked(&tok.text[1..tok.text.len() - 1]);
                 self.push_string_escape_diags(diags, tok.span);
                 Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
             }
@@ -988,7 +1474,7 @@ impl Parser {
             // IEEE 1800-2023 §5.9: triple-quoted string literal.
             TokenKind::TripleStringLiteral => {
                 let tok = self.bump();
-                let (s, diags) = decode_string_escapes_checked(&tok.text[3..tok.text.len()-3]);
+                let (s, diags) = decode_string_escapes_checked(&tok.text[3..tok.text.len() - 3]);
                 self.push_string_escape_diags(diags, tok.span);
                 Expression::new(ExprKind::StringLiteral(s), self.span_from(start))
             }
@@ -1005,8 +1491,7 @@ impl Parser {
             // are injected into every module under their own name and are
             // never shadow-renamed, so the qualifier has nothing to select.
             TokenKind::SystemIdentifier
-                if self.current().text == "$unit"
-                    && self.peek_kind() == TokenKind::DoubleColon =>
+                if self.current().text == "$unit" && self.peek_kind() == TokenKind::DoubleColon =>
             {
                 self.bump(); // $unit
                 self.bump(); // ::
@@ -1034,7 +1519,9 @@ impl Parser {
                 let name = tok.text.clone();
                 let args = if self.at(TokenKind::LParen) {
                     self.parse_call_args()
-                } else { Vec::new() };
+                } else {
+                    Vec::new()
+                };
                 Expression::new(ExprKind::SystemCall { name, args }, self.span_from(start))
             }
 
@@ -1059,10 +1546,19 @@ impl Parser {
             // super — treated as an identifier for super.new(), super.method()
             TokenKind::KwSuper => {
                 let tok = self.bump();
-                let id = Identifier { name: tok.text.clone(), span: Span { start: tok.span.start, end: tok.span.end } };
+                let id = Identifier {
+                    name: tok.text.clone(),
+                    span: Span {
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    },
+                };
                 let hier = HierarchicalIdentifier {
                     root: None,
-                    path: vec![HierPathSegment { name: id, selects: Vec::new() }],
+                    path: vec![HierPathSegment {
+                        name: id,
+                        selects: Vec::new(),
+                    }],
                     span: self.span_from(start),
                     cached_signal_id: std::cell::Cell::new(None),
                     cached_resolved_name: std::cell::OnceCell::new(),
@@ -1095,10 +1591,15 @@ impl Parser {
                         let mut depth = 1;
                         let mut text = String::new();
                         while depth > 0 && !self.at(TokenKind::Eof) {
-                            if self.at(TokenKind::LParen) { depth += 1; }
-                            else if self.at(TokenKind::RParen) { depth -= 1; }
+                            if self.at(TokenKind::LParen) {
+                                depth += 1;
+                            } else if self.at(TokenKind::RParen) {
+                                depth -= 1;
+                            }
                             if depth > 0 {
-                                if !text.is_empty() { text.push(' '); }
+                                if !text.is_empty() {
+                                    text.push(' ');
+                                }
                                 text.push_str(&self.current().text);
                             }
                             self.bump();
@@ -1108,17 +1609,23 @@ impl Parser {
                 }
                 let hier = HierarchicalIdentifier {
                     root: None,
-                    path: vec![HierPathSegment { name: id, selects: Vec::new() }],
+                    path: vec![HierPathSegment {
+                        name: id,
+                        selects: Vec::new(),
+                    }],
                     span: self.span_from(start),
                     cached_signal_id: std::cell::Cell::new(None),
                     cached_resolved_name: std::cell::OnceCell::new(),
                 };
                 let mut expr = Expression::new(ExprKind::Ident(hier), self.span_from(start));
                 if let Some(text) = spec_text {
-                    expr = Expression::new(ExprKind::Specialization {
-                        base: Box::new(expr),
-                        type_args_text: text,
-                    }, self.span_from(start));
+                    expr = Expression::new(
+                        ExprKind::Specialization {
+                            base: Box::new(expr),
+                            type_args_text: text,
+                        },
+                        self.span_from(start),
+                    );
                 }
                 // §6.24.1 cast: identifier'(expr) — `id` is either a typedef
                 // (TYPE cast: convert/resize/re-sign the operand) or a constant
@@ -1136,12 +1643,18 @@ impl Parser {
                     if matches!(&expr.kind, ExprKind::Ident(h)
                         if h.path.len() == 1 && h.path[0].selects.is_empty())
                     {
-                        return Expression::new(ExprKind::SystemCall {
-                            name: "$__xz_named_cast".to_string(),
-                            args: vec![expr, inner],
-                        }, self.span_from(start));
+                        return Expression::new(
+                            ExprKind::SystemCall {
+                                name: "$__xz_named_cast".to_string(),
+                                args: vec![expr, inner],
+                            },
+                            self.span_from(start),
+                        );
                     }
-                    return Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start));
+                    return Expression::new(
+                        ExprKind::Paren(Box::new(inner)),
+                        self.span_from(start),
+                    );
                 }
                 // §10.9.2 TYPED assignment pattern: `some_t'{ a: ..., default: ... }`.
                 // The lexer folds `'{` into one token, so the cast branch above
@@ -1169,15 +1682,22 @@ impl Parser {
                         if self.eat(TokenKind::LBrace).is_some() {
                             let mut depth = 1;
                             while depth > 0 && !self.at(TokenKind::Eof) {
-                                if self.at(TokenKind::LBrace) { depth += 1; }
-                                else if self.at(TokenKind::RBrace) { depth -= 1; }
+                                if self.at(TokenKind::LBrace) {
+                                    depth += 1;
+                                } else if self.at(TokenKind::RBrace) {
+                                    depth -= 1;
+                                }
                                 self.bump();
                             }
                         }
                     }
-                    Expression::new(ExprKind::Call {
-                        func: Box::new(expr), args,
-                    }, self.span_from(start))
+                    Expression::new(
+                        ExprKind::Call {
+                            func: Box::new(expr),
+                            args,
+                        },
+                        self.span_from(start),
+                    )
                 } else {
                     expr
                 }
@@ -1186,16 +1706,30 @@ impl Parser {
             // Type cast: type'(expr) — e.g., logic'(x), int'(x), bit'(x), void'(x)
             // These are SystemVerilog casting expressions (IEEE 1800-2017 §6.24.1)
             // For simulation, treat as pass-through (the cast is a type/size hint).
-            TokenKind::KwLogic | TokenKind::KwBit | TokenKind::KwByte |
-            TokenKind::KwInt | TokenKind::KwShortint | TokenKind::KwLongint |
-            TokenKind::KwInteger | TokenKind::KwReg | TokenKind::KwSigned | TokenKind::KwUnsigned |
-            TokenKind::KwVoid | TokenKind::KwString |
-            TokenKind::KwReal | TokenKind::KwShortreal | TokenKind::KwRealtime
+            TokenKind::KwLogic
+            | TokenKind::KwBit
+            | TokenKind::KwByte
+            | TokenKind::KwInt
+            | TokenKind::KwShortint
+            | TokenKind::KwLongint
+            | TokenKind::KwInteger
+            | TokenKind::KwReg
+            | TokenKind::KwSigned
+            | TokenKind::KwUnsigned
+            | TokenKind::KwVoid
+            | TokenKind::KwString
+            | TokenKind::KwReal
+            | TokenKind::KwShortreal
+            | TokenKind::KwRealtime
                 if {
                     // Look ahead: is this type_keyword'(expr) ?
                     let next = self.peek_kind();
                     next == TokenKind::IntegerLiteral && {
-                        let next_text = self.tokens.get(self.pos + 1).map(|t| t.text.as_str()).unwrap_or("");
+                        let next_text = self
+                            .tokens
+                            .get(self.pos + 1)
+                            .map(|t| t.text.as_str())
+                            .unwrap_or("");
                         next_text == "'"
                     }
                 } =>
@@ -1213,11 +1747,17 @@ impl Parser {
                 // equivalent system functions rather than dropping them.
                 match cast_kw {
                     TokenKind::KwSigned => Expression::new(
-                        ExprKind::SystemCall { name: "$signed".to_string(), args: vec![inner] },
+                        ExprKind::SystemCall {
+                            name: "$signed".to_string(),
+                            args: vec![inner],
+                        },
                         self.span_from(start),
                     ),
                     TokenKind::KwUnsigned => Expression::new(
-                        ExprKind::SystemCall { name: "$unsigned".to_string(), args: vec![inner] },
+                        ExprKind::SystemCall {
+                            name: "$unsigned".to_string(),
+                            args: vec![inner],
+                        },
                         self.span_from(start),
                     ),
                     TokenKind::KwVoid => {
@@ -1247,10 +1787,19 @@ impl Parser {
             // new expression: new(args) or new[size] or just new
             TokenKind::KwNew => {
                 let tok = self.bump();
-                let name_id = Identifier { name: tok.text.clone(), span: Span { start: tok.span.start, end: tok.span.end } };
+                let name_id = Identifier {
+                    name: tok.text.clone(),
+                    span: Span {
+                        start: tok.span.start,
+                        end: tok.span.end,
+                    },
+                };
                 let hier = HierarchicalIdentifier {
                     root: None,
-                    path: vec![HierPathSegment { name: name_id, selects: Vec::new() }],
+                    path: vec![HierPathSegment {
+                        name: name_id,
+                        selects: Vec::new(),
+                    }],
                     span: self.span_from(start),
                     cached_signal_id: std::cell::Cell::new(None),
                     cached_resolved_name: std::cell::OnceCell::new(),
@@ -1269,7 +1818,9 @@ impl Parser {
                 ) {
                     let src = self.parse_expr_bp(30);
                     Expression::new(
-                        ExprKind::ShallowCopy { source: Box::new(src) },
+                        ExprKind::ShallowCopy {
+                            source: Box::new(src),
+                        },
                         self.span_from(start),
                     )
                 } else {
@@ -1290,7 +1841,8 @@ impl Parser {
             // `s_always <expr>`. The SVA executor treats these as
             // future-cycle obligations.
             TokenKind::KwS_eventually => {
-                let start = self.current().span.start; self.bump();
+                let start = self.current().span.start;
+                self.bump();
                 let operand = self.parse_expr_bp(3);
                 Expression::new(
                     ExprKind::Unary {
@@ -1301,7 +1853,8 @@ impl Parser {
                 )
             }
             TokenKind::KwS_always => {
-                let start = self.current().span.start; self.bump();
+                let start = self.current().span.start;
+                self.bump();
                 let operand = self.parse_expr_bp(3);
                 Expression::new(
                     ExprKind::Unary {
@@ -1315,7 +1868,8 @@ impl Parser {
             // Desugar to `Binary{HashHash, 1, expr}` which the SVA
             // executor already treats as a 1-cycle delay.
             TokenKind::KwNexttime | TokenKind::KwS_nexttime => {
-                let start = self.current().span.start; self.bump();
+                let start = self.current().span.start;
+                self.bump();
                 let operand = self.parse_expr_bp(3);
                 let one = Expression::new(
                     ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
@@ -1365,11 +1919,14 @@ impl Parser {
                     self.error("expected '(' after first_match".to_string());
                     return Expression::new(
                         ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                            size: None, signed: false,
+                            size: None,
+                            signed: false,
                             base: crate::ast::expr::NumberBase::Decimal,
                             value: "1".to_string(),
                             cached_val: std::cell::Cell::new(None),
-                        }), self.span_from(start));
+                        }),
+                        self.span_from(start),
+                    );
                 }
                 let seq = self.parse_expr_bp(0);
                 // Optional `, sequence_match_item` list (§16.10 local-variable
@@ -1378,10 +1935,18 @@ impl Parser {
                 let mut depth = 0usize;
                 while !self.at(TokenKind::Eof) {
                     match self.current_kind() {
-                        TokenKind::LParen => { depth += 1; let _ = self.bump(); }
+                        TokenKind::LParen => {
+                            depth += 1;
+                            let _ = self.bump();
+                        }
                         TokenKind::RParen if depth == 0 => break,
-                        TokenKind::RParen => { depth -= 1; let _ = self.bump(); }
-                        _ => { let _ = self.bump(); }
+                        TokenKind::RParen => {
+                            depth -= 1;
+                            let _ = self.bump();
+                        }
+                        _ => {
+                            let _ = self.bump();
+                        }
                     }
                 }
                 let _ = self.eat(TokenKind::RParen);
@@ -1399,11 +1964,14 @@ impl Parser {
                     self.error("expected '(' after property if".to_string());
                     return Expression::new(
                         ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                            size: None, signed: false,
+                            size: None,
+                            signed: false,
                             base: crate::ast::expr::NumberBase::Decimal,
                             value: "1".to_string(),
                             cached_val: std::cell::Cell::new(None),
-                        }), self.span_from(start));
+                        }),
+                        self.span_from(start),
+                    );
                 }
                 let cond = self.parse_expr_bp(0);
                 let _ = self.eat(TokenKind::RParen);
@@ -1422,7 +1990,10 @@ impl Parser {
                 self.bump();
                 let else_p = self.parse_expr_bp(3);
                 let not_cond = Expression::new(
-                    ExprKind::Unary { op: UnaryOp::LogNot, operand: Box::new(cond) },
+                    ExprKind::Unary {
+                        op: UnaryOp::LogNot,
+                        operand: Box::new(cond),
+                    },
                     self.span_from(start),
                 );
                 let else_arm = Expression::new(
@@ -1463,7 +2034,8 @@ impl Parser {
                 // cycles, rest}. Without consuming the right-hand side
                 // here, the bare `##N` would leave the trailing operand
                 // dangling (e.g. `a |-> ##1 b` errored on `b`).
-                let start = self.current().span.start; self.bump();
+                let start = self.current().span.start;
+                self.bump();
                 // LRM §16.8: prefix `##N rest` or a cycle-delay RANGE
                 // `##[m:n]` / `##[m:$]` / `##[*]` / `##[+]` (e.g. after `|->`:
                 // `a |-> ##[1:$] b`), kept as `Range(lo, hi)`.
@@ -1527,7 +2099,11 @@ impl Parser {
             }
 
             _ => {
-                self.error(format!("expected expression, found {:?} '{}'", self.current_kind(), self.current().text));
+                self.error(format!(
+                    "expected expression, found {:?} '{}'",
+                    self.current_kind(),
+                    self.current().text
+                ));
                 self.bump();
                 Expression::new(ExprKind::Empty, self.span_from(start))
             }
@@ -1543,7 +2119,9 @@ impl Parser {
         let mut items = Vec::new();
         let mut first = true;
         loop {
-            if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+            if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
+                break;
+            }
 
             // Possible items:
             // 1. default: expr
@@ -1563,7 +2141,9 @@ impl Parser {
                 self.expect(TokenKind::Colon);
                 let expr = self.parse_expression();
                 items.push(AssignmentPatternItem::Typed(dt, expr));
-            } else if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier)) && self.peek_kind() == TokenKind::Colon {
+            } else if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
+                && self.peek_kind() == TokenKind::Colon
+            {
                 let name = self.parse_identifier();
                 self.expect(TokenKind::Colon);
                 let expr = self.parse_expression();
@@ -1590,11 +2170,16 @@ impl Parser {
                     let mut rep_items = Vec::new();
                     loop {
                         rep_items.push(self.parse_expression());
-                        if self.eat(TokenKind::Comma).is_none() { break; }
+                        if self.eat(TokenKind::Comma).is_none() {
+                            break;
+                        }
                     }
                     self.expect(TokenKind::RBrace);
                     items.push(AssignmentPatternItem::Ordered(Expression::new(
-                        ExprKind::Replication { count: Box::new(count_expr), exprs: rep_items },
+                        ExprKind::Replication {
+                            count: Box::new(count_expr),
+                            exprs: rep_items,
+                        },
                         self.span_from(start),
                     )));
                 } else {
@@ -1606,8 +2191,7 @@ impl Parser {
                     // the expansion sites can tell them apart: a bare
                     // Ordered(Replication) always means the
                     // §10.10.1 multiplier.
-                    let item_expr = if matches!(count_expr.kind, ExprKind::Replication { .. })
-                    {
+                    let item_expr = if matches!(count_expr.kind, ExprKind::Replication { .. }) {
                         Expression::new(
                             ExprKind::Paren(Box::new(count_expr)),
                             self.span_from(start),
@@ -1620,7 +2204,9 @@ impl Parser {
             }
             first = false;
 
-            if self.eat(TokenKind::Comma).is_none() { break; }
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
         }
         items
     }
@@ -1628,7 +2214,7 @@ impl Parser {
     fn parse_concatenation(&mut self) -> Expression {
         let start = self.current().span.start;
         self.expect(TokenKind::LBrace);
-        
+
         // Handle streaming operators { >> [slice_size] { ... } } or { << [slice_size] { ... } }
         if self.at(TokenKind::ShiftRight) || self.at(TokenKind::ShiftLeft) {
             let left_to_right = self.at(TokenKind::ShiftLeft);
@@ -1649,7 +2235,8 @@ impl Parser {
                     self.bump();
                     let lit = Expression::new(
                         ExprKind::Number(NumberLiteral::Integer {
-                            size: Some(32), signed: false,
+                            size: Some(32),
+                            signed: false,
                             base: NumberBase::Decimal,
                             value: w.to_string(),
                             cached_val: std::cell::Cell::new(None),
@@ -1660,17 +2247,30 @@ impl Parser {
                 } else {
                     Some(Box::new(self.parse_expression()))
                 }
-            } else { None };
+            } else {
+                None
+            };
             self.expect(TokenKind::LBrace);
             let mut exprs = Vec::new();
             loop {
-                if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+                if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
+                    break;
+                }
                 exprs.push(self.parse_expression());
-                if self.eat(TokenKind::Comma).is_none() { break; }
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
             }
             self.expect(TokenKind::RBrace);
             self.expect(TokenKind::RBrace);
-            return Expression::new(ExprKind::StreamOp { left_to_right, slice_size, exprs }, self.span_from(start));
+            return Expression::new(
+                ExprKind::StreamOp {
+                    left_to_right,
+                    slice_size,
+                    exprs,
+                },
+                self.span_from(start),
+            );
         }
 
         if self.at(TokenKind::RBrace) {
@@ -1683,19 +2283,29 @@ impl Parser {
             self.bump();
             let mut exprs = Vec::new();
             loop {
-                if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+                if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
+                    break;
+                }
                 exprs.push(self.parse_expression());
-                if self.eat(TokenKind::Comma).is_none() { break; }
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
             }
             self.expect(TokenKind::RBrace);
             self.expect(TokenKind::RBrace);
-            return Expression::new(ExprKind::Replication {
-                count: Box::new(first), exprs,
-            }, self.span_from(start));
+            return Expression::new(
+                ExprKind::Replication {
+                    count: Box::new(first),
+                    exprs,
+                },
+                self.span_from(start),
+            );
         }
         let mut exprs = vec![first];
         while self.eat(TokenKind::Comma).is_some() {
-            if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) { break; }
+            if self.at(TokenKind::RBrace) || self.at(TokenKind::Eof) {
+                break;
+            }
             exprs.push(self.parse_expression());
         }
         self.expect(TokenKind::RBrace);
@@ -1705,16 +2315,22 @@ impl Parser {
     pub(super) fn parse_call_args(&mut self) -> Vec<Expression> {
         let mut args = Vec::new();
         self.expect(TokenKind::LParen);
-        if self.at(TokenKind::RParen) { self.bump(); return args; }
+        if self.at(TokenKind::RParen) {
+            self.bump();
+            return args;
+        }
         loop {
-            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
-            
+            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
+                break;
+            }
+
             let start = self.current().span.start;
             if self.at(TokenKind::Comma) {
                 // Empty argument: foo(a, , b)
                 args.push(Expression::new(ExprKind::Empty, self.span_from(start)));
             } else if self.is_data_type_keyword()
-                && matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Comma) {
+                && matches!(self.peek_kind(), TokenKind::RParen | TokenKind::Comma)
+            {
                 // §20.6.2: a bare built-in type keyword as a call argument, e.g.
                 // `$bits(integer)` / `$bits(byte)`. The expression grammar can't
                 // parse a lone type keyword, so capture it as an Ident carrying
@@ -1724,22 +2340,37 @@ impl Parser {
                 let ident = HierarchicalIdentifier {
                     root: None,
                     path: vec![HierPathSegment {
-                        name: Identifier { name: tok.text.clone(), span },
+                        name: Identifier {
+                            name: tok.text.clone(),
+                            span,
+                        },
                         selects: Vec::new(),
                     }],
                     span,
                     cached_signal_id: std::cell::Cell::new(None),
                     cached_resolved_name: std::cell::OnceCell::new(),
                 };
-                args.push(Expression::new(ExprKind::Ident(ident), self.span_from(start)));
+                args.push(Expression::new(
+                    ExprKind::Ident(ident),
+                    self.span_from(start),
+                ));
             } else if self.eat(TokenKind::Dot).is_some() {
                 let name = self.parse_identifier();
                 let expr = if self.eat(TokenKind::LParen).is_some() {
-                    let e = if !self.at(TokenKind::RParen) { Some(Box::new(self.parse_expression())) } else { None };
+                    let e = if !self.at(TokenKind::RParen) {
+                        Some(Box::new(self.parse_expression()))
+                    } else {
+                        None
+                    };
                     self.expect(TokenKind::RParen);
                     e
-                } else { None };
-                args.push(Expression::new(ExprKind::NamedArg { name, expr }, self.span_from(start)));
+                } else {
+                    None
+                };
+                args.push(Expression::new(
+                    ExprKind::NamedArg { name, expr },
+                    self.span_from(start),
+                ));
             } else {
                 args.push(self.parse_expression());
             }
@@ -1750,7 +2381,10 @@ impl Parser {
                 break;
             } else if self.at(TokenKind::RParen) {
                 // Trailing comma case
-                args.push(Expression::new(ExprKind::Empty, self.span_from(self.current().span.start)));
+                args.push(Expression::new(
+                    ExprKind::Empty,
+                    self.span_from(self.current().span.start),
+                ));
                 break;
             }
         }
@@ -1765,43 +2399,65 @@ impl Parser {
         // IEEE 1800-2023 §23.6: `$root`, `$unit`, `local::`-style roots can
         // start a hierarchical reference. `$root.foo.bar` shows up frequently
         // in cv32e40p macros expanding to absolute paths.
-        let id = if self.at(TokenKind::KwThis) || self.at(TokenKind::KwSuper)
+        let id = if self.at(TokenKind::KwThis)
+            || self.at(TokenKind::KwSuper)
             || self.at(TokenKind::SystemIdentifier)
         {
             let tok = self.bump();
-            Identifier { name: tok.text, span: tok.span }
+            Identifier {
+                name: tok.text,
+                span: tok.span,
+            }
         } else {
             self.parse_identifier()
         };
-        let mut path = vec![HierPathSegment { name: id, selects: Vec::new() }];
-        
+        let mut path = vec![HierPathSegment {
+            name: id,
+            selects: Vec::new(),
+        }];
+
         loop {
             if self.at(TokenKind::Dot) {
                 self.bump();
                 let member = self.parse_identifier();
-                path.push(HierPathSegment { name: member, selects: Vec::new() });
+                path.push(HierPathSegment {
+                    name: member,
+                    selects: Vec::new(),
+                });
             } else if self.at(TokenKind::DoubleColon) {
                 self.bump();
                 // §8.8: `Class::new` typed-constructor reference — `new` is a
                 // keyword but names the constructor here.
                 let member = if self.at(TokenKind::KwNew) {
                     let tok = self.bump();
-                    crate::ast::Identifier { name: "new".to_string(), span: tok.span }
+                    crate::ast::Identifier {
+                        name: "new".to_string(),
+                        span: tok.span,
+                    }
                 } else {
                     self.parse_identifier()
                 };
-                path.push(HierPathSegment { name: member, selects: Vec::new() });
+                path.push(HierPathSegment {
+                    name: member,
+                    selects: Vec::new(),
+                });
             } else if self.at(TokenKind::LBracket) {
                 // Peek after the balanced bracket
                 let mut p = self.pos + 1;
                 let mut depth = 1;
                 while depth > 0 && p < self.tokens.len() {
-                    if self.tokens[p].kind == TokenKind::LBracket { depth += 1; }
-                    else if self.tokens[p].kind == TokenKind::RBracket { depth -= 1; }
+                    if self.tokens[p].kind == TokenKind::LBracket {
+                        depth += 1;
+                    } else if self.tokens[p].kind == TokenKind::RBracket {
+                        depth -= 1;
+                    }
                     p += 1;
                 }
                 if let Some(t) = self.tokens.get(p) {
-                    if t.kind == TokenKind::Dot || t.kind == TokenKind::DoubleColon || t.kind == TokenKind::LBracket {
+                    if t.kind == TokenKind::Dot
+                        || t.kind == TokenKind::DoubleColon
+                        || t.kind == TokenKind::LBracket
+                    {
                         // It's an internal index, consume it
                         self.bump();
                         let idx = self.parse_expression();
@@ -1822,7 +2478,7 @@ impl Parser {
             path,
             span: self.span_from(start),
             cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+            cached_resolved_name: std::cell::OnceCell::new(),
         }
     }
     /// Handles indices [expr] as well.
@@ -1831,33 +2487,48 @@ impl Parser {
         let id = self.parse_identifier();
         let hier = HierarchicalIdentifier {
             root: None,
-            path: vec![HierPathSegment { name: id, selects: Vec::new() }],
+            path: vec![HierPathSegment {
+                name: id,
+                selects: Vec::new(),
+            }],
             span: self.span_from(start),
             cached_signal_id: std::cell::Cell::new(None),
-                    cached_resolved_name: std::cell::OnceCell::new(),
+            cached_resolved_name: std::cell::OnceCell::new(),
         };
         let mut res = Expression::new(ExprKind::Ident(hier), self.span_from(start));
-        
+
         loop {
             if self.at(TokenKind::Dot) {
                 self.bump();
                 let member = self.parse_identifier();
-                res = Expression::new(ExprKind::MemberAccess {
-                    expr: Box::new(res), member,
-                }, self.span_from(start));
+                res = Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(res),
+                        member,
+                    },
+                    self.span_from(start),
+                );
             } else if self.at(TokenKind::DoubleColon) {
                 self.bump();
                 let member = self.parse_identifier();
-                res = Expression::new(ExprKind::MemberAccess {
-                    expr: Box::new(res), member,
-                }, self.span_from(start));
+                res = Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(res),
+                        member,
+                    },
+                    self.span_from(start),
+                );
             } else if self.at(TokenKind::LBracket) {
                 self.bump();
                 let idx = self.parse_expression();
                 self.expect(TokenKind::RBracket);
-                res = Expression::new(ExprKind::Index {
-                    expr: Box::new(res), index: Box::new(idx),
-                }, self.span_from(start));
+                res = Expression::new(
+                    ExprKind::Index {
+                        expr: Box::new(res),
+                        index: Box::new(idx),
+                    },
+                    self.span_from(start),
+                );
             } else {
                 break;
             }
@@ -1870,21 +2541,30 @@ impl Parser {
     /// the bare count for `[n]`.
     fn parse_sva_delay_range(&mut self, start: usize) -> Expression {
         let mk_num = |this: &Self, v: &str| {
-            Expression::new(ExprKind::Number(
-                crate::ast::expr::NumberLiteral::Integer {
-                    size: None, signed: false,
+            Expression::new(
+                ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
                     base: crate::ast::expr::NumberBase::Decimal,
                     value: v.to_string(),
                     cached_val: std::cell::Cell::new(None),
-                }), this.span_from(start))
+                }),
+                this.span_from(start),
+            )
         };
         self.bump(); // `[`
         let (lo, hi) = if self.at(TokenKind::Star) {
             self.bump();
-            (mk_num(self, "0"), Some(Expression::new(ExprKind::Dollar, self.span_from(start))))
+            (
+                mk_num(self, "0"),
+                Some(Expression::new(ExprKind::Dollar, self.span_from(start))),
+            )
         } else if self.at(TokenKind::Plus) {
             self.bump();
-            (mk_num(self, "1"), Some(Expression::new(ExprKind::Dollar, self.span_from(start))))
+            (
+                mk_num(self, "1"),
+                Some(Expression::new(ExprKind::Dollar, self.span_from(start))),
+            )
         } else {
             let lo = self.parse_expr_bp(0);
             let hi = if self.eat(TokenKind::Colon).is_some() {
@@ -1927,9 +2607,17 @@ impl Parser {
         let parsed = self.parse_expression();
         // `clk iff g` arrives as `Binary(Iff, clk, g)`: peel it apart.
         let (clock, iff) = match parsed.kind {
-            ExprKind::Binary { op: BinaryOp::Iff, left, right } => (*left, Some(*right)),
+            ExprKind::Binary {
+                op: BinaryOp::Iff,
+                left,
+                right,
+            } => (*left, Some(*right)),
             other => {
-                let clock = Expression { kind: other, span: parsed.span, cached_width: std::cell::Cell::new(None) };
+                let clock = Expression {
+                    kind: other,
+                    span: parsed.span,
+                    cached_width: std::cell::Cell::new(None),
+                };
                 let iff = if self.eat(TokenKind::KwIff).is_some() {
                     Some(self.parse_expression())
                 } else {
@@ -1948,7 +2636,10 @@ impl Parser {
     /// (`$sva_rep_consec(s, lo, hi)`, `$sva_first_match(s)`, ...).
     fn sva_marker(name: &str, args: Vec<Expression>, span: Span) -> Expression {
         Expression::new(
-            ExprKind::SystemCall { name: name.to_string(), args },
+            ExprKind::SystemCall {
+                name: name.to_string(),
+                args,
+            },
             span,
         )
     }
@@ -2026,9 +2717,15 @@ impl Parser {
     }
 }
 
-fn prefix_bp() -> u8 { 25 }
-fn postfix_bp() -> (u8, ()) { (27, ()) }
-fn ternary_bp() -> (u8, u8) { (1, 1) }
+fn prefix_bp() -> u8 {
+    25
+}
+fn postfix_bp() -> (u8, ()) {
+    (27, ())
+}
+fn ternary_bp() -> (u8, u8) {
+    (1, 1)
+}
 
 /// Parse a number literal string into our AST representation.
 fn parse_number_literal(text: &str) -> NumberLiteral {
@@ -2038,8 +2735,12 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
     // from a bare numeric delay (scaled by the module timeunit) so relative
     // timing is correct under sub-ns timescales.
     let time_suffixes: &[(&str, f64)] = &[
-        ("fs", 1e-15), ("ps", 1e-12), ("ns", 1e-9),
-        ("us", 1e-6),  ("ms", 1e-3),  ("s",  1.0),
+        ("fs", 1e-15),
+        ("ps", 1e-12),
+        ("ns", 1e-9),
+        ("us", 1e-6),
+        ("ms", 1e-3),
+        ("s", 1.0),
     ];
     for (suf, scale) in time_suffixes {
         if text.ends_with(suf)
@@ -2053,7 +2754,10 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
         }
     }
     // Try to parse as real
-    if text.contains('.') || (text.contains('e') && !text.contains('\'')) || (text.contains('E') && !text.contains('\'')) {
+    if text.contains('.')
+        || (text.contains('e') && !text.contains('\''))
+        || (text.contains('E') && !text.contains('\''))
+    {
         if let Ok(v) = text.replace('_', "").parse::<f64>() {
             return NumberLiteral::Real(v);
         }
@@ -2061,11 +2765,17 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
     // Based literal
     if let Some(apos) = text.find('\'') {
         let size_str = &text[..apos];
-        let size = if size_str.is_empty() { None } else { size_str.replace('_', "").parse().ok() };
-        let rest = &text[apos+1..];
+        let size = if size_str.is_empty() {
+            None
+        } else {
+            size_str.replace('_', "").parse().ok()
+        };
+        let rest = &text[apos + 1..];
         let (signed, rest) = if rest.starts_with('s') || rest.starts_with('S') {
             (true, &rest[1..])
-        } else { (false, rest) };
+        } else {
+            (false, rest)
+        };
         let (base, value) = if rest.len() > 1 {
             let b = match rest.as_bytes()[0] {
                 b'h' | b'H' => NumberBase::Hex,
@@ -2089,7 +2799,13 @@ fn parse_number_literal(text: &str) -> NumberLiteral {
             };
             (b, String::new())
         };
-        return NumberLiteral::Integer { size, signed, base, value, cached_val: Cell::new(None) };
+        return NumberLiteral::Integer {
+            size,
+            signed,
+            base,
+            value,
+            cached_val: Cell::new(None),
+        };
     }
     // Plain decimal — signed per Verilog standard (LRM section 5.7.1)
     NumberLiteral::Integer {
@@ -2122,7 +2838,11 @@ fn validate_number_literal(text: &str) -> Option<String> {
     }
     // Split off an optional signed marker, then the base specifier.
     let rest = &text[apos + 1..];
-    let rest = if rest.starts_with('s') || rest.starts_with('S') { &rest[1..] } else { rest };
+    let rest = if rest.starts_with('s') || rest.starts_with('S') {
+        &rest[1..]
+    } else {
+        rest
+    };
     let base = match rest.as_bytes().first() {
         Some(b) => *b,
         None => return None, // bare `'` (cast operator) — nothing to validate
@@ -2135,7 +2855,9 @@ fn validate_number_literal(text: &str) -> Option<String> {
             .chars()
             .filter(|c| !c.is_whitespace() && *c != '_')
             .collect();
-        let has_xz = value.chars().any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?'));
+        let has_xz = value
+            .chars()
+            .any(|c| matches!(c, 'x' | 'X' | 'z' | 'Z' | '?'));
         if has_xz {
             let single_x = value.len() == 1 && matches!(value.as_bytes()[0], b'x' | b'X');
             let single_z = value.len() == 1 && matches!(value.as_bytes()[0], b'z' | b'Z' | b'?');
@@ -2161,18 +2883,27 @@ fn validate_number_literal(text: &str) -> Option<String> {
 ///  - underscores are digit separators,
 ///  - `x`/`z`/`?` (unknown / high-Z) are legal in every base, including decimal.
 fn validate_based_literal_value(base: NumberBase, value: &str) -> Option<String> {
-    let digits: String = value.chars().filter(|c| !c.is_whitespace() && *c != '_').collect();
+    let digits: String = value
+        .chars()
+        .filter(|c| !c.is_whitespace() && *c != '_')
+        .collect();
     if digits.is_empty() {
         return Some("missing value digits in based number literal".to_string());
     }
     let in_base = |c: char| match base {
-        NumberBase::Binary  => matches!(c, '0' | '1' | 'x' | 'X' | 'z' | 'Z' | '?'),
-        NumberBase::Octal   => matches!(c, '0'..='7' | 'x' | 'X' | 'z' | 'Z' | '?'),
+        NumberBase::Binary => matches!(c, '0' | '1' | 'x' | 'X' | 'z' | 'Z' | '?'),
+        NumberBase::Octal => matches!(c, '0'..='7' | 'x' | 'X' | 'z' | 'Z' | '?'),
         NumberBase::Decimal => matches!(c, '0'..='9' | 'x' | 'X' | 'z' | 'Z' | '?'),
-        NumberBase::Hex     => matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F' | 'x' | 'X' | 'z' | 'Z' | '?'),
+        NumberBase::Hex => {
+            matches!(c, '0'..='9' | 'a'..='f' | 'A'..='F' | 'x' | 'X' | 'z' | 'Z' | '?')
+        }
     };
-    digits.chars().find(|&c| !in_base(c))
-        .map(|bad| format!("invalid digit '{}' for {:?} base in number literal", bad, base))
+    digits.chars().find(|&c| !in_base(c)).map(|bad| {
+        format!(
+            "invalid digit '{}' for {:?} base in number literal",
+            bad, base
+        )
+    })
 }
 
 /// Decode SystemVerilog string-literal escape sequences (IEEE 1800-2017 §5.9).
@@ -2206,16 +2937,46 @@ fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> St
             continue;
         }
         match bytes[i + 1] {
-            b'n' => { out.push('\n'); i += 2; }
-            b't' => { out.push('\t'); i += 2; }
-            b'r' => { out.push('\r'); i += 2; }
-            b'\\' => { out.push('\\'); i += 2; }
-            b'"' => { out.push('"'); i += 2; }
-            b'\'' => { out.push('\''); i += 2; }
-            b'a' => { out.push('\u{07}'); i += 2; }
-            b'b' => { out.push('\u{08}'); i += 2; }
-            b'f' => { out.push('\u{0c}'); i += 2; }
-            b'v' => { out.push('\u{0b}'); i += 2; }
+            b'n' => {
+                out.push('\n');
+                i += 2;
+            }
+            b't' => {
+                out.push('\t');
+                i += 2;
+            }
+            b'r' => {
+                out.push('\r');
+                i += 2;
+            }
+            b'\\' => {
+                out.push('\\');
+                i += 2;
+            }
+            b'"' => {
+                out.push('"');
+                i += 2;
+            }
+            b'\'' => {
+                out.push('\'');
+                i += 2;
+            }
+            b'a' => {
+                out.push('\u{07}');
+                i += 2;
+            }
+            b'b' => {
+                out.push('\u{08}');
+                i += 2;
+            }
+            b'f' => {
+                out.push('\u{0c}');
+                i += 2;
+            }
+            b'v' => {
+                out.push('\u{0b}');
+                i += 2;
+            }
             b'0' | b'1' | b'2' | b'3' | b'4' | b'5' | b'6' | b'7' => {
                 // 1-3 octal digits
                 let mut j = i + 1;
@@ -2239,10 +3000,15 @@ fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> St
                 let mut digits = 0;
                 while j < bytes.len() && digits < 2 {
                     let c = bytes[j];
-                    let d = if c.is_ascii_digit() { c - b'0' }
-                            else if (b'a'..=b'f').contains(&c) { c - b'a' + 10 }
-                            else if (b'A'..=b'F').contains(&c) { c - b'A' + 10 }
-                            else { break };
+                    let d = if c.is_ascii_digit() {
+                        c - b'0'
+                    } else if (b'a'..=b'f').contains(&c) {
+                        c - b'a' + 10
+                    } else if (b'A'..=b'F').contains(&c) {
+                        c - b'A' + 10
+                    } else {
+                        break;
+                    };
                     val = val * 16 + d as u32;
                     j += 1;
                     digits += 1;
@@ -2262,10 +3028,13 @@ fn decode_string_escapes_inner(raw: &str, diags: &mut Vec<(bool, String)>) -> St
                 // a reference simulator (the oracle) drops the backslash and keeps the char, so
                 // we match that VALUE, but emit a warning so the mangle is not
                 // silent.
-                diags.push((false, format!(
-                    "unknown escape sequence '\\{}' in string literal (IEEE 1800-2017 §5.9)",
-                    bytes[i + 1] as char
-                )));
+                diags.push((
+                    false,
+                    format!(
+                        "unknown escape sequence '\\{}' in string literal (IEEE 1800-2017 §5.9)",
+                        bytes[i + 1] as char
+                    ),
+                ));
                 out.push(char::from(bytes[i + 1]));
                 i += 2;
             }

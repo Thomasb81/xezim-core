@@ -18,8 +18,7 @@ fn norm(s: &str) -> String {
 fn inline_ifndef_keeps_the_body_when_the_macro_is_undefined() {
     let out = preprocess("static `ifndef FOO local `endif bit x;\n");
     assert!(
-        norm(&out).contains("static local bit x ;")
-            || norm(&out).contains("static local bit x;"),
+        norm(&out).contains("static local bit x ;") || norm(&out).contains("static local bit x;"),
         "inline `ifndef should keep `local` when FOO is undefined; got: {:?}",
         norm(&out)
     );
@@ -29,21 +28,37 @@ fn inline_ifndef_keeps_the_body_when_the_macro_is_undefined() {
 fn inline_ifndef_drops_the_body_when_the_macro_is_defined() {
     let out = preprocess("`define FOO\nstatic `ifndef FOO local `endif bit x;\n");
     let n = norm(&out);
-    assert!(n.contains("static bit x"), "expected `static bit x`, got: {:?}", n);
-    assert!(!n.contains("local"), "`local` must be dropped when FOO is defined; got: {:?}", n);
+    assert!(
+        n.contains("static bit x"),
+        "expected `static bit x`, got: {:?}",
+        n
+    );
+    assert!(
+        !n.contains("local"),
+        "`local` must be dropped when FOO is defined; got: {:?}",
+        n
+    );
 }
 
 #[test]
 fn inline_ifdef_keeps_the_body_when_the_macro_is_defined() {
     let out = preprocess("`define FOO\nstatic `ifdef FOO local `endif bit x;\n");
-    assert!(norm(&out).contains("static local bit x"), "got: {:?}", norm(&out));
+    assert!(
+        norm(&out).contains("static local bit x"),
+        "got: {:?}",
+        norm(&out)
+    );
 }
 
 #[test]
 fn inline_conditional_inside_a_string_is_not_treated_as_a_directive() {
     // A backtick inside a string literal is data, not a directive.
     let out = preprocess("string s = \"a `ifndef b\";\nint y;\n");
-    assert!(norm(&out).contains("`ifndef"), "string content must be preserved: {:?}", norm(&out));
+    assert!(
+        norm(&out).contains("`ifndef"),
+        "string content must be preserved: {:?}",
+        norm(&out)
+    );
 }
 
 #[test]

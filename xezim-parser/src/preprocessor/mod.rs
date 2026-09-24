@@ -83,7 +83,6 @@ struct IfdefState {
     active: bool,
 }
 
-
 /// §22.5.1: a compiler directive matches as a WHOLE word — a user macro is
 /// allowed to merely START with a directive keyword (`include_default_...`,
 /// `undefined_x`, `ifdef_guard_y`). Prefix matching swallowed such macro
@@ -118,11 +117,14 @@ impl Preprocessor {
             ("SV_COV_OK", "1"),
             ("SV_COV_PARTIAL", "2"),
         ] {
-            defines.insert(name.to_string(), MacroDef {
-                name: name.to_string(),
-                params: None,
-                body: val.to_string(),
-            });
+            defines.insert(
+                name.to_string(),
+                MacroDef {
+                    name: name.to_string(),
+                    params: None,
+                    body: val.to_string(),
+                },
+            );
         }
     }
 
@@ -161,23 +163,61 @@ impl Preprocessor {
     /// and this is most useful precisely when compiling.
     fn note_undefined_macro(&self, name: &str) {
         const DIRECTIVES: &[&str] = &[
-            "define", "undef", "undefineall", "ifdef", "ifndef", "elsif",
-            "else", "endif", "include", "line", "pragma", "resetall",
-            "timescale", "begin_keywords", "end_keywords",
-            "default_nettype", "celldefine", "endcelldefine",
-            "unconnected_drive", "nounconnected_drive", "protect",
-            "endprotect", "protected", "endprotected", "uselib", "default_decay_time",
-            "default_trireg_strength", "delay_mode_distributed", "delay_mode_path",
-            "delay_mode_unit", "delay_mode_zero", "accelerate", "noaccelerate",
-            "autoexpand_vectornets", "expand_vectornets", "noexpand_vectornets",
-            "remove_gatenames", "noremove_gatenames", "remove_netnames",
-            "noremove_netnames", "suppress_faults", "nosuppress_faults",
-            "enable_portfaults", "disable_portfaults", "signed", "unsigned",
+            "define",
+            "undef",
+            "undefineall",
+            "ifdef",
+            "ifndef",
+            "elsif",
+            "else",
+            "endif",
+            "include",
+            "line",
+            "pragma",
+            "resetall",
+            "timescale",
+            "begin_keywords",
+            "end_keywords",
+            "default_nettype",
+            "celldefine",
+            "endcelldefine",
+            "unconnected_drive",
+            "nounconnected_drive",
+            "protect",
+            "endprotect",
+            "protected",
+            "endprotected",
+            "uselib",
+            "default_decay_time",
+            "default_trireg_strength",
+            "delay_mode_distributed",
+            "delay_mode_path",
+            "delay_mode_unit",
+            "delay_mode_zero",
+            "accelerate",
+            "noaccelerate",
+            "autoexpand_vectornets",
+            "expand_vectornets",
+            "noexpand_vectornets",
+            "remove_gatenames",
+            "noremove_gatenames",
+            "remove_netnames",
+            "noremove_netnames",
+            "suppress_faults",
+            "nosuppress_faults",
+            "enable_portfaults",
+            "disable_portfaults",
+            "signed",
+            "unsigned",
         ];
         if name.is_empty() || DIRECTIVES.contains(&name) {
             return;
         }
-        if !self.reported_undefined.borrow_mut().insert(name.to_string()) {
+        if !self
+            .reported_undefined
+            .borrow_mut()
+            .insert(name.to_string())
+        {
             return;
         }
         eprintln!(
@@ -198,8 +238,12 @@ impl Preprocessor {
         } else {
             self.current_file.as_str()
         };
-        self.errors
-            .push(format!("{}:{}: {}", file, self.current_line.max(1), message));
+        self.errors.push(format!(
+            "{}:{}: {}",
+            file,
+            self.current_line.max(1),
+            message
+        ));
     }
 
     /// True when `trimmed` is the directive `\`<name>` followed by whitespace
@@ -237,14 +281,18 @@ impl Preprocessor {
     /// Update the design-element nesting depth from one source line. Opening
     /// keywords increment; `end…` keywords decrement (floored at 0).
     fn update_design_depth(trimmed: &str, depth: &mut i32) {
-        let first = trimmed.split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .next().unwrap_or("");
+        let first = trimmed
+            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+            .next()
+            .unwrap_or("");
         match first {
-            "module" | "macromodule" | "interface" | "package" | "program"
-            | "primitive" | "checker" => *depth += 1,
-            "endmodule" | "endinterface" | "endpackage" | "endprogram"
-            | "endprimitive" | "endchecker" => {
-                if *depth > 0 { *depth -= 1; }
+            "module" | "macromodule" | "interface" | "package" | "program" | "primitive"
+            | "checker" => *depth += 1,
+            "endmodule" | "endinterface" | "endpackage" | "endprogram" | "endprimitive"
+            | "endchecker" => {
+                if *depth > 0 {
+                    *depth -= 1;
+                }
             }
             _ => {}
         }
@@ -261,7 +309,8 @@ impl Preprocessor {
         let mut why = String::new();
         // number: positive integer
         if num_tok.parse::<u32>().is_err() {
-            bad = true; why = format!("number `{}` must be a positive integer", num_tok);
+            bad = true;
+            why = format!("number `{}` must be a positive integer", num_tok);
         } else if !after_num.starts_with('"') {
             bad = true;
             if after_num.is_empty() {
@@ -282,11 +331,14 @@ impl Preprocessor {
                 );
             }
         } else {
-            bad = true; why = "unterminated filename string".into();
+            bad = true;
+            why = "unterminated filename string".into();
         }
         if bad {
             self.push_error_here(format!(
-                "illegal `line directive (IEEE 1800-2017 §22.12): {}", why));
+                "illegal `line directive (IEEE 1800-2017 §22.12): {}",
+                why
+            ));
         }
     }
 
@@ -295,15 +347,25 @@ impl Preprocessor {
     /// and the mantissa must be 1, 10, or 100.
     fn parse_time_literal(s: &str) -> Option<f64> {
         let s = s.trim();
-        let (num_str, unit) = if let Some(stripped) = s.strip_suffix("fs") { (stripped, 1e-15) }
-            else if let Some(stripped) = s.strip_suffix("ps") { (stripped, 1e-12) }
-            else if let Some(stripped) = s.strip_suffix("ns") { (stripped, 1e-9) }
-            else if let Some(stripped) = s.strip_suffix("us") { (stripped, 1e-6) }
-            else if let Some(stripped) = s.strip_suffix("ms") { (stripped, 1e-3) }
-            else if let Some(stripped) = s.strip_suffix("s")  { (stripped, 1.0) }
-            else { return None; };
+        let (num_str, unit) = if let Some(stripped) = s.strip_suffix("fs") {
+            (stripped, 1e-15)
+        } else if let Some(stripped) = s.strip_suffix("ps") {
+            (stripped, 1e-12)
+        } else if let Some(stripped) = s.strip_suffix("ns") {
+            (stripped, 1e-9)
+        } else if let Some(stripped) = s.strip_suffix("us") {
+            (stripped, 1e-6)
+        } else if let Some(stripped) = s.strip_suffix("ms") {
+            (stripped, 1e-3)
+        } else if let Some(stripped) = s.strip_suffix("s") {
+            (stripped, 1.0)
+        } else {
+            return None;
+        };
         let mantissa: f64 = num_str.trim().parse().ok()?;
-        if mantissa != 1.0 && mantissa != 10.0 && mantissa != 100.0 { return None; }
+        if mantissa != 1.0 && mantissa != 10.0 && mantissa != 100.0 {
+            return None;
+        }
         Some(mantissa * unit)
     }
 
@@ -327,19 +389,27 @@ impl Preprocessor {
         let t = line.trim_start();
         for kw in ["macromodule", "module", "interface", "program", "package"] {
             if let Some(rest) = t.strip_prefix(kw) {
-                if !rest.starts_with(char::is_whitespace) { continue; }
+                if !rest.starts_with(char::is_whitespace) {
+                    continue;
+                }
                 let mut rest = rest.trim_start();
                 // skip an optional lifetime qualifier
                 for q in ["static", "automatic"] {
                     if let Some(r2) = rest.strip_prefix(q) {
-                        if r2.starts_with(char::is_whitespace) { rest = r2.trim_start(); }
+                        if r2.starts_with(char::is_whitespace) {
+                            rest = r2.trim_start();
+                        }
                     }
                 }
                 let name: String = rest
                     .chars()
                     .take_while(|c| c.is_alphanumeric() || *c == '_' || *c == '$')
                     .collect();
-                if name.chars().next().map_or(false, |c| c.is_alphabetic() || c == '_') {
+                if name
+                    .chars()
+                    .next()
+                    .map_or(false, |c| c.is_alphabetic() || c == '_')
+                {
                     return Some(name);
                 }
             }
@@ -362,11 +432,14 @@ impl Preprocessor {
     pub fn with_defines(defines: HashMap<String, String>) -> Self {
         let mut pp = Self::new();
         for (k, v) in defines {
-            pp.defines.insert(k.clone(), MacroDef {
-                name: k,
-                params: None,
-                body: v,
-            });
+            pp.defines.insert(
+                k.clone(),
+                MacroDef {
+                    name: k,
+                    params: None,
+                    body: v,
+                },
+            );
         }
         pp
     }
@@ -419,7 +492,7 @@ impl Preprocessor {
         let mut i = 0;
         while i < bytes.len() {
             if bytes[i] == b'/' && i + 1 < bytes.len() {
-                if bytes[i+1] == b'/' {
+                if bytes[i + 1] == b'/' {
                     // Line comment: replace with spaces until newline to preserve line numbers
                     // BUT: keep the backslash if it's at the end of the line (continuation)
                     let start = i;
@@ -428,20 +501,26 @@ impl Preprocessor {
                     }
                     // Check if the line ends with a backslash (ignoring whitespace)
                     let mut j = i;
-                    while j > start && bytes[j-1].is_ascii_whitespace() {
+                    while j > start && bytes[j - 1].is_ascii_whitespace() {
                         j -= 1;
                     }
-                    if j > start && bytes[j-1] == b'\\' {
+                    if j > start && bytes[j - 1] == b'\\' {
                         // Preserve the backslash by replacing everything else with spaces
-                        for _ in start..j-1 { result.push(' '); }
+                        for _ in start..j - 1 {
+                            result.push(' ');
+                        }
                         result.push('\\');
-                        for _ in j..i { result.push(' '); }
+                        for _ in j..i {
+                            result.push(' ');
+                        }
                     } else {
-                        for _ in start..i { result.push(' '); }
+                        for _ in start..i {
+                            result.push(' ');
+                        }
                     }
                     continue;
                 }
-                if bytes[i+1] == b'*' {
+                if bytes[i + 1] == b'*' {
                     // Block comment: replace with spaces, preserving newlines.
                     // A `\` immediately before a newline is a line-continuation;
                     // keep it so a multi-line `/* */` comment inside a `define
@@ -453,7 +532,7 @@ impl Preprocessor {
                     result.push(' ');
                     i += 2;
                     while i + 1 < bytes.len() {
-                        if bytes[i] == b'*' && bytes[i+1] == b'/' {
+                        if bytes[i] == b'*' && bytes[i + 1] == b'/' {
                             result.push(' ');
                             result.push(' ');
                             i += 2;
@@ -461,7 +540,7 @@ impl Preprocessor {
                         }
                         if bytes[i] == b'\n' {
                             result.push('\n');
-                        } else if bytes[i] == b'\\' && bytes[i+1] == b'\n' {
+                        } else if bytes[i] == b'\\' && bytes[i + 1] == b'\n' {
                             result.push('\\');
                         } else {
                             result.push(' ');
@@ -478,7 +557,7 @@ impl Preprocessor {
                 while i < bytes.len() {
                     if bytes[i] == b'\\' && i + 1 < bytes.len() {
                         result.push('\\');
-                        result.push(bytes[i+1] as char);
+                        result.push(bytes[i + 1] as char);
                         i += 2;
                         continue;
                     }
@@ -574,8 +653,7 @@ impl Preprocessor {
                     continue;
                 }
                 if !in_str && c == b'`' {
-                    if let Some((dir_len, takes_name)) =
-                        Self::conditional_directive_len(&line[i..])
+                    if let Some((dir_len, takes_name)) = Self::conditional_directive_len(&line[i..])
                     {
                         let mut j = i + dir_len;
                         if takes_name {
@@ -639,17 +717,17 @@ impl Preprocessor {
             if directive_word(trimmed, "`define") {
                 // Join backslash-continuation lines (IEEE 1800-2017 §22.5.1)
                 let mut consumed_lines = 1;
-                
+
                 // For the directive, we want to strip the \ and the newline
                 let mut clean_line = String::new();
                 let mut current = line.to_string();
-                
+
                 loop {
                     let text = current.as_str();
                     // Handle trailing comment if any? No, trim_end handles it if it's after \.
                     // But if comment has \, it's tricky. Let's assume clean source after strip_comments.
                     if let Some(pos) = text.trim_end().rfind('\\') {
-                        if text[pos+1..].chars().all(|c| c.is_ascii_whitespace()) {
+                        if text[pos + 1..].chars().all(|c| c.is_ascii_whitespace()) {
                             clean_line.push_str(&text[..pos]);
                             if let Some(next) = lines.next() {
                                 // Preserve the line break between continuation
@@ -679,7 +757,7 @@ impl Preprocessor {
                     clean_line.push_str(text);
                     break;
                 }
-                
+
                 if ifdef_stack.iter().all(|s| s.active) {
                     self.parse_define(&clean_line);
                 }
@@ -717,7 +795,11 @@ impl Preprocessor {
                 let name = name.split_whitespace().next().unwrap_or(name);
                 let parent_active = ifdef_stack.iter().all(|s| s.active);
                 let active = parent_active && self.is_defined(name);
-                ifdef_stack.push(IfdefState { parent_active, branch_taken: active, active });
+                ifdef_stack.push(IfdefState {
+                    parent_active,
+                    branch_taken: active,
+                    active,
+                });
                 output.push('\n');
                 continue;
             }
@@ -727,7 +809,11 @@ impl Preprocessor {
                 let name = name.split_whitespace().next().unwrap_or(name);
                 let parent_active = ifdef_stack.iter().all(|s| s.active);
                 let active = parent_active && !self.is_defined(name);
-                ifdef_stack.push(IfdefState { parent_active, branch_taken: active, active });
+                ifdef_stack.push(IfdefState {
+                    parent_active,
+                    branch_taken: active,
+                    active,
+                });
                 output.push('\n');
                 continue;
             }
@@ -789,21 +875,25 @@ impl Preprocessor {
                     Self::parse_include_path(expanded.trim())
                 });
                 if parsed.is_none() {
-                    self.errors.push(format!(
-                        "malformed `include directive: {}", trimmed
-                    ));
+                    self.errors
+                        .push(format!("malformed `include directive: {}", trimmed));
                     eprintln!("[PP] error: malformed `include directive: {}", trimmed);
                 }
                 if let Some(inc_file) = parsed {
                     if self.include_depth < MAX_INCLUDE_DEPTH {
-                        if let Some(resolved) = self.resolve_include(&inc_file, source_dir.as_deref()) {
+                        if let Some(resolved) =
+                            self.resolve_include(&inc_file, source_dir.as_deref())
+                        {
                             // Lossy decode — tolerate stray non-UTF-8 bytes in
                             // included RTL (replace with U+FFFD, don't fail).
-                            match std::fs::read(&resolved).map(|b| String::from_utf8_lossy(&b).into_owned()) {
+                            match std::fs::read(&resolved)
+                                .map(|b| String::from_utf8_lossy(&b).into_owned())
+                            {
                                 Ok(contents) => {
                                     self.include_depth += 1;
                                     let stripped = self.strip_comments(&contents);
-                                    let included = self.resolve_directives(&stripped, Some(&resolved));
+                                    let included =
+                                        self.resolve_directives(&stripped, Some(&resolved));
                                     self.include_depth -= 1;
                                     output.push_str(&included);
                                     // Don't push extra newline — included content has its own
@@ -815,9 +905,14 @@ impl Preprocessor {
                                     // file — every mainstream tool errors here.
                                     self.errors.push(format!(
                                         "cannot read `include file '{}': {}",
-                                        resolved.display(), e
+                                        resolved.display(),
+                                        e
                                     ));
-                                    eprintln!("[PP] error: cannot read `include file '{}': {}", resolved.display(), e);
+                                    eprintln!(
+                                        "[PP] error: cannot read `include file '{}': {}",
+                                        resolved.display(),
+                                        e
+                                    );
                                 }
                             }
                         } else {
@@ -838,7 +933,10 @@ impl Preprocessor {
                             "`include depth limit ({}) exceeded for '{}' — recursive include?",
                             MAX_INCLUDE_DEPTH, inc_file
                         ));
-                        eprintln!("[PP] error: `include depth limit ({}) exceeded for '{}'", MAX_INCLUDE_DEPTH, inc_file);
+                        eprintln!(
+                            "[PP] error: `include depth limit ({}) exceeded for '{}'",
+                            MAX_INCLUDE_DEPTH, inc_file
+                        );
                     }
                 }
                 output.push('\n');
@@ -894,8 +992,15 @@ impl Preprocessor {
                     let rest = trimmed.trim_start_matches("`begin_keywords").trim();
                     let ver = rest.trim_matches(|c: char| c == '"' || c.is_whitespace());
                     const VALID: &[&str] = &[
-                        "1800-2023", "1800-2017", "1800-2012", "1800-2009", "1800-2005",
-                        "1364-2005", "1364-2001", "1364-2001-noconfig", "1364-1995",
+                        "1800-2023",
+                        "1800-2017",
+                        "1800-2012",
+                        "1800-2009",
+                        "1800-2005",
+                        "1364-2005",
+                        "1364-2001",
+                        "1364-2001-noconfig",
+                        "1364-1995",
                     ];
                     if VALID.contains(&ver) {
                         self.keywords_stack.push(ver.to_string());
@@ -938,7 +1043,10 @@ impl Preprocessor {
                 let rest = rest.trim_start();
                 if let Some(slash) = rest.find('/') {
                     let unit_str = rest[..slash].trim();
-                    let prec_str = rest[slash + 1..].trim_end_matches("//").trim_end_matches("/*").trim();
+                    let prec_str = rest[slash + 1..]
+                        .trim_end_matches("//")
+                        .trim_end_matches("/*")
+                        .trim();
                     let unit = Self::parse_time_literal(unit_str);
                     let prec = Self::parse_time_literal(prec_str);
                     if let (Some(u), Some(p)) = (unit, prec) {
@@ -971,9 +1079,7 @@ impl Preprocessor {
                 let num_tok = rest.split_whitespace().next().unwrap_or("");
                 if let Ok(n) = num_tok.parse::<u32>() {
                     let after_num = rest[num_tok.len()..].trim_start();
-                    if let Some(end) =
-                        after_num.strip_prefix('"').and_then(|r| r.find('"'))
-                    {
+                    if let Some(end) = after_num.strip_prefix('"').and_then(|r| r.find('"')) {
                         let fname = &after_num[1..1 + end];
                         let level = after_num[1 + end + 1..].trim();
                         if !matches!(level, "0" | "1" | "2") && !crate::strict_checks() {
@@ -996,7 +1102,8 @@ impl Preprocessor {
                 let args = trimmed["`pragma".len()..].trim();
                 if crate::strict_checks() && args.is_empty() {
                     self.push_error_here(
-                        "`pragma requires a pragma_name (IEEE 1800-2017 §22.11)".into());
+                        "`pragma requires a pragma_name (IEEE 1800-2017 §22.11)".into(),
+                    );
                 }
                 // §34.2 protect pragmas: everything between
                 // `pragma protect begin_protected` and the matching
@@ -1029,7 +1136,9 @@ impl Preprocessor {
                 if crate::strict_checks() && self.design_element_depth > 0 {
                     self.push_error_here(
                         "`resetall is illegal inside a design element \
-                         (IEEE 1800-2017 §22.3)".into());
+                         (IEEE 1800-2017 §22.3)"
+                            .into(),
+                    );
                 }
                 // §22.3: `\`resetall` resets all compiler directives to their
                 // defaults, including clearing the active `\`timescale`, so a
@@ -1041,8 +1150,10 @@ impl Preprocessor {
 
             // Skip other compiler directives that don't affect simulation
             // semantics (kept silent — no warning).
-            if directive_word(trimmed, "`celldefine") || directive_word(trimmed, "`endcelldefine")
-                || directive_word(trimmed, "`nounconnected_drive") || directive_word(trimmed, "`unconnected_drive")
+            if directive_word(trimmed, "`celldefine")
+                || directive_word(trimmed, "`endcelldefine")
+                || directive_word(trimmed, "`nounconnected_drive")
+                || directive_word(trimmed, "`unconnected_drive")
             {
                 output.push('\n');
                 continue;
@@ -1104,7 +1215,9 @@ impl Preprocessor {
                 // element name; they take the first `timescale in effect
                 // before them, recorded once under the synthetic name "$unit".
                 if let Some(ts) = self.timescale {
-                    self.module_timescales.entry("$unit".to_string()).or_insert(ts);
+                    self.module_timescales
+                        .entry("$unit".to_string())
+                        .or_insert(ts);
                 }
                 output.push_str(&expanded);
                 output.push('\n');
@@ -1239,13 +1352,17 @@ impl Preprocessor {
 
     fn parse_define(&mut self, line: &str) {
         let trimmed = line.trim();
-        if !directive_word(trimmed, "`define") { return; }
+        if !directive_word(trimmed, "`define") {
+            return;
+        }
         let rest = trimmed[7..].trim(); // after `define
         // Find name
-        let name_end = rest.find(|c: char| !c.is_alphanumeric() && c != '_').unwrap_or(rest.len());
+        let name_end = rest
+            .find(|c: char| !c.is_alphanumeric() && c != '_')
+            .unwrap_or(rest.len());
         let name = rest[..name_end].to_string();
         let after_name = rest[name_end..].trim_start();
-        
+
         // Check for parameterized macro: `define NAME(param1, param2) body
         // Note: LRM says NO space between NAME and '('
         let (params, body) = if rest[name_end..].starts_with('(') {
@@ -1253,8 +1370,9 @@ impl Preprocessor {
             let mut depth = 0;
             let mut close_pos = None;
             for (idx, c) in rest[name_end..].char_indices() {
-                if c == '(' { depth += 1; }
-                else if c == ')' {
+                if c == '(' {
+                    depth += 1;
+                } else if c == ')' {
                     depth -= 1;
                     if depth == 0 {
                         close_pos = Some(name_end + idx);
@@ -1262,7 +1380,7 @@ impl Preprocessor {
                     }
                 }
             }
-            
+
             if let Some(close) = close_pos {
                 let param_str = &rest[name_end + 1..close];
                 let params: Vec<(String, Option<String>)> = Self::split_top_level_commas(param_str)
@@ -1285,43 +1403,67 @@ impl Preprocessor {
         } else {
             (None, after_name.to_string())
         };
-        
+
         if !name.is_empty() {
             if crate::strict_checks() {
                 // §22.5.1: a compiler-directive name is a predefined macro and
                 // shall not be redefined as a user macro.
                 const DIRECTIVES: &[&str] = &[
-                    "define", "undef", "undefineall", "ifdef", "ifndef", "elsif",
-                    "else", "endif", "include", "line", "pragma", "resetall",
-                    "timescale", "begin_keywords", "end_keywords",
-                    "default_nettype", "celldefine", "endcelldefine",
-                    "unconnected_drive", "nounconnected_drive",
-                    "__FILE__", "__LINE__",
+                    "define",
+                    "undef",
+                    "undefineall",
+                    "ifdef",
+                    "ifndef",
+                    "elsif",
+                    "else",
+                    "endif",
+                    "include",
+                    "line",
+                    "pragma",
+                    "resetall",
+                    "timescale",
+                    "begin_keywords",
+                    "end_keywords",
+                    "default_nettype",
+                    "celldefine",
+                    "endcelldefine",
+                    "unconnected_drive",
+                    "nounconnected_drive",
+                    "__FILE__",
+                    "__LINE__",
                 ];
                 if DIRECTIVES.contains(&name.as_str()) {
                     self.push_error_here(format!(
                         "`{}` is a compiler directive and cannot be redefined as \
-                         a macro (IEEE 1800-2017 §22.5.1)", name));
+                         a macro (IEEE 1800-2017 §22.5.1)",
+                        name
+                    ));
                 }
                 // §22.5.1: the macro text shall not contain an unterminated
                 // string literal (a `"` opened in the body and never closed).
                 let (mut quotes, mut esc) = (0u32, false);
                 for c in body.chars() {
-                    if esc { esc = false; continue; }
-                    match c { '\\' => esc = true, '"' => quotes += 1, _ => {} }
+                    if esc {
+                        esc = false;
+                        continue;
+                    }
+                    match c {
+                        '\\' => esc = true,
+                        '"' => quotes += 1,
+                        _ => {}
+                    }
                 }
                 if quotes % 2 == 1 {
                     self.push_error_here(format!(
                         "macro `{}` text has an unterminated string literal \
-                         (IEEE 1800-2017 §22.5.1)", name));
+                         (IEEE 1800-2017 §22.5.1)",
+                        name
+                    ));
                 }
             }
             // eprintln!("[PP] defining macro '{}'", name);
-            self.defines.insert(name.clone(), MacroDef {
-                name,
-                params,
-                body,
-            });
+            self.defines
+                .insert(name.clone(), MacroDef { name, params, body });
         }
     }
 
@@ -1335,63 +1477,67 @@ impl Preprocessor {
         // tokenizer then reported as parse errors. We stop early on
         // fixed-point so the cap only matters for pathological cases.
         for _ in 0..128 {
-            if !result.contains('`') { break; }
+            if !result.contains('`') {
+                break;
+            }
             let next = self.expand_macros_once(&result);
-            if next == result { break; }
+            if next == result {
+                break;
+            }
             result = next;
         }
         result
     }
 
-fn apply_token_pasting(text: &str) -> String {
-    if !text.contains("``") {
-        return text.to_string();
-    }
-    let mut result = String::with_capacity(text.len());
-    let bytes = text.as_bytes();
-    let mut i = 0;
-    let mut in_string = false;
-    while i < bytes.len() {
-        if in_string {
-            let ch = text[i..].chars().next().unwrap();
-            if ch == '\\' {
+    fn apply_token_pasting(text: &str) -> String {
+        if !text.contains("``") {
+            return text.to_string();
+        }
+        let mut result = String::with_capacity(text.len());
+        let bytes = text.as_bytes();
+        let mut i = 0;
+        let mut in_string = false;
+        while i < bytes.len() {
+            if in_string {
+                let ch = text[i..].chars().next().unwrap();
+                if ch == '\\' {
+                    result.push(ch);
+                    i += ch.len_utf8();
+                    if i < bytes.len() {
+                        let n = text[i..].chars().next().unwrap();
+                        result.push(n);
+                        i += n.len_utf8();
+                    }
+                    continue;
+                }
+                if ch == '"' {
+                    in_string = false;
+                }
                 result.push(ch);
                 i += ch.len_utf8();
-                if i < bytes.len() {
-                    let n = text[i..].chars().next().unwrap();
-                    result.push(n);
-                    i += n.len_utf8();
-                }
                 continue;
             }
-            if ch == '"' {
-                in_string = false;
+
+            if bytes[i] == b'`' && i + 1 < bytes.len() && bytes[i + 1] == b'`' {
+                // §22.5.1: `` DELIMITS lexical tokens "without introducing white
+                // space" — it is deleted, nothing more. It must NOT eat existing
+                // whitespace around it: `localparam `` i``a``b``j` keeps the gap
+                // after `localparam` (br979), while `i``a` glues because there
+                // was no whitespace between the tokens to begin with.
+                i += 2;
+                continue;
             }
+
+            if bytes[i] == b'"' && !(i > 0 && bytes[i - 1] == b'`') {
+                in_string = true;
+            }
+
+            let ch = text[i..].chars().next().unwrap();
             result.push(ch);
             i += ch.len_utf8();
-            continue;
         }
-
-        if bytes[i] == b'`' && i + 1 < bytes.len() && bytes[i + 1] == b'`' {
-            // §22.5.1: `` DELIMITS lexical tokens "without introducing white
-            // space" — it is deleted, nothing more. It must NOT eat existing
-            // whitespace around it: `localparam `` i``a``b``j` keeps the gap
-            // after `localparam` (br979), while `i``a` glues because there
-            // was no whitespace between the tokens to begin with.
-            i += 2;
-            continue;
-        }
-
-        if bytes[i] == b'"' && !(i > 0 && bytes[i - 1] == b'`') {
-            in_string = true;
-        }
-
-        let ch = text[i..].chars().next().unwrap();
-        result.push(ch);
-        i += ch.len_utf8();
+        result
     }
-    result
-}
 
     fn expand_macros_once(&self, line: &str) -> String {
         let line_pasted = Self::apply_token_pasting(line);
@@ -1433,12 +1579,12 @@ fn apply_token_pasting(text: &str) -> String {
                 continue;
             }
             if bytes[i] == b'`' {
-                if i + 1 < bytes.len() && bytes[i+1] == b'`' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'`' {
                     // Concatenation: skip both backticks
                     i += 2;
                     continue;
                 }
-                if i + 1 < bytes.len() && bytes[i+1] == b'\"' {
+                if i + 1 < bytes.len() && bytes[i + 1] == b'\"' {
                     // Stringification: replace with normal quote
                     result.push('\"');
                     i += 2;
@@ -1457,7 +1603,7 @@ fn apply_token_pasting(text: &str) -> String {
                     i += 4;
                     continue;
                 }
-                
+
                 i += 1;
                 let start = i;
                 while i < bytes.len() && (bytes[i].is_ascii_alphanumeric() || bytes[i] == b'_') {
@@ -1472,8 +1618,14 @@ fn apply_token_pasting(text: &str) -> String {
                     result.push('\"');
                     for ch in self.current_file.chars() {
                         match ch {
-                            '\\' => { result.push('\\'); result.push('\\'); }
-                            '\"' => { result.push('\\'); result.push('\"'); }
+                            '\\' => {
+                                result.push('\\');
+                                result.push('\\');
+                            }
+                            '\"' => {
+                                result.push('\\');
+                                result.push('\"');
+                            }
                             _ => result.push(ch),
                         }
                     }
@@ -1499,7 +1651,10 @@ fn apply_token_pasting(text: &str) -> String {
                                 self.expansion_errors.borrow_mut().push(format!(
                                     "macro `{}` invoked with {} arguments but only \
                                      {} are declared (IEEE 1800-2017 §22.5.1)",
-                                    macro_name, args.len(), params.len()));
+                                    macro_name,
+                                    args.len(),
+                                    params.len()
+                                ));
                             } else {
                                 // §22.5.1: an actual at a position (even empty,
                                 // via a trailing/leading comma) is legal — only a
@@ -1509,7 +1664,9 @@ fn apply_token_pasting(text: &str) -> String {
                                     if pi >= args.len() && default.is_none() {
                                         self.expansion_errors.borrow_mut().push(format!(
                                             "macro `{}` missing required argument `{}` \
-                                             (IEEE 1800-2017 §22.5.1)", macro_name, pname));
+                                             (IEEE 1800-2017 §22.5.1)",
+                                            macro_name, pname
+                                        ));
                                     }
                                 }
                             }
@@ -1524,7 +1681,10 @@ fn apply_token_pasting(text: &str) -> String {
                             let arg: Option<&String> = match args.get(pi) {
                                 Some(a) if !a.trim().is_empty() => Some(a),
                                 _ => match default {
-                                    Some(d) => { arg_owned = d.clone(); Some(&arg_owned) }
+                                    Some(d) => {
+                                        arg_owned = d.clone();
+                                        Some(&arg_owned)
+                                    }
                                     // §22.5.1: an empty (or white-space) actual
                                     // with no default substitutes NOTHING.
                                     // Leaving the formal name in the body
@@ -1533,82 +1693,99 @@ fn apply_token_pasting(text: &str) -> String {
                                     // and stringified as the formal's own
                                     // name (`` `"b`" `` gave "b", the
                                     // reference gives "").
-                                    None => { arg_owned = String::new(); Some(&arg_owned) }
+                                    None => {
+                                        arg_owned = String::new();
+                                        Some(&arg_owned)
+                                    }
                                 },
                             };
                             {
-                            if let Some(arg) = arg {
-                                // Replace only whole words, and only outside
-                                // string literals (so a parameter name that
-                                // also appears in a format string in the
-                                // body — e.g. `actual` in
-                                // `"actual=%0d"` — isn't substituted away,
-                                // which would corrupt the string when the
-                                // arg itself contains a `"`).
-                                let mut new_body = String::with_capacity(body.len());
-                                let mut last = 0;
-                                let body_bytes = body.as_bytes();
-                                let mut string_ranges: Vec<(usize, usize)> = Vec::new();
-                                {
-                                    let mut i = 0;
-                                    while i < body_bytes.len() {
-                                        // A `"` preceded by a backtick is the
-                                        // preprocessor stringify-quote delimiter
-                                        // (`\`"..."\``), NOT a regular string
-                                        // literal. Per IEEE 1800-2017 §22.5.1,
-                                        // macro formals inside `\`"..."\`` MUST be
-                                        // substituted (then stringized), so do not
-                                        // open an opaque string range here — else
-                                        // `uvm_type_name_decl(\`"T\`")` leaves `T`
-                                        // unsubstituted and get_type_name returns
-                                        // the literal "T" instead of the class name.
-                                        if body_bytes[i] == b'"'
-                                            && !(i > 0 && body_bytes[i - 1] == b'`')
-                                        {
-                                            let start = i;
-                                            i += 1;
-                                            while i < body_bytes.len() {
-                                                if body_bytes[i] == b'\\' && i + 1 < body_bytes.len() { i += 2; continue; }
-                                                if body_bytes[i] == b'"' { i += 1; break; }
+                                if let Some(arg) = arg {
+                                    // Replace only whole words, and only outside
+                                    // string literals (so a parameter name that
+                                    // also appears in a format string in the
+                                    // body — e.g. `actual` in
+                                    // `"actual=%0d"` — isn't substituted away,
+                                    // which would corrupt the string when the
+                                    // arg itself contains a `"`).
+                                    let mut new_body = String::with_capacity(body.len());
+                                    let mut last = 0;
+                                    let body_bytes = body.as_bytes();
+                                    let mut string_ranges: Vec<(usize, usize)> = Vec::new();
+                                    {
+                                        let mut i = 0;
+                                        while i < body_bytes.len() {
+                                            // A `"` preceded by a backtick is the
+                                            // preprocessor stringify-quote delimiter
+                                            // (`\`"..."\``), NOT a regular string
+                                            // literal. Per IEEE 1800-2017 §22.5.1,
+                                            // macro formals inside `\`"..."\`` MUST be
+                                            // substituted (then stringized), so do not
+                                            // open an opaque string range here — else
+                                            // `uvm_type_name_decl(\`"T\`")` leaves `T`
+                                            // unsubstituted and get_type_name returns
+                                            // the literal "T" instead of the class name.
+                                            if body_bytes[i] == b'"'
+                                                && !(i > 0 && body_bytes[i - 1] == b'`')
+                                            {
+                                                let start = i;
+                                                i += 1;
+                                                while i < body_bytes.len() {
+                                                    if body_bytes[i] == b'\\'
+                                                        && i + 1 < body_bytes.len()
+                                                    {
+                                                        i += 2;
+                                                        continue;
+                                                    }
+                                                    if body_bytes[i] == b'"' {
+                                                        i += 1;
+                                                        break;
+                                                    }
+                                                    i += 1;
+                                                }
+                                                // A `` inside these quotes does NOT
+                                                // reopen the region to substitution:
+                                                // §22.5.1 says argument substitution
+                                                // shall not occur within a string
+                                                // literal, and `\`"` is the construct
+                                                // for building a string from an
+                                                // argument. `"``x``"` therefore stays
+                                                // literal (GitHub #62 asked for it to
+                                                // expand; a reference simulator
+                                                // leaves it alone too, so expanding
+                                                // would be a divergence).
+                                                string_ranges.push((start, i));
+                                            } else {
                                                 i += 1;
                                             }
-                                            // A `` inside these quotes does NOT
-                                            // reopen the region to substitution:
-                                            // §22.5.1 says argument substitution
-                                            // shall not occur within a string
-                                            // literal, and `\`"` is the construct
-                                            // for building a string from an
-                                            // argument. `"``x``"` therefore stays
-                                            // literal (GitHub #62 asked for it to
-                                            // expand; a reference simulator
-                                            // leaves it alone too, so expanding
-                                            // would be a divergence).
-                                            string_ranges.push((start, i));
-                                        } else {
-                                            i += 1;
                                         }
                                     }
-                                }
-                                let in_string = |pos: usize| -> bool {
-                                    string_ranges.iter().any(|(lo, hi)| pos >= *lo && pos < *hi)
-                                };
-                                for (start, part) in body.match_indices(pname) {
-                                    let before = body_bytes.get(start.wrapping_sub(1)).copied().unwrap_or(0);
-                                    let after = body_bytes.get(start + part.len()).copied().unwrap_or(0);
-                                    new_body.push_str(&body[last..start]);
-                                    if !(before.is_ascii_alphanumeric() || before == b'_')
-                                        && !(after.is_ascii_alphanumeric() || after == b'_')
-                                        && !in_string(start)
-                                    {
-                                        new_body.push_str(arg);
-                                    } else {
-                                        new_body.push_str(part);
+                                    let in_string = |pos: usize| -> bool {
+                                        string_ranges.iter().any(|(lo, hi)| pos >= *lo && pos < *hi)
+                                    };
+                                    for (start, part) in body.match_indices(pname) {
+                                        let before = body_bytes
+                                            .get(start.wrapping_sub(1))
+                                            .copied()
+                                            .unwrap_or(0);
+                                        let after = body_bytes
+                                            .get(start + part.len())
+                                            .copied()
+                                            .unwrap_or(0);
+                                        new_body.push_str(&body[last..start]);
+                                        if !(before.is_ascii_alphanumeric() || before == b'_')
+                                            && !(after.is_ascii_alphanumeric() || after == b'_')
+                                            && !in_string(start)
+                                        {
+                                            new_body.push_str(arg);
+                                        } else {
+                                            new_body.push_str(part);
+                                        }
+                                        last = start + part.len();
                                     }
-                                    last = start + part.len();
+                                    new_body.push_str(&body[last..]);
+                                    body = new_body;
                                 }
-                                new_body.push_str(&body[last..]);
-                                body = new_body;
-                            }
                             }
                         }
                         let body_pasted = Self::apply_token_pasting(&body);
@@ -1619,7 +1796,9 @@ fn apply_token_pasting(text: &str) -> String {
                         if crate::strict_checks() && def.params.is_some() {
                             self.expansion_errors.borrow_mut().push(format!(
                                 "macro `{}` requires parentheses (it is defined with \
-                                 arguments) (IEEE 1800-2017 §22.5.1)", macro_name));
+                                 arguments) (IEEE 1800-2017 §22.5.1)",
+                                macro_name
+                            ));
                         }
                         let body_pasted = Self::apply_token_pasting(&def.body);
                         result.push_str(&body_pasted);
@@ -1674,8 +1853,13 @@ impl Preprocessor {
         while i < bytes.len() {
             let c = bytes[i];
             if in_string {
-                if c == b'\\' { i += 2; continue; }
-                if c == b'"' { in_string = false; }
+                if c == b'\\' {
+                    i += 2;
+                    continue;
+                }
+                if c == b'"' {
+                    in_string = false;
+                }
             } else {
                 match c {
                     b'"' => in_string = true,
@@ -1725,10 +1909,22 @@ impl Preprocessor {
                     }
                 }
                 b'{' if !in_string => brace_depth += 1,
-                b'}' if !in_string => if brace_depth > 0 { brace_depth -= 1; },
+                b'}' if !in_string => {
+                    if brace_depth > 0 {
+                        brace_depth -= 1;
+                    }
+                }
                 b'[' if !in_string => bracket_depth += 1,
-                b']' if !in_string => if bracket_depth > 0 { bracket_depth -= 1; },
-                b',' if !in_string && paren_depth == 1 && brace_depth == 0 && bracket_depth == 0 => {
+                b']' if !in_string => {
+                    if bracket_depth > 0 {
+                        bracket_depth -= 1;
+                    }
+                }
+                b',' if !in_string
+                    && paren_depth == 1
+                    && brace_depth == 0
+                    && bracket_depth == 0 =>
+                {
                     args.push(line[arg_start..*i].trim().to_string());
                     arg_start = *i + 1;
                 }

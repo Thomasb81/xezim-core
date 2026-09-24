@@ -12,25 +12,41 @@
 use sv_parser::parse;
 
 fn errors(src: &str) -> Vec<String> {
-    parse(src).errors.iter().map(|e| format!("{:?}", e)).collect()
+    parse(src)
+        .errors
+        .iter()
+        .map(|e| format!("{:?}", e))
+        .collect()
 }
 
 #[test]
 fn unit_scope_static_declaration_parses() {
     let e = errors("static int counter = 0;\nmodule m; endmodule\n");
-    assert!(e.is_empty(), "`static` at $unit scope must parse, got: {:?}", e);
+    assert!(
+        e.is_empty(),
+        "`static` at $unit scope must parse, got: {:?}",
+        e
+    );
 }
 
 #[test]
 fn unit_scope_automatic_declaration_parses() {
     let e = errors("automatic int counter = 0;\nmodule m; endmodule\n");
-    assert!(e.is_empty(), "`automatic` at $unit scope must parse, got: {:?}", e);
+    assert!(
+        e.is_empty(),
+        "`automatic` at $unit scope must parse, got: {:?}",
+        e
+    );
 }
 
 #[test]
 fn unit_scope_static_vector_declaration_parses() {
     let e = errors("static logic [7:0] flags = 0;\nmodule m; endmodule\n");
-    assert!(e.is_empty(), "a lifetime on a vector decl must parse, got: {:?}", e);
+    assert!(
+        e.is_empty(),
+        "a lifetime on a vector decl must parse, got: {:?}",
+        e
+    );
 }
 
 /// The forms that already worked must keep working — the guard was widened,
@@ -44,6 +60,11 @@ fn unit_scope_plain_forms_still_parse() {
         "string label = \"x\";\nmodule m; endmodule\n",
     ] {
         let e = errors(src);
-        assert!(e.is_empty(), "`{}` must still parse, got: {:?}", src.lines().next().unwrap(), e);
+        assert!(
+            e.is_empty(),
+            "`{}` must still parse, got: {:?}",
+            src.lines().next().unwrap(),
+            e
+        );
     }
 }

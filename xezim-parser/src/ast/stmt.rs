@@ -1,9 +1,8 @@
 //! SystemVerilog statements (IEEE 1800-2017 §A.6)
 
-
-use super::{Identifier, Span};
 use super::expr::Expression;
 use super::types::{DataType, Lifetime, UnpackedDimension};
+use super::{Identifier, Span};
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -13,7 +12,9 @@ pub struct Statement {
 }
 
 impl Statement {
-    pub fn new(kind: StatementKind, span: Span) -> Self { Self { kind, span } }
+    pub fn new(kind: StatementKind, span: Span) -> Self {
+        Self { kind, span }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -39,12 +40,38 @@ pub enum StatementKind {
     /// fork that haven't yet completed.
     DisableFork,
     Expr(Expression),
-    BlockingAssign { lvalue: Expression, rvalue: Expression },
-    NonblockingAssign { lvalue: Expression, delay: Option<Expression>, rvalue: Expression },
-    If { unique_priority: Option<UniquePriority>, condition: Expression, then_stmt: Box<Statement>, else_stmt: Option<Box<Statement>> },
-    Case { unique_priority: Option<UniquePriority>, kind: CaseKind, expr: Expression, items: Vec<CaseItem> },
-    For { init: Vec<ForInit>, condition: Option<Expression>, step: Vec<Expression>, body: Box<Statement> },
-    Foreach { array: Expression, vars: Vec<Option<Identifier>>, body: Box<Statement> },
+    BlockingAssign {
+        lvalue: Expression,
+        rvalue: Expression,
+    },
+    NonblockingAssign {
+        lvalue: Expression,
+        delay: Option<Expression>,
+        rvalue: Expression,
+    },
+    If {
+        unique_priority: Option<UniquePriority>,
+        condition: Expression,
+        then_stmt: Box<Statement>,
+        else_stmt: Option<Box<Statement>>,
+    },
+    Case {
+        unique_priority: Option<UniquePriority>,
+        kind: CaseKind,
+        expr: Expression,
+        items: Vec<CaseItem>,
+    },
+    For {
+        init: Vec<ForInit>,
+        condition: Option<Expression>,
+        step: Vec<Expression>,
+        body: Box<Statement>,
+    },
+    Foreach {
+        array: Expression,
+        vars: Vec<Option<Identifier>>,
+        body: Box<Statement>,
+    },
     /// INTERNAL (not parsed): continuation sentinel for a `foreach` whose
     /// body can block (suspend). Mirrors how `while`/`for` re-append
     /// themselves so a process blocked at a timing control inside the loop
@@ -75,10 +102,21 @@ pub enum StatementKind {
         #[cfg_attr(feature = "serde", serde(default))]
         key_type: (u32, bool),
     },
-    While { condition: Expression, body: Box<Statement> },
-    DoWhile { body: Box<Statement>, condition: Expression },
-    Repeat { count: Expression, body: Box<Statement> },
-    Forever { body: Box<Statement> },
+    While {
+        condition: Expression,
+        body: Box<Statement>,
+    },
+    DoWhile {
+        body: Box<Statement>,
+        condition: Expression,
+    },
+    Repeat {
+        count: Expression,
+        body: Box<Statement>,
+    },
+    Forever {
+        body: Box<Statement>,
+    },
     /// INTERNAL (not parsed): continuation sentinel for a `forever` whose
     /// body can block (suspend). Like `ForeachTail`, it distinguishes
     /// FIRST entry (the `Forever` arm, which runs the body's first
@@ -87,17 +125,37 @@ pub enum StatementKind {
     /// resume (IEEE 1800-2023 §9.3.3) instead of being silently dropped
     /// while the loop re-arms. Carries only the body; the statements after
     /// the loop live in the surrounding flattened stream.
-    ForeverTail { body: Box<Statement> },
-    SeqBlock { name: Option<Identifier>, stmts: Vec<Statement> },
-    ParBlock { name: Option<Identifier>, join_type: JoinType, stmts: Vec<Statement> },
-    TimingControl { control: TimingControl, stmt: Box<Statement> },
+    ForeverTail {
+        body: Box<Statement>,
+    },
+    SeqBlock {
+        name: Option<Identifier>,
+        stmts: Vec<Statement>,
+    },
+    ParBlock {
+        name: Option<Identifier>,
+        join_type: JoinType,
+        stmts: Vec<Statement>,
+    },
+    TimingControl {
+        control: TimingControl,
+        stmt: Box<Statement>,
+    },
     /// `-> target` / `->> target`. `name` is the legacy flattened dotted
     /// string (kept for the simple module-scope paths); `target` carries the
     /// full parsed expression so receivers with runtime selects
     /// (`-> m_events[obj].all_dropped`, §15.5) can be evaluated at fire time
     /// — the string form cannot express them.
-    EventTrigger { nonblocking: bool, name: Identifier, target: Option<Box<Expression>>, span: Span },
-    Wait { condition: Expression, stmt: Box<Statement> },
+    EventTrigger {
+        nonblocking: bool,
+        name: Identifier,
+        target: Option<Box<Expression>>,
+        span: Span,
+    },
+    Wait {
+        condition: Expression,
+        stmt: Box<Statement>,
+    },
     WaitFork,
     Disable(Identifier),
     Return(Option<Expression>),
@@ -105,23 +163,39 @@ pub enum StatementKind {
     Continue,
     Assertion(AssertionStatement),
     ProceduralContinuous(ProceduralContinuous),
-    VarDecl { data_type: DataType, lifetime: Option<Lifetime>, declarators: Vec<VarDeclarator> },
+    VarDecl {
+        data_type: DataType,
+        lifetime: Option<Lifetime>,
+        declarators: Vec<VarDeclarator>,
+    },
     /// §18.16 `randcase` (and the alternatives of a §18.17 `randsequence`
     /// production): ONE branch is chosen at RUNTIME with probability
     /// weight_i / sum(weights). Both used to be lowered at parse time to the
     /// first non-zero-weight branch — i.e. not random at all.
-    RandCase { items: Vec<(Expression, Statement)> },
+    RandCase {
+        items: Vec<(Expression, Statement)>,
+    },
     /// Block-local `typedef ...;` (§6.18). Registered when the enclosing
     /// process first executes it, so later VarDecls in the block resolve
     /// the name. Was parsed and DISCARDED before, which broke member access
     /// on locals of block-local packed-struct typedefs.
     Typedef(Box<crate::ast::decl::TypedefDeclaration>),
-    Coverpoint { name: Option<Identifier>, expr: Expression, span: Span },
-    Cross { name: Option<Identifier>, items: Vec<Expression>, span: Span },
+    Coverpoint {
+        name: Option<Identifier>,
+        expr: Expression,
+        span: Span,
+    },
+    Cross {
+        name: Option<Identifier>,
+        items: Vec<Expression>,
+        span: Span,
+    },
     /// Randsequence action-block boundary. Catches an `RsReturn` raised
     /// inside `body` so it exits only this production, not the whole
     /// sequence or the enclosing subroutine.
-    RsAction { body: Box<Statement> },
+    RsAction {
+        body: Box<Statement>,
+    },
     /// Randsequence `return` — terminates the current production's action
     /// block. Caught by the enclosing `RsAction`.
     RsReturn,
@@ -153,11 +227,20 @@ pub struct VarDeclarator {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum UniquePriority { Unique, Unique0, Priority }
+pub enum UniquePriority {
+    Unique,
+    Unique0,
+    Priority,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum CaseKind { Case, Casex, Casez, CaseInside }
+pub enum CaseKind {
+    Case,
+    Casex,
+    Casez,
+    CaseInside,
+}
 
 /// IEEE 1800-2017 §12.6 pattern (for `case … matches` / `if … matches`).
 #[derive(Debug, Clone)]
@@ -168,7 +251,10 @@ pub enum Pattern {
     /// `.name` — matches anything and binds the subject to `name`.
     Binding(crate::ast::Identifier),
     /// `tagged Tag [sub_pattern]` — matches a tagged-union member (§7.3.2).
-    Tagged { tag: crate::ast::Identifier, inner: Option<Box<Pattern>> },
+    Tagged {
+        tag: crate::ast::Identifier,
+        inner: Option<Box<Pattern>>,
+    },
     /// A constant expression the subject must equal.
     Expr(Expression),
     /// `'{ [name:] pat, … }` — structure pattern.
@@ -194,13 +280,24 @@ pub struct CaseItem {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ForInit {
-    VarDecl { data_type: DataType, name: Identifier, init: Expression },
-    Assign { lvalue: Expression, rvalue: Expression },
+    VarDecl {
+        data_type: DataType,
+        name: Identifier,
+        init: Expression,
+    },
+    Assign {
+        lvalue: Expression,
+        rvalue: Expression,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum JoinType { Join, JoinAny, JoinNone }
+pub enum JoinType {
+    Join,
+    JoinAny,
+    JoinNone,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -230,7 +327,11 @@ pub struct EventExpr {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Edge { Posedge, Negedge, Edge }
+pub enum Edge {
+    Posedge,
+    Negedge,
+    Edge,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -254,13 +355,23 @@ pub struct AssertionStatement {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum AssertionKind { Assert, Assume, Cover }
+pub enum AssertionKind {
+    Assert,
+    Assume,
+    Cover,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ProceduralContinuous {
-    Assign { lvalue: Expression, rvalue: Expression },
+    Assign {
+        lvalue: Expression,
+        rvalue: Expression,
+    },
     Deassign(Expression),
-    Force { lvalue: Expression, rvalue: Expression },
+    Force {
+        lvalue: Expression,
+        rvalue: Expression,
+    },
     Release(Expression),
 }

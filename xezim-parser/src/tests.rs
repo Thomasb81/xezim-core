@@ -1,4 +1,4 @@
-use crate::ast::{decl::ModuleItem, Description};
+use crate::ast::{Description, decl::ModuleItem};
 use crate::parse;
 
 #[test]
@@ -94,7 +94,10 @@ fn test_module_header_imports() {
             assert_eq!(import.items[0].package.name, "p");
             assert!(import.items[0].item.is_none());
         }
-        other => panic!("expected header import as first module item, got {:?}", other),
+        other => panic!(
+            "expected header import as first module item, got {:?}",
+            other
+        ),
     }
 }
 

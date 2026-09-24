@@ -19,7 +19,11 @@
 use sv_parser::parse;
 
 fn errors(src: &str) -> Vec<String> {
-    parse(src).errors.iter().map(|e| format!("{:?}", e)).collect()
+    parse(src)
+        .errors
+        .iter()
+        .map(|e| format!("{:?}", e))
+        .collect()
 }
 
 /// Wrap a property expression in a minimal module so each case is one line.
@@ -46,7 +50,11 @@ fn first_match_parses_around_a_simple_sequence() {
 fn first_match_parses_around_a_delayed_sampled_value() {
     // The shape a "request eventually acknowledged" check takes.
     let e = errors(&prop("req |-> first_match((##[0:64] $fell(busy)))"));
-    assert!(e.is_empty(), "first_match over a delay must parse, got: {:?}", e);
+    assert!(
+        e.is_empty(),
+        "first_match over a delay must parse, got: {:?}",
+        e
+    );
 }
 
 // ── §16.12.7 property if / if-else ─────────────────────────────────────
@@ -66,7 +74,11 @@ fn property_if_else_parses() {
 #[test]
 fn property_if_else_chains_and_takes_sequences() {
     let e = errors(&prop("if (req) ##2 ack else if (busy) ##1 ack"));
-    assert!(e.is_empty(), "chained property `if` must parse, got: {:?}", e);
+    assert!(
+        e.is_empty(),
+        "chained property `if` must parse, got: {:?}",
+        e
+    );
 }
 
 // ── §16.9.2 delay followed by a sampled-value function ─────────────────
@@ -91,7 +103,11 @@ fn fixed_delay_then_sampled_value_parses() {
 #[test]
 fn fixed_delay_then_unary_expression_parses() {
     let e = errors(&prop("req |-> (##1 !ack)"));
-    assert!(e.is_empty(), "a delayed unary expression must parse, got: {:?}", e);
+    assert!(
+        e.is_empty(),
+        "a delayed unary expression must parse, got: {:?}",
+        e
+    );
 }
 
 #[test]
@@ -100,7 +116,11 @@ fn stability_across_a_delayed_sampled_value_parses() {
     let e = errors(&prop(
         "$rose(req) && (ack === 0) |=> ($stable(req) throughout (##[0:16] $rose(ack)))",
     ));
-    assert!(e.is_empty(), "throughout over a delay must parse, got: {:?}", e);
+    assert!(
+        e.is_empty(),
+        "throughout over a delay must parse, got: {:?}",
+        e
+    );
 }
 
 // ── regression guards: shapes that already worked must keep working ────

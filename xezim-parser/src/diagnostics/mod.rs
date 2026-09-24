@@ -21,11 +21,19 @@ pub struct Diagnostic {
 
 impl Diagnostic {
     pub fn error(message: impl Into<String>, span: Span) -> Self {
-        Self { severity: Severity::Error, message: message.into(), span }
+        Self {
+            severity: Severity::Error,
+            message: message.into(),
+            span,
+        }
     }
 
     pub fn warning(message: impl Into<String>, span: Span) -> Self {
-        Self { severity: Severity::Warning, message: message.into(), span }
+        Self {
+            severity: Severity::Warning,
+            message: message.into(),
+            span,
+        }
     }
 }
 
@@ -36,7 +44,11 @@ impl fmt::Display for Diagnostic {
             Severity::Warning => "warning",
             Severity::Info => "info",
         };
-        write!(f, "{}: {} (at byte {}..{})", sev, self.message, self.span.start, self.span.end)
+        write!(
+            f,
+            "{}: {} (at byte {}..{})",
+            sev, self.message, self.span.start, self.span.end
+        )
     }
 }
 
@@ -55,9 +67,15 @@ fn byte_to_line_col(source: &str, byte_offset: usize) -> (usize, usize) {
     let mut line = 1;
     let mut col = 1;
     for (i, ch) in source.char_indices() {
-        if i >= byte_offset { break; }
-        if ch == '\n' { line += 1; col = 1; }
-        else { col += 1; }
+        if i >= byte_offset {
+            break;
+        }
+        if ch == '\n' {
+            line += 1;
+            col = 1;
+        } else {
+            col += 1;
+        }
     }
     (line, col)
 }

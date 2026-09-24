@@ -36,10 +36,10 @@
 //! and restores the previous value.
 
 use std::sync::{Mutex, OnceLock};
+use sv_parser::ast::Description;
 use sv_parser::ast::decl::{ClassItem, ModuleItem};
 use sv_parser::ast::types::PortDirection;
-use sv_parser::ast::Description;
-use sv_parser::{is_sv2023, parse, set_sv2023, ParseResult};
+use sv_parser::{ParseResult, is_sv2023, parse, set_sv2023};
 
 /// Serialise access to the global standard flag and restore it afterwards, so
 /// these tests are safe under the default multi-threaded test runner.
@@ -66,7 +66,11 @@ fn parse_2023(src: &str) -> ParseResult {
 
 fn first_function_first_port_direction(src: &str) -> Option<PortDirection> {
     let result = parse_2023(src);
-    assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
+    assert!(
+        result.errors.is_empty(),
+        "parse errors: {:?}",
+        result.errors
+    );
     for desc in &result.source.descriptions {
         if let Description::Module(m) = desc {
             for item in &m.items {
@@ -342,7 +346,10 @@ fn plain_coverpoint_keeps_is_real_false() {
                  endgroup\n\
                endmodule";
     let cp = first_coverpoint(src, true);
-    assert!(!cp.is_real, "an integral coverpoint must leave is_real false");
+    assert!(
+        !cp.is_real,
+        "an integral coverpoint must leave is_real false"
+    );
 }
 
 /// Under SV-2017 `real` is not a coverpoint modifier, so the declaration must

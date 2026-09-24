@@ -71,6 +71,13 @@ fn guarded_reserved_macro_fallbacks_are_skipped_in_strict_mode() {
         Some(Path::new("/work/chip_ut/amb_types.h")),
     );
 
-    assert!(pp.errors().is_empty(), "guarded fallback should be skipped: {:?}", pp.errors());
-    assert!(out.contains("marker \"/work/chip_ut/amb_types.h\" 7"), "unexpected output:\n{out}");
+    assert!(
+        pp.errors().is_empty(),
+        "guarded fallback should be skipped: {:?}",
+        pp.errors()
+    );
+    assert!(
+        out.contains("marker \"/work/chip_ut/amb_types.h\" 7"),
+        "unexpected output:\n{out}"
+    );
 }

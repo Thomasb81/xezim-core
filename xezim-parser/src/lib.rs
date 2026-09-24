@@ -108,7 +108,9 @@ pub(crate) fn push_class_context(name: String) {
 }
 
 pub(crate) fn pop_class_context() {
-    CLASS_CONTEXT.with(|s| { s.borrow_mut().pop(); });
+    CLASS_CONTEXT.with(|s| {
+        s.borrow_mut().pop();
+    });
 }
 
 pub(crate) fn current_class_name() -> Option<String> {
@@ -221,8 +223,8 @@ pub fn parse_file(
     include_dirs: &[&str],
     defines: &[(&str, &str)],
 ) -> Result<ParseResult, String> {
-    let content = std::fs::read_to_string(path)
-        .map_err(|e| format!("cannot read '{}': {}", path, e))?;
+    let content =
+        std::fs::read_to_string(path).map_err(|e| format!("cannot read '{}': {}", path, e))?;
 
     // Add the file's parent directory to include dirs
     let mut dirs: Vec<&str> = include_dirs.to_vec();
@@ -277,13 +279,17 @@ pub fn preprocess(source: &str) -> String {
     pp.preprocess(source)
 }
 
-fn partition_diagnostics(diags: &[diagnostics::Diagnostic]) -> (Vec<diagnostics::Diagnostic>, Vec<diagnostics::Diagnostic>) {
+fn partition_diagnostics(
+    diags: &[diagnostics::Diagnostic],
+) -> (Vec<diagnostics::Diagnostic>, Vec<diagnostics::Diagnostic>) {
     let mut errors = Vec::new();
     let mut warnings = Vec::new();
     for d in diags {
         match d.severity {
             diagnostics::Severity::Error => errors.push(d.clone()),
-            diagnostics::Severity::Warning | diagnostics::Severity::Info => warnings.push(d.clone()),
+            diagnostics::Severity::Warning | diagnostics::Severity::Info => {
+                warnings.push(d.clone())
+            }
         }
     }
     (errors, warnings)

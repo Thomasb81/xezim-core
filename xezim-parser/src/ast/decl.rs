@@ -1,10 +1,9 @@
 //! SystemVerilog declarations (IEEE 1800-2017 §A.2)
 
-
-use super::{Identifier, Span};
 use super::expr::Expression;
 use super::stmt::{Statement, VarDeclarator};
 use super::types::*;
+use super::{Identifier, Span};
 
 /// IEEE 1800-2017 §29 User-Defined Primitive declaration.
 /// `primitive name(out, in..); ... table ... endtable endprimitive`
@@ -109,7 +108,11 @@ pub enum ModuleItem {
     /// class's extern-constraint prototype can be filled in at elaboration
     /// (it used to be brace-skipped and discarded, so the constraints simply
     /// did not exist at solve time).
-    OutOfClassConstraint { class_name: String, constraint_name: String, items: Vec<crate::ast::decl::ConstraintItem> },
+    OutOfClassConstraint {
+        class_name: String,
+        constraint_name: String,
+        items: Vec<crate::ast::decl::ConstraintItem>,
+    },
     /// `bind <target> <module> <inst>(<ports>);` appearing as a module item
     /// (rather than at compilation-unit scope). Treated by elaboration the
     /// same way as a top-level bind: the wrapped instantiation is appended
@@ -238,7 +241,10 @@ pub enum DPIProto {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum DPIProperty { Context, Pure }
+pub enum DPIProperty {
+    Context,
+    Pure,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -381,7 +387,12 @@ pub struct CoverBin {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum CoverBinKind { Bins, Ignore, Illegal, Default }
+pub enum CoverBinKind {
+    Bins,
+    Ignore,
+    Illegal,
+    Default,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -512,13 +523,33 @@ pub struct GateInstance {
 #[derive(Debug, Clone, Copy, PartialEq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum GateType {
-    And, Nand, Or, Nor, Xor, Xnor,
-    Buf, Not,
-    Bufif0, Bufif1, Notif0, Notif1,
+    And,
+    Nand,
+    Or,
+    Nor,
+    Xor,
+    Xnor,
+    Buf,
+    Not,
+    Bufif0,
+    Bufif1,
+    Notif0,
+    Notif1,
     // §28 switch (MOS/bidirectional/pull) primitives
-    Nmos, Pmos, Cmos, Rnmos, Rpmos, Rcmos,
-    Tran, Rtran, Tranif0, Tranif1, Rtranif0, Rtranif1,
-    Pullup, Pulldown,
+    Nmos,
+    Pmos,
+    Cmos,
+    Rnmos,
+    Rpmos,
+    Rcmos,
+    Tran,
+    Rtran,
+    Tranif0,
+    Tranif1,
+    Rtranif0,
+    Rtranif1,
+    Pullup,
+    Pulldown,
 }
 
 #[derive(Debug, Clone)]
@@ -573,8 +604,13 @@ pub struct ParameterDeclaration {
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ParameterKind {
-    Data { data_type: DataType, assignments: Vec<ParamAssignment> },
-    Type { assignments: Vec<TypeParamAssignment> },
+    Data {
+        data_type: DataType,
+        assignments: Vec<ParamAssignment>,
+    },
+    Type {
+        assignments: Vec<TypeParamAssignment>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -613,7 +649,12 @@ pub struct TypedefDeclaration {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum AlwaysKind { Always, AlwaysComb, AlwaysFf, AlwaysLatch }
+pub enum AlwaysKind {
+    Always,
+    AlwaysComb,
+    AlwaysFf,
+    AlwaysLatch,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -679,7 +720,10 @@ pub enum ParamValue {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum ParamConnection {
     Ordered(Option<ParamValue>),
-    Named { name: Identifier, value: Option<ParamValue> },
+    Named {
+        name: Identifier,
+        value: Option<ParamValue>,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -699,7 +743,11 @@ pub enum PortConnection {
     /// connection to a same-named net). `implicit` is true only for the last,
     /// parenthesis-free form (§23.3.2.2), which requires a matching net; the
     /// `.name()` form is an explicit no-connect and imposes no such requirement.
-    Named { name: Identifier, expr: Option<Expression>, implicit: bool },
+    Named {
+        name: Identifier,
+        expr: Option<Expression>,
+        implicit: bool,
+    },
     Wildcard,
 }
 
@@ -961,10 +1009,28 @@ pub enum ConstraintItem {
         dist_weights: Vec<Option<DistWeight>>,
         span: Span,
     },
-    Implication { condition: Expression, constraint: Box<ConstraintItem>, span: Span },
-    IfElse { condition: Expression, then_item: Box<ConstraintItem>, else_item: Option<Box<ConstraintItem>>, span: Span },
-    Foreach { array: Expression, vars: Vec<Option<Identifier>>, item: Box<ConstraintItem>, span: Span },
-    Solve { before: Vec<Identifier>, after: Vec<Identifier>, span: Span },
+    Implication {
+        condition: Expression,
+        constraint: Box<ConstraintItem>,
+        span: Span,
+    },
+    IfElse {
+        condition: Expression,
+        then_item: Box<ConstraintItem>,
+        else_item: Option<Box<ConstraintItem>>,
+        span: Span,
+    },
+    Foreach {
+        array: Expression,
+        vars: Vec<Option<Identifier>>,
+        item: Box<ConstraintItem>,
+        span: Span,
+    },
+    Solve {
+        before: Vec<Identifier>,
+        after: Vec<Identifier>,
+        span: Span,
+    },
     Soft(Box<ConstraintItem>),
     Block(Vec<ConstraintItem>),
     /// LRM §18.5.5 `unique {expr_list}` where the list could not be fully
@@ -972,7 +1038,10 @@ pub enum ConstraintItem {
     /// naming a whole array, whose element count is only known at solve
     /// time (`unique {gpr}` over `rand reg_t gpr[4]`). Multi-expression
     /// lists are still desugared by the parser and never reach this variant.
-    Unique { exprs: Vec<Expression>, span: Span },
+    Unique {
+        exprs: Vec<Expression>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]

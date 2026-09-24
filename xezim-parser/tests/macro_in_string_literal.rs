@@ -38,8 +38,7 @@ fn norm(s: &str) -> String {
 /// raised. The same macro OUTSIDE the string still expands.
 #[test]
 fn parameterized_macro_in_string_is_literal_and_outside_expands() {
-    let (out, errs) = run(
-        r#"
+    let (out, errs) = run(r#"
 `define FOO(x) ((x)+1)
 module top;
   int a;
@@ -48,8 +47,7 @@ module top;
     $display("lit `FOO stays literal end");
   end
 endmodule
-"#,
-    );
+"#);
     let n = norm(&out);
     // Outside the string: macro expanded to ((5)+1).
     assert!(
@@ -74,8 +72,7 @@ endmodule
 /// An object-like (no-arg) macro name inside a string is also left untouched.
 #[test]
 fn object_macro_in_string_is_literal() {
-    let (out, errs) = run(
-        r#"
+    let (out, errs) = run(r#"
 `define SIZE 8
 module top;
   int w;
@@ -84,10 +81,13 @@ module top;
     $display("width is `SIZE bits");
   end
 endmodule
-"#,
-    );
+"#);
     let n = norm(&out);
-    assert!(n.contains("w = 8"), "expansion outside string; got: {:?}", n);
+    assert!(
+        n.contains("w = 8"),
+        "expansion outside string; got: {:?}",
+        n
+    );
     assert!(
         n.contains("`SIZE bits"),
         "object macro name inside string must be literal; got: {:?}",
@@ -101,8 +101,7 @@ endmodule
 /// expanded macro had no parens). Post-fix it is literal text and no error.
 #[test]
 fn parameterized_macro_in_string_emits_no_paren_error() {
-    let (out, errs) = run(
-        r#"
+    let (out, errs) = run(r#"
 `define BAR(y) (2*(y))
 module top;
   initial begin
@@ -110,8 +109,7 @@ module top;
     $display("ok=%0d", `BAR(3));
   end
 endmodule
-"#,
-    );
+"#);
     let n = norm(&out);
     assert!(
         n.contains("see `BAR here"),
@@ -129,16 +127,14 @@ endmodule
 /// string: the macro name after the escaped quote is still literal.
 #[test]
 fn escaped_quote_does_not_end_the_string() {
-    let (out, errs) = run(
-        r#"
+    let (out, errs) = run(r#"
 `define QX(x) (x)
 module top;
   initial begin
     $display("he said \"hi\" then `QX end");
   end
 endmodule
-"#,
-    );
+"#);
     let n = norm(&out);
     assert!(
         n.contains("`QX end"),

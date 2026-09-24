@@ -1,8 +1,8 @@
 //! Statement parsing (IEEE 1800-2017 §A.6)
 
 use super::Parser;
+use crate::ast::expr::{BinaryOp, ExprKind, Expression, NumberBase, NumberLiteral};
 use crate::ast::stmt::*;
-use crate::ast::expr::{ExprKind, BinaryOp, Expression, NumberLiteral, NumberBase};
 use crate::ast::types::{DataType, Lifetime, SimpleType};
 use crate::lexer::token::TokenKind;
 use std::cell::Cell;
@@ -53,10 +53,7 @@ impl Parser {
                 // `disable <label>` (§9.6.2 / §12.7) resume AFTER the labelled
                 // statement — e.g. a labelled loop exits and control continues
                 // past it, instead of the whole process terminating.
-                if matches!(
-                    after_colon,
-                    TokenKind::KwBegin | TokenKind::KwFork
-                ) {
+                if matches!(after_colon, TokenKind::KwBegin | TokenKind::KwFork) {
                     return inner;
                 }
                 let span = self.span_from(start);
@@ -71,19 +68,29 @@ impl Parser {
         }
 
         match self.current_kind() {
-            TokenKind::Directive => { self.bump(); self.parse_statement() }
+            TokenKind::Directive => {
+                self.bump();
+                self.parse_statement()
+            }
             TokenKind::KwBegin => self.parse_seq_block(),
             TokenKind::KwFork => self.parse_par_block(),
-            TokenKind::KwIf | TokenKind::KwUnique | TokenKind::KwUnique0 | TokenKind::KwPriority => {
-                self.parse_if_or_case()
+            TokenKind::KwIf
+            | TokenKind::KwUnique
+            | TokenKind::KwUnique0
+            | TokenKind::KwPriority => self.parse_if_or_case(),
+            TokenKind::KwCase | TokenKind::KwCasex | TokenKind::KwCasez => {
+                self.parse_case_statement()
             }
-            TokenKind::KwCase | TokenKind::KwCasex | TokenKind::KwCasez => self.parse_case_statement(),
             TokenKind::KwParameter | TokenKind::KwLocalparam => {
                 // Local `parameter`/`localparam` inside a procedural block is
                 // semantically equivalent to a const var decl with an init.
                 let decl = self.parse_parameter_decl_stmt();
                 let span = self.span_from(start);
-                if let crate::ast::decl::ParameterKind::Data { data_type, assignments } = decl.kind {
+                if let crate::ast::decl::ParameterKind::Data {
+                    data_type,
+                    assignments,
+                } = decl.kind
+                {
                     // §6.20.2: an UNTYPED local `localparam`/`parameter` is
                     // SELF-DETERMINED from its initializer — NOT the 1-bit that
                     // an implicit `logic` resolves to (which truncates
@@ -122,9 +129,15 @@ impl Parser {
                     } else {
                         data_type
                     };
-                    let declarators: Vec<VarDeclarator> = assignments.into_iter().map(|a| {
-                        VarDeclarator { name: a.name, dimensions: a.dimensions, init: a.init, span: a.span }
-                    }).collect();
+                    let declarators: Vec<VarDeclarator> = assignments
+                        .into_iter()
+                        .map(|a| VarDeclarator {
+                            name: a.name,
+                            dimensions: a.dimensions,
+                            init: a.init,
+                            span: a.span,
+                        })
+                        .collect();
                     // §6.20.4: a block-scope localparam/parameter is a
                     // CONSTANT — mark the lowered decl `static` so the §6.21
                     // implicitly-static check (which targets variables with
@@ -132,11 +145,14 @@ impl Parser {
                     // carry an initializer; the reference accepts it inside
                     // static tasks (customer testbench task-body
                     // `localparam int MIN = 24;` was wrongly rejected).
-                    return Statement::new(StatementKind::VarDecl {
-                        data_type,
-                        lifetime: Some(crate::ast::types::Lifetime::Static),
-                        declarators,
-                    }, span);
+                    return Statement::new(
+                        StatementKind::VarDecl {
+                            data_type,
+                            lifetime: Some(crate::ast::types::Lifetime::Static),
+                            declarators,
+                        },
+                        span,
+                    );
                 }
                 return Statement::new(StatementKind::Null, span);
             }
@@ -150,18 +166,33 @@ impl Parser {
             TokenKind::KwForever => {
                 self.bump();
                 let body = self.parse_statement();
-                Statement::new(StatementKind::Forever { body: Box::new(body) }, self.span_from(start))
+                Statement::new(
+                    StatementKind::Forever {
+                        body: Box::new(body),
+                    },
+                    self.span_from(start),
+                )
             }
             TokenKind::KwReturn => {
                 self.bump();
                 let expr = if !self.at(TokenKind::Semicolon) {
                     Some(self.parse_expression())
-                } else { None };
+                } else {
+                    None
+                };
                 self.expect(TokenKind::Semicolon);
                 Statement::new(StatementKind::Return(expr), self.span_from(start))
             }
-            TokenKind::KwBreak => { self.bump(); self.expect(TokenKind::Semicolon); Statement::new(StatementKind::Break, self.span_from(start)) }
-            TokenKind::KwContinue => { self.bump(); self.expect(TokenKind::Semicolon); Statement::new(StatementKind::Continue, self.span_from(start)) }
+            TokenKind::KwBreak => {
+                self.bump();
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::Break, self.span_from(start))
+            }
+            TokenKind::KwContinue => {
+                self.bump();
+                self.expect(TokenKind::Semicolon);
+                Statement::new(StatementKind::Continue, self.span_from(start))
+            }
             TokenKind::KwWait_order => {
                 // §15.5.3: wait_order ( event {, event} ) action_block
                 // action_block ::= statement_or_null [ else statement ]
@@ -170,7 +201,9 @@ impl Parser {
                 let mut events = Vec::new();
                 loop {
                     events.push(self.parse_identifier());
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::RParen);
                 let pass = if self.eat(TokenKind::Semicolon).is_some() {
@@ -185,10 +218,17 @@ impl Parser {
                 } else {
                     None
                 };
-                Statement::new(StatementKind::WaitOrder {
-                    events, pass, fail, armed: false, idx: 0,
-                    span: self.span_from(start),
-                }, self.span_from(start))
+                Statement::new(
+                    StatementKind::WaitOrder {
+                        events,
+                        pass,
+                        fail,
+                        armed: false,
+                        idx: 0,
+                        span: self.span_from(start),
+                    },
+                    self.span_from(start),
+                )
             }
             TokenKind::KwWait => {
                 self.bump();
@@ -200,23 +240,44 @@ impl Parser {
                     let cond = self.parse_expression();
                     self.expect(TokenKind::RParen);
                     let stmt = self.parse_statement();
-                    Statement::new(StatementKind::Wait { condition: cond, stmt: Box::new(stmt) }, self.span_from(start))
+                    Statement::new(
+                        StatementKind::Wait {
+                            condition: cond,
+                            stmt: Box::new(stmt),
+                        },
+                        self.span_from(start),
+                    )
                 }
             }
             TokenKind::KwStatic | TokenKind::KwAutomatic | TokenKind::KwLocal => {
                 let mut lifetime = None;
-                if self.at(TokenKind::KwStatic) { lifetime = Some(Lifetime::Static); self.bump(); }
-                else if self.at(TokenKind::KwAutomatic) { lifetime = Some(Lifetime::Automatic); self.bump(); }
-                else if self.at(TokenKind::KwLocal) { self.bump(); } // skip local
-                
+                if self.at(TokenKind::KwStatic) {
+                    lifetime = Some(Lifetime::Static);
+                    self.bump();
+                } else if self.at(TokenKind::KwAutomatic) {
+                    lifetime = Some(Lifetime::Automatic);
+                    self.bump();
+                } else if self.at(TokenKind::KwLocal) {
+                    self.bump();
+                } // skip local
+
                 if lifetime.is_none() {
-                    if self.at(TokenKind::KwStatic) { lifetime = Some(Lifetime::Static); self.bump(); }
-                    else if self.at(TokenKind::KwAutomatic) { lifetime = Some(Lifetime::Automatic); self.bump(); }
+                    if self.at(TokenKind::KwStatic) {
+                        lifetime = Some(Lifetime::Static);
+                        self.bump();
+                    } else if self.at(TokenKind::KwAutomatic) {
+                        lifetime = Some(Lifetime::Automatic);
+                        self.bump();
+                    }
                 }
                 let data_type = if self.is_data_type_keyword() || self.at(TokenKind::Identifier) {
                     self.parse_data_type()
                 } else {
-                    DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+                    DataType::Implicit {
+                        signing: None,
+                        dimensions: Vec::new(),
+                        span: self.span_from(start),
+                    }
                 };
                 let mut declarators = Vec::new();
                 loop {
@@ -225,12 +286,28 @@ impl Parser {
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
-                    } else { None };
-                    declarators.push(VarDeclarator { name, dimensions, init, span: self.span_from(ds) });
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    } else {
+                        None
+                    };
+                    declarators.push(VarDeclarator {
+                        name,
+                        dimensions,
+                        init,
+                        span: self.span_from(ds),
+                    });
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::VarDecl { data_type, lifetime, declarators }, self.span_from(start))
+                Statement::new(
+                    StatementKind::VarDecl {
+                        data_type,
+                        lifetime,
+                        declarators,
+                    },
+                    self.span_from(start),
+                )
             }
             TokenKind::KwTypedef => {
                 let td = self.parse_typedef_declaration();
@@ -256,18 +333,26 @@ impl Parser {
                     Statement::new(StatementKind::Disable(name), self.span_from(start))
                 }
             }
-            TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover | TokenKind::KwExpect => {
-                Statement::new(StatementKind::Assertion(self.parse_assertion_statement()), self.span_from(start))
-            }
+            TokenKind::KwAssert
+            | TokenKind::KwAssume
+            | TokenKind::KwCover
+            | TokenKind::KwExpect => Statement::new(
+                StatementKind::Assertion(self.parse_assertion_statement()),
+                self.span_from(start),
+            ),
             TokenKind::KwAssign => {
                 self.bump();
                 let lv = self.parse_expression();
                 self.expect(TokenKind::Assign);
                 let rv = self.parse_expression();
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::ProceduralContinuous(
-                    ProceduralContinuous::Assign { lvalue: lv, rvalue: rv }
-                ), self.span_from(start))
+                Statement::new(
+                    StatementKind::ProceduralContinuous(ProceduralContinuous::Assign {
+                        lvalue: lv,
+                        rvalue: rv,
+                    }),
+                    self.span_from(start),
+                )
             }
             TokenKind::KwForce => {
                 self.bump();
@@ -275,50 +360,75 @@ impl Parser {
                 self.expect(TokenKind::Assign);
                 let rv = self.parse_expression();
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::ProceduralContinuous(
-                    ProceduralContinuous::Force { lvalue: lv, rvalue: rv }
-                ), self.span_from(start))
+                Statement::new(
+                    StatementKind::ProceduralContinuous(ProceduralContinuous::Force {
+                        lvalue: lv,
+                        rvalue: rv,
+                    }),
+                    self.span_from(start),
+                )
             }
             TokenKind::KwDeassign => {
                 self.bump();
                 let lv = self.parse_expression();
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::ProceduralContinuous(
-                    ProceduralContinuous::Deassign(lv)
-                ), self.span_from(start))
+                Statement::new(
+                    StatementKind::ProceduralContinuous(ProceduralContinuous::Deassign(lv)),
+                    self.span_from(start),
+                )
             }
             TokenKind::KwCoverpoint => {
                 self.bump();
                 let expr = self.parse_expression();
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::Coverpoint { name: None, expr, span: self.span_from(start) }, self.span_from(start))
+                Statement::new(
+                    StatementKind::Coverpoint {
+                        name: None,
+                        expr,
+                        span: self.span_from(start),
+                    },
+                    self.span_from(start),
+                )
             }
             TokenKind::KwCross => {
                 self.bump();
                 let mut items = Vec::new();
                 loop {
                     items.push(self.parse_expression());
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::Cross { name: None, items, span: self.span_from(start) }, self.span_from(start))
+                Statement::new(
+                    StatementKind::Cross {
+                        name: None,
+                        items,
+                        span: self.span_from(start),
+                    },
+                    self.span_from(start),
+                )
             }
             TokenKind::KwRelease => {
                 self.bump();
                 let lv = self.parse_expression();
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::ProceduralContinuous(
-                    ProceduralContinuous::Release(lv)
-                ), self.span_from(start))
+                Statement::new(
+                    StatementKind::ProceduralContinuous(ProceduralContinuous::Release(lv)),
+                    self.span_from(start),
+                )
             }
             // Timing control: @
             TokenKind::At => {
                 let ctrl = self.parse_event_control();
                 let stmt = self.parse_statement();
-                Statement::new(StatementKind::TimingControl {
-                    control: TimingControl::Event(ctrl),
-                    stmt: Box::new(stmt),
-                }, self.span_from(start))
+                Statement::new(
+                    StatementKind::TimingControl {
+                        control: TimingControl::Event(ctrl),
+                        stmt: Box::new(stmt),
+                    },
+                    self.span_from(start),
+                )
             }
             // Event trigger: ->, ->>
             TokenKind::Arrow | TokenKind::DoubleArrow => {
@@ -329,13 +439,25 @@ impl Parser {
                 let name = match target.kind {
                     // Trailing element select parses as Index (`-> ev_arr[1]`):
                     // bake a literal index into the element sync-object name.
-                    ExprKind::Index { ref expr, ref index } => {
+                    ExprKind::Index {
+                        ref expr,
+                        ref index,
+                    } => {
                         let base = if let ExprKind::Ident(h) = &expr.kind {
                             h.path.last().map(|s| s.name.name.clone())
-                        } else { None };
-                        let idx = if let ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) = &index.kind {
-                            Some(value.clone())
-                        } else { None };
+                        } else {
+                            None
+                        };
+                        let idx =
+                            if let ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
+                                value,
+                                ..
+                            }) = &index.kind
+                            {
+                                Some(value.clone())
+                            } else {
+                                None
+                            };
                         match (base, idx) {
                             (Some(b), Some(i)) => crate::ast::Identifier {
                                 name: format!("{}[{}]", b, i),
@@ -352,22 +474,31 @@ impl Parser {
                         }
                     }
                     ExprKind::Ident(hier) => {
-                        hier.path.last().map(|seg| {
-                            // §15.5.5 event-array element trigger
-                            // (`-> ev_arr[1]`): bake integer-literal selects
-                            // into the name so the element's sync object is
-                            // fired, not the base name.
-                            let mut nm = seg.name.name.clone();
-                            for sel in &seg.selects {
-                                if let ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) = &sel.kind {
-                                    nm = format!("{}[{}]", nm, value);
+                        hier.path
+                            .last()
+                            .map(|seg| {
+                                // §15.5.5 event-array element trigger
+                                // (`-> ev_arr[1]`): bake integer-literal selects
+                                // into the name so the element's sync object is
+                                // fired, not the base name.
+                                let mut nm = seg.name.name.clone();
+                                for sel in &seg.selects {
+                                    if let ExprKind::Number(
+                                        crate::ast::expr::NumberLiteral::Integer { value, .. },
+                                    ) = &sel.kind
+                                    {
+                                        nm = format!("{}[{}]", nm, value);
+                                    }
                                 }
-                            }
-                            crate::ast::Identifier { name: nm, span: seg.name.span }
-                        }).unwrap_or_else(|| crate::ast::Identifier {
-                            name: "event".to_string(),
-                            span: self.span_from(start),
-                        })
+                                crate::ast::Identifier {
+                                    name: nm,
+                                    span: seg.name.span,
+                                }
+                            })
+                            .unwrap_or_else(|| crate::ast::Identifier {
+                                name: "event".to_string(),
+                                span: self.span_from(start),
+                            })
                     }
                     // §15.5 an event that is a CLASS PROPERTY reached through
                     // a handle (`-> h.ce`, `-> this.ce`) parses as a
@@ -404,13 +535,17 @@ impl Parser {
                                         return false;
                                     }
                                     let idx = match &index.kind {
-                                        ExprKind::Ident(h) if h.path.len() == 1
-                                            && h.path[0].selects.is_empty() => {
+                                        ExprKind::Ident(h)
+                                            if h.path.len() == 1
+                                                && h.path[0].selects.is_empty() =>
+                                        {
                                             h.path[0].name.name.clone()
                                         }
-                                        ExprKind::Number(crate::ast::expr::NumberLiteral::Integer { value, .. }) => {
-                                            value.clone()
-                                        }
+                                        ExprKind::Number(
+                                            crate::ast::expr::NumberLiteral::Integer {
+                                                value, ..
+                                            },
+                                        ) => value.clone(),
                                         _ => return false,
                                     };
                                     if let Some(last) = out.last_mut() {
@@ -449,7 +584,15 @@ impl Parser {
                         span: self.span_from(start),
                     },
                 };
-                Statement::new(StatementKind::EventTrigger { nonblocking, name, target: Some(Box::new(target_expr)), span: self.span_from(start) }, self.span_from(start))
+                Statement::new(
+                    StatementKind::EventTrigger {
+                        nonblocking,
+                        name,
+                        target: Some(Box::new(target_expr)),
+                        span: self.span_from(start),
+                    },
+                    self.span_from(start),
+                )
             }
             // Delay control: #
             TokenKind::Hash => {
@@ -464,7 +607,9 @@ impl Parser {
                         self.expect(TokenKind::Colon);
                         let _max = self.parse_expression();
                         typ
-                    } else { first };
+                    } else {
+                        first
+                    };
                     self.expect(TokenKind::RParen);
                     chosen
                 } else {
@@ -478,10 +623,13 @@ impl Parser {
                     self.parse_expr_bp(3)
                 };
                 let stmt = self.parse_statement();
-                Statement::new(StatementKind::TimingControl {
-                    control: TimingControl::Delay(delay),
-                    stmt: Box::new(stmt),
-                }, self.span_from(start))
+                Statement::new(
+                    StatementKind::TimingControl {
+                        control: TimingControl::Delay(delay),
+                        stmt: Box::new(stmt),
+                    },
+                    self.span_from(start),
+                )
             }
             // §14.11: procedural cycle delay `##N [stmt]` — wait N cycles of
             // the DEFAULT clocking block's clock event. Desugared here to
@@ -505,13 +653,20 @@ impl Parser {
                 };
                 let sp = self.span_from(start);
                 let stmt = self.parse_statement();
-                let mk_wait = |name: &str| Statement::new(StatementKind::TimingControl {
-                    control: TimingControl::Event(EventControl::Identifier(crate::ast::Identifier {
-                        name: name.to_string(),
-                        span: sp,
-                    })),
-                    stmt: Box::new(Statement::new(StatementKind::Null, sp)),
-                }, sp);
+                let mk_wait = |name: &str| {
+                    Statement::new(
+                        StatementKind::TimingControl {
+                            control: TimingControl::Event(EventControl::Identifier(
+                                crate::ast::Identifier {
+                                    name: name.to_string(),
+                                    span: sp,
+                                },
+                            )),
+                            stmt: Box::new(Statement::new(StatementKind::Null, sp)),
+                        },
+                        sp,
+                    )
+                };
                 // §14.11: a LITERAL `##0` does not wait a cycle — it
                 // SYNCHRONIZES to the clocking event (the simulator's
                 // `__xz_default_clocking0` handler is a no-op when the
@@ -528,15 +683,21 @@ impl Parser {
                 let wait_stmt = if is_lit_zero {
                     mk_wait("__xz_default_clocking0")
                 } else {
-                    Statement::new(StatementKind::Repeat {
-                        count,
-                        body: Box::new(mk_wait("__xz_default_clocking")),
-                    }, sp)
+                    Statement::new(
+                        StatementKind::Repeat {
+                            count,
+                            body: Box::new(mk_wait("__xz_default_clocking")),
+                        },
+                        sp,
+                    )
                 };
-                Statement::new(StatementKind::SeqBlock {
-                    name: None,
-                    stmts: vec![wait_stmt, stmt],
-                }, self.span_from(start))
+                Statement::new(
+                    StatementKind::SeqBlock {
+                        name: None,
+                        stmts: vec![wait_stmt, stmt],
+                    },
+                    self.span_from(start),
+                )
             }
             // §26.3: a local `import pkg::item;` / `import pkg::*;` inside a
             // statement block (UVM's `initial begin import uvm_pkg::…; … end`).
@@ -555,14 +716,28 @@ impl Parser {
                 let _is_const = self.eat(TokenKind::KwConst).is_some();
                 let var_kw = self.eat(TokenKind::KwVar).is_some();
                 let lifetime = match self.current_kind() {
-                    TokenKind::KwStatic => { self.bump(); Some(Lifetime::Static) }
-                    TokenKind::KwAutomatic => { self.bump(); Some(Lifetime::Automatic) }
+                    TokenKind::KwStatic => {
+                        self.bump();
+                        Some(Lifetime::Static)
+                    }
+                    TokenKind::KwAutomatic => {
+                        self.bump();
+                        Some(Lifetime::Automatic)
+                    }
                     _ => None,
                 };
                 // §6.8: `var name;` with no explicit type — implicit `logic`.
-                let data_type = if var_kw && self.at(TokenKind::Identifier)
-                    && matches!(self.peek_kind(), TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign) {
-                    DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+                let data_type = if var_kw
+                    && self.at(TokenKind::Identifier)
+                    && matches!(
+                        self.peek_kind(),
+                        TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign
+                    ) {
+                    DataType::Implicit {
+                        signing: None,
+                        dimensions: Vec::new(),
+                        span: self.span_from(start),
+                    }
                 } else {
                     self.parse_data_type()
                 };
@@ -573,12 +748,28 @@ impl Parser {
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
-                    } else { None };
-                    declarators.push(VarDeclarator { name, dimensions, init, span: self.span_from(ds) });
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    } else {
+                        None
+                    };
+                    declarators.push(VarDeclarator {
+                        name,
+                        dimensions,
+                        init,
+                        span: self.span_from(ds),
+                    });
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::VarDecl { data_type, lifetime, declarators }, self.span_from(start))
+                Statement::new(
+                    StatementKind::VarDecl {
+                        data_type,
+                        lifetime,
+                        declarators,
+                    },
+                    self.span_from(start),
+                )
             }
             // §25.9: a `virtual interface` local variable declaration inside a
             // procedural block — `virtual <iface> [#(...)] [.modport] name;`
@@ -586,7 +777,11 @@ impl Parser {
             // Only when an identifier (the interface type) and then a declarator
             // name follow, so a stray `virtual` elsewhere isn't misparsed.
             TokenKind::KwVirtual
-                if matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::KwInterface) => {
+                if matches!(
+                    self.peek_kind(),
+                    TokenKind::Identifier | TokenKind::KwInterface
+                ) =>
+            {
                 let data_type = self.parse_data_type();
                 let mut declarators = Vec::new();
                 loop {
@@ -595,19 +790,41 @@ impl Parser {
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
-                    } else { None };
-                    declarators.push(VarDeclarator { name, dimensions, init, span: self.span_from(ds) });
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    } else {
+                        None
+                    };
+                    declarators.push(VarDeclarator {
+                        name,
+                        dimensions,
+                        init,
+                        span: self.span_from(ds),
+                    });
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::VarDecl { data_type, lifetime: None, declarators }, self.span_from(start))
+                Statement::new(
+                    StatementKind::VarDecl {
+                        data_type,
+                        lifetime: None,
+                        declarators,
+                    },
+                    self.span_from(start),
+                )
             }
             // Variable declaration (data type keywords)
-            k if self.is_data_type_keyword() && k != TokenKind::KwEvent &&
-                 !(self.peek_kind() == TokenKind::IntegerLiteral && {
-                     let next_text = self.tokens.get(self.pos + 1).map(|t| t.text.as_str()).unwrap_or("");
-                     next_text == "'"
-                 }) => {
+            k if self.is_data_type_keyword()
+                && k != TokenKind::KwEvent
+                && !(self.peek_kind() == TokenKind::IntegerLiteral && {
+                    let next_text = self
+                        .tokens
+                        .get(self.pos + 1)
+                        .map(|t| t.text.as_str())
+                        .unwrap_or("");
+                    next_text == "'"
+                }) =>
+            {
                 let data_type = self.parse_data_type();
                 let lifetime = None;
                 let mut declarators = Vec::new();
@@ -617,17 +834,35 @@ impl Parser {
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
-                    } else { None };
-                    declarators.push(VarDeclarator { name, dimensions, init, span: self.span_from(ds) });
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    } else {
+                        None
+                    };
+                    declarators.push(VarDeclarator {
+                        name,
+                        dimensions,
+                        init,
+                        span: self.span_from(ds),
+                    });
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::VarDecl { data_type, lifetime, declarators }, self.span_from(start))
+                Statement::new(
+                    StatementKind::VarDecl {
+                        data_type,
+                        lifetime,
+                        declarators,
+                    },
+                    self.span_from(start),
+                )
             }
             TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef => {
                 let start = self.current().span.start;
                 self.bump();
-                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                    self.bump();
+                }
                 self.expect(TokenKind::Semicolon);
                 Statement::new(StatementKind::Null, self.span_from(start))
             }
@@ -652,14 +887,18 @@ impl Parser {
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
-                    } else { None };
+                    } else {
+                        None
+                    };
                     declarators.push(VarDeclarator {
                         name,
                         dimensions,
                         init,
                         span: self.span_from(ds),
                     });
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::Semicolon);
                 Statement::new(
@@ -680,41 +919,45 @@ impl Parser {
             // Expressions starting with Identifier: class_scope::member, pkg::member, obj.member
             // Also: `typedef_t [packed-dims] var;` — distinguish from `arr[idx] = ...`
             // by requiring an Identifier after the balanced [..] block.
-            TokenKind::Identifier if !self.peek_is_class_scope() && (
-                matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon)
-                || (self.peek_kind() == TokenKind::LBracket && {
-                    // Look-ahead: balance brackets and check what follows.
-                    // §7.4.1: a typedef may carry SEVERAL packed dims
-                    // (`s_t [1:0][1:0] m;`), so walk every consecutive
-                    // balanced group before judging — stopping at the
-                    // first `]` saw the second `[` and sent the declaration
-                    // down the expression path (a parse error), while the
-                    // same declaration at module scope parsed fine.
-                    let mut depth: i32 = 0;
-                    let mut k: usize = 0;
-                    let mut next_after = TokenKind::Eof;
-                    loop {
-                        let kind = self.peek_kind_n(k + 1);
-                        match kind {
-                            TokenKind::LBracket => depth += 1,
-                            TokenKind::RBracket => {
-                                depth -= 1;
-                                if depth == 0 {
-                                    next_after = self.peek_kind_n(k + 2);
-                                    if next_after != TokenKind::LBracket {
-                                        break;
+            TokenKind::Identifier
+                if !self.peek_is_class_scope()
+                    && (matches!(
+                        self.peek_kind(),
+                        TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon
+                    ) || (self.peek_kind() == TokenKind::LBracket && {
+                        // Look-ahead: balance brackets and check what follows.
+                        // §7.4.1: a typedef may carry SEVERAL packed dims
+                        // (`s_t [1:0][1:0] m;`), so walk every consecutive
+                        // balanced group before judging — stopping at the
+                        // first `]` saw the second `[` and sent the declaration
+                        // down the expression path (a parse error), while the
+                        // same declaration at module scope parsed fine.
+                        let mut depth: i32 = 0;
+                        let mut k: usize = 0;
+                        let mut next_after = TokenKind::Eof;
+                        loop {
+                            let kind = self.peek_kind_n(k + 1);
+                            match kind {
+                                TokenKind::LBracket => depth += 1,
+                                TokenKind::RBracket => {
+                                    depth -= 1;
+                                    if depth == 0 {
+                                        next_after = self.peek_kind_n(k + 2);
+                                        if next_after != TokenKind::LBracket {
+                                            break;
+                                        }
                                     }
                                 }
+                                TokenKind::Eof => break,
+                                _ => {}
                             }
-                            TokenKind::Eof => break,
-                            _ => {}
+                            k += 1;
+                            if k > 64 {
+                                break;
+                            }
                         }
-                        k += 1;
-                        if k > 64 { break; }
-                    }
-                    matches!(next_after, TokenKind::Identifier)
-                })
-            ) =>
+                        matches!(next_after, TokenKind::Identifier)
+                    })) =>
             {
                 let data_type = self.parse_data_type();
                 let mut declarators = Vec::new();
@@ -724,58 +967,179 @@ impl Parser {
                     let dimensions = self.parse_unpacked_dimensions();
                     let init = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
-                    } else { None };
-                    declarators.push(VarDeclarator { name, dimensions, init, span: self.span_from(ds) });
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    } else {
+                        None
+                    };
+                    declarators.push(VarDeclarator {
+                        name,
+                        dimensions,
+                        init,
+                        span: self.span_from(ds),
+                    });
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::Semicolon);
-                Statement::new(StatementKind::VarDecl { data_type, lifetime: None, declarators }, self.span_from(start))
+                Statement::new(
+                    StatementKind::VarDecl {
+                        data_type,
+                        lifetime: None,
+                        declarators,
+                    },
+                    self.span_from(start),
+                )
             }
             // Expression statement (assignment, call, inc/dec)
             _ => {
                 // Parse LHS expression, but stop at <= to allow nonblocking assignment
                 let expr = self.parse_lvalue_or_expr();
                 // Check for blocking/nonblocking assignment
-                if self.at(TokenKind::Assign) || self.at_any(&[
-                    TokenKind::PlusAssign, TokenKind::MinusAssign,
-                    TokenKind::StarAssign, TokenKind::SlashAssign,
-                    TokenKind::PercentAssign, TokenKind::AndAssign,
-                    TokenKind::OrAssign, TokenKind::XorAssign,
-                    TokenKind::ShiftLeftAssign, TokenKind::ShiftRightAssign,
-                    TokenKind::ArithShiftLeftAssign, TokenKind::ArithShiftRightAssign,
-                ]) {
+                if self.at(TokenKind::Assign)
+                    || self.at_any(&[
+                        TokenKind::PlusAssign,
+                        TokenKind::MinusAssign,
+                        TokenKind::StarAssign,
+                        TokenKind::SlashAssign,
+                        TokenKind::PercentAssign,
+                        TokenKind::AndAssign,
+                        TokenKind::OrAssign,
+                        TokenKind::XorAssign,
+                        TokenKind::ShiftLeftAssign,
+                        TokenKind::ShiftRightAssign,
+                        TokenKind::ArithShiftLeftAssign,
+                        TokenKind::ArithShiftRightAssign,
+                    ])
+                {
                     let op_kind = self.current().kind.clone();
                     self.bump();
                     // §9.4.5 intra-assignment timing (only on plain `=`).
-                    if op_kind == TokenKind::Assign { self.skip_intra_assignment_timing(); }
+                    if op_kind == TokenKind::Assign {
+                        self.skip_intra_assignment_timing();
+                    }
                     let rhs = self.parse_expression();
                     self.expect(TokenKind::Semicolon);
                     // Expand compound assignments: lhs += rhs => lhs = lhs + rhs
                     let rvalue = match op_kind {
-                        TokenKind::PlusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Add, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::MinusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Sub, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::StarAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mul, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::SlashAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Div, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::PercentAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mod, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::AndAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitAnd, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::OrAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitOr, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::XorAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitXor, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::ShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::ShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::ArithShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
-                        TokenKind::ArithShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, self.span_from(start)),
+                        TokenKind::PlusAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Add,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::MinusAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Sub,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::StarAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Mul,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::SlashAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Div,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::PercentAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Mod,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::AndAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitAnd,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::OrAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitOr,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::XorAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitXor,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::ShiftLeftAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ShiftLeft,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::ShiftRightAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ShiftRight,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::ArithShiftLeftAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ArithShiftLeft,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
+                        TokenKind::ArithShiftRightAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ArithShiftRight,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            self.span_from(start),
+                        ),
                         _ => rhs, // TokenKind::Assign - plain assignment
                     };
-                    Statement::new(StatementKind::BlockingAssign { lvalue: expr, rvalue }, self.span_from(start))
+                    Statement::new(
+                        StatementKind::BlockingAssign {
+                            lvalue: expr,
+                            rvalue,
+                        },
+                        self.span_from(start),
+                    )
                 } else if self.at(TokenKind::Leq) {
                     // Nonblocking assignment: lvalue <= rvalue
                     self.bump();
                     self.skip_intra_assignment_timing(); // §9.4.5
                     let rvalue = self.parse_expression();
                     self.expect(TokenKind::Semicolon);
-                    Statement::new(StatementKind::NonblockingAssign {
-                        lvalue: expr, delay: None, rvalue,
-                    }, self.span_from(start))
+                    Statement::new(
+                        StatementKind::NonblockingAssign {
+                            lvalue: expr,
+                            delay: None,
+                            rvalue,
+                        },
+                        self.span_from(start),
+                    )
                 } else {
                     self.expect(TokenKind::Semicolon);
                     Statement::new(StatementKind::Expr(expr), self.span_from(start))
@@ -789,7 +1153,9 @@ impl Parser {
         self.expect(TokenKind::KwBegin);
         let name = if self.eat(TokenKind::Colon).is_some() {
             Some(self.parse_identifier())
-        } else { None };
+        } else {
+            None
+        };
         let mut stmts = Vec::new();
         while !self.at(TokenKind::KwEnd) && !self.at(TokenKind::Eof) {
             stmts.push(self.parse_statement());
@@ -797,10 +1163,17 @@ impl Parser {
         self.expect(TokenKind::KwEnd);
         // §9.3.4: an end label must match the block name (if any).
         match name {
-            Some(ref n) => { let _ = self.parse_block_end_label_checked(&n.name); }
-            None => { let _ = self.parse_end_label(); }
+            Some(ref n) => {
+                let _ = self.parse_block_end_label_checked(&n.name);
+            }
+            None => {
+                let _ = self.parse_end_label();
+            }
         }
-        Statement::new(StatementKind::SeqBlock { name, stmts }, self.span_from(start))
+        Statement::new(
+            StatementKind::SeqBlock { name, stmts },
+            self.span_from(start),
+        )
     }
 
     fn parse_par_block(&mut self) -> Statement {
@@ -808,22 +1181,49 @@ impl Parser {
         self.expect(TokenKind::KwFork);
         let name = if self.eat(TokenKind::Colon).is_some() {
             Some(self.parse_identifier())
-        } else { None };
+        } else {
+            None
+        };
         let mut stmts = Vec::new();
-        while !self.at_any(&[TokenKind::KwJoin, TokenKind::KwJoin_any, TokenKind::KwJoin_none, TokenKind::Eof]) {
+        while !self.at_any(&[
+            TokenKind::KwJoin,
+            TokenKind::KwJoin_any,
+            TokenKind::KwJoin_none,
+            TokenKind::Eof,
+        ]) {
             stmts.push(self.parse_statement());
         }
         let join_type = match self.current_kind() {
-            TokenKind::KwJoin_any => { self.bump(); JoinType::JoinAny }
-            TokenKind::KwJoin_none => { self.bump(); JoinType::JoinNone }
-            _ => { self.expect(TokenKind::KwJoin); JoinType::Join }
+            TokenKind::KwJoin_any => {
+                self.bump();
+                JoinType::JoinAny
+            }
+            TokenKind::KwJoin_none => {
+                self.bump();
+                JoinType::JoinNone
+            }
+            _ => {
+                self.expect(TokenKind::KwJoin);
+                JoinType::Join
+            }
         };
         // §9.3.4: a fork/join end label must match the fork name (if any).
         match name {
-            Some(ref n) => { let _ = self.parse_block_end_label_checked(&n.name); }
-            None => { let _ = self.parse_end_label(); }
+            Some(ref n) => {
+                let _ = self.parse_block_end_label_checked(&n.name);
+            }
+            None => {
+                let _ = self.parse_end_label();
+            }
         }
-        Statement::new(StatementKind::ParBlock { name, join_type, stmts }, self.span_from(start))
+        Statement::new(
+            StatementKind::ParBlock {
+                name,
+                join_type,
+                stmts,
+            },
+            self.span_from(start),
+        )
     }
 
     fn parse_if_or_case(&mut self) -> Statement {
@@ -839,9 +1239,18 @@ impl Parser {
 
     fn parse_unique_priority(&mut self) -> Option<UniquePriority> {
         match self.current_kind() {
-            TokenKind::KwUnique => { self.bump(); Some(UniquePriority::Unique) }
-            TokenKind::KwUnique0 => { self.bump(); Some(UniquePriority::Unique0) }
-            TokenKind::KwPriority => { self.bump(); Some(UniquePriority::Priority) }
+            TokenKind::KwUnique => {
+                self.bump();
+                Some(UniquePriority::Unique)
+            }
+            TokenKind::KwUnique0 => {
+                self.bump();
+                Some(UniquePriority::Unique0)
+            }
+            TokenKind::KwPriority => {
+                self.bump();
+                Some(UniquePriority::Priority)
+            }
             _ => None,
         }
     }
@@ -851,8 +1260,14 @@ impl Parser {
     /// prepended as `logic <name>;` decls in a synthetic begin/end block, so
     /// elaboration's scope walk finds them in `locals` before the matched
     /// statement runs. Returns `stmt` unchanged when there are no bindings.
-    fn wrap_with_pattern_bindings(&self, bindings: Vec<crate::ast::Identifier>, stmt: Statement) -> Statement {
-        if bindings.is_empty() { return stmt; }
+    fn wrap_with_pattern_bindings(
+        &self,
+        bindings: Vec<crate::ast::Identifier>,
+        stmt: Statement,
+    ) -> Statement {
+        if bindings.is_empty() {
+            return stmt;
+        }
         let span = stmt.span;
         let mut stmts: Vec<Statement> = Vec::with_capacity(bindings.len() + 1);
         for id in bindings {
@@ -860,11 +1275,16 @@ impl Parser {
             let decl = StatementKind::VarDecl {
                 data_type: DataType::IntegerVector {
                     kind: crate::ast::types::IntegerVectorType::Logic,
-                    signing: None, dimensions: Vec::new(), span: id_span,
+                    signing: None,
+                    dimensions: Vec::new(),
+                    span: id_span,
                 },
                 lifetime: None,
                 declarators: vec![VarDeclarator {
-                    name: id, dimensions: Vec::new(), init: None, span: id_span,
+                    name: id,
+                    dimensions: Vec::new(),
+                    init: None,
+                    span: id_span,
                 }],
             };
             stmts.push(Statement::new(decl, id_span));
@@ -890,11 +1310,18 @@ impl Parser {
         let then_stmt = self.parse_statement();
         let else_stmt = if self.eat(TokenKind::KwElse).is_some() {
             Some(Box::new(self.parse_statement()))
-        } else { None };
-        Statement::new(StatementKind::If {
-            condition, then_stmt: Box::new(then_stmt), else_stmt,
-            unique_priority: up,
-        }, self.span_from(start))
+        } else {
+            None
+        };
+        Statement::new(
+            StatementKind::If {
+                condition,
+                then_stmt: Box::new(then_stmt),
+                else_stmt,
+                unique_priority: up,
+            },
+            self.span_from(start),
+        )
     }
 
     fn parse_case_statement(&mut self) -> Statement {
@@ -914,7 +1341,9 @@ impl Parser {
         // Check for "inside" keyword
         let kind = if kind == CaseKind::Case && self.eat(TokenKind::KwInside).is_some() {
             CaseKind::CaseInside
-        } else { kind };
+        } else {
+            kind
+        };
 
         // IEEE 1800-2017 §12.6.1: pattern case statement
         // `case (expr) matches { pattern [&&& expr] : stmt } endcase`.
@@ -930,29 +1359,53 @@ impl Parser {
                 if self.eat(TokenKind::KwDefault).is_some() {
                     self.eat(TokenKind::Colon);
                     let stmt = self.parse_statement();
-                    items.push(CaseItem { patterns: Vec::new(), is_default: true, stmt, span: self.span_from(istart), pattern: None, guard: None });
+                    items.push(CaseItem {
+                        patterns: Vec::new(),
+                        is_default: true,
+                        stmt,
+                        span: self.span_from(istart),
+                        pattern: None,
+                        guard: None,
+                    });
                 } else {
                     self.pending_pattern_bindings.clear();
                     let pattern = self.parse_pattern();
                     // Optional pattern guard: `&&& <expression>`.
                     // `&&&` lexes as LogAnd (`&&`) followed by BitAnd (`&`).
-                    let guard = if self.at(TokenKind::LogAnd) && self.peek_kind() == TokenKind::BitAnd {
-                        self.bump(); self.bump();
-                        Some(self.parse_expression())
-                    } else {
-                        None
-                    };
+                    let guard =
+                        if self.at(TokenKind::LogAnd) && self.peek_kind() == TokenKind::BitAnd {
+                            self.bump();
+                            self.bump();
+                            Some(self.parse_expression())
+                        } else {
+                            None
+                        };
                     self.expect(TokenKind::Colon);
                     self.pending_pattern_bindings.clear();
                     let stmt = self.parse_statement();
-                    items.push(CaseItem { patterns: Vec::new(), is_default: false, stmt, span: self.span_from(istart), pattern: Some(pattern), guard });
+                    items.push(CaseItem {
+                        patterns: Vec::new(),
+                        is_default: false,
+                        stmt,
+                        span: self.span_from(istart),
+                        pattern: Some(pattern),
+                        guard,
+                    });
                 }
-                if self.pos == before { self.bump(); }
+                if self.pos == before {
+                    self.bump();
+                }
             }
             self.expect(TokenKind::KwEndcase);
-            return Statement::new(StatementKind::Case {
-                unique_priority: up, kind, expr, items,
-            }, self.span_from(start));
+            return Statement::new(
+                StatementKind::Case {
+                    unique_priority: up,
+                    kind,
+                    expr,
+                    items,
+                },
+                self.span_from(start),
+            );
         }
 
         let mut items = Vec::new();
@@ -961,7 +1414,14 @@ impl Parser {
             if self.eat(TokenKind::KwDefault).is_some() {
                 self.eat(TokenKind::Colon);
                 let stmt = self.parse_statement();
-                items.push(CaseItem { patterns: Vec::new(), is_default: true, stmt, span: self.span_from(istart), pattern: None, guard: None });
+                items.push(CaseItem {
+                    patterns: Vec::new(),
+                    is_default: true,
+                    stmt,
+                    span: self.span_from(istart),
+                    pattern: None,
+                    guard: None,
+                });
             } else {
                 let mut patterns = Vec::new();
                 loop {
@@ -983,17 +1443,32 @@ impl Parser {
                     } else {
                         patterns.push(self.parse_expression());
                     }
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::Colon);
                 let stmt = self.parse_statement();
-                items.push(CaseItem { patterns, is_default: false, stmt, span: self.span_from(istart), pattern: None, guard: None });
+                items.push(CaseItem {
+                    patterns,
+                    is_default: false,
+                    stmt,
+                    span: self.span_from(istart),
+                    pattern: None,
+                    guard: None,
+                });
             }
         }
         self.expect(TokenKind::KwEndcase);
-        Statement::new(StatementKind::Case {
-            unique_priority: up, kind, expr, items,
-        }, self.span_from(start))
+        Statement::new(
+            StatementKind::Case {
+                unique_priority: up,
+                kind,
+                expr,
+                items,
+            },
+            self.span_from(start),
+        )
     }
 
     fn parse_for_statement(&mut self) -> Statement {
@@ -1013,19 +1488,29 @@ impl Parser {
             loop {
                 // Optional `var`/`const` lifetime/qualifier prefix on a typed
                 // init declaration: `for (var int i = 1, bit c = 0; …)`.
-                let var_prefix = matches!(self.current_kind(),
-                    TokenKind::KwVar | TokenKind::KwConst);
-                if var_prefix { self.bump(); }
-                if var_prefix || self.is_data_type_keyword() ||
-                    (self.at(TokenKind::Identifier) &&
-                        matches!(self.peek_kind(),
-                            TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash)) {
+                let var_prefix =
+                    matches!(self.current_kind(), TokenKind::KwVar | TokenKind::KwConst);
+                if var_prefix {
+                    self.bump();
+                }
+                if var_prefix
+                    || self.is_data_type_keyword()
+                    || (self.at(TokenKind::Identifier)
+                        && matches!(
+                            self.peek_kind(),
+                            TokenKind::Identifier | TokenKind::DoubleColon | TokenKind::Hash
+                        ))
+                {
                     let dt = self.parse_data_type();
                     let name = self.parse_identifier();
                     self.expect(TokenKind::Assign);
                     let val = self.parse_expression();
                     decl_dt = Some(dt.clone());
-                    init.push(ForInit::VarDecl { data_type: dt, name, init: val });
+                    init.push(ForInit::VarDecl {
+                        data_type: dt,
+                        name,
+                        init: val,
+                    });
                 } else if decl_dt.is_some()
                     && self.at(TokenKind::Identifier)
                     && self.peek_kind() == TokenKind::Assign
@@ -1042,95 +1527,214 @@ impl Parser {
                     let lv = self.parse_expression();
                     self.expect(TokenKind::Assign);
                     let rv = self.parse_expression();
-                    init.push(ForInit::Assign { lvalue: lv, rvalue: rv });
+                    init.push(ForInit::Assign {
+                        lvalue: lv,
+                        rvalue: rv,
+                    });
                 }
-                if self.eat(TokenKind::Comma).is_none() { break; }
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::Semicolon);
         let condition = if !self.at(TokenKind::Semicolon) {
             Some(self.parse_expression())
-        } else { None };
+        } else {
+            None
+        };
         self.expect(TokenKind::Semicolon);
         let mut step = Vec::new();
         if !self.at(TokenKind::RParen) {
             loop {
                 // Step can be assignment (i = i + 1 / i += 2) or expression (i++).
                 let expr = self.parse_lvalue_or_expr();
-                if self.at(TokenKind::Assign) || self.at_any(&[
-                    TokenKind::PlusAssign, TokenKind::MinusAssign,
-                    TokenKind::StarAssign, TokenKind::SlashAssign,
-                    TokenKind::PercentAssign, TokenKind::AndAssign,
-                    TokenKind::OrAssign, TokenKind::XorAssign,
-                    TokenKind::ShiftLeftAssign, TokenKind::ShiftRightAssign,
-                    TokenKind::ArithShiftLeftAssign, TokenKind::ArithShiftRightAssign,
-                ]) {
+                if self.at(TokenKind::Assign)
+                    || self.at_any(&[
+                        TokenKind::PlusAssign,
+                        TokenKind::MinusAssign,
+                        TokenKind::StarAssign,
+                        TokenKind::SlashAssign,
+                        TokenKind::PercentAssign,
+                        TokenKind::AndAssign,
+                        TokenKind::OrAssign,
+                        TokenKind::XorAssign,
+                        TokenKind::ShiftLeftAssign,
+                        TokenKind::ShiftRightAssign,
+                        TokenKind::ArithShiftLeftAssign,
+                        TokenKind::ArithShiftRightAssign,
+                    ])
+                {
                     let op_kind = self.current().kind;
                     self.bump();
                     let rhs = self.parse_expression();
                     let span = self.span_from(start);
                     let rvalue = match op_kind {
-                        TokenKind::PlusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Add, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::MinusAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Sub, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::StarAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mul, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::SlashAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Div, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::PercentAssign => Expression::new(ExprKind::Binary { op: BinaryOp::Mod, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::AndAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitAnd, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::OrAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitOr, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::XorAssign => Expression::new(ExprKind::Binary { op: BinaryOp::BitXor, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::ShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::ShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::ArithShiftLeftAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftLeft, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
-                        TokenKind::ArithShiftRightAssign => Expression::new(ExprKind::Binary { op: BinaryOp::ArithShiftRight, left: Box::new(expr.clone()), right: Box::new(rhs) }, span),
+                        TokenKind::PlusAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Add,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::MinusAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Sub,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::StarAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Mul,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::SlashAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Div,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::PercentAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::Mod,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::AndAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitAnd,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::OrAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitOr,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::XorAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::BitXor,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::ShiftLeftAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ShiftLeft,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::ShiftRightAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ShiftRight,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::ArithShiftLeftAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ArithShiftLeft,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
+                        TokenKind::ArithShiftRightAssign => Expression::new(
+                            ExprKind::Binary {
+                                op: BinaryOp::ArithShiftRight,
+                                left: Box::new(expr.clone()),
+                                right: Box::new(rhs),
+                            },
+                            span,
+                        ),
                         _ => rhs,
                     };
                     step.push(Expression::new(
-                        ExprKind::AssignExpr { lvalue: Box::new(expr), rvalue: Box::new(rvalue) },
+                        ExprKind::AssignExpr {
+                            lvalue: Box::new(expr),
+                            rvalue: Box::new(rvalue),
+                        },
                         span,
                     ));
                 } else {
                     step.push(expr);
                 }
-                if !self.eat(TokenKind::Comma).is_some() { break; }
+                if !self.eat(TokenKind::Comma).is_some() {
+                    break;
+                }
             }
         }
         self.expect(TokenKind::RParen);
         let body = self.parse_statement();
-        Statement::new(StatementKind::For {
-            init, condition, step, body: Box::new(body),
-        }, self.span_from(start))
+        Statement::new(
+            StatementKind::For {
+                init,
+                condition,
+                step,
+                body: Box::new(body),
+            },
+            self.span_from(start),
+        )
     }
 
     fn parse_foreach_statement(&mut self) -> Statement {
         let start = self.current().span.start;
         self.expect(TokenKind::KwForeach);
         self.expect(TokenKind::LParen);
-        
+
         // Array name: can be hierarchical, but NO indices yet.
         let array_hier = self.parse_hierarchical_identifier();
         let array_expr = Expression::new(ExprKind::Ident(array_hier), self.span_from(start));
         // Actually, parse_expression_prefix might be too limited.
         // Let's just parse a HierarchicalIdentifier manually or via a new helper.
         // For UVM, most are simple or pkg::name.
-        
+
         let mut vars = Vec::new();
         self.expect(TokenKind::LBracket);
         loop {
-            if self.at(TokenKind::RBracket) { break; }
+            if self.at(TokenKind::RBracket) {
+                break;
+            }
             if self.at(TokenKind::Comma) {
                 vars.push(None);
             } else {
                 vars.push(Some(self.parse_identifier()));
             }
-            if self.eat(TokenKind::Comma).is_none() { break; }
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
         }
         self.expect(TokenKind::RBracket);
-        
+
         self.expect(TokenKind::RParen);
         let body = self.parse_statement();
-        Statement::new(StatementKind::Foreach {
-            array: array_expr, vars, body: Box::new(body),
-        }, self.span_from(start))
+        Statement::new(
+            StatementKind::Foreach {
+                array: array_expr,
+                vars,
+                body: Box::new(body),
+            },
+            self.span_from(start),
+        )
     }
 
     fn parse_while_statement(&mut self) -> Statement {
@@ -1140,7 +1744,13 @@ impl Parser {
         let condition = self.parse_expression();
         self.expect(TokenKind::RParen);
         let body = self.parse_statement();
-        Statement::new(StatementKind::While { condition, body: Box::new(body) }, self.span_from(start))
+        Statement::new(
+            StatementKind::While {
+                condition,
+                body: Box::new(body),
+            },
+            self.span_from(start),
+        )
     }
 
     fn parse_do_while_statement(&mut self) -> Statement {
@@ -1152,7 +1762,13 @@ impl Parser {
         let condition = self.parse_expression();
         self.expect(TokenKind::RParen);
         self.expect(TokenKind::Semicolon);
-        Statement::new(StatementKind::DoWhile { body: Box::new(body), condition }, self.span_from(start))
+        Statement::new(
+            StatementKind::DoWhile {
+                body: Box::new(body),
+                condition,
+            },
+            self.span_from(start),
+        )
     }
 
     fn parse_repeat_statement(&mut self) -> Statement {
@@ -1162,7 +1778,13 @@ impl Parser {
         let count = self.parse_expression();
         self.expect(TokenKind::RParen);
         let body = self.parse_statement();
-        Statement::new(StatementKind::Repeat { count, body: Box::new(body) }, self.span_from(start))
+        Statement::new(
+            StatementKind::Repeat {
+                count,
+                body: Box::new(body),
+            },
+            self.span_from(start),
+        )
     }
 
     /// IEEE 1800-2017 §9.4.5: intra-assignment timing control that may appear
@@ -1178,9 +1800,13 @@ impl Parser {
                     let _ = self.parse_expression();
                     self.expect(TokenKind::RParen);
                 }
-                if self.at(TokenKind::At) { let _ = self.parse_event_control(); }
+                if self.at(TokenKind::At) {
+                    let _ = self.parse_event_control();
+                }
             }
-            TokenKind::At => { let _ = self.parse_event_control(); }
+            TokenKind::At => {
+                let _ = self.parse_event_control();
+            }
             TokenKind::Hash => {
                 self.bump();
                 if self.eat(TokenKind::LParen).is_some() {
@@ -1210,9 +1836,18 @@ impl Parser {
             loop {
                 let estart = self.current().span.start;
                 let edge = match self.current_kind() {
-                    TokenKind::KwPosedge => { self.bump(); Some(Edge::Posedge) }
-                    TokenKind::KwNegedge => { self.bump(); Some(Edge::Negedge) }
-                    TokenKind::KwEdge => { self.bump(); Some(Edge::Edge) }
+                    TokenKind::KwPosedge => {
+                        self.bump();
+                        Some(Edge::Posedge)
+                    }
+                    TokenKind::KwNegedge => {
+                        self.bump();
+                        Some(Edge::Negedge)
+                    }
+                    TokenKind::KwEdge => {
+                        self.bump();
+                        Some(Edge::Edge)
+                    }
                     _ => None,
                 };
                 // LRM §9.4.2.3 `@(posedge clk iff guard)`. `parse_expression`
@@ -1227,18 +1862,31 @@ impl Parser {
                 // precedence ever stops treating `iff` as an operator.
                 let parsed = self.parse_expression();
                 let (expr, iff) = match parsed.kind {
-                    ExprKind::Binary { op: BinaryOp::Iff, left, right } => {
-                        (*left, Some(*right))
-                    }
+                    ExprKind::Binary {
+                        op: BinaryOp::Iff,
+                        left,
+                        right,
+                    } => (*left, Some(*right)),
                     other => {
-                        let expr = Expression { kind: other, span: parsed.span, cached_width: std::cell::Cell::new(None) };
+                        let expr = Expression {
+                            kind: other,
+                            span: parsed.span,
+                            cached_width: std::cell::Cell::new(None),
+                        };
                         let iff = if self.eat(TokenKind::KwIff).is_some() {
                             Some(self.parse_expression())
-                        } else { None };
+                        } else {
+                            None
+                        };
                         (expr, iff)
                     }
                 };
-                events.push(EventExpr { edge, expr, iff, span: self.span_from(estart) });
+                events.push(EventExpr {
+                    edge,
+                    expr,
+                    iff,
+                    span: self.span_from(estart),
+                });
                 if self.eat(TokenKind::KwOr).is_some() || self.eat(TokenKind::Comma).is_some() {
                     continue;
                 }
@@ -1265,12 +1913,19 @@ impl Parser {
             self.bump();
             // Skip delay value (could be `#0` or `#(0)`)
             if self.at(TokenKind::LParen) {
-                let mut d = 1; self.bump();
+                let mut d = 1;
+                self.bump();
                 while !self.at(TokenKind::Eof) && d > 0 {
-                    match self.current_kind() { TokenKind::LParen => d += 1, TokenKind::RParen => d -= 1, _ => {} }
+                    match self.current_kind() {
+                        TokenKind::LParen => d += 1,
+                        TokenKind::RParen => d -= 1,
+                        _ => {}
+                    }
                     self.bump();
                 }
-            } else { self.bump(); }
+            } else {
+                self.bump();
+            }
         }
         let is_property = self.eat(TokenKind::KwProperty).is_some();
         self.expect(TokenKind::LParen);
@@ -1285,9 +1940,10 @@ impl Parser {
         let clk_event = if self.at(TokenKind::At) {
             self.bump(); // @
             Some(self.parse_sva_clock_event())
-        } else { None };
-        let disable_guard = if self.at(TokenKind::KwDisable)
-            && self.peek_kind() == TokenKind::KwIff
+        } else {
+            None
+        };
+        let disable_guard = if self.at(TokenKind::KwDisable) && self.peek_kind() == TokenKind::KwIff
         {
             self.bump(); // disable
             self.bump(); // iff
@@ -1321,12 +1977,16 @@ impl Parser {
         let action = if !self.at(TokenKind::Semicolon) && !self.at(TokenKind::KwElse) {
             Some(Box::new(self.parse_statement()))
         } else {
-            if self.at(TokenKind::Semicolon) { self.bump(); }
+            if self.at(TokenKind::Semicolon) {
+                self.bump();
+            }
             None
         };
         let else_action = if self.eat(TokenKind::KwElse).is_some() {
             Some(Box::new(self.parse_statement()))
-        } else { None };
+        } else {
+            None
+        };
         self.eat(TokenKind::Semicolon);
         let expr = if let Some((clk, edge, iff)) = clk_event {
             Expression::new(
@@ -1341,7 +2001,14 @@ impl Parser {
         } else {
             body
         };
-        AssertionStatement { kind, expr, action, else_action, is_property, span: self.span_from(start) }
+        AssertionStatement {
+            kind,
+            expr,
+            action,
+            else_action,
+            is_property,
+            span: self.span_from(start),
+        }
     }
 
     /// `randcase { weight : statement }+ endcase`
@@ -1372,7 +2039,9 @@ impl Parser {
             let id = self.parse_identifier();
             self.expect(TokenKind::RParen);
             id.name
-        } else { "main".to_string() };
+        } else {
+            "main".to_string()
+        };
 
         let mut prods: HashMap<String, (Vec<(DataType, String)>, RsAlt)> = HashMap::new();
         let mut first_name: Option<String> = None;
@@ -1397,22 +2066,34 @@ impl Parser {
             if self.eat(TokenKind::LParen).is_some() {
                 while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                     // Optional direction qualifier
-                    if matches!(self.current_kind(), TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef) {
+                    if matches!(
+                        self.current_kind(),
+                        TokenKind::KwInput
+                            | TokenKind::KwOutput
+                            | TokenKind::KwInout
+                            | TokenKind::KwRef
+                    ) {
                         self.bump();
                     }
-                    let dt = if self.is_data_type_keyword() { self.parse_data_type() }
-                        else {
-                            // Fallback: treat as int.
-                            DataType::IntegerAtom {
-                                kind: crate::ast::types::IntegerAtomType::Int,
-                                signing: None,
-                                span: self.current().span,
-                            }
-                        };
-                    if !self.at(TokenKind::Identifier) { self.bump(); continue; }
+                    let dt = if self.is_data_type_keyword() {
+                        self.parse_data_type()
+                    } else {
+                        // Fallback: treat as int.
+                        DataType::IntegerAtom {
+                            kind: crate::ast::types::IntegerAtomType::Int,
+                            signing: None,
+                            span: self.current().span,
+                        }
+                    };
+                    if !self.at(TokenKind::Identifier) {
+                        self.bump();
+                        continue;
+                    }
                     let pn = self.parse_identifier().name;
                     params.push((dt, pn));
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                 }
                 self.expect(TokenKind::RParen);
             }
@@ -1420,26 +2101,46 @@ impl Parser {
                 let a = self.parse_rs_alt();
                 a
             } else {
-                RsAlt { alts: vec![(RsSeq { items: Vec::new() }, None)] }
+                RsAlt {
+                    alts: vec![(RsSeq { items: Vec::new() }, None)],
+                }
             };
             self.eat(TokenKind::Semicolon);
-            if first_name.is_none() { first_name = Some(pname.clone()); }
+            if first_name.is_none() {
+                first_name = Some(pname.clone());
+            }
             prods.insert(pname, (params, alt));
         }
         self.expect(TokenKind::KwEndsequence);
         let span = self.span_from(start);
-        let main = if prods.contains_key(&main_name) { main_name }
-                   else if let Some(f) = first_name { f }
-                   else { return Statement::new(StatementKind::Null, span); };
+        let main = if prods.contains_key(&main_name) {
+            main_name
+        } else if let Some(f) = first_name {
+            f
+        } else {
+            return Statement::new(StatementKind::Null, span);
+        };
         let mut depth = 0u32;
         let body = expand_rs_ref(&prods, &main, &mut depth, span);
         // Wrap in `repeat (1) ...` so a `break` inside a production aborts the
         // sequence without leaking the break_flag out to enclosing code.
-        let one = Expression::new(ExprKind::Number(NumberLiteral::Integer {
-            size: None, signed: true, base: NumberBase::Decimal,
-            value: "1".into(), cached_val: Cell::new(None),
-        }), span);
-        Statement::new(StatementKind::Repeat { count: one, body: Box::new(body) }, span)
+        let one = Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: NumberBase::Decimal,
+                value: "1".into(),
+                cached_val: Cell::new(None),
+            }),
+            span,
+        );
+        Statement::new(
+            StatementKind::Repeat {
+                count: one,
+                body: Box::new(body),
+            },
+            span,
+        )
     }
 
     /// rs_alt ::= rs_seq ('|' rs_seq)* with optional `:= weight` after each seq.
@@ -1453,9 +2154,13 @@ impl Parser {
                 // `|` (bp 7/8) so `a := 0 | b := 1` yields two alternatives
                 // rather than one weight of `0 | b`.
                 Some(self.parse_expr_bp(9))
-            } else { None };
+            } else {
+                None
+            };
             alts.push((seq, weight));
-            if self.eat(TokenKind::BitOr).is_none() { break; }
+            if self.eat(TokenKind::BitOr).is_none() {
+                break;
+            }
         }
         RsAlt { alts }
     }
@@ -1464,9 +2169,15 @@ impl Parser {
         let mut items = Vec::new();
         loop {
             match self.current_kind() {
-                TokenKind::BitOr | TokenKind::Semicolon | TokenKind::KwEndsequence
-                | TokenKind::ColonAssign | TokenKind::Eof | TokenKind::RParen
-                | TokenKind::RBrace | TokenKind::KwEndcase | TokenKind::KwElse => break,
+                TokenKind::BitOr
+                | TokenKind::Semicolon
+                | TokenKind::KwEndsequence
+                | TokenKind::ColonAssign
+                | TokenKind::Eof
+                | TokenKind::RParen
+                | TokenKind::RBrace
+                | TokenKind::KwEndcase
+                | TokenKind::KwElse => break,
                 _ => {}
             }
             let item = self.parse_rs_prod();
@@ -1493,13 +2204,15 @@ impl Parser {
                     stmts.push(self.parse_statement());
                 }
                 self.expect(TokenKind::RBrace);
-                for s in &mut stmts { rs_rewrite_return_as_rsreturn(s); }
+                for s in &mut stmts {
+                    rs_rewrite_return_as_rsreturn(s);
+                }
                 let span = self.span_from(start);
-                let inner = Statement::new(StatementKind::SeqBlock {
-                    name: None, stmts,
-                }, span);
+                let inner = Statement::new(StatementKind::SeqBlock { name: None, stmts }, span);
                 RsProd::Block(Statement::new(
-                    StatementKind::RsAction { body: Box::new(inner) },
+                    StatementKind::RsAction {
+                        body: Box::new(inner),
+                    },
                     span,
                 ))
             }
@@ -1511,7 +2224,9 @@ impl Parser {
                 let then_a = self.parse_rs_alt();
                 let else_a = if self.eat(TokenKind::KwElse).is_some() {
                     Some(Box::new(self.parse_rs_alt()))
-                } else { None };
+                } else {
+                    None
+                };
                 RsProd::If(cond, Box::new(then_a), else_a)
             }
             TokenKind::KwCase => {
@@ -1531,7 +2246,9 @@ impl Parser {
                         let mut pats = Vec::new();
                         loop {
                             pats.push(self.parse_expression());
-                            if self.eat(TokenKind::Comma).is_none() { break; }
+                            if self.eat(TokenKind::Comma).is_none() {
+                                break;
+                            }
                         }
                         self.expect(TokenKind::Colon);
                         let a = self.parse_rs_alt();
@@ -1557,17 +2274,31 @@ impl Parser {
                     let mut depth = 0i32;
                     loop {
                         match self.current_kind() {
-                            TokenKind::LParen => { depth += 1; self.bump(); }
-                            TokenKind::RParen => { depth -= 1; self.bump(); if depth == 0 { break; } }
+                            TokenKind::LParen => {
+                                depth += 1;
+                                self.bump();
+                            }
+                            TokenKind::RParen => {
+                                depth -= 1;
+                                self.bump();
+                                if depth == 0 {
+                                    break;
+                                }
+                            }
                             TokenKind::Eof => break,
-                            _ => { self.bump(); }
+                            _ => {
+                                self.bump();
+                            }
                         }
                     }
                 }
                 let body = self.parse_rs_seq();
                 RsProd::RandJoin(body.items)
             }
-            TokenKind::KwBreak => { self.bump(); RsProd::Break }
+            TokenKind::KwBreak => {
+                self.bump();
+                RsProd::Break
+            }
             TokenKind::KwReturn => {
                 self.bump();
                 if !self.at(TokenKind::Semicolon) && !self.at(TokenKind::BitOr) {
@@ -1581,7 +2312,9 @@ impl Parser {
                 if self.eat(TokenKind::LParen).is_some() {
                     while !self.at(TokenKind::RParen) && !self.at(TokenKind::Eof) {
                         args.push(self.parse_expression());
-                        if self.eat(TokenKind::Comma).is_none() { break; }
+                        if self.eat(TokenKind::Comma).is_none() {
+                            break;
+                        }
                     }
                     self.expect(TokenKind::RParen);
                 }
@@ -1601,19 +2334,42 @@ impl Parser {
         let mut block_depth = 0i32;
         while !self.at(TokenKind::Eof) {
             match self.current_kind() {
-                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => { depth += 1; self.bump(); }
-                TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
-                    if depth > 0 { depth -= 1; self.bump(); } else { break; }
+                TokenKind::LParen | TokenKind::LBrace | TokenKind::LBracket => {
+                    depth += 1;
+                    self.bump();
                 }
-                TokenKind::KwBegin => { block_depth += 1; self.bump(); }
+                TokenKind::RParen | TokenKind::RBrace | TokenKind::RBracket => {
+                    if depth > 0 {
+                        depth -= 1;
+                        self.bump();
+                    } else {
+                        break;
+                    }
+                }
+                TokenKind::KwBegin => {
+                    block_depth += 1;
+                    self.bump();
+                }
                 TokenKind::KwEnd => {
-                    if block_depth > 0 { block_depth -= 1; self.bump(); if block_depth == 0 && depth == 0 { break; } } else { break; }
+                    if block_depth > 0 {
+                        block_depth -= 1;
+                        self.bump();
+                        if block_depth == 0 && depth == 0 {
+                            break;
+                        }
+                    } else {
+                        break;
+                    }
                 }
                 TokenKind::Semicolon => {
                     self.bump();
-                    if depth == 0 && block_depth == 0 { break; }
+                    if depth == 0 && block_depth == 0 {
+                        break;
+                    }
                 }
-                _ => { self.bump(); }
+                _ => {
+                    self.bump();
+                }
             }
         }
     }
@@ -1638,7 +2394,11 @@ enum RsProd {
     Block(Statement),
     Ref(String, Vec<Expression>),
     If(Expression, Box<RsAlt>, Option<Box<RsAlt>>),
-    Case(Expression, Vec<(Vec<Expression>, Box<RsAlt>)>, Option<Box<RsAlt>>),
+    Case(
+        Expression,
+        Vec<(Vec<Expression>, Box<RsAlt>)>,
+        Option<Box<RsAlt>>,
+    ),
     Repeat(Expression, Box<RsAlt>),
     RandJoin(Vec<RsProd>),
     Break,
@@ -1651,16 +2411,28 @@ enum RsProd {
 /// captured), so only bare returns in the straight-line body are touched.
 fn rs_rewrite_return_as_rsreturn(s: &mut Statement) {
     match &mut s.kind {
-        StatementKind::Return(None) => { s.kind = StatementKind::RsReturn; }
-        StatementKind::SeqBlock { stmts, .. } => {
-            for c in stmts { rs_rewrite_return_as_rsreturn(c); }
+        StatementKind::Return(None) => {
+            s.kind = StatementKind::RsReturn;
         }
-        StatementKind::If { then_stmt, else_stmt, .. } => {
+        StatementKind::SeqBlock { stmts, .. } => {
+            for c in stmts {
+                rs_rewrite_return_as_rsreturn(c);
+            }
+        }
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
             rs_rewrite_return_as_rsreturn(then_stmt);
-            if let Some(e) = else_stmt { rs_rewrite_return_as_rsreturn(e); }
+            if let Some(e) = else_stmt {
+                rs_rewrite_return_as_rsreturn(e);
+            }
         }
         StatementKind::Case { items, .. } => {
-            for it in items { rs_rewrite_return_as_rsreturn(&mut it.stmt); }
+            for it in items {
+                rs_rewrite_return_as_rsreturn(&mut it.stmt);
+            }
         }
         StatementKind::TimingControl { stmt, .. } | StatementKind::Wait { stmt, .. } => {
             rs_rewrite_return_as_rsreturn(stmt);
@@ -1686,10 +2458,18 @@ fn expand_alt(prods: &ProdMap, alt: &RsAlt, depth: &mut u32, span: crate::ast::S
     if alt.alts.len() == 1 {
         return expand_seq(prods, &alt.alts[0].0, depth, span);
     }
-    let one = |sp| Expression::new(ExprKind::Number(NumberLiteral::Integer {
-        size: None, signed: true, base: NumberBase::Decimal,
-        value: "1".into(), cached_val: Cell::new(None),
-    }), sp);
+    let one = |sp| {
+        Expression::new(
+            ExprKind::Number(NumberLiteral::Integer {
+                size: None,
+                signed: true,
+                base: NumberBase::Decimal,
+                value: "1".into(),
+                cached_val: Cell::new(None),
+            }),
+            sp,
+        )
+    };
     let items: Vec<(Expression, Statement)> = alt
         .alts
         .iter()
@@ -1705,7 +2485,11 @@ fn expand_alt(prods: &ProdMap, alt: &RsAlt, depth: &mut u32, span: crate::ast::S
 }
 
 fn expand_seq(prods: &ProdMap, seq: &RsSeq, depth: &mut u32, span: crate::ast::Span) -> Statement {
-    let stmts: Vec<Statement> = seq.items.iter().map(|p| expand_prod(prods, p, depth, span)).collect();
+    let stmts: Vec<Statement> = seq
+        .items
+        .iter()
+        .map(|p| expand_prod(prods, p, depth, span))
+        .collect();
     Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
 }
 
@@ -1718,13 +2502,18 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
         RsProd::Ref(name, args) => {
             let body = expand_rs_ref(prods, name, depth, span);
             let params = prods.get(name).map(|(p, _)| p.clone()).unwrap_or_default();
-            if params.is_empty() && args.is_empty() { return body; }
+            if params.is_empty() && args.is_empty() {
+                return body;
+            }
             // Bind call args to fresh local variables inside a begin/end
             // wrapper so the production body sees them.
             let mut stmts: Vec<Statement> = Vec::new();
             for ((dt, pname), arg) in params.iter().zip(args.iter()) {
                 let declarator = VarDeclarator {
-                    name: crate::ast::Identifier { name: pname.clone(), span },
+                    name: crate::ast::Identifier {
+                        name: pname.clone(),
+                        span,
+                    },
                     dimensions: Vec::new(),
                     init: Some(arg.clone()),
                     span,
@@ -1744,27 +2533,33 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
         RsProd::If(cond, then_a, else_a) => {
             *depth += 1;
             let then_s = expand_alt(prods, then_a, depth, span);
-            let else_s = else_a.as_ref().map(|a| Box::new(expand_alt(prods, a, depth, span)));
+            let else_s = else_a
+                .as_ref()
+                .map(|a| Box::new(expand_alt(prods, a, depth, span)));
             *depth -= 1;
-            Statement::new(StatementKind::If {
-                unique_priority: None,
-                condition: cond.clone(),
-                then_stmt: Box::new(then_s),
-                else_stmt: else_s,
-            }, span)
+            Statement::new(
+                StatementKind::If {
+                    unique_priority: None,
+                    condition: cond.clone(),
+                    then_stmt: Box::new(then_s),
+                    else_stmt: else_s,
+                },
+                span,
+            )
         }
         RsProd::Case(head, items, default) => {
             *depth += 1;
-            let mut case_items: Vec<CaseItem> = items.iter().map(|(pats, alt)| {
-                CaseItem {
+            let mut case_items: Vec<CaseItem> = items
+                .iter()
+                .map(|(pats, alt)| CaseItem {
                     patterns: pats.clone(),
                     is_default: false,
                     stmt: expand_alt(prods, alt, depth, span),
                     span,
                     pattern: None,
                     guard: None,
-                }
-            }).collect();
+                })
+                .collect();
             if let Some(d) = default {
                 case_items.push(CaseItem {
                     patterns: Vec::new(),
@@ -1776,22 +2571,34 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
                 });
             }
             *depth -= 1;
-            Statement::new(StatementKind::Case {
-                unique_priority: None,
-                kind: CaseKind::Case,
-                expr: head.clone(),
-                items: case_items,
-            }, span)
+            Statement::new(
+                StatementKind::Case {
+                    unique_priority: None,
+                    kind: CaseKind::Case,
+                    expr: head.clone(),
+                    items: case_items,
+                },
+                span,
+            )
         }
         RsProd::Repeat(n, body) => {
             *depth += 1;
             let b = expand_alt(prods, body, depth, span);
             *depth -= 1;
-            Statement::new(StatementKind::Repeat { count: n.clone(), body: Box::new(b) }, span)
+            Statement::new(
+                StatementKind::Repeat {
+                    count: n.clone(),
+                    body: Box::new(b),
+                },
+                span,
+            )
         }
         RsProd::RandJoin(items) => {
             // Treat as sequential for now.
-            let stmts: Vec<Statement> = items.iter().map(|p| expand_prod(prods, p, depth, span)).collect();
+            let stmts: Vec<Statement> = items
+                .iter()
+                .map(|p| expand_prod(prods, p, depth, span))
+                .collect();
             Statement::new(StatementKind::SeqBlock { name: None, stmts }, span)
         }
         RsProd::Break => Statement::new(StatementKind::Break, span),
@@ -1799,7 +2606,12 @@ fn expand_prod(prods: &ProdMap, p: &RsProd, depth: &mut u32, span: crate::ast::S
     }
 }
 
-fn expand_rs_ref(prods: &ProdMap, name: &str, depth: &mut u32, span: crate::ast::Span) -> Statement {
+fn expand_rs_ref(
+    prods: &ProdMap,
+    name: &str,
+    depth: &mut u32,
+    span: crate::ast::Span,
+) -> Statement {
     if *depth > 64 {
         return Statement::new(StatementKind::Null, span);
     }

@@ -11,13 +11,13 @@
 //! checks don't suffer the scope ambiguity a token scan does (e.g. DPI/extern
 //! functions are distinct nodes, not open scopes).
 
-use std::collections::{HashMap, HashSet};
 use crate::ast::Description;
-use crate::ast::stmt::{Statement, StatementKind};
 use crate::ast::decl::{
-    ModuleItem, PackageItem, ClassItem, ClassMethodKind, ParameterKind, ParamConnection,
-    FunctionDeclaration, TaskDeclaration, FunctionPort, ParameterDeclaration,
+    ClassItem, ClassMethodKind, FunctionDeclaration, FunctionPort, ModuleItem, PackageItem,
+    ParamConnection, ParameterDeclaration, ParameterKind, TaskDeclaration,
 };
+use crate::ast::stmt::{Statement, StatementKind};
+use std::collections::{HashMap, HashSet};
 
 /// Run all enabled strict checks over one file's parsed descriptions. Returns
 /// human-readable violation messages (empty = clean). No-op when disabled.
@@ -34,7 +34,7 @@ pub fn strict_violations(descriptions: &[Description]) -> Vec<String> {
             Description::Package(p) => walk_package_items(&p.items, &mut out),
             Description::Class(c) => walk_class_items(&c.items, &mut out),
             Description::PackageItem(pi) => walk_package_item(pi, &mut out),
-            _ => { }
+            _ => {}
         }
     }
     // §6.20.2 / §23.10: a named parameter override must name an *overridable*
@@ -53,7 +53,9 @@ pub fn strict_violations(descriptions: &[Description]) -> Vec<String> {
 /// name -> set of overridable parameter names for every module in this file.
 /// "Overridable" excludes localparams (header `localparam` / body
 /// `localparam`); both header `#(...)` and body `parameter` decls are included.
-fn build_module_overridable_params(descriptions: &[Description]) -> HashMap<String, HashSet<String>> {
+fn build_module_overridable_params(
+    descriptions: &[Description],
+) -> HashMap<String, HashSet<String>> {
     let mut map = HashMap::new();
     for d in descriptions {
         if let Description::Module(m) = d {
@@ -78,10 +80,14 @@ fn add_overridable_param_names(pd: &ParameterDeclaration, out: &mut HashSet<Stri
     }
     match &pd.kind {
         ParameterKind::Data { assignments, .. } => {
-            for a in assignments { out.insert(a.name.name.clone()); }
+            for a in assignments {
+                out.insert(a.name.name.clone());
+            }
         }
         ParameterKind::Type { assignments } => {
-            for a in assignments { out.insert(a.name.name.clone()); }
+            for a in assignments {
+                out.insert(a.name.name.clone());
+            }
         }
     }
 }
@@ -94,7 +100,9 @@ fn check_param_overrides(
     for it in items {
         if let ModuleItem::ModuleInstantiation(inst) = it {
             // Only check when the target module is defined in this file.
-            let Some(params) = overridable.get(&inst.module_name.name) else { continue };
+            let Some(params) = overridable.get(&inst.module_name.name) else {
+                continue;
+            };
             if let Some(conns) = &inst.params {
                 for c in conns {
                     if let ParamConnection::Named { name, .. } = c {
@@ -166,12 +174,24 @@ fn walk_class_items(items: &[ClassItem], out: &mut Vec<String>) {
 }
 
 fn check_function(fd: &FunctionDeclaration, out: &mut Vec<String>) {
-    check_dup_ports("function", &fd.name.name.name, &fd.ports, &fd.strict_body_ports, out);
+    check_dup_ports(
+        "function",
+        &fd.name.name.name,
+        &fd.ports,
+        &fd.strict_body_ports,
+        out,
+    );
     check_decl_order_list(&fd.items, out);
 }
 
 fn check_task(td: &TaskDeclaration, out: &mut Vec<String>) {
-    check_dup_ports("task", &td.name.name.name, &td.ports, &td.strict_body_ports, out);
+    check_dup_ports(
+        "task",
+        &td.name.name.name,
+        &td.ports,
+        &td.strict_body_ports,
+        out,
+    );
     check_decl_order_list(&td.items, out);
 }
 
@@ -219,7 +239,11 @@ fn check_decl_order_stmt(st: &Statement, out: &mut Vec<String>) {
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
             check_decl_order_list(stmts, out)
         }
-        StatementKind::If { then_stmt, else_stmt, .. } => {
+        StatementKind::If {
+            then_stmt,
+            else_stmt,
+            ..
+        } => {
             check_decl_order_stmt(then_stmt, out);
             if let Some(e) = else_stmt {
                 check_decl_order_stmt(e, out);
@@ -253,10 +277,14 @@ fn check_dup_ports(
     out: &mut Vec<String>,
 ) {
     let mut seen: Vec<&str> = Vec::new();
-    let names = ports.iter().map(|p| p.name.name.as_str())
+    let names = ports
+        .iter()
+        .map(|p| p.name.name.as_str())
         .chain(body_ports.iter().map(|i| i.name.as_str()));
     for n in names {
-        if n.is_empty() { continue; }
+        if n.is_empty() {
+            continue;
+        }
         if seen.contains(&n) {
             out.push(format!("duplicate port '{}' in {} '{}'", n, kind, sub_name));
         } else {

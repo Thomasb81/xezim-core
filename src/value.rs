@@ -5784,9 +5784,10 @@ impl Value {
         for offset in (0..valid_width).step_by(64) {
             let count = (valid_width - offset).min(64);
             let (val_bits, xz_bits) = match &self.storage {
-                ValueStorage::Inline { val_bits, xz_bits } => {
-                    ((*val_bits >> (src_start + offset)), (*xz_bits >> (src_start + offset)))
-                }
+                ValueStorage::Inline { val_bits, xz_bits } => (
+                    (*val_bits >> (src_start + offset)),
+                    (*xz_bits >> (src_start + offset)),
+                ),
                 ValueStorage::Wide(bits) => bits.extract64(src_start + offset, count),
             };
             result.splice_bits64(dst_start + offset, val_bits, xz_bits, count);

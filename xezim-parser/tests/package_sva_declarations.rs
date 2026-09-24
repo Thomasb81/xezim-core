@@ -16,7 +16,11 @@ endpackage
 module m; endmodule
 "#;
     let result = parse(src);
-    assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
+    assert!(
+        result.errors.is_empty(),
+        "parse errors: {:?}",
+        result.errors
+    );
 }
 
 #[test]
@@ -33,5 +37,9 @@ endpackage
 module m; endmodule
 "#;
     let result = parse(src);
-    assert!(result.errors.is_empty(), "parse errors: {:?}", result.errors);
+    assert!(
+        result.errors.is_empty(),
+        "parse errors: {:?}",
+        result.errors
+    );
 }

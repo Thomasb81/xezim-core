@@ -6,7 +6,11 @@
 use sv_parser::parse;
 
 fn errors(src: &str) -> Vec<String> {
-    parse(src).errors.iter().map(|e| format!("{:?}", e)).collect()
+    parse(src)
+        .errors
+        .iter()
+        .map(|e| format!("{:?}", e))
+        .collect()
 }
 
 /// The reporter's shape: `not` wrapping a boolean property expression.

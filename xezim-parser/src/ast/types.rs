@@ -1,22 +1,50 @@
 //! SystemVerilog data types (IEEE 1800-2017 §6, §7)
 
-
 use super::{Identifier, Span, expr};
 
 /// Data type AST node.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum DataType {
-    IntegerVector { kind: IntegerVectorType, signing: Option<Signing>, dimensions: Vec<PackedDimension>, span: Span },
-    IntegerAtom { kind: IntegerAtomType, signing: Option<Signing>, span: Span },
-    Real { kind: RealType, span: Span },
-    Simple { kind: SimpleType, span: Span },
+    IntegerVector {
+        kind: IntegerVectorType,
+        signing: Option<Signing>,
+        dimensions: Vec<PackedDimension>,
+        span: Span,
+    },
+    IntegerAtom {
+        kind: IntegerAtomType,
+        signing: Option<Signing>,
+        span: Span,
+    },
+    Real {
+        kind: RealType,
+        span: Span,
+    },
+    Simple {
+        kind: SimpleType,
+        span: Span,
+    },
     Struct(StructUnionType),
     Enum(EnumType),
     Void(Span),
-    TypeReference { name: TypeName, dimensions: Vec<PackedDimension>, type_args: Vec<expr::Expression>, span: Span },
-    Interface { name: Identifier, modport: Option<Identifier>, type_args: Vec<expr::Expression>, span: Span },
-    Implicit { signing: Option<Signing>, dimensions: Vec<PackedDimension>, span: Span },
+    TypeReference {
+        name: TypeName,
+        dimensions: Vec<PackedDimension>,
+        type_args: Vec<expr::Expression>,
+        span: Span,
+    },
+    Interface {
+        name: Identifier,
+        modport: Option<Identifier>,
+        type_args: Vec<expr::Expression>,
+        span: Span,
+    },
+    Implicit {
+        signing: Option<Signing>,
+        dimensions: Vec<PackedDimension>,
+        span: Span,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -29,39 +57,78 @@ pub struct TypeName {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum IntegerVectorType { Bit, Logic, Reg }
+pub enum IntegerVectorType {
+    Bit,
+    Logic,
+    Reg,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum IntegerAtomType { Byte, ShortInt, Int, LongInt, Integer, Time }
+pub enum IntegerAtomType {
+    Byte,
+    ShortInt,
+    Int,
+    LongInt,
+    Integer,
+    Time,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum RealType { Real, ShortReal, RealTime }
+pub enum RealType {
+    Real,
+    ShortReal,
+    RealTime,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum SimpleType { String, Chandle, Event }
+pub enum SimpleType {
+    String,
+    Chandle,
+    Event,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Signing { Signed, Unsigned }
+pub enum Signing {
+    Signed,
+    Unsigned,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum PackedDimension {
-    Range { left: Box<expr::Expression>, right: Box<expr::Expression>, span: Span },
+    Range {
+        left: Box<expr::Expression>,
+        right: Box<expr::Expression>,
+        span: Span,
+    },
     Unsized(Span),
 }
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum UnpackedDimension {
-    Range { left: Box<expr::Expression>, right: Box<expr::Expression>, span: Span },
-    Expression { expr: Box<expr::Expression>, span: Span },
+    Range {
+        left: Box<expr::Expression>,
+        right: Box<expr::Expression>,
+        span: Span,
+    },
+    Expression {
+        expr: Box<expr::Expression>,
+        span: Span,
+    },
     Unsized(Span),
-    Queue { max_size: Option<Box<expr::Expression>>, span: Span },
-    Associative { data_type: Option<Box<DataType>>, span: Span },
+    Queue {
+        max_size: Option<Box<expr::Expression>>,
+        span: Span,
+    },
+    Associative {
+        data_type: Option<Box<DataType>>,
+        span: Span,
+    },
 }
 
 /// struct/union type
@@ -89,7 +156,10 @@ pub struct StructUnionType {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum StructUnionKind { Struct, Union }
+pub enum StructUnionKind {
+    Struct,
+    Union,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -102,7 +172,10 @@ pub struct StructMember {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum RandQualifier { Rand, Randc }
+pub enum RandQualifier {
+    Rand,
+    Randc,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
@@ -138,18 +211,40 @@ pub struct EnumMember {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum NetType { Wire, Tri, Wand, Wor, TriAnd, TriOr, Tri0, Tri1, Supply0, Supply1, TriReg, Uwire, Interconnect,
-                   /// Verilog-AMS `wreal` -- a net whose value is a real, not a
-                   /// vector of bits. Multiple drivers are SUMMED (see
-                   /// `ResolvedNetKind::RealSum`), which is the resolution the
-                   /// current-summing wrappers this simulator is pointed at rely
-                   /// on; the Verilog-AMS default leaves it tool-defined.
-                   Wreal }
+pub enum NetType {
+    Wire,
+    Tri,
+    Wand,
+    Wor,
+    TriAnd,
+    TriOr,
+    Tri0,
+    Tri1,
+    Supply0,
+    Supply1,
+    TriReg,
+    Uwire,
+    Interconnect,
+    /// Verilog-AMS `wreal` -- a net whose value is a real, not a
+    /// vector of bits. Multiple drivers are SUMMED (see
+    /// `ResolvedNetKind::RealSum`), which is the resolution the
+    /// current-summing wrappers this simulator is pointed at rely
+    /// on; the Verilog-AMS default leaves it tool-defined.
+    Wreal,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum Lifetime { Static, Automatic }
+pub enum Lifetime {
+    Static,
+    Automatic,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum PortDirection { Input, Output, Inout, Ref }
+pub enum PortDirection {
+    Input,
+    Output,
+    Inout,
+    Ref,
+}

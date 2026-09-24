@@ -1,12 +1,10 @@
 //! Abstract Syntax Tree definitions for SystemVerilog IEEE 1800-2017/2023.
 
-
-
-pub mod types;
-pub mod expr;
-pub mod stmt;
 pub mod decl;
+pub mod expr;
 pub mod module;
+pub mod stmt;
+pub mod types;
 
 /// A span of source text identified by byte offsets.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -17,8 +15,12 @@ pub struct Span {
 }
 
 impl Span {
-    pub fn new(start: usize, end: usize) -> Self { Self { start, end } }
-    pub fn dummy() -> Self { Self { start: 0, end: 0 } }
+    pub fn new(start: usize, end: usize) -> Self {
+        Self { start, end }
+    }
+    pub fn dummy() -> Self {
+        Self { start: 0, end: 0 }
+    }
 }
 
 /// Trait for AST nodes that have a source span.
@@ -78,5 +80,9 @@ pub enum Description {
     /// class's extern-constraint prototype can be filled in at elaboration
     /// (it used to be brace-skipped and discarded, so the constraints simply
     /// did not exist at solve time).
-    OutOfClassConstraint { class_name: String, constraint_name: String, items: Vec<crate::ast::decl::ConstraintItem> },
+    OutOfClassConstraint {
+        class_name: String,
+        constraint_name: String,
+        items: Vec<crate::ast::decl::ConstraintItem>,
+    },
 }

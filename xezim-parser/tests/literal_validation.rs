@@ -11,12 +11,18 @@ use sv_parser::parse;
 /// Parse `expr` as the RHS of a continuous assign and return whether the parse
 /// produced any error diagnostic.
 fn has_error(expr: &str) -> bool {
-    let src = format!("module t; real r; logic [31:0] a; initial begin r = 0.0; a = {}; end endmodule", expr);
+    let src = format!(
+        "module t; real r; logic [31:0] a; initial begin r = 0.0; a = {}; end endmodule",
+        expr
+    );
     !parse(&src).errors.is_empty()
 }
 
 fn stmt_has_error(stmt: &str) -> bool {
-    let src = format!("module t; real r; logic [31:0] a; initial begin {} end endmodule", stmt);
+    let src = format!(
+        "module t; real r; logic [31:0] a; initial begin {} end endmodule",
+        stmt
+    );
     !parse(&src).errors.is_empty()
 }
 
@@ -26,7 +32,10 @@ fn stmt_has_error(stmt: &str) -> bool {
 
 #[test]
 fn l1_real_missing_exponent_digits_errors() {
-    assert!(stmt_has_error("r = 1.0e+;"), "1.0e+ must error, not become 0");
+    assert!(
+        stmt_has_error("r = 1.0e+;"),
+        "1.0e+ must error, not become 0"
+    );
     assert!(stmt_has_error("r = 1.0e;"), "1.0e must error");
     assert!(stmt_has_error("r = 1.0e-;"), "1.0e- must error");
 }
@@ -110,7 +119,10 @@ fn string_warns(lit: &str) -> bool {
 
 #[test]
 fn l4_bad_hex_escape_errors() {
-    assert!(string_errors("\"a\\xGGb\""), "\\x with no hex digit must error");
+    assert!(
+        string_errors("\"a\\xGGb\""),
+        "\\x with no hex digit must error"
+    );
     assert!(string_errors("\"\\x\""), "\\x at end of string must error");
 }
 
@@ -119,11 +131,20 @@ fn l4_valid_escapes_ok() {
     assert!(!string_errors("\"\\x41\""), "\\x41 must parse");
     assert!(!string_errors("\"\\101\""), "\\101 (octal) must parse");
     assert!(!string_errors("\"a\\nb\""), "\\n must parse");
-    assert!(!string_errors("\"a\\tb\\\\c\\\"d\""), "\\t \\\\ \\\" must parse");
+    assert!(
+        !string_errors("\"a\\tb\\\\c\\\"d\""),
+        "\\t \\\\ \\\" must parse"
+    );
 }
 
 #[test]
 fn l4_unknown_escape_warns_not_errors() {
-    assert!(!string_errors("\"a\\qb\""), "unknown escape must not be a hard error");
-    assert!(string_warns("\"a\\qb\""), "unknown escape must warn (not silently mangle)");
+    assert!(
+        !string_errors("\"a\\qb\""),
+        "unknown escape must not be a hard error"
+    );
+    assert!(
+        string_warns("\"a\\qb\""),
+        "unknown escape must warn (not silently mangle)"
+    );
 }

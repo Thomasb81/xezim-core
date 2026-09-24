@@ -1,14 +1,16 @@
 //! Module, interface, program, and package declarations.
 
-
-use super::{Identifier, AttributeInstance, Span};
+use super::decl::*;
 use super::expr::Expression;
 use super::types::*;
-use super::decl::*;
+use super::{AttributeInstance, Identifier, Span};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
-pub enum ModuleKind { Module, Macromodule }
+pub enum ModuleKind {
+    Module,
+    Macromodule,
+}
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

@@ -25,4 +25,4 @@
 // `crate::serde::Serialize` instead of depending on the external name.
 // (Outside this crate, users should depend on `serde` directly.)
 #[cfg(feature = "serde")]
-pub use ::serde::{Serialize, Deserialize};
+pub use ::serde::{Deserialize, Serialize};

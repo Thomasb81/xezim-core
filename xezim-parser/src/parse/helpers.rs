@@ -2,8 +2,8 @@
 
 use super::Parser;
 use crate::ast::{Identifier, Span};
-use crate::lexer::token::{Token, TokenKind};
 use crate::diagnostics::Diagnostic;
+use crate::lexer::token::{Token, TokenKind};
 
 impl Parser {
     pub(super) fn current(&self) -> &Token {
@@ -15,12 +15,18 @@ impl Parser {
     }
 
     pub(super) fn peek_kind(&self) -> TokenKind {
-        self.tokens.get(self.pos + 1).map(|t| t.kind).unwrap_or(TokenKind::Eof)
+        self.tokens
+            .get(self.pos + 1)
+            .map(|t| t.kind)
+            .unwrap_or(TokenKind::Eof)
     }
 
     #[allow(dead_code)]
     pub(super) fn peek_kind_n(&self, n: usize) -> TokenKind {
-        self.tokens.get(self.pos + n).map(|t| t.kind).unwrap_or(TokenKind::Eof)
+        self.tokens
+            .get(self.pos + n)
+            .map(|t| t.kind)
+            .unwrap_or(TokenKind::Eof)
     }
 
     pub(super) fn at(&self, kind: TokenKind) -> bool {
@@ -33,7 +39,9 @@ impl Parser {
 
     pub(super) fn bump(&mut self) -> Token {
         let tok = self.tokens[self.pos.min(self.tokens.len() - 1)].clone();
-        if self.pos < self.tokens.len() { self.pos += 1; }
+        if self.pos < self.tokens.len() {
+            self.pos += 1;
+        }
         tok
     }
 
@@ -51,13 +59,19 @@ impl Parser {
     }
 
     pub(super) fn eat(&mut self, kind: TokenKind) -> Option<Token> {
-        if self.at(kind) { Some(self.bump()) } else { None }
+        if self.at(kind) {
+            Some(self.bump())
+        } else {
+            None
+        }
     }
 
     pub(super) fn span_from(&self, start: usize) -> Span {
         let end = if self.pos > 0 {
             self.tokens[self.pos - 1].span.end
-        } else { start };
+        } else {
+            start
+        };
         Span::new(start, end)
     }
 
@@ -71,7 +85,9 @@ impl Parser {
         while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
             self.bump();
         }
-        if self.at(TokenKind::Semicolon) { self.bump(); }
+        if self.at(TokenKind::Semicolon) {
+            self.bump();
+        }
     }
 
     pub(super) fn parse_identifier(&mut self) -> Identifier {
@@ -83,15 +99,27 @@ impl Parser {
                 // same identifier as the nonescaped spelling (`cpu3`). Strip the
                 // leading backslash so both forms resolve to one symbol.
                 let name = tok.text.strip_prefix('\\').unwrap_or(&tok.text).to_string();
-                Identifier { name, span: tok.span }
+                Identifier {
+                    name,
+                    span: tok.span,
+                }
             }
             TokenKind::Identifier => {
                 self.bump();
-                Identifier { name: tok.text, span: tok.span }
+                Identifier {
+                    name: tok.text,
+                    span: tok.span,
+                }
             }
             _ => {
-                self.error(format!("expected identifier, found {:?} '{}'", tok.kind, tok.text));
-                Identifier { name: String::from("<e>"), span: tok.span }
+                self.error(format!(
+                    "expected identifier, found {:?} '{}'",
+                    tok.kind, tok.text
+                ));
+                Identifier {
+                    name: String::from("<e>"),
+                    span: tok.span,
+                }
             }
         }
     }
@@ -100,7 +128,10 @@ impl Parser {
         if self.eat(TokenKind::Colon).is_some() {
             let id = if self.at(TokenKind::KwNew) {
                 let tok = self.bump();
-                Identifier { name: tok.text, span: tok.span }
+                Identifier {
+                    name: tok.text,
+                    span: tok.span,
+                }
             } else {
                 self.parse_identifier()
             };
@@ -110,7 +141,9 @@ impl Parser {
             // loop doesn't trip on the lone semicolon.
             let _ = self.eat(TokenKind::Semicolon);
             Some(id)
-        } else { None }
+        } else {
+            None
+        }
     }
 
     /// IEEE 1800-2023 §8.20.5: optional `:final` / `:extends` / `:initial`
@@ -121,8 +154,12 @@ impl Parser {
         &mut self,
     ) -> Option<crate::ast::decl::MethodSpecifier> {
         use crate::ast::decl::MethodSpecifier;
-        if !crate::is_sv2023() { return None; }
-        if !self.at(TokenKind::Colon) { return None; }
+        if !crate::is_sv2023() {
+            return None;
+        }
+        if !self.at(TokenKind::Colon) {
+            return None;
+        }
         let next = self.peek_kind();
         let spec = match next {
             TokenKind::KwFinal => MethodSpecifier::Final,
@@ -176,7 +213,9 @@ impl Parser {
     /// Check if the current identifier is followed by #(...) :: or just ::
     /// which indicates a class scope (expression) rather than a type declaration.
     pub(super) fn peek_is_class_scope(&self) -> bool {
-        if !self.at(TokenKind::Identifier) { return false; }
+        if !self.at(TokenKind::Identifier) {
+            return false;
+        }
         let mut p = self.pos + 1;
         if let Some(t) = self.tokens.get(p) {
             if t.kind == TokenKind::DoubleColon {
@@ -191,7 +230,10 @@ impl Parser {
                             // declaration (`pkg::Type #(...) var`), `::` means a
                             // scoped access (`pkg::Cls#(...)::member`).
                             if t3.kind == TokenKind::Hash
-                                && self.tokens.get(p + 1).is_some_and(|t| t.kind == TokenKind::LParen)
+                                && self
+                                    .tokens
+                                    .get(p + 1)
+                                    .is_some_and(|t| t.kind == TokenKind::LParen)
                             {
                                 let mut q = p + 2;
                                 let mut depth = 1;
@@ -221,8 +263,11 @@ impl Parser {
                         p += 1;
                         let mut depth = 1;
                         while depth > 0 && p < self.tokens.len() {
-                            if self.tokens[p].kind == TokenKind::LParen { depth += 1; }
-                            else if self.tokens[p].kind == TokenKind::RParen { depth -= 1; }
+                            if self.tokens[p].kind == TokenKind::LParen {
+                                depth += 1;
+                            } else if self.tokens[p].kind == TokenKind::RParen {
+                                depth -= 1;
+                            }
                             p += 1;
                         }
                         if let Some(t3) = self.tokens.get(p) {

@@ -31989,25 +31989,25 @@ fn rewrite_expr_impl(
                 _ => (clock.clone(), *edge),
             };
             ExprKind::SvaClocked {
-            clock: Box::new(clock),
-            edge,
-            iff: iff.as_ref().map(|g| {
-                Box::new(rewrite_expr_impl(
-                    g,
+                clock: Box::new(clock),
+                edge,
+                iff: iff.as_ref().map(|g| {
+                    Box::new(rewrite_expr_impl(
+                        g,
+                        prefix,
+                        port_map,
+                        local_names,
+                        interface_map,
+                    ))
+                }),
+                body: Box::new(rewrite_expr_impl(
+                    body,
                     prefix,
                     port_map,
                     local_names,
                     interface_map,
-                ))
-            }),
-            body: Box::new(rewrite_expr_impl(
-                body,
-                prefix,
-                port_map,
-                local_names,
-                interface_map,
-            )),
-        }
+                )),
+            }
         }
         // §10.9.2: an assignment pattern is an EXPRESSION, and its items name
         // parameters and signals of the module it was written in. Falling

@@ -12,9 +12,9 @@
 //!   -D <name=val>   Define preprocessor macro
 //!   --help          Show this help
 
-use sv_parser::*;
-use sv_parser::diagnostics::format_diagnostic;
 use std::process;
+use sv_parser::diagnostics::format_diagnostic;
+use sv_parser::*;
 
 fn main() {
     let args: Vec<String> = std::env::args().collect();
@@ -88,7 +88,10 @@ fn main() {
     }
 
     let inc_refs: Vec<&str> = include_dirs.iter().map(|s| s.as_str()).collect();
-    let def_refs: Vec<(&str, &str)> = defines.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let def_refs: Vec<(&str, &str)> = defines
+        .iter()
+        .map(|(k, v)| (k.as_str(), v.as_str()))
+        .collect();
 
     let mut total_errors = 0;
     let mut total_warnings = 0;
@@ -98,25 +101,42 @@ fn main() {
         if dump_tokens {
             let content = match std::fs::read_to_string(file) {
                 Ok(c) => c,
-                Err(e) => { eprintln!("Error: {}: {}", file, e); total_errors += 1; continue; }
+                Err(e) => {
+                    eprintln!("Error: {}: {}", file, e);
+                    total_errors += 1;
+                    continue;
+                }
             };
             let tokens = tokenize(&content);
             for tok in &tokens {
-                println!("{:?} {:?} @ {}..{}", tok.kind, tok.text, tok.span.start, tok.span.end);
+                println!(
+                    "{:?} {:?} @ {}..{}",
+                    tok.kind, tok.text, tok.span.start, tok.span.end
+                );
             }
             continue;
         }
 
         let result = match parse_file(file, &inc_refs, &def_refs) {
             Ok(r) => r,
-            Err(e) => { eprintln!("Error: {}", e); total_errors += 1; continue; }
+            Err(e) => {
+                eprintln!("Error: {}", e);
+                total_errors += 1;
+                continue;
+            }
         };
 
         for err in &result.errors {
-            eprintln!("{}", format_diagnostic(&result.source_text, err).replace("<source>", file));
+            eprintln!(
+                "{}",
+                format_diagnostic(&result.source_text, err).replace("<source>", file)
+            );
         }
         for warn in &result.warnings {
-            eprintln!("{}", format_diagnostic(&result.source_text, warn).replace("<source>", file));
+            eprintln!(
+                "{}",
+                format_diagnostic(&result.source_text, warn).replace("<source>", file)
+            );
         }
 
         total_errors += result.errors.len();
@@ -138,7 +158,10 @@ fn main() {
             });
             // JSONL: one object per file, single line — ready for
             // line-buffered consumers (xevdb's sv.py reads one per file).
-            println!("{}", serde_json::to_string(&envelope).expect("ast serialization"));
+            println!(
+                "{}",
+                serde_json::to_string(&envelope).expect("ast serialization")
+            );
         }
 
         #[cfg(not(feature = "json-cli"))]
@@ -150,7 +173,10 @@ fn main() {
 
     eprintln!(
         "Parsed {} file(s): {} module(s), {} error(s), {} warning(s)",
-        files.len(), total_modules, total_errors, total_warnings,
+        files.len(),
+        total_modules,
+        total_errors,
+        total_warnings,
     );
 
     if total_errors > 0 {

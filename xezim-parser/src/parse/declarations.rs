@@ -1,21 +1,29 @@
 //! Declaration parsing (IEEE 1800-2017 §A.2)
 
 use super::Parser;
-use crate::ast::decl::*;
-use crate::ast::types::*;
-use crate::ast::stmt::VarDeclarator;
 use crate::ast::Identifier;
+use crate::ast::decl::*;
+use crate::ast::stmt::VarDeclarator;
+use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
 impl Parser {
     pub(super) fn parse_parameter_port_list(&mut self) -> Vec<ParameterDeclaration> {
         let mut params = Vec::new();
-        if self.eat(TokenKind::Hash).is_none() { return params; }
-        if self.eat(TokenKind::LParen).is_none() { return params; }
+        if self.eat(TokenKind::Hash).is_none() {
+            return params;
+        }
+        if self.eat(TokenKind::LParen).is_none() {
+            return params;
+        }
         loop {
-            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
+            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
+                break;
+            }
             params.push(self.parse_parameter_declaration());
-            if self.eat(TokenKind::Comma).is_none() { break; }
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
         }
         self.expect(TokenKind::RParen);
         params
@@ -24,8 +32,14 @@ impl Parser {
     pub(super) fn parse_parameter_declaration(&mut self) -> ParameterDeclaration {
         let start = self.current().span.start;
         let local = match self.current_kind() {
-            TokenKind::KwParameter => { self.bump(); false }
-            TokenKind::KwLocalparam => { self.bump(); true }
+            TokenKind::KwParameter => {
+                self.bump();
+                false
+            }
+            TokenKind::KwLocalparam => {
+                self.bump();
+                true
+            }
             _ => false,
         };
         if self.at(TokenKind::KwType) {
@@ -46,8 +60,15 @@ impl Parser {
                 };
                 let init = if self.eat(TokenKind::Assign).is_some() {
                     Some(self.parse_data_type())
-                } else { None };
-                assignments.push(TypeParamAssignment { name, extends, init, span: self.span_from(astart) });
+                } else {
+                    None
+                };
+                assignments.push(TypeParamAssignment {
+                    name,
+                    extends,
+                    init,
+                    span: self.span_from(astart),
+                });
                 // A comma followed by a new parameter/localparam/type keyword
                 // OR a data-type keyword ends this `type` declaration — e.g.
                 // `#(type TYPE = int, string FIELD = "x")` (UVM uvm_utils): the
@@ -55,22 +76,42 @@ impl Parser {
                 // assignment. A comma followed by a bare identifier stays a
                 // type-assignment continuation (`type A = int, B = bit`).
                 if self.at(TokenKind::Comma)
-                    && !matches!(self.peek_kind(),
-                        TokenKind::KwParameter | TokenKind::KwLocalparam | TokenKind::KwType
-                        | TokenKind::KwBit | TokenKind::KwLogic | TokenKind::KwReg
-                        | TokenKind::KwByte | TokenKind::KwShortint | TokenKind::KwInt
-                        | TokenKind::KwLongint | TokenKind::KwInteger | TokenKind::KwTime
-                        | TokenKind::KwReal | TokenKind::KwShortreal | TokenKind::KwRealtime
-                        | TokenKind::KwString | TokenKind::KwChandle | TokenKind::KwEvent
-                        | TokenKind::KwVoid | TokenKind::KwStruct | TokenKind::KwUnion
-                        | TokenKind::KwEnum)
+                    && !matches!(
+                        self.peek_kind(),
+                        TokenKind::KwParameter
+                            | TokenKind::KwLocalparam
+                            | TokenKind::KwType
+                            | TokenKind::KwBit
+                            | TokenKind::KwLogic
+                            | TokenKind::KwReg
+                            | TokenKind::KwByte
+                            | TokenKind::KwShortint
+                            | TokenKind::KwInt
+                            | TokenKind::KwLongint
+                            | TokenKind::KwInteger
+                            | TokenKind::KwTime
+                            | TokenKind::KwReal
+                            | TokenKind::KwShortreal
+                            | TokenKind::KwRealtime
+                            | TokenKind::KwString
+                            | TokenKind::KwChandle
+                            | TokenKind::KwEvent
+                            | TokenKind::KwVoid
+                            | TokenKind::KwStruct
+                            | TokenKind::KwUnion
+                            | TokenKind::KwEnum
+                    )
                 {
                     self.bump();
                 } else {
                     break;
                 }
             }
-            return ParameterDeclaration { local, kind: ParameterKind::Type { assignments }, span: self.span_from(start) };
+            return ParameterDeclaration {
+                local,
+                kind: ParameterKind::Type { assignments },
+                span: self.span_from(start),
+            };
         }
         // Check if there's an explicit data type keyword or just an implicit type
         // "parameter integer X = ..." has explicit type
@@ -83,10 +124,18 @@ impl Parser {
         } else if self.at(TokenKind::LBracket) {
             // Implicit type with packed dimensions
             let dimensions = self.parse_packed_dimensions();
-            DataType::Implicit { signing: None, dimensions, span: self.span_from(start) }
+            DataType::Implicit {
+                signing: None,
+                dimensions,
+                span: self.span_from(start),
+            }
         } else {
             // No explicit type - implicit
-            DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+            DataType::Implicit {
+                signing: None,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+            }
         };
         let mut assignments = Vec::new();
         loop {
@@ -95,8 +144,15 @@ impl Parser {
             let dimensions = self.parse_unpacked_dimensions();
             let init = if self.eat(TokenKind::Assign).is_some() {
                 Some(self.parse_expression())
-            } else { None };
-            assignments.push(ParamAssignment { name, dimensions, init, span: self.span_from(astart) });
+            } else {
+                None
+            };
+            assignments.push(ParamAssignment {
+                name,
+                dimensions,
+                init,
+                span: self.span_from(astart),
+            });
             // Don't consume comma if next token after comma starts a NEW
             // parameter declaration rather than another same-type assignment:
             //  - `parameter`/`localparam` keyword, or
@@ -105,16 +161,31 @@ impl Parser {
             //    because B is a bare identifier, handled by the default path).
             if self.at(TokenKind::Comma) {
                 let next = self.peek_kind();
-                if next == TokenKind::KwParameter || next == TokenKind::KwLocalparam
+                if next == TokenKind::KwParameter
+                    || next == TokenKind::KwLocalparam
                     || next == TokenKind::KwType
-                    || matches!(next,
-                        TokenKind::KwBit | TokenKind::KwLogic | TokenKind::KwReg |
-                        TokenKind::KwByte | TokenKind::KwShortint | TokenKind::KwInt |
-                        TokenKind::KwLongint | TokenKind::KwInteger | TokenKind::KwTime |
-                        TokenKind::KwReal | TokenKind::KwShortreal | TokenKind::KwRealtime |
-                        TokenKind::KwString | TokenKind::KwChandle | TokenKind::KwEvent |
-                        TokenKind::KwVoid | TokenKind::KwStruct | TokenKind::KwUnion |
-                        TokenKind::KwEnum)
+                    || matches!(
+                        next,
+                        TokenKind::KwBit
+                            | TokenKind::KwLogic
+                            | TokenKind::KwReg
+                            | TokenKind::KwByte
+                            | TokenKind::KwShortint
+                            | TokenKind::KwInt
+                            | TokenKind::KwLongint
+                            | TokenKind::KwInteger
+                            | TokenKind::KwTime
+                            | TokenKind::KwReal
+                            | TokenKind::KwShortreal
+                            | TokenKind::KwRealtime
+                            | TokenKind::KwString
+                            | TokenKind::KwChandle
+                            | TokenKind::KwEvent
+                            | TokenKind::KwVoid
+                            | TokenKind::KwStruct
+                            | TokenKind::KwUnion
+                            | TokenKind::KwEnum
+                    )
                 {
                     break;
                 }
@@ -125,7 +196,9 @@ impl Parser {
                 if matches!(next, TokenKind::Identifier | TokenKind::EscapedIdentifier)
                     && matches!(
                         self.peek_kind_n(2),
-                        TokenKind::Identifier | TokenKind::EscapedIdentifier | TokenKind::DoubleColon
+                        TokenKind::Identifier
+                            | TokenKind::EscapedIdentifier
+                            | TokenKind::DoubleColon
                     )
                 {
                     break;
@@ -135,15 +208,28 @@ impl Parser {
                 break;
             }
         }
-        ParameterDeclaration { local, kind: ParameterKind::Data { data_type, assignments }, span: self.span_from(start) }
+        ParameterDeclaration {
+            local,
+            kind: ParameterKind::Data {
+                data_type,
+                assignments,
+            },
+            span: self.span_from(start),
+        }
     }
 
     fn looks_like_parameter_type_reference(&self) -> bool {
-        matches!(self.current_kind(), TokenKind::Identifier | TokenKind::EscapedIdentifier) &&
-            matches!(
-                self.peek_kind(),
-                TokenKind::Identifier | TokenKind::EscapedIdentifier | TokenKind::DoubleColon | TokenKind::Hash | TokenKind::LBracket
-            )
+        matches!(
+            self.current_kind(),
+            TokenKind::Identifier | TokenKind::EscapedIdentifier
+        ) && matches!(
+            self.peek_kind(),
+            TokenKind::Identifier
+                | TokenKind::EscapedIdentifier
+                | TokenKind::DoubleColon
+                | TokenKind::Hash
+                | TokenKind::LBracket
+        )
     }
 
     pub(super) fn parse_parameter_decl_stmt(&mut self) -> ParameterDeclaration {
@@ -197,12 +283,15 @@ impl Parser {
         // IEEE 1800-2017 §6.18: bare forward type declaration `typedef name;`
         // (no type body) — promises a later full typedef. Multiple are legal.
         if (self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier))
-            && self.peek_kind() == TokenKind::Semicolon {
+            && self.peek_kind() == TokenKind::Semicolon
+        {
             let name = self.parse_identifier();
             self.expect(TokenKind::Semicolon);
             return TypedefDeclaration {
                 data_type: DataType::Void(self.span_from(start)),
-                name, dimensions: Vec::new(), span: self.span_from(start),
+                name,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
                 forward: true,
             };
         }
@@ -210,7 +299,13 @@ impl Parser {
         let name = self.parse_identifier();
         let dimensions = self.parse_unpacked_dimensions();
         self.expect(TokenKind::Semicolon);
-        TypedefDeclaration { data_type, name, dimensions, span: self.span_from(start), forward: false }
+        TypedefDeclaration {
+            data_type,
+            name,
+            dimensions,
+            span: self.span_from(start),
+            forward: false,
+        }
     }
 
     pub(super) fn parse_import_declaration(&mut self) -> ImportDeclaration {
@@ -221,13 +316,25 @@ impl Parser {
             let item_start = self.current().span.start;
             let package = self.parse_identifier();
             self.expect(TokenKind::DoubleColon);
-            let item = if self.eat(TokenKind::Star).is_some() { None }
-            else { Some(self.parse_identifier()) };
-            items.push(ImportItem { package, item, span: self.span_from(item_start) });
-            if self.eat(TokenKind::Comma).is_none() { break; }
+            let item = if self.eat(TokenKind::Star).is_some() {
+                None
+            } else {
+                Some(self.parse_identifier())
+            };
+            items.push(ImportItem {
+                package,
+                item,
+                span: self.span_from(item_start),
+            });
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
         }
         self.expect(TokenKind::Semicolon);
-        ImportDeclaration { items, span: self.span_from(start) }
+        ImportDeclaration {
+            items,
+            span: self.span_from(start),
+        }
     }
 
     pub(super) fn parse_dpi_import(&mut self) -> DPIImport {
@@ -235,8 +342,14 @@ impl Parser {
         self.expect(TokenKind::KwImport);
         self.expect(TokenKind::StringLiteral); // "DPI-C" etc
         let property = match self.current_kind() {
-            TokenKind::KwContext => { self.bump(); Some(DPIProperty::Context) }
-            TokenKind::KwPure => { self.bump(); Some(DPIProperty::Pure) }
+            TokenKind::KwContext => {
+                self.bump();
+                Some(DPIProperty::Context)
+            }
+            TokenKind::KwPure => {
+                self.bump();
+                Some(DPIProperty::Pure)
+            }
             _ => None,
         };
         // optional [c_identifier =]
@@ -250,7 +363,12 @@ impl Parser {
         } else {
             DPIProto::Task(self.parse_task_prototype())
         };
-        DPIImport { property, c_name, proto, span: self.span_from(start) }
+        DPIImport {
+            property,
+            c_name,
+            proto,
+            span: self.span_from(start),
+        }
     }
 
     pub(super) fn parse_dpi_export(&mut self) -> DPIExport {
@@ -267,7 +385,11 @@ impl Parser {
         } else {
             DPIProto::Task(self.parse_task_prototype())
         };
-        DPIExport { c_name, proto, span: self.span_from(start) }
+        DPIExport {
+            c_name,
+            proto,
+            span: self.span_from(start),
+        }
     }
 
     pub(super) fn parse_timeunits_declaration(&mut self) -> TimeunitsDeclaration {
@@ -283,7 +405,11 @@ impl Parser {
             precision = Some(self.bump().text.clone());
         }
         self.expect(TokenKind::Semicolon);
-        TimeunitsDeclaration { unit, precision, span: self.span_from(start) }
+        TimeunitsDeclaration {
+            unit,
+            precision,
+            span: self.span_from(start),
+        }
     }
 
     pub(super) fn parse_data_declaration(&mut self) -> DataDeclaration {
@@ -293,15 +419,30 @@ impl Parser {
         let lifetime = self.parse_optional_lifetime();
         // §6.8: `var name;` — the `var` keyword with no explicit type means the
         // identifier is the declarator (implicit `logic`), not a type name.
-        let data_type = if var_kw && self.at(TokenKind::Identifier)
-            && matches!(self.peek_kind(), TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign) {
-            DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+        let data_type = if var_kw
+            && self.at(TokenKind::Identifier)
+            && matches!(
+                self.peek_kind(),
+                TokenKind::Semicolon | TokenKind::Comma | TokenKind::Assign
+            ) {
+            DataType::Implicit {
+                signing: None,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+            }
         } else {
             self.parse_data_type()
         };
         let declarators = self.parse_var_declarator_list();
         self.expect(TokenKind::Semicolon);
-        DataDeclaration { const_kw, var_kw, lifetime, data_type, declarators, span: self.span_from(start) }
+        DataDeclaration {
+            const_kw,
+            var_kw,
+            lifetime,
+            data_type,
+            declarators,
+            span: self.span_from(start),
+        }
     }
 
     pub(super) fn parse_var_declarator_list(&mut self) -> Vec<VarDeclarator> {
@@ -312,9 +453,18 @@ impl Parser {
             let dimensions = self.parse_unpacked_dimensions();
             let init = if self.eat(TokenKind::Assign).is_some() {
                 Some(self.parse_expression())
-            } else { None };
-            decls.push(VarDeclarator { name, dimensions, init, span: self.span_from(start) });
-            if self.eat(TokenKind::Comma).is_none() { break; }
+            } else {
+                None
+            };
+            decls.push(VarDeclarator {
+                name,
+                dimensions,
+                init,
+                span: self.span_from(start),
+            });
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
         }
         decls
     }
@@ -329,26 +479,35 @@ impl Parser {
         // virtual-interface type (`function automatic virtual bus_if #(4).drv
         // get(...)`) — a virtual METHOD's keyword sits BEFORE `function` and
         // was consumed above.
-        let return_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid)
-            || self.at(TokenKind::KwVirtual) ||
-                            (self.at(TokenKind::Identifier) && (
-                                self.peek_kind() == TokenKind::Identifier ||
+        let return_type = if self.is_data_type_keyword()
+            || self.at(TokenKind::KwVoid)
+            || self.at(TokenKind::KwVirtual)
+            || (self.at(TokenKind::Identifier)
+                && (self.peek_kind() == TokenKind::Identifier ||
                                 (self.peek_kind() == TokenKind::DoubleColon
                                     && self.peek_kind_n(2) != TokenKind::KwNew
                                     && !self.scoped_name_is_the_method_name()) ||
                                 self.peek_kind() == TokenKind::Hash ||
                                 // `function automatic typedef_t [7:0] name(...)` — packed
                                 // dimension on a typedef-named return type.
-                                self.peek_kind() == TokenKind::LBracket
-                            )) {
+                                self.peek_kind() == TokenKind::LBracket))
+        {
             self.parse_data_type()
         } else if self.at(TokenKind::LBracket) {
             // `function automatic [PtrW-1:0] name(...)` — implicit type
             // (just packed dimensions, no leading type name).
             let dims = self.parse_packed_dimensions();
-            DataType::Implicit { signing: None, dimensions: dims, span: self.span_from(start) }
+            DataType::Implicit {
+                signing: None,
+                dimensions: dims,
+                span: self.span_from(start),
+            }
         } else {
-            DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+            DataType::Implicit {
+                signing: None,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+            }
         };
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
@@ -357,8 +516,10 @@ impl Parser {
         let mut items = Vec::new();
         let mut strict_body_ports = Vec::new();
         while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
-            if matches!(self.current_kind(),
-                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef) {
+            if matches!(
+                self.current_kind(),
+                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
+            ) {
                 // §13.4.2 non-ANSI body ports fill `ports` for arg binding
                 // (ANSI functions already have a non-empty `ports` here).
                 self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
@@ -369,7 +530,17 @@ impl Parser {
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
-        FunctionDeclaration { lifetime, specifier, return_type, name, ports, items, endlabel, strict_body_ports, span: self.span_from(start) }
+        FunctionDeclaration {
+            lifetime,
+            specifier,
+            return_type,
+            name,
+            ports,
+            items,
+            endlabel,
+            strict_body_ports,
+            span: self.span_from(start),
+        }
     }
 
     /// Consume a non-ANSI task/function body port declaration
@@ -382,19 +553,32 @@ impl Parser {
         let mut bdepth = 0i32;
         while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
             match self.current_kind() {
-                TokenKind::LBracket => { bdepth += 1; self.bump(); }
-                TokenKind::RBracket => { bdepth -= 1; self.bump(); }
+                TokenKind::LBracket => {
+                    bdepth += 1;
+                    self.bump();
+                }
+                TokenKind::RBracket => {
+                    bdepth -= 1;
+                    self.bump();
+                }
                 TokenKind::Identifier | TokenKind::EscapedIdentifier if bdepth == 0 => {
                     // A declared name is an identifier at bracket-depth 0
                     // immediately followed by a declarator terminator.
-                    if matches!(self.peek_kind(),
-                        TokenKind::Comma | TokenKind::Semicolon | TokenKind::Assign) {
+                    if matches!(
+                        self.peek_kind(),
+                        TokenKind::Comma | TokenKind::Semicolon | TokenKind::Assign
+                    ) {
                         let tok = self.current();
-                        out.push(Identifier { name: tok.text.clone(), span: tok.span });
+                        out.push(Identifier {
+                            name: tok.text.clone(),
+                            span: tok.span,
+                        });
                     }
                     self.bump();
                 }
-                _ => { self.bump(); }
+                _ => {
+                    self.bump();
+                }
             }
         }
         self.eat(TokenKind::Semicolon);
@@ -413,20 +597,33 @@ impl Parser {
         _strict: &mut Vec<Identifier>,
     ) {
         let start = self.current().span.start;
-        let direction = self.parse_optional_direction().unwrap_or(PortDirection::Input);
+        let direction = self
+            .parse_optional_direction()
+            .unwrap_or(PortDirection::Input);
         let var_kw = self.eat(TokenKind::KwVar).is_some();
         // Optional shared data type (implicit 1-bit when omitted, e.g. `input x;`).
         let data_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) {
             self.parse_data_type()
         } else if self.at(TokenKind::Identifier)
-            && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon)
+            && matches!(
+                self.peek_kind(),
+                TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon
+            )
         {
             self.parse_data_type()
         } else if self.at(TokenKind::LBracket) {
             let dims = self.parse_packed_dimensions();
-            DataType::Implicit { signing: None, dimensions: dims, span: self.span_from(start) }
+            DataType::Implicit {
+                signing: None,
+                dimensions: dims,
+                span: self.span_from(start),
+            }
         } else {
-            DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+            DataType::Implicit {
+                signing: None,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+            }
         };
         // One or more declarators sharing that direction+type.
         loop {
@@ -469,8 +666,10 @@ impl Parser {
         let mut items = Vec::new();
         let mut strict_body_ports = Vec::new();
         while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
-            if matches!(self.current_kind(),
-                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef) {
+            if matches!(
+                self.current_kind(),
+                TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
+            ) {
                 self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
             } else {
                 items.push(self.parse_statement());
@@ -479,7 +678,16 @@ impl Parser {
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
         Self::merge_nonansi_port_types(&mut ports, &mut items);
-        TaskDeclaration { lifetime, specifier, name, ports, items, endlabel, strict_body_ports, span: self.span_from(start) }
+        TaskDeclaration {
+            lifetime,
+            specifier,
+            name,
+            ports,
+            items,
+            endlabel,
+            strict_body_ports,
+            span: self.span_from(start),
+        }
     }
 
     /// §13.3: the non-ANSI style may declare a port's DIRECTION and its DATA
@@ -495,7 +703,11 @@ impl Parser {
     ) {
         use super::super::ast::stmt::StatementKind;
         items.retain(|it| {
-            let StatementKind::VarDecl { data_type, lifetime: None, declarators } = &it.kind
+            let StatementKind::VarDecl {
+                data_type,
+                lifetime: None,
+                declarators,
+            } = &it.kind
             else {
                 return true;
             };
@@ -543,7 +755,10 @@ impl Parser {
         let start = self.current().span.start;
         let first = if self.at(TokenKind::KwNew) {
             let tok = self.bump();
-            Identifier { name: tok.text.clone(), span: tok.span }
+            Identifier {
+                name: tok.text.clone(),
+                span: tok.span,
+            }
         } else {
             self.parse_identifier()
         };
@@ -552,13 +767,24 @@ impl Parser {
             self.bump();
             let second = if self.at(TokenKind::KwNew) {
                 let tok = self.bump();
-                Identifier { name: tok.text.clone(), span: tok.span }
+                Identifier {
+                    name: tok.text.clone(),
+                    span: tok.span,
+                }
             } else {
                 self.parse_identifier()
             };
-            TypeName { scope: Some(first), name: second, span: self.span_from(start) }
+            TypeName {
+                scope: Some(first),
+                name: second,
+                span: self.span_from(start),
+            }
         } else {
-            TypeName { scope: None, name: first, span: self.span_from(start) }
+            TypeName {
+                scope: None,
+                name: first,
+                span: self.span_from(start),
+            }
         }
     }
     /// Parse a function prototype (no body, no endfunction). Used for pure virtual.
@@ -570,22 +796,37 @@ impl Parser {
         let specifier = self.parse_optional_method_specifier();
 
         let lifetime = self.parse_optional_lifetime();
-        let return_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) ||
-                            (self.at(TokenKind::Identifier) && (
-                                self.peek_kind() == TokenKind::Identifier ||
-                                (self.peek_kind() == TokenKind::DoubleColon
-                                    && self.peek_kind_n(2) != TokenKind::KwNew
-                                    && !self.scoped_name_is_the_method_name()) ||
-                                self.peek_kind() == TokenKind::Hash
-                            )) {
+        let return_type = if self.is_data_type_keyword()
+            || self.at(TokenKind::KwVoid)
+            || (self.at(TokenKind::Identifier)
+                && (self.peek_kind() == TokenKind::Identifier
+                    || (self.peek_kind() == TokenKind::DoubleColon
+                        && self.peek_kind_n(2) != TokenKind::KwNew
+                        && !self.scoped_name_is_the_method_name())
+                    || self.peek_kind() == TokenKind::Hash))
+        {
             self.parse_data_type()
         } else {
-            DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+            DataType::Implicit {
+                signing: None,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+            }
         };
         let name = self.parse_method_name();
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
-        FunctionDeclaration { lifetime, specifier, return_type, name, ports, items: Vec::new(), endlabel: None, strict_body_ports: Vec::new(), span: self.span_from(start) }
+        FunctionDeclaration {
+            lifetime,
+            specifier,
+            return_type,
+            name,
+            ports,
+            items: Vec::new(),
+            endlabel: None,
+            strict_body_ports: Vec::new(),
+            span: self.span_from(start),
+        }
     }
 
     pub(super) fn parse_task_prototype(&mut self) -> TaskDeclaration {
@@ -596,7 +837,16 @@ impl Parser {
         let name = self.parse_method_name();
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
-        TaskDeclaration { lifetime, specifier, name, ports, items: Vec::new(), endlabel: None, strict_body_ports: Vec::new(), span: self.span_from(start) }
+        TaskDeclaration {
+            lifetime,
+            specifier,
+            name,
+            ports,
+            items: Vec::new(),
+            endlabel: None,
+            strict_body_ports: Vec::new(),
+            span: self.span_from(start),
+        }
     }
 
     pub(super) fn parse_param_value(&mut self) -> ParamValue {
@@ -605,7 +855,12 @@ impl Parser {
         // not a type-parameter override. Defer to parse_expression in that case.
         let is_type_cast = (self.is_data_type_keyword() || self.at(TokenKind::KwVoid))
             && self.peek_kind() == TokenKind::IntegerLiteral
-            && self.tokens.get(self.pos + 1).map(|t| t.text.as_str()).unwrap_or("") == "'";
+            && self
+                .tokens
+                .get(self.pos + 1)
+                .map(|t| t.text.as_str())
+                .unwrap_or("")
+                == "'";
         if (self.is_data_type_keyword() || self.at(TokenKind::KwVoid)) && !is_type_cast {
             ParamValue::Type(self.parse_data_type())
         } else if self.at(TokenKind::KwVirtual)
@@ -642,10 +897,17 @@ impl Parser {
             args.push(self.parse_param_value());
             return args;
         }
-        if self.eat(TokenKind::LParen).is_none() { return args; }
-        if self.at(TokenKind::RParen) { self.bump(); return args; }
+        if self.eat(TokenKind::LParen).is_none() {
+            return args;
+        }
+        if self.at(TokenKind::RParen) {
+            self.bump();
+            return args;
+        }
         loop {
-            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
+            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
+                break;
+            }
             // IEEE 1800-2023 §8.25.1 — `extends <base>#(.NAME(value), ...)` is
             // the named form of parameter binding. We accept it here and drop
             // the name (Elaboration matches positionally for now; recording
@@ -663,15 +925,22 @@ impl Parser {
             } else {
                 args.push(self.parse_param_value());
             }
-            if self.eat(TokenKind::Comma).is_none() { break; }
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
         }
         self.expect(TokenKind::RParen);
         args
     }
     pub(super) fn parse_function_ports(&mut self) -> Vec<FunctionPort> {
         let mut ports = Vec::new();
-        if self.eat(TokenKind::LParen).is_none() { return ports; }
-        if self.at(TokenKind::RParen) { self.bump(); return ports; }
+        if self.eat(TokenKind::LParen).is_none() {
+            return ports;
+        }
+        if self.at(TokenKind::RParen) {
+            self.bump();
+            return ports;
+        }
         // §13.5.2: a formal whose direction is omitted takes the direction of
         // the PREVIOUS formal; only the first defaults to input. Defaulting
         // every one to input made `output logic [7:0] r0, r1, r2, r3` declare
@@ -680,15 +949,21 @@ impl Parser {
         // updated one byte per column and nothing else).
         let mut prev_direction = PortDirection::Input;
         loop {
-            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) { break; }
+            if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
+                break;
+            }
             let start = self.current().span.start;
             let mut var_kw = self.eat(TokenKind::KwVar).is_some();
             let _const_kw = self.eat(TokenKind::KwConst).is_some();
-            if !var_kw && self.at(TokenKind::KwVar) { var_kw = self.eat(TokenKind::KwVar).is_some(); } // Handle var after const
+            if !var_kw && self.at(TokenKind::KwVar) {
+                var_kw = self.eat(TokenKind::KwVar).is_some();
+            } // Handle var after const
             let direction = self.parse_optional_direction().unwrap_or(prev_direction);
             prev_direction = direction;
             // §13.3: `input var int x` — `var` may follow the direction too.
-            if !var_kw && self.at(TokenKind::KwVar) { var_kw = self.eat(TokenKind::KwVar).is_some(); }
+            if !var_kw && self.at(TokenKind::KwVar) {
+                var_kw = self.eat(TokenKind::KwVar).is_some();
+            }
 
             // Handle `virtual interface <name>` port type (legacy form)
             // and the LRM 1800-2017 §25.9 form `virtual <iface_type>` /
@@ -720,19 +995,41 @@ impl Parser {
                     let _modport = self.parse_identifier();
                 }
                 let name = self.parse_identifier();
-                let data_type = DataType::TypeReference { name: TypeName { scope: None, name: iface_name, span: self.span_from(start) }, dimensions: Vec::new(), type_args: Vec::new(), span: self.span_from(start) };
+                let data_type = DataType::TypeReference {
+                    name: TypeName {
+                        scope: None,
+                        name: iface_name,
+                        span: self.span_from(start),
+                    },
+                    dimensions: Vec::new(),
+                    type_args: Vec::new(),
+                    span: self.span_from(start),
+                };
                 let dimensions = self.parse_unpacked_dimensions();
                 let default = if self.eat(TokenKind::Assign).is_some() {
                     Some(self.parse_expression())
-                } else { None };
-                ports.push(FunctionPort { direction, var_kw, data_type, name, dimensions, default, span: self.span_from(start) });
-                if self.eat(TokenKind::Comma).is_none() { break; }
+                } else {
+                    None
+                };
+                ports.push(FunctionPort {
+                    direction,
+                    var_kw,
+                    data_type,
+                    name,
+                    dimensions,
+                    default,
+                    span: self.span_from(start),
+                });
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
                 continue;
             }
 
             let data_type = if self.is_data_type_keyword() || self.at(TokenKind::KwVoid) {
                 self.parse_data_type()
-            } else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket
+            } else if self.at(TokenKind::Identifier)
+                && self.peek_kind() == TokenKind::LBracket
                 && self.peek_kind_n(2) == TokenKind::Dollar
                 && self.peek_kind_n(3) == TokenKind::RBracket
             {
@@ -752,11 +1049,28 @@ impl Parser {
                 };
                 let default = if self.eat(TokenKind::Assign).is_some() {
                     Some(self.parse_expression())
-                } else { None };
-                ports.push(FunctionPort { direction, var_kw, data_type, name, dimensions, default, span: self.span_from(start) });
-                if self.eat(TokenKind::Comma).is_none() { break; }
+                } else {
+                    None
+                };
+                ports.push(FunctionPort {
+                    direction,
+                    var_kw,
+                    data_type,
+                    name,
+                    dimensions,
+                    default,
+                    span: self.span_from(start),
+                });
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
                 continue;
-            } else if self.at(TokenKind::Identifier) && matches!(self.peek_kind(), TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon) {
+            } else if self.at(TokenKind::Identifier)
+                && matches!(
+                    self.peek_kind(),
+                    TokenKind::Identifier | TokenKind::Hash | TokenKind::DoubleColon
+                )
+            {
                 self.parse_data_type()
             } else if self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket {
                 // `typedef_t [7:0] port_name` — user-defined type with packed
@@ -788,7 +1102,9 @@ impl Parser {
                         _ => {}
                     }
                     k += 1;
-                    if k > 64 { break; }
+                    if k > 64 {
+                        break;
+                    }
                 }
                 if matches!(next_after, TokenKind::Identifier) {
                     self.parse_data_type()
@@ -807,24 +1123,56 @@ impl Parser {
                     };
                     let default = if self.eat(TokenKind::Assign).is_some() {
                         Some(self.parse_expression())
-                    } else { None };
-                    ports.push(FunctionPort { direction, var_kw, data_type, name, dimensions, default, span: self.span_from(start) });
-                    if self.eat(TokenKind::Comma).is_none() { break; }
+                    } else {
+                        None
+                    };
+                    ports.push(FunctionPort {
+                        direction,
+                        var_kw,
+                        data_type,
+                        name,
+                        dimensions,
+                        default,
+                        span: self.span_from(start),
+                    });
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
                     continue;
                 }
             } else if self.at(TokenKind::LBracket) {
                 let dims = self.parse_packed_dimensions();
-                DataType::Implicit { signing: None, dimensions: dims, span: self.span_from(start) }
+                DataType::Implicit {
+                    signing: None,
+                    dimensions: dims,
+                    span: self.span_from(start),
+                }
             } else {
-                DataType::Implicit { signing: None, dimensions: Vec::new(), span: self.span_from(start) }
+                DataType::Implicit {
+                    signing: None,
+                    dimensions: Vec::new(),
+                    span: self.span_from(start),
+                }
             };
             let name = self.parse_identifier();
             let dimensions = self.parse_unpacked_dimensions();
             let default = if self.eat(TokenKind::Assign).is_some() {
                 Some(self.parse_expression())
-            } else { None };
-            ports.push(FunctionPort { direction, var_kw, data_type, name, dimensions, default, span: self.span_from(start) });
-            if self.eat(TokenKind::Comma).is_none() { break; }
+            } else {
+                None
+            };
+            ports.push(FunctionPort {
+                direction,
+                var_kw,
+                data_type,
+                name,
+                dimensions,
+                default,
+                span: self.span_from(start),
+            });
+            if self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
         }
         self.expect(TokenKind::RParen);
         ports
@@ -832,11 +1180,15 @@ impl Parser {
 
     pub(super) fn parse_package_item(&mut self) -> Option<PackageItem> {
         match self.current_kind() {
-            TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
-                Some(PackageItem::TimeunitsDecl(self.parse_timeunits_declaration()))
+            TokenKind::KwTimeunit | TokenKind::KwTimeprecision => Some(PackageItem::TimeunitsDecl(
+                self.parse_timeunits_declaration(),
+            )),
+            TokenKind::KwParameter => {
+                Some(PackageItem::Parameter(self.parse_parameter_decl_stmt()))
             }
-            TokenKind::KwParameter => Some(PackageItem::Parameter(self.parse_parameter_decl_stmt())),
-            TokenKind::KwLocalparam => Some(PackageItem::Parameter(self.parse_parameter_decl_stmt())),
+            TokenKind::KwLocalparam => {
+                Some(PackageItem::Parameter(self.parse_parameter_decl_stmt()))
+            }
             TokenKind::KwTypedef => Some(PackageItem::Typedef(self.parse_typedef_declaration())),
             TokenKind::KwFunction => Some(PackageItem::Function(self.parse_function_declaration())),
             TokenKind::KwTask => Some(PackageItem::Task(self.parse_task_declaration())),
@@ -862,7 +1214,13 @@ impl Parser {
                         let item_start = self.current().span.start;
                         let package = if self.at(TokenKind::Star) {
                             self.bump();
-                            Identifier { name: "*".to_string(), span: crate::ast::Span { start: item_start, end: item_start } }
+                            Identifier {
+                                name: "*".to_string(),
+                                span: crate::ast::Span {
+                                    start: item_start,
+                                    end: item_start,
+                                },
+                            }
                         } else {
                             self.parse_identifier()
                         };
@@ -872,18 +1230,26 @@ impl Parser {
                         } else {
                             Some(self.parse_identifier())
                         };
-                        items.push(ImportItem { package, item, span: self.span_from(item_start) });
+                        items.push(ImportItem {
+                            package,
+                            item,
+                            span: self.span_from(item_start),
+                        });
                         if self.eat(TokenKind::Comma).is_none() {
                             break;
                         }
                     }
                     self.expect(TokenKind::Semicolon);
-                    Some(PackageItem::Export(ImportDeclaration { items, span: self.span_from(start_sp) }))
+                    Some(PackageItem::Export(ImportDeclaration {
+                        items,
+                        span: self.span_from(start_sp),
+                    }))
                 }
             }
             // §8.26: `interface class …` inside a package is a class.
-            TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass =>
-                Some(PackageItem::Class(self.parse_class_declaration())),
+            TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass => {
+                Some(PackageItem::Class(self.parse_class_declaration()))
+            }
             TokenKind::KwClass => Some(PackageItem::Class(self.parse_class_declaration())),
             // IEEE 1800-2023 §19: covergroup at package scope. Parsed for
             // syntactic acceptance, but not hosted as a PackageItem (no
@@ -897,32 +1263,34 @@ impl Parser {
             TokenKind::KwChecker => {
                 if let Some(ModuleItem::CheckerDeclaration(c)) = self.parse_module_item() {
                     Some(PackageItem::Checker(c))
-                } else { None }
+                } else {
+                    None
+                }
             }
             TokenKind::KwLet => {
                 if let Some(ModuleItem::LetDeclaration(l)) = self.parse_module_item() {
                     Some(PackageItem::Let(l))
-                } else { None }
+                } else {
+                    None
+                }
             }
             // §26.2: named property / sequence declarations at package
             // scope. Without these arms `property` was read as a type name
             // and every token after it derailed the whole package.
-            TokenKind::KwProperty => {
-                match self.parse_module_item() {
-                    Some(ModuleItem::PropertyDeclaration(pd)) => Some(PackageItem::Property(pd)),
-                    _ => Some(PackageItem::Null),
-                }
-            }
-            TokenKind::KwSequence => {
-                match self.parse_module_item() {
-                    Some(ModuleItem::SequenceDeclaration(sd)) => Some(PackageItem::Sequence(sd)),
-                    _ => Some(PackageItem::Null),
-                }
-            }
+            TokenKind::KwProperty => match self.parse_module_item() {
+                Some(ModuleItem::PropertyDeclaration(pd)) => Some(PackageItem::Property(pd)),
+                _ => Some(PackageItem::Null),
+            },
+            TokenKind::KwSequence => match self.parse_module_item() {
+                Some(ModuleItem::SequenceDeclaration(sd)) => Some(PackageItem::Sequence(sd)),
+                _ => Some(PackageItem::Null),
+            },
             TokenKind::KwNettype => {
                 if let Some(ModuleItem::NettypeDeclaration(n)) = self.parse_module_item() {
                     Some(PackageItem::Nettype(n))
-                } else { None }
+                } else {
+                    None
+                }
             }
             TokenKind::KwExtern => {
                 self.bump();
@@ -952,11 +1320,21 @@ impl Parser {
                     self.parse_package_item()
                 }
             }
-            _ if self.is_data_type_keyword() || self.at(TokenKind::KwVar) || self.at(TokenKind::KwConst) =>
-                Some(PackageItem::Data(self.parse_data_declaration())),
+            _ if self.is_data_type_keyword()
+                || self.at(TokenKind::KwVar)
+                || self.at(TokenKind::KwConst) =>
+            {
+                Some(PackageItem::Data(self.parse_data_declaration()))
+            }
             TokenKind::Identifier => Some(PackageItem::Data(self.parse_data_declaration())),
-            TokenKind::Directive => { self.bump(); self.parse_package_item() }
-            TokenKind::Semicolon => { self.bump(); self.parse_package_item() }
+            TokenKind::Directive => {
+                self.bump();
+                self.parse_package_item()
+            }
+            TokenKind::Semicolon => {
+                self.bump();
+                self.parse_package_item()
+            }
             _ => None,
         }
     }

@@ -1,16 +1,16 @@
 //! Recursive descent parser for SystemVerilog IEEE 1800-2017/2023.
 
-mod helpers;
-mod types;
-mod expressions;
-mod statements;
 mod declarations;
+mod expressions;
+mod helpers;
 mod items;
+mod statements;
+mod types;
 
-use crate::ast::*;
 use crate::ast::decl::{ModuleItem, PackageItem};
-use crate::lexer::token::{Token, TokenKind};
+use crate::ast::*;
 use crate::diagnostics::Diagnostic;
+use crate::lexer::token::{Token, TokenKind};
 
 pub struct Parser {
     tokens: Vec<Token>,
@@ -34,23 +34,33 @@ pub struct Parser {
     pub(super) in_constraint: bool,
     /// The dist body captured by that paren form, handed back to
     /// `parse_constraint_item` once the enclosing expression finishes.
-    pub(super) pending_paren_dist:
-        Vec<(Vec<crate::ast::decl::ConstraintRange>, Vec<Option<crate::ast::decl::DistWeight>>)>,
+    pub(super) pending_paren_dist: Vec<(
+        Vec<crate::ast::decl::ConstraintRange>,
+        Vec<Option<crate::ast::decl::DistWeight>>,
+    )>,
 }
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
-        Self { tokens, pos: 0, diagnostics: Vec::new(),
-               pending_pattern_bindings: Vec::new(),
-               in_sva_seq: false,
-               in_constraint: false,
-               pending_paren_dist: Vec::new() }
+        Self {
+            tokens,
+            pos: 0,
+            diagnostics: Vec::new(),
+            pending_pattern_bindings: Vec::new(),
+            in_sva_seq: false,
+            in_constraint: false,
+            pending_paren_dist: Vec::new(),
+        }
     }
 
-    pub fn diagnostics(&self) -> &[Diagnostic] { &self.diagnostics }
+    pub fn diagnostics(&self) -> &[Diagnostic] {
+        &self.diagnostics
+    }
 
     pub fn has_errors(&self) -> bool {
-        self.diagnostics.iter().any(|d| d.severity == crate::diagnostics::Severity::Error)
+        self.diagnostics
+            .iter()
+            .any(|d| d.severity == crate::diagnostics::Severity::Error)
     }
 
     /// source_text ::= { description }
@@ -69,7 +79,10 @@ impl Parser {
             // A None that advanced (e.g. a stray top-level `;` consumed by the
             // Semicolon arm) is a clean skip, not an error.
         }
-        SourceText { descriptions, span: self.span_from(start) }
+        SourceText {
+            descriptions,
+            span: self.span_from(start),
+        }
     }
 
     /// Parse the simple `bind <target> <bind_mod> <inst>(<ports>);` form
@@ -152,10 +165,21 @@ impl Parser {
         let mut depth_paren = 0i32;
         while !self.at(TokenKind::Eof) {
             match self.current_kind() {
-                TokenKind::LParen => { depth_paren += 1; self.bump(); }
-                TokenKind::RParen => { depth_paren -= 1; self.bump(); }
-                TokenKind::Semicolon if depth_paren <= 0 => { self.bump(); break; }
-                _ => { self.bump(); }
+                TokenKind::LParen => {
+                    depth_paren += 1;
+                    self.bump();
+                }
+                TokenKind::RParen => {
+                    depth_paren -= 1;
+                    self.bump();
+                }
+                TokenKind::Semicolon if depth_paren <= 0 => {
+                    self.bump();
+                    break;
+                }
+                _ => {
+                    self.bump();
+                }
             }
         }
         None
@@ -184,30 +208,32 @@ impl Parser {
                 self.expect(TokenKind::Semicolon);
                 self.parse_description()
             }
-            TokenKind::KwModule | TokenKind::KwMacromodule =>
-                Some(Description::Module(self.parse_module_declaration())),
+            TokenKind::KwModule | TokenKind::KwMacromodule => {
+                Some(Description::Module(self.parse_module_declaration()))
+            }
             // IEEE 1800-2017 §8.26: `interface class …` is a class, not a
             // module-style interface — route it to the class parser.
-            TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass =>
-                Some(Description::Class(self.parse_class_declaration())),
-            TokenKind::KwInterface =>
-                Some(Description::Interface(self.parse_interface_declaration())),
-            TokenKind::KwProgram =>
-                Some(Description::Program(self.parse_program_declaration())),
+            TokenKind::KwInterface if self.peek_kind() == TokenKind::KwClass => {
+                Some(Description::Class(self.parse_class_declaration()))
+            }
+            TokenKind::KwInterface => {
+                Some(Description::Interface(self.parse_interface_declaration()))
+            }
+            TokenKind::KwProgram => Some(Description::Program(self.parse_program_declaration())),
             // IEEE 1800-2017 §29 User-Defined Primitive. Parsed into a real
             // `Description::Udp` carrying the truth table; on any table-row it
             // cannot parse, `parse_primitive` emits a loud warning and falls
             // back to the historical empty-module stub for that UDP only.
             TokenKind::KwPrimitive => Some(self.parse_primitive()),
-            TokenKind::KwPackage =>
-                Some(Description::Package(self.parse_package_declaration())),
+            TokenKind::KwPackage => Some(Description::Package(self.parse_package_declaration())),
             TokenKind::KwNettype => {
                 if let Some(ModuleItem::NettypeDeclaration(n)) = self.parse_module_item() {
                     Some(Description::PackageItem(PackageItem::Nettype(n)))
-                } else { None }
+                } else {
+                    None
+                }
             }
-            TokenKind::KwClass =>
-                Some(Description::Class(self.parse_class_declaration())),
+            TokenKind::KwClass => Some(Description::Class(self.parse_class_declaration())),
             // IEEE 1800-2023 §19: a top-level (\$unit-scope) covergroup is
             // legal. We parse it for syntax acceptance but don't surface it
             // as a Description (no covergroup runtime hosted outside a
@@ -220,25 +246,31 @@ impl Parser {
             TokenKind::KwChecker => {
                 if let Some(ModuleItem::CheckerDeclaration(c)) = self.parse_module_item() {
                     Some(Description::PackageItem(PackageItem::Checker(c)))
-                } else { None }
+                } else {
+                    None
+                }
             }
-            TokenKind::KwVirtual if self.peek_kind() == TokenKind::KwClass =>
-                Some(Description::Class(self.parse_class_declaration())),
+            TokenKind::KwVirtual if self.peek_kind() == TokenKind::KwClass => {
+                Some(Description::Class(self.parse_class_declaration()))
+            }
             TokenKind::KwLet => {
                 if let Some(ModuleItem::LetDeclaration(l)) = self.parse_module_item() {
                     Some(Description::PackageItem(PackageItem::Let(l)))
-                } else { None }
+                } else {
+                    None
+                }
             }
-            TokenKind::KwTypedef =>
-                Some(Description::TypedefDecl(self.parse_typedef_declaration())),
+            TokenKind::KwTypedef => {
+                Some(Description::TypedefDecl(self.parse_typedef_declaration()))
+            }
             // IEEE 1800-2017 §3.12 / §6.20: compilation-unit ($unit) scope
             // `parameter`/`localparam` declarations. Surface them as a
             // PackageItem::Parameter so elaboration can hoist them into every
             // module (like $unit functions/tasks). Without this the top-level
             // `parameter int N = 1;` form was an "unexpected token".
-            TokenKind::KwParameter | TokenKind::KwLocalparam =>
-                Some(Description::PackageItem(PackageItem::Parameter(
-                    self.parse_parameter_decl_stmt()))),
+            TokenKind::KwParameter | TokenKind::KwLocalparam => Some(Description::PackageItem(
+                PackageItem::Parameter(self.parse_parameter_decl_stmt()),
+            )),
             TokenKind::KwImport => {
                 if self.peek_kind() == TokenKind::StringLiteral {
                     Some(Description::DPIImport(self.parse_dpi_import()))
@@ -251,7 +283,9 @@ impl Parser {
                     Some(Description::DPIExport(self.parse_dpi_export()))
                 } else {
                     self.bump();
-                    while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) { self.bump(); }
+                    while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof) {
+                        self.bump();
+                    }
                     self.expect(TokenKind::Semicolon);
                     self.parse_description()
                 }
@@ -279,11 +313,18 @@ impl Parser {
                 self.bump();
                 let hid = self.parse_hierarchical_identifier();
                 let (class_name, constraint_name) = if hid.path.len() >= 2 {
-                    (hid.path[hid.path.len() - 2].name.name.clone(),
-                     hid.path[hid.path.len() - 1].name.name.clone())
+                    (
+                        hid.path[hid.path.len() - 2].name.name.clone(),
+                        hid.path[hid.path.len() - 1].name.name.clone(),
+                    )
                 } else {
-                    (String::new(),
-                     hid.path.last().map(|s| s.name.name.clone()).unwrap_or_default())
+                    (
+                        String::new(),
+                        hid.path
+                            .last()
+                            .map(|s| s.name.name.clone())
+                            .unwrap_or_default(),
+                    )
                 };
                 let mut items = Vec::new();
                 if self.at(TokenKind::LBrace) {
@@ -293,23 +334,36 @@ impl Parser {
                     }
                     self.expect(TokenKind::RBrace);
                 }
-                if self.at(TokenKind::Semicolon) { self.bump(); }
+                if self.at(TokenKind::Semicolon) {
+                    self.bump();
+                }
                 if class_name.is_empty() {
                     self.parse_description()
                 } else {
-                    Some(Description::OutOfClassConstraint { class_name, constraint_name, items })
+                    Some(Description::OutOfClassConstraint {
+                        class_name,
+                        constraint_name,
+                        items,
+                    })
                 }
             }
-            TokenKind::KwTimeunit | TokenKind::KwTimeprecision =>
-                Some(Description::TimeunitsDecl(self.parse_timeunits_declaration())),
-            TokenKind::KwFunction =>
-                Some(Description::PackageItem(self.parse_package_item().unwrap())),
-            TokenKind::KwTask =>
-                Some(Description::PackageItem(self.parse_package_item().unwrap())),
-            TokenKind::Directive => { self.bump(); self.parse_description() }
+            TokenKind::KwTimeunit | TokenKind::KwTimeprecision => Some(Description::TimeunitsDecl(
+                self.parse_timeunits_declaration(),
+            )),
+            TokenKind::KwFunction => {
+                Some(Description::PackageItem(self.parse_package_item().unwrap()))
+            }
+            TokenKind::KwTask => Some(Description::PackageItem(self.parse_package_item().unwrap())),
+            TokenKind::Directive => {
+                self.bump();
+                self.parse_description()
+            }
             // Stray top-level `;` — e.g. `endmodule;` (an empty
             // compilation-unit item, §A.1.2). Skip and continue.
-            TokenKind::Semicolon => { self.bump(); self.parse_description() }
+            TokenKind::Semicolon => {
+                self.bump();
+                self.parse_description()
+            }
             _ => {
                 // Compilation-unit ($unit) scope data declaration like
                 // `string label = "...";`. Surface it as a PackageItem::Data so
@@ -324,17 +378,24 @@ impl Parser {
                 // the guard only admitted builtin type keywords, leaving
                 // `rw_tr q[$];` as an unexpected token.
                 let is_user_type_decl = self.at(TokenKind::Identifier)
-                    && matches!(self.peek_kind(),
-                        TokenKind::Identifier | TokenKind::DoubleColon
-                        | TokenKind::Hash | TokenKind::LBracket);
+                    && matches!(
+                        self.peek_kind(),
+                        TokenKind::Identifier
+                            | TokenKind::DoubleColon
+                            | TokenKind::Hash
+                            | TokenKind::LBracket
+                    );
                 // §A.2.1.3: a data_declaration may carry an explicit LIFETIME
                 // (`static int n = 0;`). `parse_data_declaration` already eats
                 // it, but this guard did not admit one, so a $unit-scope
                 // `static`/`automatic` declaration — the usual way a testbench
                 // keeps a shared failure counter — died as "unexpected token".
-                if self.is_data_type_keyword() || self.at(TokenKind::KwVar)
-                    || self.at(TokenKind::KwConst) || is_user_type_decl
-                    || self.at(TokenKind::KwStatic) || self.at(TokenKind::KwAutomatic)
+                if self.is_data_type_keyword()
+                    || self.at(TokenKind::KwVar)
+                    || self.at(TokenKind::KwConst)
+                    || is_user_type_decl
+                    || self.at(TokenKind::KwStatic)
+                    || self.at(TokenKind::KwAutomatic)
                 {
                     let before = self.pos;
                     let decl = self.parse_data_declaration();
@@ -346,9 +407,16 @@ impl Parser {
                     let mut depth = 0i32;
                     while !self.at(TokenKind::Eof) {
                         match self.current_kind() {
-                            TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => depth += 1,
-                            TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => depth -= 1,
-                            TokenKind::Semicolon if depth <= 0 => { self.bump(); break; }
+                            TokenKind::LBrace | TokenKind::LParen | TokenKind::LBracket => {
+                                depth += 1
+                            }
+                            TokenKind::RBrace | TokenKind::RParen | TokenKind::RBracket => {
+                                depth -= 1
+                            }
+                            TokenKind::Semicolon if depth <= 0 => {
+                                self.bump();
+                                break;
+                            }
                             _ => {}
                         }
                         self.bump();
@@ -366,7 +434,7 @@ impl Parser {
     /// falls back to the historical empty-module stub for THIS udp only, so a
     /// malformed table never crashes the parse nor silently mis-simulates.
     fn parse_primitive(&mut self) -> Description {
-        use crate::ast::decl::{UdpDecl, UdpTableRow, UdpSym, UdpOut};
+        use crate::ast::decl::{UdpDecl, UdpOut, UdpSym, UdpTableRow};
         let start = self.current().span.start;
         self.bump(); // `primitive`
         let name = self.parse_identifier();
@@ -380,13 +448,24 @@ impl Parser {
             let mut depth = 1i32;
             while depth > 0 && !self.at(TokenKind::Eof) {
                 match self.current_kind() {
-                    TokenKind::LParen => { depth += 1; self.bump(); }
-                    TokenKind::RParen => { depth -= 1; self.bump(); }
-                    TokenKind::KwReg if depth == 1 => { is_sequential = true; self.bump(); }
+                    TokenKind::LParen => {
+                        depth += 1;
+                        self.bump();
+                    }
+                    TokenKind::RParen => {
+                        depth -= 1;
+                        self.bump();
+                    }
+                    TokenKind::KwReg if depth == 1 => {
+                        is_sequential = true;
+                        self.bump();
+                    }
                     TokenKind::Identifier | TokenKind::EscapedIdentifier if depth == 1 => {
                         ports.push(self.parse_identifier());
                     }
-                    _ => { self.bump(); }
+                    _ => {
+                        self.bump();
+                    }
                 }
             }
         }
@@ -395,17 +474,22 @@ impl Parser {
         // --- Body declarations up to `table`: pick up `reg` (=> sequential)
         // and `initial out = 1'bX;` (start state).
         let mut init: Option<char> = None;
-        while !self.at(TokenKind::KwTable) && !self.at(TokenKind::KwEndprimitive)
+        while !self.at(TokenKind::KwTable)
+            && !self.at(TokenKind::KwEndprimitive)
             && !self.at(TokenKind::Eof)
         {
             match self.current_kind() {
-                TokenKind::KwReg => { is_sequential = true; self.skip_udp_to_semi(); }
+                TokenKind::KwReg => {
+                    is_sequential = true;
+                    self.skip_udp_to_semi();
+                }
                 TokenKind::KwInitial => {
                     self.bump(); // `initial`
                     // out = <value> ;  — collect value tokens after `=`.
                     let mut seen_eq = false;
                     let mut val = String::new();
-                    while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof)
+                    while !self.at(TokenKind::Semicolon)
+                        && !self.at(TokenKind::Eof)
                         && !self.at(TokenKind::KwTable)
                     {
                         let k = self.current_kind();
@@ -428,7 +512,9 @@ impl Parser {
                         'x'
                     });
                 }
-                _ => { self.skip_udp_to_semi(); }
+                _ => {
+                    self.skip_udp_to_semi();
+                }
             }
         }
 
@@ -441,7 +527,8 @@ impl Parser {
         if self.eat(TokenKind::KwTable).is_some() {
             // Gather raw table tokens up to `endtable`.
             let mut toks: Vec<Token> = Vec::new();
-            while !self.at(TokenKind::KwEndtable) && !self.at(TokenKind::Eof)
+            while !self.at(TokenKind::KwEndtable)
+                && !self.at(TokenKind::Eof)
                 && !self.at(TokenKind::KwEndprimitive)
             {
                 toks.push(self.current().clone());
@@ -462,7 +549,8 @@ impl Parser {
                         Some(r) => rows.push(r),
                         None => {
                             table_ok = false;
-                            let txt: String = slice.iter()
+                            let txt: String = slice
+                                .iter()
                                 .map(|t| t.text.clone())
                                 .collect::<Vec<_>>()
                                 .join(" ");
@@ -482,7 +570,9 @@ impl Parser {
             self.bump();
         }
         self.expect(TokenKind::KwEndprimitive);
-        if self.eat(TokenKind::Colon).is_some() { let _ = self.parse_identifier(); }
+        if self.eat(TokenKind::Colon).is_some() {
+            let _ = self.parse_identifier();
+        }
 
         let span = self.span_from(start);
         let _ = UdpOut::NoChange; // (variant use silence if unused paths)
@@ -490,7 +580,12 @@ impl Parser {
 
         if table_ok && !rows.is_empty() {
             Description::Udp(UdpDecl {
-                name, ports, is_sequential, init, rows, span,
+                name,
+                ports,
+                is_sequential,
+                init,
+                rows,
+                span,
             })
         } else {
             // FAIL LOUD: name exactly what could not be parsed and the
@@ -506,11 +601,15 @@ impl Parser {
                  ========================================================================\n",
                 name.name, table_line, fail_detail
             );
-            self.diagnostics.push(crate::diagnostics::Diagnostic::warning(
-                format!("unsupported UDP truth-table in primitive '{}' (row: {}); \
-                         instances left undriven", name.name, fail_detail),
-                span,
-            ));
+            self.diagnostics
+                .push(crate::diagnostics::Diagnostic::warning(
+                    format!(
+                        "unsupported UDP truth-table in primitive '{}' (row: {}); \
+                         instances left undriven",
+                        name.name, fail_detail
+                    ),
+                    span,
+                ));
             Description::Module(crate::ast::module::ModuleDeclaration {
                 attrs: Vec::new(),
                 kind: crate::ast::module::ModuleKind::Module,
@@ -527,8 +626,10 @@ impl Parser {
 
     /// Consume tokens up to and including the next `;` (UDP body decls).
     fn skip_udp_to_semi(&mut self) {
-        while !self.at(TokenKind::Semicolon) && !self.at(TokenKind::Eof)
-            && !self.at(TokenKind::KwTable) && !self.at(TokenKind::KwEndprimitive)
+        while !self.at(TokenKind::Semicolon)
+            && !self.at(TokenKind::Eof)
+            && !self.at(TokenKind::KwTable)
+            && !self.at(TokenKind::KwEndprimitive)
         {
             self.bump();
         }
@@ -547,7 +648,7 @@ impl Parser {
     /// `:`-separated; combinational = 2 fields, sequential = 3). Returns
     /// `None` on any unrecognised symbol or shape so the caller can fall back.
     fn parse_udp_row(slice: &[Token], n_inputs: usize) -> Option<crate::ast::decl::UdpTableRow> {
-        use crate::ast::decl::{UdpTableRow, UdpOut};
+        use crate::ast::decl::{UdpOut, UdpTableRow};
         // Split fields on `:`.
         let mut fields: Vec<&[Token]> = Vec::new();
         let mut fs = 0usize;
@@ -563,17 +664,23 @@ impl Parser {
             _ => return None,
         };
         let inputs = Self::parse_udp_syms(input_f)?;
-        if inputs.len() != n_inputs { return None; }
+        if inputs.len() != n_inputs {
+            return None;
+        }
         let state = match state_f {
             Some(f) => {
                 let mut s = Self::parse_udp_syms(f)?;
-                if s.len() != 1 { return None; }
+                if s.len() != 1 {
+                    return None;
+                }
                 Some(s.remove(0))
             }
             None => None,
         };
         // Output field: single symbol 0/1/x, or `-` (sequential no-change).
-        if out_f.len() != 1 { return None; }
+        if out_f.len() != 1 {
+            return None;
+        }
         let output = match out_f[0].text.as_str() {
             "0" => UdpOut::Level('0'),
             "1" => UdpOut::Level('1'),
@@ -581,8 +688,16 @@ impl Parser {
             "-" => UdpOut::NoChange,
             _ => return None,
         };
-        let span = slice.first().map(|t| t.span).unwrap_or(crate::ast::Span::dummy());
-        Some(UdpTableRow { inputs, state, output, span })
+        let span = slice
+            .first()
+            .map(|t| t.span)
+            .unwrap_or(crate::ast::Span::dummy());
+        Some(UdpTableRow {
+            inputs,
+            state,
+            output,
+            span,
+        })
     }
 
     /// Parse a sequence of input/state symbols from a token slice.
@@ -601,11 +716,14 @@ impl Parser {
                         txt.push_str(&field[j].text);
                         j += 1;
                     }
-                    if j >= field.len() { return None; } // unmatched `(`
+                    if j >= field.len() {
+                        return None;
+                    } // unmatched `(`
                     i = j + 1;
-                    let chars: Vec<char> =
-                        txt.chars().filter(|c| !c.is_whitespace()).collect();
-                    if chars.len() != 2 { return None; }
+                    let chars: Vec<char> = txt.chars().filter(|c| !c.is_whitespace()).collect();
+                    if chars.len() != 2 {
+                        return None;
+                    }
                     let from = Self::udp_norm_level(chars[0])?;
                     let to = Self::udp_norm_level(chars[1])?;
                     out.push(UdpSym::Edge { from, to });

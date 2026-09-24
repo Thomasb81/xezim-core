@@ -12,9 +12,8 @@ fn norm(s: &str) -> String {
 
 #[test]
 fn macro_starting_with_include_expands() {
-    let out = preprocess(
-        "`define include_default_error_task int x = 5;\n`include_default_error_task\n",
-    );
+    let out =
+        preprocess("`define include_default_error_task int x = 5;\n`include_default_error_task\n");
     assert!(
         norm(&out).contains("int x = 5"),
         "macro named include_* must expand, not parse as `include; got: {:?}",

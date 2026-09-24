@@ -15,7 +15,11 @@ pub struct Lexer<'a> {
 
 impl<'a> Lexer<'a> {
     pub fn new(source: &'a str) -> Self {
-        Self { input: source.as_bytes(), pos: 0, kw_stack: Vec::new() }
+        Self {
+            input: source.as_bytes(),
+            pos: 0,
+            kw_stack: Vec::new(),
+        }
     }
 
     pub fn tokenize(mut self) -> Vec<Token> {
@@ -23,13 +27,19 @@ impl<'a> Lexer<'a> {
         loop {
             self.skip_whitespace();
             if self.pos >= self.input.len() {
-                tokens.push(Token::new(TokenKind::Eof, String::new(), Span::new(self.pos, self.pos)));
+                tokens.push(Token::new(
+                    TokenKind::Eof,
+                    String::new(),
+                    Span::new(self.pos, self.pos),
+                ));
                 break;
             }
             // Skip comments
             if self.pos + 1 < self.input.len() && self.input[self.pos] == b'/' {
                 if self.input[self.pos + 1] == b'/' {
-                    while self.pos < self.input.len() && self.input[self.pos] != b'\n' { self.pos += 1; }
+                    while self.pos < self.input.len() && self.input[self.pos] != b'\n' {
+                        self.pos += 1;
+                    }
                     continue;
                 }
                 if self.input[self.pos + 1] == b'*' {
@@ -66,7 +76,9 @@ impl<'a> Lexer<'a> {
             // Handle line continuation: \ followed by optional spaces and then newline
             if ch == b'\\' && self.pos + 1 < self.input.len() {
                 let mut p = self.pos + 1;
-                while p < self.input.len() && (self.input[p] == b' ' || self.input[p] == b'\t' || self.input[p] == b'\r') {
+                while p < self.input.len()
+                    && (self.input[p] == b' ' || self.input[p] == b'\t' || self.input[p] == b'\r')
+                {
                     p += 1;
                 }
                 if p < self.input.len() && self.input[p] == b'\n' {
@@ -94,7 +106,10 @@ impl<'a> Lexer<'a> {
             b'`' => self.scan_directive(start),
             // System identifier
             b'$' => {
-                if self.peek().map_or(false, |c| c.is_ascii_alphabetic() || c == b'_') {
+                if self
+                    .peek()
+                    .map_or(false, |c| c.is_ascii_alphabetic() || c == b'_')
+                {
                     self.scan_system_id(start)
                 } else {
                     self.make_token(start, TokenKind::Dollar)
@@ -106,11 +121,21 @@ impl<'a> Lexer<'a> {
             b'\'' => {
                 if self.peek().map_or(false, |c| matches!(c, b'{')) {
                     self.pos += 2;
-                    Token::new(TokenKind::ApostropheLBrace, "'{".into(), Span::new(start, self.pos))
-                } else if self.peek().map_or(false, |c| matches!(c, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z')) {
+                    Token::new(
+                        TokenKind::ApostropheLBrace,
+                        "'{".into(),
+                        Span::new(start, self.pos),
+                    )
+                } else if self.peek().map_or(false, |c| {
+                    matches!(c, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z')
+                }) {
                     self.pos += 2;
                     let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
-                    Token::new(TokenKind::UnbasedUnsizedLiteral, text, Span::new(start, self.pos))
+                    Token::new(
+                        TokenKind::UnbasedUnsizedLiteral,
+                        text,
+                        Span::new(start, self.pos),
+                    )
                 } else {
                     self.scan_based_number(start)
                 }
@@ -134,57 +159,142 @@ impl<'a> Lexer<'a> {
             b'~' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'&') => { self.pos += 1; Token::new(TokenKind::BitNand, "~&".into(), Span::new(start, self.pos)) }
-                    Some(b'|') => { self.pos += 1; Token::new(TokenKind::BitNor, "~|".into(), Span::new(start, self.pos)) }
-                    Some(b'^') => { self.pos += 1; Token::new(TokenKind::BitXnor, "~^".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::BitNot, "~".into(), Span::new(start, self.pos))
+                    Some(b'&') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::BitNand, "~&".into(), Span::new(start, self.pos))
+                    }
+                    Some(b'|') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::BitNor, "~|".into(), Span::new(start, self.pos))
+                    }
+                    Some(b'^') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::BitXnor, "~^".into(), Span::new(start, self.pos))
+                    }
+                    _ => Token::new(TokenKind::BitNot, "~".into(), Span::new(start, self.pos)),
                 }
             }
             b'+' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'+') => { self.pos += 1; Token::new(TokenKind::Increment, "++".into(), Span::new(start, self.pos)) }
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::PlusAssign, "+=".into(), Span::new(start, self.pos)) }
-                    Some(b':') => { self.pos += 1; Token::new(TokenKind::PlusColon, "+:".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::Plus, "+".into(), Span::new(start, self.pos))
+                    Some(b'+') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::Increment,
+                            "++".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::PlusAssign,
+                            "+=".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    Some(b':') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::PlusColon,
+                            "+:".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    _ => Token::new(TokenKind::Plus, "+".into(), Span::new(start, self.pos)),
                 }
             }
             b'-' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'-') => { self.pos += 1; Token::new(TokenKind::Decrement, "--".into(), Span::new(start, self.pos)) }
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::MinusAssign, "-=".into(), Span::new(start, self.pos)) }
+                    Some(b'-') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::Decrement,
+                            "--".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::MinusAssign,
+                            "-=".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
                     Some(b'>') => {
                         self.pos += 1;
                         if self.input.get(self.pos) == Some(&b'>') {
-                            self.pos += 1; Token::new(TokenKind::DoubleArrow, "->>".into(), Span::new(start, self.pos))
+                            self.pos += 1;
+                            Token::new(
+                                TokenKind::DoubleArrow,
+                                "->>".into(),
+                                Span::new(start, self.pos),
+                            )
                         } else {
                             Token::new(TokenKind::Arrow, "->".into(), Span::new(start, self.pos))
                         }
                     }
-                    Some(b':') => { self.pos += 1; Token::new(TokenKind::MinusColon, "-:".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::Minus, "-".into(), Span::new(start, self.pos))
+                    Some(b':') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::MinusColon,
+                            "-:".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    _ => Token::new(TokenKind::Minus, "-".into(), Span::new(start, self.pos)),
                 }
             }
             b'*' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'*') => { self.pos += 1; Token::new(TokenKind::DoubleStar, "**".into(), Span::new(start, self.pos)) }
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::StarAssign, "*=".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::Star, "*".into(), Span::new(start, self.pos))
+                    Some(b'*') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::DoubleStar,
+                            "**".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::StarAssign,
+                            "*=".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    _ => Token::new(TokenKind::Star, "*".into(), Span::new(start, self.pos)),
                 }
             }
             b'/' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::SlashAssign, "/=".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::Slash, "/".into(), Span::new(start, self.pos))
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::SlashAssign,
+                            "/=".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    _ => Token::new(TokenKind::Slash, "/".into(), Span::new(start, self.pos)),
                 }
             }
             b'%' => {
                 self.pos += 1;
-                if self.input.get(self.pos) == Some(&b'=') { self.pos += 1; Token::new(TokenKind::PercentAssign, "%=".into(), Span::new(start, self.pos)) }
-                else { Token::new(TokenKind::Percent, "%".into(), Span::new(start, self.pos)) }
+                if self.input.get(self.pos) == Some(&b'=') {
+                    self.pos += 1;
+                    Token::new(
+                        TokenKind::PercentAssign,
+                        "%=".into(),
+                        Span::new(start, self.pos),
+                    )
+                } else {
+                    Token::new(TokenKind::Percent, "%".into(), Span::new(start, self.pos))
+                }
             }
             b'!' => {
                 self.pos += 1;
@@ -192,12 +302,28 @@ impl<'a> Lexer<'a> {
                     Some(b'=') => {
                         self.pos += 1;
                         match self.input.get(self.pos) {
-                            Some(b'=') => { self.pos += 1; Token::new(TokenKind::CaseNeq, "!==".into(), Span::new(start, self.pos)) }
-                            Some(b'?') => { self.pos += 1; Token::new(TokenKind::WildcardNeq, "!=?".into(), Span::new(start, self.pos)) }
-                            _ => Token::new(TokenKind::Neq, "!=".into(), Span::new(start, self.pos))
+                            Some(b'=') => {
+                                self.pos += 1;
+                                Token::new(
+                                    TokenKind::CaseNeq,
+                                    "!==".into(),
+                                    Span::new(start, self.pos),
+                                )
+                            }
+                            Some(b'?') => {
+                                self.pos += 1;
+                                Token::new(
+                                    TokenKind::WildcardNeq,
+                                    "!=?".into(),
+                                    Span::new(start, self.pos),
+                                )
+                            }
+                            _ => {
+                                Token::new(TokenKind::Neq, "!=".into(), Span::new(start, self.pos))
+                            }
                         }
                     }
-                    _ => Token::new(TokenKind::LogNot, "!".into(), Span::new(start, self.pos))
+                    _ => Token::new(TokenKind::LogNot, "!".into(), Span::new(start, self.pos)),
                 }
             }
             b'=' => {
@@ -206,73 +332,170 @@ impl<'a> Lexer<'a> {
                     Some(b'=') => {
                         self.pos += 1;
                         match self.input.get(self.pos) {
-                            Some(b'=') => { self.pos += 1; Token::new(TokenKind::CaseEq, "===".into(), Span::new(start, self.pos)) }
-                            Some(b'?') => { self.pos += 1; Token::new(TokenKind::WildcardEq, "==?".into(), Span::new(start, self.pos)) }
-                            _ => Token::new(TokenKind::Eq, "==".into(), Span::new(start, self.pos))
+                            Some(b'=') => {
+                                self.pos += 1;
+                                Token::new(
+                                    TokenKind::CaseEq,
+                                    "===".into(),
+                                    Span::new(start, self.pos),
+                                )
+                            }
+                            Some(b'?') => {
+                                self.pos += 1;
+                                Token::new(
+                                    TokenKind::WildcardEq,
+                                    "==?".into(),
+                                    Span::new(start, self.pos),
+                                )
+                            }
+                            _ => Token::new(TokenKind::Eq, "==".into(), Span::new(start, self.pos)),
                         }
                     }
-                    Some(b'>') => { self.pos += 1; Token::new(TokenKind::FatArrow, "=>".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::Assign, "=".into(), Span::new(start, self.pos))
+                    Some(b'>') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::FatArrow, "=>".into(), Span::new(start, self.pos))
+                    }
+                    _ => Token::new(TokenKind::Assign, "=".into(), Span::new(start, self.pos)),
                 }
             }
             b'<' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::Leq, "<=".into(), Span::new(start, self.pos)) }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::Leq, "<=".into(), Span::new(start, self.pos))
+                    }
                     Some(b'<') => {
                         self.pos += 1;
                         match self.input.get(self.pos) {
-                            Some(b'<') => { self.pos += 1;
-                                if self.input.get(self.pos) == Some(&b'=') { self.pos += 1; Token::new(TokenKind::ArithShiftLeftAssign, "<<<=".into(), Span::new(start, self.pos)) }
-                                else { Token::new(TokenKind::ArithShiftLeft, "<<<".into(), Span::new(start, self.pos)) }
+                            Some(b'<') => {
+                                self.pos += 1;
+                                if self.input.get(self.pos) == Some(&b'=') {
+                                    self.pos += 1;
+                                    Token::new(
+                                        TokenKind::ArithShiftLeftAssign,
+                                        "<<<=".into(),
+                                        Span::new(start, self.pos),
+                                    )
+                                } else {
+                                    Token::new(
+                                        TokenKind::ArithShiftLeft,
+                                        "<<<".into(),
+                                        Span::new(start, self.pos),
+                                    )
+                                }
                             }
-                            Some(b'=') => { self.pos += 1; Token::new(TokenKind::ShiftLeftAssign, "<<=".into(), Span::new(start, self.pos)) }
-                            _ => Token::new(TokenKind::ShiftLeft, "<<".into(), Span::new(start, self.pos))
+                            Some(b'=') => {
+                                self.pos += 1;
+                                Token::new(
+                                    TokenKind::ShiftLeftAssign,
+                                    "<<=".into(),
+                                    Span::new(start, self.pos),
+                                )
+                            }
+                            _ => Token::new(
+                                TokenKind::ShiftLeft,
+                                "<<".into(),
+                                Span::new(start, self.pos),
+                            ),
                         }
                     }
                     Some(b'-') => {
                         self.pos += 1;
-                        if self.input.get(self.pos) == Some(&b'>') { self.pos += 1; Token::new(TokenKind::LogEquiv, "<->".into(), Span::new(start, self.pos)) }
-                        else { self.pos -= 1; Token::new(TokenKind::Lt, "<".into(), Span::new(start, self.pos)) }
+                        if self.input.get(self.pos) == Some(&b'>') {
+                            self.pos += 1;
+                            Token::new(
+                                TokenKind::LogEquiv,
+                                "<->".into(),
+                                Span::new(start, self.pos),
+                            )
+                        } else {
+                            self.pos -= 1;
+                            Token::new(TokenKind::Lt, "<".into(), Span::new(start, self.pos))
+                        }
                     }
-                    _ => Token::new(TokenKind::Lt, "<".into(), Span::new(start, self.pos))
+                    _ => Token::new(TokenKind::Lt, "<".into(), Span::new(start, self.pos)),
                 }
             }
             b'>' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::Geq, ">=".into(), Span::new(start, self.pos)) }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::Geq, ">=".into(), Span::new(start, self.pos))
+                    }
                     Some(b'>') => {
                         self.pos += 1;
                         match self.input.get(self.pos) {
-                            Some(b'>') => { self.pos += 1;
-                                if self.input.get(self.pos) == Some(&b'=') { self.pos += 1; Token::new(TokenKind::ArithShiftRightAssign, ">>>=".into(), Span::new(start, self.pos)) }
-                                else { Token::new(TokenKind::ArithShiftRight, ">>>".into(), Span::new(start, self.pos)) }
+                            Some(b'>') => {
+                                self.pos += 1;
+                                if self.input.get(self.pos) == Some(&b'=') {
+                                    self.pos += 1;
+                                    Token::new(
+                                        TokenKind::ArithShiftRightAssign,
+                                        ">>>=".into(),
+                                        Span::new(start, self.pos),
+                                    )
+                                } else {
+                                    Token::new(
+                                        TokenKind::ArithShiftRight,
+                                        ">>>".into(),
+                                        Span::new(start, self.pos),
+                                    )
+                                }
                             }
-                            Some(b'=') => { self.pos += 1; Token::new(TokenKind::ShiftRightAssign, ">>=".into(), Span::new(start, self.pos)) }
-                            _ => Token::new(TokenKind::ShiftRight, ">>".into(), Span::new(start, self.pos))
+                            Some(b'=') => {
+                                self.pos += 1;
+                                Token::new(
+                                    TokenKind::ShiftRightAssign,
+                                    ">>=".into(),
+                                    Span::new(start, self.pos),
+                                )
+                            }
+                            _ => Token::new(
+                                TokenKind::ShiftRight,
+                                ">>".into(),
+                                Span::new(start, self.pos),
+                            ),
                         }
                     }
-                    _ => Token::new(TokenKind::Gt, ">".into(), Span::new(start, self.pos))
+                    _ => Token::new(TokenKind::Gt, ">".into(), Span::new(start, self.pos)),
                 }
             }
             b'&' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'&') => { self.pos += 1; Token::new(TokenKind::LogAnd, "&&".into(), Span::new(start, self.pos)) }
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::AndAssign, "&=".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::BitAnd, "&".into(), Span::new(start, self.pos))
+                    Some(b'&') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::LogAnd, "&&".into(), Span::new(start, self.pos))
+                    }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::AndAssign,
+                            "&=".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    _ => Token::new(TokenKind::BitAnd, "&".into(), Span::new(start, self.pos)),
                 }
             }
             b'|' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'|') => { self.pos += 1; Token::new(TokenKind::LogOr, "||".into(), Span::new(start, self.pos)) }
+                    Some(b'|') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::LogOr, "||".into(), Span::new(start, self.pos))
+                    }
                     Some(b'=') => {
                         self.pos += 1;
                         if self.input.get(self.pos) == Some(&b'>') {
                             self.pos += 1;
-                            Token::new(TokenKind::OrFatArrow, "|=>".into(), Span::new(start, self.pos))
+                            Token::new(
+                                TokenKind::OrFatArrow,
+                                "|=>".into(),
+                                Span::new(start, self.pos),
+                            )
                         } else {
                             Token::new(TokenKind::OrAssign, "|=".into(), Span::new(start, self.pos))
                         }
@@ -281,28 +504,43 @@ impl<'a> Lexer<'a> {
                         self.pos += 1;
                         if self.input.get(self.pos) == Some(&b'>') {
                             self.pos += 1;
-                            Token::new(TokenKind::OrMinusArrow, "|->".into(), Span::new(start, self.pos))
+                            Token::new(
+                                TokenKind::OrMinusArrow,
+                                "|->".into(),
+                                Span::new(start, self.pos),
+                            )
                         } else {
                             // Backtrack or just bitwise or and minus. Since `-` isn't assignment, return `|` and leave `-`
                             self.pos -= 1;
                             Token::new(TokenKind::BitOr, "|".into(), Span::new(start, self.pos))
                         }
                     }
-                    _ => Token::new(TokenKind::BitOr, "|".into(), Span::new(start, self.pos))
+                    _ => Token::new(TokenKind::BitOr, "|".into(), Span::new(start, self.pos)),
                 }
             }
             b'^' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b'~') => { self.pos += 1; Token::new(TokenKind::BitXnor, "^~".into(), Span::new(start, self.pos)) }
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::XorAssign, "^=".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::BitXor, "^".into(), Span::new(start, self.pos))
+                    Some(b'~') => {
+                        self.pos += 1;
+                        Token::new(TokenKind::BitXnor, "^~".into(), Span::new(start, self.pos))
+                    }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::XorAssign,
+                            "^=".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    _ => Token::new(TokenKind::BitXor, "^".into(), Span::new(start, self.pos)),
                 }
             }
             b'#' => {
                 self.pos += 1;
                 if self.input.get(self.pos) == Some(&b'#') {
-                    self.pos += 1; Token::new(TokenKind::HashHash, "##".into(), Span::new(start, self.pos))
+                    self.pos += 1;
+                    Token::new(TokenKind::HashHash, "##".into(), Span::new(start, self.pos))
                 } else {
                     Token::new(TokenKind::Hash, "#".into(), Span::new(start, self.pos))
                 }
@@ -310,10 +548,31 @@ impl<'a> Lexer<'a> {
             b':' => {
                 self.pos += 1;
                 match self.input.get(self.pos) {
-                    Some(b':') => { self.pos += 1; Token::new(TokenKind::DoubleColon, "::".into(), Span::new(start, self.pos)) }
-                    Some(b'/') => { self.pos += 1; Token::new(TokenKind::ColonSlash, ":/".into(), Span::new(start, self.pos)) }
-                    Some(b'=') => { self.pos += 1; Token::new(TokenKind::ColonAssign, ":=".into(), Span::new(start, self.pos)) }
-                    _ => Token::new(TokenKind::Colon, ":".into(), Span::new(start, self.pos))
+                    Some(b':') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::DoubleColon,
+                            "::".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    Some(b'/') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::ColonSlash,
+                            ":/".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    Some(b'=') => {
+                        self.pos += 1;
+                        Token::new(
+                            TokenKind::ColonAssign,
+                            ":=".into(),
+                            Span::new(start, self.pos),
+                        )
+                    }
+                    _ => Token::new(TokenKind::Colon, ":".into(), Span::new(start, self.pos)),
                 }
             }
             _ => self.make_token(start, TokenKind::Unknown),
@@ -345,13 +604,23 @@ impl<'a> Lexer<'a> {
                 self.pos += 1;
             }
             let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
-            return Token::new(TokenKind::TripleStringLiteral, text, Span::new(start, self.pos));
+            return Token::new(
+                TokenKind::TripleStringLiteral,
+                text,
+                Span::new(start, self.pos),
+            );
         }
 
         self.pos += 1; // skip opening "
         while self.pos < self.input.len() {
-            if self.input[self.pos] == b'\\' { self.pos += 2; continue; }
-            if self.input[self.pos] == b'"' { self.pos += 1; break; }
+            if self.input[self.pos] == b'\\' {
+                self.pos += 2;
+                continue;
+            }
+            if self.input[self.pos] == b'"' {
+                self.pos += 1;
+                break;
+            }
             self.pos += 1;
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
@@ -360,7 +629,9 @@ impl<'a> Lexer<'a> {
 
     fn scan_directive(&mut self, start: usize) -> Token {
         self.pos += 1; // skip `
-        while self.pos < self.input.len() && (self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == b'_') {
+        while self.pos < self.input.len()
+            && (self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == b'_')
+        {
             self.pos += 1;
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
@@ -370,7 +641,8 @@ impl<'a> Lexer<'a> {
         if text == "`begin_keywords" {
             let save = self.pos;
             while self.pos < self.input.len()
-                && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t') {
+                && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t')
+            {
                 self.pos += 1;
             }
             if self.pos < self.input.len() && self.input[self.pos] == b'"' {
@@ -380,7 +652,9 @@ impl<'a> Lexer<'a> {
                     self.pos += 1;
                 }
                 let ver = String::from_utf8_lossy(&self.input[vstart..self.pos]).to_string();
-                if self.pos < self.input.len() { self.pos += 1; } // closing quote
+                if self.pos < self.input.len() {
+                    self.pos += 1;
+                } // closing quote
                 self.kw_stack.push(ver.starts_with("1364"));
             } else {
                 // Malformed (no version) — keep the stack balanced anyway.
@@ -398,11 +672,19 @@ impl<'a> Lexer<'a> {
 
     fn scan_system_id(&mut self, start: usize) -> Token {
         self.pos += 1; // skip $
-        while self.pos < self.input.len() && (self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == b'_' || self.input[self.pos] == b'$') {
+        while self.pos < self.input.len()
+            && (self.input[self.pos].is_ascii_alphanumeric()
+                || self.input[self.pos] == b'_'
+                || self.input[self.pos] == b'$')
+        {
             self.pos += 1;
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
-        Token::new(TokenKind::SystemIdentifier, text, Span::new(start, self.pos))
+        Token::new(
+            TokenKind::SystemIdentifier,
+            text,
+            Span::new(start, self.pos),
+        )
     }
 
     fn scan_escaped_id(&mut self, start: usize) -> Token {
@@ -411,11 +693,19 @@ impl<'a> Lexer<'a> {
             self.pos += 1;
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
-        Token::new(TokenKind::EscapedIdentifier, text, Span::new(start, self.pos))
+        Token::new(
+            TokenKind::EscapedIdentifier,
+            text,
+            Span::new(start, self.pos),
+        )
     }
 
     fn scan_identifier(&mut self, start: usize) -> Token {
-        while self.pos < self.input.len() && (self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == b'_' || self.input[self.pos] == b'$') {
+        while self.pos < self.input.len()
+            && (self.input[self.pos].is_ascii_alphanumeric()
+                || self.input[self.pos] == b'_'
+                || self.input[self.pos] == b'$')
+        {
             self.pos += 1;
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
@@ -431,7 +721,9 @@ impl<'a> Lexer<'a> {
 
     fn scan_number(&mut self, start: usize) -> Token {
         // Consume decimal digits (and underscores)
-        while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') {
+        while self.pos < self.input.len()
+            && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_')
+        {
             self.pos += 1;
         }
         // Check for based literal: <size>'<base><value>. IEEE 1800-2017
@@ -439,23 +731,44 @@ impl<'a> Lexer<'a> {
         // (`32 'h ff`), so probe past spaces/tabs before the apostrophe and
         // only commit if a real base specifier follows.
         let mut probe = self.pos;
-        while probe < self.input.len() && (self.input[probe] == b' ' || self.input[probe] == b'\t') {
+        while probe < self.input.len() && (self.input[probe] == b' ' || self.input[probe] == b'\t')
+        {
             probe += 1;
         }
         if probe < self.input.len() && self.input[probe] == b'\'' {
             let next = self.input.get(probe + 1).copied().unwrap_or(0);
-            if matches!(next, b's' | b'S' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H') {
+            if matches!(
+                next,
+                b's' | b'S' | b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H'
+            ) {
                 self.pos = probe; // consume the inter-token whitespace
                 self.pos += 1; // skip '
-                if matches!(self.input.get(self.pos), Some(b's' | b'S')) { self.pos += 1; }
-                if self.pos < self.input.len() && matches!(self.input[self.pos], b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H') {
+                if matches!(self.input.get(self.pos), Some(b's' | b'S')) {
+                    self.pos += 1;
+                }
+                if self.pos < self.input.len()
+                    && matches!(
+                        self.input[self.pos],
+                        b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H'
+                    )
+                {
                     self.pos += 1;
                 }
                 // IEEE 1800-2017 §5.7.1: whitespace allowed between base and value
-                while self.pos < self.input.len() && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t') {
+                while self.pos < self.input.len()
+                    && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t')
+                {
                     self.pos += 1;
                 }
-                while self.pos < self.input.len() && (self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == b'_' || self.input[self.pos] == b'?' || self.input[self.pos] == b'x' || self.input[self.pos] == b'X' || self.input[self.pos] == b'z' || self.input[self.pos] == b'Z') {
+                while self.pos < self.input.len()
+                    && (self.input[self.pos].is_ascii_alphanumeric()
+                        || self.input[self.pos] == b'_'
+                        || self.input[self.pos] == b'?'
+                        || self.input[self.pos] == b'x'
+                        || self.input[self.pos] == b'X'
+                        || self.input[self.pos] == b'z'
+                        || self.input[self.pos] == b'Z')
+                {
                     self.pos += 1;
                 }
                 let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
@@ -463,9 +776,19 @@ impl<'a> Lexer<'a> {
             }
         }
         // Check for real literal: digits.digits or digitsEexp
-        if self.pos < self.input.len() && self.input[self.pos] == b'.' && self.input.get(self.pos + 1).map_or(false, |c| c.is_ascii_digit()) {
+        if self.pos < self.input.len()
+            && self.input[self.pos] == b'.'
+            && self
+                .input
+                .get(self.pos + 1)
+                .map_or(false, |c| c.is_ascii_digit())
+        {
             self.pos += 1;
-            while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') { self.pos += 1; }
+            while self.pos < self.input.len()
+                && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_')
+            {
+                self.pos += 1;
+            }
             // Optional exponent. IEEE 1800-2017 §5.7.2: the exponent REQUIRES
             // at least one digit after `e[+-]`. Mirror the no-dot path below and
             // backtrack when it is missing, so `1.0e+`/`1.0e`/`1.0e-` do not
@@ -475,9 +798,15 @@ impl<'a> Lexer<'a> {
             if self.pos < self.input.len() && matches!(self.input[self.pos], b'e' | b'E') {
                 let exp_start = self.pos;
                 self.pos += 1;
-                if self.pos < self.input.len() && matches!(self.input[self.pos], b'+' | b'-') { self.pos += 1; }
+                if self.pos < self.input.len() && matches!(self.input[self.pos], b'+' | b'-') {
+                    self.pos += 1;
+                }
                 if self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-                    while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') { self.pos += 1; }
+                    while self.pos < self.input.len()
+                        && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_')
+                    {
+                        self.pos += 1;
+                    }
                 } else {
                     self.pos = exp_start; // malformed exponent: no digits after e[+-]
                 }
@@ -488,11 +817,18 @@ impl<'a> Lexer<'a> {
                 let rest = &self.input[self.pos..];
                 for suffix in &[b"ns" as &[u8], b"us", b"ms", b"ps", b"fs", b"s"] {
                     if rest.starts_with(suffix)
-                        && !rest.get(suffix.len()).map_or(false, |c| c.is_ascii_alphanumeric())
+                        && !rest
+                            .get(suffix.len())
+                            .map_or(false, |c| c.is_ascii_alphanumeric())
                     {
                         self.pos += suffix.len();
-                        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
-                        return Token::new(TokenKind::TimeLiteral, text, Span::new(start, self.pos));
+                        let text =
+                            String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+                        return Token::new(
+                            TokenKind::TimeLiteral,
+                            text,
+                            Span::new(start, self.pos),
+                        );
                     }
                 }
             }
@@ -503,9 +839,15 @@ impl<'a> Lexer<'a> {
         if self.pos < self.input.len() && matches!(self.input[self.pos], b'e' | b'E') {
             let saved = self.pos;
             self.pos += 1;
-            if self.pos < self.input.len() && matches!(self.input[self.pos], b'+' | b'-') { self.pos += 1; }
+            if self.pos < self.input.len() && matches!(self.input[self.pos], b'+' | b'-') {
+                self.pos += 1;
+            }
             if self.pos < self.input.len() && self.input[self.pos].is_ascii_digit() {
-                while self.pos < self.input.len() && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_') { self.pos += 1; }
+                while self.pos < self.input.len()
+                    && (self.input[self.pos].is_ascii_digit() || self.input[self.pos] == b'_')
+                {
+                    self.pos += 1;
+                }
                 let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
                 return Token::new(TokenKind::RealLiteral, text, Span::new(start, self.pos));
             }
@@ -515,7 +857,11 @@ impl<'a> Lexer<'a> {
         if self.pos + 1 < self.input.len() {
             let rest = &self.input[self.pos..];
             for suffix in &[b"ns" as &[u8], b"us", b"ms", b"ps", b"fs", b"s"] {
-                if rest.starts_with(suffix) && !rest.get(suffix.len()).map_or(false, |c| c.is_ascii_alphanumeric()) {
+                if rest.starts_with(suffix)
+                    && !rest
+                        .get(suffix.len())
+                        .map_or(false, |c| c.is_ascii_alphanumeric())
+                {
                     self.pos += suffix.len();
                     let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
                     return Token::new(TokenKind::TimeLiteral, text, Span::new(start, self.pos));
@@ -529,9 +875,14 @@ impl<'a> Lexer<'a> {
     fn scan_based_number(&mut self, start: usize) -> Token {
         self.pos += 1; // skip '
         let mut p = self.pos;
-        if p < self.input.len() && matches!(self.input[p], b's' | b'S') { p += 1; }
+        if p < self.input.len() && matches!(self.input[p], b's' | b'S') {
+            p += 1;
+        }
         let has_base = p < self.input.len()
-            && matches!(self.input[p], b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H');
+            && matches!(
+                self.input[p],
+                b'b' | b'B' | b'o' | b'O' | b'd' | b'D' | b'h' | b'H'
+            );
         if !has_base {
             // No base specifier after `'` — this is a cast operator (`expr'(…)`)
             // or an assignment pattern, NOT a based literal. Emit a bare `'`
@@ -539,14 +890,28 @@ impl<'a> Lexer<'a> {
             // cast like `(w) ' (v)` still has `text == "'"` for the parser's
             // cast handler. (Consuming the space here was tokenizing `"' "`,
             // breaking real-world RTL such as basejump's `(nodes_p) ' (0)`.)
-            return Token::new(TokenKind::IntegerLiteral, "'".into(), Span::new(start, self.pos));
+            return Token::new(
+                TokenKind::IntegerLiteral,
+                "'".into(),
+                Span::new(start, self.pos),
+            );
         }
         self.pos = p + 1; // consume optional sign + base specifier
         // IEEE 1800-2017 §5.7.1: whitespace allowed between base and value
-        while self.pos < self.input.len() && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t') {
+        while self.pos < self.input.len()
+            && (self.input[self.pos] == b' ' || self.input[self.pos] == b'\t')
+        {
             self.pos += 1;
         }
-        while self.pos < self.input.len() && (self.input[self.pos].is_ascii_alphanumeric() || self.input[self.pos] == b'_' || self.input[self.pos] == b'?' || self.input[self.pos] == b'x' || self.input[self.pos] == b'X' || self.input[self.pos] == b'z' || self.input[self.pos] == b'Z') {
+        while self.pos < self.input.len()
+            && (self.input[self.pos].is_ascii_alphanumeric()
+                || self.input[self.pos] == b'_'
+                || self.input[self.pos] == b'?'
+                || self.input[self.pos] == b'x'
+                || self.input[self.pos] == b'X'
+                || self.input[self.pos] == b'z'
+                || self.input[self.pos] == b'Z')
+        {
             self.pos += 1;
         }
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
@@ -562,7 +927,8 @@ impl<'a> Lexer<'a> {
 /// keyword region, so over-inclusion is harmless while under-inclusion would
 /// leave a legacy identifier wrongly reserved.
 fn is_sv_only_keyword(s: &str) -> bool {
-    matches!(s,
+    matches!(
+        s,
         // data types
         "logic" | "bit" | "byte" | "shortint" | "int" | "longint"
         | "shortreal" | "void" | "chandle" | "string" | "var" | "type"
