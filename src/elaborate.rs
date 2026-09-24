@@ -1929,6 +1929,14 @@ pub struct ElaboratedModule {
     /// non-ANSI redeclarations while still permitting the legal split forms.
     #[serde(skip)]
     pub typed_decls: HashMap<String, bool>,
+    /// Transient: non-ANSI ports that a separate net or variable declaration
+    /// has already completed (§23.2.2.1 allows exactly one such declaration).
+    #[serde(skip)]
+    pub completed_ports: HashSet<String>,
+    /// Transient: width of each non-ANSI port whose port declaration carries
+    /// an explicit packed range (`output [7:0] x;`).
+    #[serde(skip)]
+    pub ranged_port_widths: HashMap<String, u32>,
     /// §26.3: names that are BOTH brought in by a wildcard package import
     /// (`import pkg::*`) AND re-declared locally in this scope. A local
     /// declaration shadows the imported name — so at such a name the
@@ -2456,6 +2464,51 @@ impl ElaboratedModule {
             .or_insert_with(|| (span, kind.to_string(), own_scope));
     }
 
+    /// §23.2.2.1: a non-ANSI port declared without a net or variable type may
+    /// be declared again ONCE, by a net or variable declaration. A second one
+    /// (`output x; reg x; reg x;`, `input x; wire x; reg x;`) redeclares it.
+    ///
+    /// When the port declaration has an explicit range, a completing
+    /// declaration that states its own shape must match it ("the range
+    /// specification between the two declarations of a port shall be
+    /// identical"); a bare `wire x;` takes the port's range.
+    fn complete_port(
+        &mut self,
+        name: &str,
+        span: Span,
+        dt: &DataType,
+        width: u32,
+    ) -> Result<(), String> {
+        if !self.completed_ports.insert(name.to_string()) {
+            if sv_parser::strict_checks() {
+                return Err(duplicate_decl_error(self, name, span, "variable/net"));
+            }
+            eprintln!(
+                "[xezim][warning] duplicate declaration of port '{}'; keeping first definition",
+                name
+            );
+            return Ok(());
+        }
+        let bare = matches!(dt, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
+        if let Some(&port_w) = self.ranged_port_widths.get(name)
+            && !bare
+            && port_w != width
+            && sv_parser::strict_checks()
+        {
+            return Err(span_error(
+                self,
+                span,
+                &format!(
+                    "port '{}' is declared {} bits wide but redeclared {} bits wide; the \
+                     port and its net/variable declaration must have identical ranges \
+                     (IEEE 1800-2017 §23.2.2.1)",
+                    name, port_w, width
+                ),
+            ));
+        }
+        Ok(())
+    }
+
     fn note_explicit_type(&mut self, name: &str, dt: &DataType, span: Span) -> Result<(), String> {
         // A *bare* implicit type — `output x;` / `wire x;` (no range, no
         // signing) — carries no type; it is the legal half of a non-ANSI split
@@ -2500,6 +2553,8 @@ impl ElaboratedModule {
             tick_s: default_tick_s(),
             signals: HashMap::default(),
             typed_decls: HashMap::default(),
+            completed_ports: HashSet::default(),
+            ranged_port_widths: HashMap::default(),
             wildcard_shadowed: std::collections::HashSet::default(),
             port_order: Vec::new(),
             continuous_assigns: Vec::new(),
@@ -5589,6 +5644,9 @@ pub fn elaborate_module_with_defs(
                     resolve_type_width(&pd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed(&pd.data_type);
                 let is_real = is_type_real(&pd.data_type);
+                let ranged = matches!(&pd.data_type,
+                    DataType::Implicit { dimensions, .. } | DataType::IntegerVector { dimensions, .. }
+                        if !dimensions.is_empty());
                 for decl in &pd.declarators {
                     if elab.parameters.contains_key(&decl.name.name) {
                         if elab.claim_local_decl_displacement(
@@ -5606,6 +5664,10 @@ pub fn elaborate_module_with_defs(
                                 "net",
                             ));
                         }
+                    }
+                    if ranged {
+                        elab.ranged_port_widths
+                            .insert(decl.name.name.clone(), width);
                     }
                     // §7.4.1: a non-ANSI PORT of a packed multi-D (or packed
                     // struct) type needs the same element/field registrations
@@ -5799,6 +5861,13 @@ pub fn elaborate_module_with_defs(
                     // and just record the leaf in `nets`. Only treat it
                     // as an error if the existing entry is not a port
                     // (i.e. a true duplicate user declaration).
+                    if elab
+                        .signals
+                        .get(&decl.name.name)
+                        .is_some_and(|s| s.direction.is_some())
+                    {
+                        elab.complete_port(&decl.name.name, decl.name.span, &nd.data_type, width)?;
+                    }
                     if let Some(existing) = elab.signals.get_mut(&decl.name.name) {
                         if existing.direction.is_some() {
                             existing.value =
@@ -6234,6 +6303,7 @@ pub fn elaborate_module_with_defs(
                         .is_some_and(|s| s.direction.is_some())
                         && !elab.parameters.contains_key(&decl.name.name)
                     {
+                        elab.complete_port(&decl.name.name, decl.name.span, &dd.data_type, width)?;
                         let explicit_type = !matches!(dd.data_type, DataType::Implicit { .. });
                         let decl_is_real =
                             is_type_real_resolved(&dd.data_type, &elab.typedef_types);
