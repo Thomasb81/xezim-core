@@ -3345,7 +3345,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 };
                 let base_width =
                     resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
-                let is_implicit = matches!(data_type, DataType::Implicit { .. });
+                let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                 for assign in assignments {
                     let Some(init) = &assign.init else { continue };
                     let width = if is_implicit {
@@ -3376,8 +3376,9 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                         init
                     };
                     let mut v = eval_init_for_width(init, &elab.parameters, width);
-                    if is_type_signed(data_type) || is_implicit {
-                        v.is_signed = true;
+                    if !v.is_real {
+                        v.is_signed =
+                            pkg_param_is_signed(data_type, Some(init), &elab.typedef_types);
                     }
                     if is_type_real(data_type) {
                         v = Value::from_f64(v.to_f64());
@@ -5071,7 +5072,6 @@ pub fn elaborate_module_with_defs(
                             data_type,
                             DataType::Implicit { dimensions, .. } if dimensions.is_empty()
                         );
-                        let is_signed = is_type_signed(data_type);
                         for assign in assignments {
                             register_packed_array_elem_w(
                                 &assign.name.name,
@@ -5127,8 +5127,12 @@ pub fn elaborate_module_with_defs(
                                 };
                                 let mut v =
                                     eval_init_for_width(init_eval, &elab.parameters, eff_width);
-                                if is_signed {
-                                    v.is_signed = true;
+                                if !v.is_real {
+                                    v.is_signed = pkg_param_is_signed(
+                                        data_type,
+                                        Some(init_eval),
+                                        &elab.typedef_types,
+                                    );
                                 }
                                 alias_pkg_param(&mut elab, &p.name.name, &assign.name.name, &v);
                                 params_insert_traced(
@@ -15647,6 +15651,26 @@ fn untyped_param_is_signed(init: &Expression) -> bool {
     }
 }
 
+/// §6.20.2: a package parameter's DECLARED type fixes its signedness, as a
+/// module parameter's does. The package paths only ever SET the flag, so a
+/// signed initializer leaked into an unsigned parameter: `parameter bit B = 1`
+/// read as a signed 1-bit -1, and `B === 1` was false. Only an untyped,
+/// unranged parameter takes the signedness of its value.
+fn pkg_param_is_signed(
+    dt: &DataType,
+    init: Option<&Expression>,
+    typedef_types: &HashMap<String, DataType>,
+) -> bool {
+    match dt {
+        DataType::Implicit {
+            signing: None,
+            dimensions,
+            ..
+        } if dimensions.is_empty() => init.map(untyped_param_is_signed).unwrap_or(true),
+        _ => is_type_signed_resolved(dt, typedef_types),
+    }
+}
+
 fn default_value_for_type_resolved(
     dt: &DataType,
     width: u32,
@@ -21505,11 +21529,7 @@ pub fn inline_instantiations(
                                         Some(&elab.parameters),
                                         Some(&elab.typedefs),
                                     );
-                                    let mut is_signed = is_type_signed(data_type);
                                     let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
-                                    if is_implicit {
-                                        is_signed = true;
-                                    }
                                     for assign in assignments {
                                         let width = if is_implicit {
                                             assign
@@ -21554,8 +21574,12 @@ pub fn inline_instantiations(
                                                 &elab.typedef_types,
                                                 width,
                                             );
-                                            if is_signed {
-                                                v.is_signed = true;
+                                            if !v.is_real {
+                                                v.is_signed = pkg_param_is_signed(
+                                                    data_type,
+                                                    Some(init),
+                                                    &elab.typedef_types,
+                                                );
                                             }
                                             alias_pkg_param(elab, name, &assign.name.name, &v);
                                             params_insert_traced(
@@ -21658,11 +21682,7 @@ pub fn inline_instantiations(
                                     Some(&elab.parameters),
                                     Some(&elab.typedefs),
                                 );
-                                let mut is_signed = is_type_signed(data_type);
                                 let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
-                                if is_implicit {
-                                    is_signed = true;
-                                }
                                 for assign in assignments {
                                     // Implicit-typed param: use the sized-
                                     // literal width from the initializer when
@@ -21716,8 +21736,12 @@ pub fn inline_instantiations(
                                             &elab.typedef_types,
                                             width,
                                         );
-                                        if is_signed {
-                                            v.is_signed = true;
+                                        if !v.is_real {
+                                            v.is_signed = pkg_param_is_signed(
+                                                data_type,
+                                                Some(init),
+                                                &elab.typedef_types,
+                                            );
                                         }
                                         params_insert_traced(
                                             &mut elab.parameters,
@@ -33742,9 +33766,14 @@ fn process_import(
                                             Some(&elab.parameters),
                                             Some(&elab.typedefs),
                                         );
-                                        let mut signed = is_type_signed(data_type);
+                                        let signed = pkg_param_is_signed(
+                                            data_type,
+                                            assign.init.as_ref(),
+                                            &elab.typedef_types,
+                                        );
                                         let is_real = is_type_real(data_type);
-                                        if matches!(data_type, DataType::Implicit { .. }) {
+                                        if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+                                        {
                                             // Infer width from sized literal
                                             // initializer (`7'h13` → 7) so the
                                             // parameter doesn't default to 32
@@ -33755,7 +33784,6 @@ fn process_import(
                                                 .as_ref()
                                                 .and_then(sized_literal_width)
                                                 .unwrap_or(32);
-                                            signed = true;
                                         }
                                         let v = if let Some(init) = &assign.init {
                                             // §13.4.3 const-function calls.
@@ -33780,8 +33808,12 @@ fn process_import(
                                             };
                                             let mut v =
                                                 eval_init_for_width(init, &elab.parameters, width);
-                                            if signed {
-                                                v.is_signed = true;
+                                            if !v.is_real {
+                                                v.is_signed = pkg_param_is_signed(
+                                                    data_type,
+                                                    Some(init),
+                                                    &elab.typedef_types,
+                                                );
                                             }
                                             if is_real {
                                                 v = Value::from_f64(v.to_f64());
@@ -34107,13 +34139,14 @@ fn process_import(
                                     Some(&elab.parameters),
                                     Some(&elab.typedefs),
                                 );
-                                let mut signed = is_type_signed(data_type);
                                 let is_real = is_type_real(data_type);
-                                let is_implicit = matches!(data_type, DataType::Implicit { .. });
-                                if is_implicit {
-                                    signed = true;
-                                }
+                                let is_implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                                 for assign in assignments {
+                                    let signed = pkg_param_is_signed(
+                                        data_type,
+                                        assign.init.as_ref(),
+                                        &elab.typedef_types,
+                                    );
                                     // Per-assignment width: implicit-typed
                                     // parameters take the sized-literal
                                     // initializer width when available
@@ -34161,8 +34194,12 @@ fn process_import(
                                             &elab.typedef_types,
                                             width,
                                         );
-                                        if signed {
-                                            v.is_signed = true;
+                                        if !v.is_real {
+                                            v.is_signed = pkg_param_is_signed(
+                                                data_type,
+                                                Some(init),
+                                                &elab.typedef_types,
+                                            );
                                         }
                                         if is_real {
                                             v = Value::from_f64(v.to_f64());
