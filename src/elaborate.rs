@@ -4811,9 +4811,23 @@ pub fn elaborate_module_with_defs(
                             &elab.typedef_types,
                         )
                         .map(|sv| sv.resize(width))
-                        .unwrap_or_else(|| eval_init_for_width(init_eval, &elab.parameters, width))
+                        .unwrap_or_else(|| {
+                            eval_param_init(
+                                data_type,
+                                init_eval,
+                                &elab.parameters,
+                                &elab.typedef_types,
+                                width,
+                            )
+                        })
                     } else {
-                        eval_init_for_width(init_eval, &elab.parameters, width)
+                        eval_param_init(
+                            data_type,
+                            init_eval,
+                            &elab.parameters,
+                            &elab.typedef_types,
+                            width,
+                        )
                     };
                     if signed {
                         v.is_signed = true;
@@ -18333,6 +18347,31 @@ fn eval_param_value(
     }
     if let Some(v) = pack_packed_vector_pattern(dt, init, params, typedef_types) {
         return v.resize(width);
+    }
+    eval_param_init(dt, init, params, typedef_types, width)
+}
+
+/// §6.20.2 / §10.7: a parameter with an explicit type or range is ASSIGNED its
+/// value, so the declared width is the initializer's context — `localparam
+/// int P = A + B` over 8-bit A and B is 300, not the 8-bit wrap 44. An untyped
+/// parameter keeps its value's self-determined width, and a real target takes
+/// no integral context.
+fn eval_param_init(
+    dt: &DataType,
+    init: &Expression,
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+    width: u32,
+) -> Value {
+    let typed = !matches!(dt, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
+        && !is_type_real_resolved(dt, typedef_types);
+    if typed
+        && !matches!(
+            init.kind,
+            ExprKind::Number(NumberLiteral::UnbasedUnsized(_))
+        )
+    {
+        return eval_const_expr_val_ctx(init, params, width).resize_for_assign(width);
     }
     eval_init_for_width(init, params, width)
 }
