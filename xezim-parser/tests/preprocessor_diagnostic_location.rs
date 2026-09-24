@@ -12,12 +12,12 @@ fn reserved_macro_redefinition_reports_source_path_and_line() {
 
     assert_eq!(pp.errors().len(), 2);
     assert!(
-        pp.errors()[0].starts_with("/work/chip_ut/top.sv:2: `__FILE__"),
+        pp.errors()[0].starts_with("/work/chip_ut/top.sv:2:1: error: `__FILE__"),
         "unexpected diagnostic: {}",
         pp.errors()[0]
     );
     assert!(
-        pp.errors()[1].starts_with("/work/chip_ut/top.sv:3: `__LINE__"),
+        pp.errors()[1].starts_with("/work/chip_ut/top.sv:3:1: error: `__LINE__"),
         "unexpected diagnostic: {}",
         pp.errors()[1]
     );
@@ -46,7 +46,11 @@ fn reserved_macro_redefinition_in_include_reports_include_location() {
     let mut pp = Preprocessor::new();
     pp.preprocess_file("`include \"diag_defs.svh\"\n", Some(&top));
 
-    let expected = format!("{}:2: `__FILE__", include.display());
+    let expected = format!(
+        "In file included from {}:1:\n{}:2:1: error: `__FILE__",
+        top.display(),
+        include.display()
+    );
     assert_eq!(pp.errors().len(), 1);
     assert!(
         pp.errors()[0].starts_with(&expected),

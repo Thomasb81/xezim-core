@@ -783,6 +783,42 @@ fn report_file_definitions(label: &str, descriptions: &[ast::Description]) {
     }
 }
 
+/// Render the `severity` diagnostics of one parsed file, each located
+/// through `map` (spans index `text`, the file's preprocessed text). The
+/// parser's error recovery can report one problem twice at the same place;
+/// identical repeats are dropped, and past the first 20 (by then mostly
+/// recovery cascades) only a count is given.
+pub fn render_parse_diagnostics(
+    diags: &[diagnostics::Diagnostic],
+    severity: diagnostics::Severity,
+    text: &str,
+    map: Option<&sv_parser::source_map::LineMap>,
+    file: &str,
+) -> Vec<String> {
+    const SHOWN: usize = 20;
+    let mut seen: std::collections::HashSet<(usize, usize, &str)> =
+        std::collections::HashSet::new();
+    let unique: Vec<&diagnostics::Diagnostic> = diags
+        .iter()
+        .filter(|d| d.severity == severity)
+        .filter(|d| seen.insert((d.span.start, d.span.end, d.message.as_str())))
+        .collect();
+    let mut out: Vec<String> = unique
+        .iter()
+        .take(SHOWN)
+        .map(|d| diagnostics::render_diagnostic(d, text, map, file))
+        .collect();
+    if unique.len() > SHOWN {
+        out.push(format!(
+            "... {} more {}(s) in '{}' not shown",
+            unique.len() - SHOWN,
+            severity.as_str(),
+            file
+        ));
+    }
+    out
+}
+
 pub fn parse_and_elaborate_multi(
     sources: &[String],
     top_module_name: Option<&str>,
@@ -802,6 +838,10 @@ pub fn parse_and_elaborate_multi(
     // are what runtime diagnostics need to turn a span into `file:line`
     // (see `ElaboratedModule::source_texts`).
     let mut preprocessed_texts: Vec<String> = Vec::with_capacity(sources.len());
+    // Line map of each preprocessed text back to the original files, for
+    // `file:line:col` diagnostics through `include`s and macros.
+    let mut line_maps: Vec<Option<sv_parser::source_map::LineMap>> =
+        Vec::with_capacity(sources.len());
     // Which file defined each module/interface/program, by name. Captured
     // HERE — the only point where a description's originating file is still
     // known — and handed to runtime diagnostics via
@@ -844,6 +884,7 @@ pub fn parse_and_elaborate_multi(
         // rather than declared here.
         pp.begin_top_level_file();
         let preprocessed = pp.preprocess_file(source, source_path.as_deref());
+        let line_map = pp.take_line_map();
         // Preprocessor-fatal conditions (missing/unreadable `include, include
         // recursion, strict directive violations): fail the run at the first
         // affected file. Continuing used to silently drop the include's
@@ -870,11 +911,13 @@ pub fn parse_and_elaborate_multi(
             .any(|d| d.severity == diagnostics::Severity::Error)
         {
             progress_clear();
-            let errs: Vec<_> = diags
-                .iter()
-                .filter(|d| d.severity == diagnostics::Severity::Error)
-                .map(|d| d.to_string())
-                .collect();
+            let errs = render_parse_diagnostics(
+                &diags,
+                diagnostics::Severity::Error,
+                &preprocessed,
+                line_map.as_ref(),
+                label,
+            );
             return Err(format!(
                 "Parse errors in '{}' (file {} of {}):\n{}",
                 label,
@@ -883,21 +926,42 @@ pub fn parse_and_elaborate_multi(
                 errs.join("\n")
             ));
         }
+        // Parser warnings (an unsupported UDP table, a nonstandard
+        // construct accepted for compatibility), located like the errors;
+        // informational notes only under --verbose.
+        let mut shown = vec![diagnostics::Severity::Warning];
+        if compile_verbose() {
+            shown.push(diagnostics::Severity::Info);
+        }
+        for sev in shown {
+            for w in render_parse_diagnostics(&diags, sev, &preprocessed, line_map.as_ref(), label)
+            {
+                progress_clear();
+                eprintln!("{}", w);
+            }
+        }
         if compile_verbose() {
             report_file_definitions(label, &source_ast.descriptions);
         }
         // Second, AST-level strict pass (runs alongside the permissive parser;
         // gated by --strict, on by default). Rejects LRM violations the main
         // parser accepts. See sv_parser::strict_check.
-        let strict_viol = sv_parser::strict_check::strict_violations(&source_ast.descriptions);
+        let strict_viol = sv_parser::strict_check::strict_diagnostics(&source_ast.descriptions);
         if !strict_viol.is_empty() {
             progress_clear();
+            let errs = render_parse_diagnostics(
+                &strict_viol,
+                diagnostics::Severity::Error,
+                &preprocessed,
+                line_map.as_ref(),
+                label,
+            );
             return Err(format!(
                 "Strict check failed in '{}' (file {} of {}):\n{}",
                 label,
                 i + 1,
                 sources.len(),
-                strict_viol.join("\n")
+                errs.join("\n")
             ));
         }
         for d in &source_ast.descriptions {
@@ -921,6 +985,7 @@ pub fn parse_and_elaborate_multi(
         }
         all_descriptions.extend(source_ast.descriptions);
         preprocessed_texts.push(preprocessed);
+        line_maps.push(line_map);
     }
 
     // IEEE 1801 power intent: splice the generated UPF package and glue
@@ -934,6 +999,7 @@ pub fn parse_and_elaborate_multi(
     // `elab.source_texts` below is assigned too late for that. Moved, not
     // cloned, then moved back out.
     elaborate::set_elab_sources(preprocessed_texts, source_files.to_vec());
+    elaborate::set_elab_line_maps(line_maps);
     elaborate::set_elab_module_files(src_file_of_module.clone());
     if !compile_verbose() {
         progress_status(&format!(
@@ -952,9 +1018,11 @@ pub fn parse_and_elaborate_multi(
     );
     progress_clear();
     let (texts, files) = elaborate::take_elab_sources();
+    let maps = elaborate::take_elab_line_maps();
     let (defs, mut elab) = elaborated?;
     elab.source_texts = texts;
     elab.source_files = files;
+    elab.source_line_maps = maps;
     elab.src_file_of_module = src_file_of_module;
     // Captured from the RAW sources — the only place the pre-preprocessing
     // line counts are still known.
@@ -2787,21 +2855,19 @@ fn resolve_library_modules(
             pp.define(name.clone(), def.clone());
         }
         let preprocessed = pp.preprocess_file(&source, Some(&path));
+        let line_map = pp.take_line_map();
+        // A missing `include or illegal directive in a library file: nothing
+        // else reports the preprocessor's list on this path.
+        for e in pp.errors() {
+            eprintln!("{}", e);
+        }
         let result = sv_parser::parse(&preprocessed);
-        let line_col = |off: usize| -> (usize, usize) {
-            let (mut line, mut col) = (1usize, 1usize);
-            for (i, ch) in preprocessed.char_indices() {
-                if i >= off {
-                    break;
-                }
-                if ch == '\n' {
-                    line += 1;
-                    col = 1;
-                } else {
-                    col += 1;
-                }
-            }
-            (line, col)
+        // Spans index the re-parsed text; it is the preprocessed text again
+        // (nothing is left to expand), so the map applies to it.
+        let line_map = line_map.filter(|_| result.source_text == preprocessed);
+        let file_label = path.display().to_string();
+        let render = |d: &diagnostics::Diagnostic| {
+            diagnostics::render_diagnostic(d, &result.source_text, line_map.as_ref(), &file_label)
         };
         if explicit_v && lib_cli.primitive_verbose {
             let mut modules = 0usize;
@@ -2856,36 +2922,15 @@ fn resolve_library_modules(
                     "[primitive-verbose] detailed parser diagnostics for -v '{}':",
                     path.display()
                 );
-                for (severity, diagnostic) in result
-                    .errors
-                    .iter()
-                    .map(|d| ("error", d))
-                    .chain(result.warnings.iter().map(|d| ("warning", d)))
-                    .take(16)
-                {
-                    let (line, col) = line_col(diagnostic.span.start);
-                    let source_line = preprocessed
-                        .lines()
-                        .nth(line.saturating_sub(1))
-                        .unwrap_or("");
-                    eprintln!(
-                        "  {}:{}:{}: {}: {}",
-                        path.display(),
-                        line,
-                        col,
-                        severity,
-                        diagnostic.message
-                    );
-                    eprintln!("    {}", source_line);
-                    eprintln!("    {}^", " ".repeat(col.saturating_sub(1)));
+                for diagnostic in result.errors.iter().chain(result.warnings.iter()).take(16) {
+                    eprintln!("{}", render(diagnostic));
                 }
             }
         }
         // A half-parsed library file silently loses every definition after the
         // point of failure — the classic "-v vendor.v then Module 'X' not
-        // found". Surface it VCS-style: file:line:col per error (first three),
-        // resolved against the preprocessed text the spans index (line numbers
-        // can shift from the raw file where `include/macros expand).
+        // found". Surface it: file:line:col per error (first three), located
+        // through the line map in the original (possibly `include`d) file.
         if !result.errors.is_empty() {
             eprintln!(
                 "Warning: library file '{}': {} parse error(s) — definitions after the first error may be lost:",
@@ -2893,8 +2938,7 @@ fn resolve_library_modules(
                 result.errors.len()
             );
             for e in result.errors.iter().take(3) {
-                let (line, col) = line_col(e.span.start);
-                eprintln!("  {}:{}:{}: {}", path.display(), line, col, e.message);
+                eprintln!("{}", render(e));
             }
             if result.errors.len() > 3 {
                 eprintln!("  ... and {} more", result.errors.len() - 3);

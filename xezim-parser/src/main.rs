@@ -13,7 +13,7 @@
 //!   --help          Show this help
 
 use std::process;
-use sv_parser::diagnostics::format_diagnostic;
+use sv_parser::diagnostics::render_diagnostic;
 use sv_parser::*;
 
 fn main() {
@@ -126,20 +126,18 @@ fn main() {
             }
         };
 
-        for err in &result.errors {
-            eprintln!(
-                "{}",
-                format_diagnostic(&result.source_text, err).replace("<source>", file)
-            );
+        for err in &result.preprocess_errors {
+            eprintln!("{}", err);
         }
-        for warn in &result.warnings {
+        let map = result.line_map.as_ref();
+        for diag in result.errors.iter().chain(&result.warnings) {
             eprintln!(
                 "{}",
-                format_diagnostic(&result.source_text, warn).replace("<source>", file)
+                render_diagnostic(diag, &result.source_text, map, file)
             );
         }
 
-        total_errors += result.errors.len();
+        total_errors += result.errors.len() + result.preprocess_errors.len();
         total_warnings += result.warnings.len();
         total_modules += result.source.descriptions.len();
 

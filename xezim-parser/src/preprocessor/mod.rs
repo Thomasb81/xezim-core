@@ -6,6 +6,9 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
+use crate::diagnostics::{self, Location};
+use crate::source_map::{LineMap, LineOrigin, MapFile};
+
 #[derive(Debug, Clone)]
 pub struct MacroDef {
     pub name: String,
@@ -67,11 +70,24 @@ pub struct Preprocessor {
     /// Macro-expansion-time strict errors (bad argument counts). Interior
     /// mutability because `expand_macros*` run behind `&self`; drained into
     /// `errors` after each line is expanded.
-    expansion_errors: std::cell::RefCell<Vec<String>>,
-    /// Names already reported by `note_undefined_macro`, so a macro used in a
-    /// loop or an `include pulled in many times warns once rather than once
-    /// per use.
-    reported_undefined: std::cell::RefCell<HashSet<String>>,
+    /// `(macro name, message)`, located at the invocation when drained.
+    expansion_errors: std::cell::RefCell<Vec<(String, String)>>,
+    /// Undefined macro names seen while expanding the current line; reported
+    /// (located at the use) when the line is done.
+    undefined_seen: std::cell::RefCell<Vec<String>>,
+    /// Files contributing to the text being produced, for its line map.
+    map_files: Vec<MapFile>,
+    /// Macro names referenced by the line map, and their indices.
+    map_macros: Vec<String>,
+    map_macro_idx: HashMap<String, u32>,
+    /// `map_files` index of `current_file`.
+    cur_file_idx: u32,
+    /// The source line being processed and its column in the original line
+    /// (non-zero for a piece split off it), for diagnostic carets.
+    cur_line_text: String,
+    cur_col_off: u32,
+    /// Line map of the text the last `preprocess_file`/`preprocess` returned.
+    last_map: Option<LineMap>,
 }
 
 const MAX_INCLUDE_DEPTH: usize = 32;
@@ -81,6 +97,44 @@ struct IfdefState {
     parent_active: bool,
     branch_taken: bool,
     active: bool,
+}
+
+/// What `resolve_directives` is resolving.
+#[derive(Clone, Copy)]
+enum Ctx {
+    /// A source file (`source_path`), pulled in by the `include at
+    /// `(map file, line)` when there is one.
+    File { included_from: Option<(u32, u32)> },
+    /// Macro-expanded text that still held directives; all of it maps to
+    /// the invocation.
+    Macro(LineOrigin),
+}
+
+/// Collects one origin per output line, in step with the output text.
+#[derive(Default)]
+struct OriginSink {
+    origins: Vec<LineOrigin>,
+    /// Bytes of the output already accounted for.
+    seen: usize,
+}
+
+impl OriginSink {
+    /// Give every line completed since the last call the origin `o`.
+    fn fill(&mut self, output: &str, o: LineOrigin) {
+        let n = output.as_bytes()[self.seen..]
+            .iter()
+            .filter(|&&b| b == b'\n')
+            .count();
+        self.origins.extend(std::iter::repeat_n(o, n));
+        self.seen = output.len();
+    }
+
+    /// Append the origins of text just appended to `output` (which must be
+    /// in sync before that text).
+    fn extend(&mut self, output: &str, origins: Vec<LineOrigin>) {
+        self.origins.extend(origins);
+        self.seen = output.len();
+    }
 }
 
 /// §22.5.1: a compiler directive matches as a WHOLE word — a user macro is
@@ -146,14 +200,19 @@ impl Preprocessor {
             design_element_depth: 0,
             unconnected_pull: None,
             expansion_errors: std::cell::RefCell::new(Vec::new()),
-            reported_undefined: std::cell::RefCell::new(HashSet::new()),
+            undefined_seen: std::cell::RefCell::new(Vec::new()),
+            map_files: Vec::new(),
+            map_macros: Vec::new(),
+            map_macro_idx: HashMap::new(),
+            cur_file_idx: 0,
+            cur_line_text: String::new(),
+            cur_col_off: 0,
+            last_map: None,
         }
     }
 
-    /// Strict-mode directive errors collected during preprocessing (empty
-    /// unless `strict_checks()` is on and an illegal directive was seen).
     /// Report a `\`name` that no `\`define` (and no compiler directive) covers,
-    /// once per name, naming the file and line of the first use.
+    /// once per name, naming the file, line and column of the first use.
     ///
     /// Standard compiler directives reach this path too when they appear in a
     /// position `resolve_directives` does not handle, and an unrecognised
@@ -213,37 +272,137 @@ impl Preprocessor {
         if name.is_empty() || DIRECTIVES.contains(&name) {
             return;
         }
-        if !self
-            .reported_undefined
-            .borrow_mut()
-            .insert(name.to_string())
-        {
-            return;
-        }
-        eprintln!(
-            "[{}] {}: warning: macro `{} is undefined (IEEE 1800-2017 §22.5.1) \
-             — it is left as literal text, which usually causes a syntax error \
-             at the point of use",
-            self.current_file, self.current_line, name
-        );
+        self.undefined_seen.borrow_mut().push(name.to_string());
     }
 
+    /// Report the undefined macros seen while expanding the current line,
+    /// each once per run (the driver preprocesses a design more than once).
+    fn flush_undefined_macros(&self) {
+        static REPORTED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+        let names: Vec<String> = self.undefined_seen.borrow_mut().drain(..).collect();
+        for name in names {
+            let fresh = REPORTED
+                .lock()
+                .map(|mut g| g.get_or_insert_with(HashSet::new).insert(name.clone()))
+                .unwrap_or(true);
+            if !fresh {
+                continue;
+            }
+            let tick = format!("`{}", name);
+            let loc = self.here_at(&tick);
+            eprintln!(
+                "{}",
+                diagnostics::render(
+                    "warning",
+                    &format!(
+                        "macro `{} is undefined (IEEE 1800-2017 §22.5.1) — it is left as \
+                         literal text, which usually causes a syntax error at the point of use",
+                        name
+                    ),
+                    &loc,
+                )
+            );
+        }
+    }
+
+    /// Strict-mode directive errors collected during preprocessing (empty
+    /// unless `strict_checks()` is on and an illegal directive was seen), and
+    /// fatal `include failures. Each entry is a fully rendered diagnostic
+    /// (`file:line:col: error: ...` plus the source line).
     pub fn errors(&self) -> &[String] {
         &self.errors
     }
 
-    fn push_error_here(&mut self, message: String) {
-        let file = if self.current_file.is_empty() {
-            "<input>"
-        } else {
-            self.current_file.as_str()
+    /// The location of the line being processed: its first non-blank
+    /// character, underlining the first word (the directive).
+    fn here(&self) -> Location {
+        let text = self.cur_line_text.lines().next().unwrap_or("");
+        let lead = text.chars().take_while(|c| c.is_whitespace()).count() as u32;
+        let word = text
+            .trim_start()
+            .chars()
+            .take_while(|c| !c.is_whitespace())
+            .count() as u32;
+        self.location(0, lead, word.max(1))
+    }
+
+    /// The location of the first occurrence of `needle` in the (logical)
+    /// line being processed; the line start when it does not occur there.
+    fn here_at(&self, needle: &str) -> Location {
+        let text = self.cur_line_text.as_str();
+        let Some(p) = text.find(needle) else {
+            return self.here();
         };
-        self.errors.push(format!(
-            "{}:{}: {}",
+        let before = &text[..p];
+        let (delta, line_start) = match before.rfind('\n') {
+            Some(nl) => (before.matches('\n').count() as u32, nl + 1),
+            None => (0, 0),
+        };
+        let mut loc = self.location(
+            delta,
+            text[line_start..p].chars().count() as u32,
+            needle.chars().count() as u32,
+        );
+        if delta > 0 {
+            // A later physical line of a joined invocation: no split offset.
+            loc.col -= self.cur_col_off;
+            loc.fallback_text = text[line_start..].lines().next().map(str::to_string);
+        }
+        loc
+    }
+
+    /// `current_file`, `line_delta` lines below `current_line`, at 0-based
+    /// column `col` of the line being processed.
+    fn location(&self, line_delta: u32, col: u32, len: u32) -> Location {
+        let file = if self.current_file.is_empty() {
+            "<input>".to_string()
+        } else {
+            self.current_file.clone()
+        };
+        let mut included_from = Vec::new();
+        let mut f = self.cur_file_idx;
+        while let Some((parent, line)) =
+            self.map_files.get(f as usize).and_then(|m| m.included_from)
+        {
+            let Some(p) = self.map_files.get(parent as usize) else {
+                break;
+            };
+            included_from.push((p.path.clone(), line));
+            if included_from.len() > MAX_INCLUDE_DEPTH {
+                break;
+            }
+            f = parent;
+        }
+        Location {
             file,
-            self.current_line.max(1),
-            message
-        ));
+            line: self.current_line.max(1) + line_delta,
+            col: self.cur_col_off + col + 1,
+            len,
+            macro_name: None,
+            included_from,
+            fallback_text: self.cur_line_text.lines().next().map(str::to_string),
+        }
+    }
+
+    fn push_error_here(&mut self, message: String) {
+        let loc = self.here();
+        self.errors
+            .push(diagnostics::render("error", &message, &loc));
+    }
+
+    /// Print a preprocessor warning at the line being processed, once per
+    /// run for identical text (the driver preprocesses a design more than
+    /// once).
+    fn warn_here(&self, message: &str) {
+        static WARNED: std::sync::Mutex<Option<HashSet<String>>> = std::sync::Mutex::new(None);
+        let text = diagnostics::render("warning", message, &self.here());
+        let fresh = WARNED
+            .lock()
+            .map(|mut g| g.get_or_insert_with(HashSet::new).insert(text.clone()))
+            .unwrap_or(true);
+        if fresh {
+            eprintln!("{}", text);
+        }
     }
 
     /// True when `trimmed` is the directive `\`<name>` followed by whitespace
@@ -324,11 +483,10 @@ impl Preprocessor {
                 // Reference tools accept an out-of-range level with a
                 // WARNING (number/filename still apply) — a hard error here
                 // failed otherwise-valid third-party sources.
-                eprintln!(
-                    "[PP] warning: {}:{}: `line level `{}` is not 0/1/2 \
-                     (IEEE 1800-2017 §22.12) — ignored",
-                    self.current_file, self.current_line, level
-                );
+                self.warn_here(&format!(
+                    "`line level `{}` is not 0/1/2 (IEEE 1800-2017 §22.12) — ignored",
+                    level
+                ));
             }
         } else {
             bad = true;
@@ -471,7 +629,14 @@ impl Preprocessor {
             }
         }
         let stripped = self.strip_comments(source);
-        let resolved = self.resolve_directives(&stripped, source_path);
+        let (resolved, origins) = self.resolve_directives(
+            &stripped,
+            source_path,
+            Ctx::File {
+                included_from: None,
+            },
+        );
+        self.finish_map(&resolved, &origins);
         Self::strip_attributes(&resolved)
     }
 
@@ -482,8 +647,32 @@ impl Preprocessor {
         // pollute this one.
         crate::set_default_nettype_none_seen(false);
         let stripped = self.strip_comments(source);
-        let resolved = self.resolve_directives(&stripped, None);
+        let (resolved, origins) = self.resolve_directives(
+            &stripped,
+            None,
+            Ctx::File {
+                included_from: None,
+            },
+        );
+        self.finish_map(&resolved, &origins);
         Self::strip_attributes(&resolved)
+    }
+
+    /// Build the line map of the text just produced. A map that does not
+    /// cover the text line for line (a bug) is dropped, so diagnostics fall
+    /// back to the preprocessed text's own lines rather than lie.
+    fn finish_map(&mut self, text: &str, origins: &[LineOrigin]) {
+        let files = std::mem::take(&mut self.map_files);
+        let macros = std::mem::take(&mut self.map_macros);
+        self.map_macro_idx.clear();
+        let lines = text.as_bytes().iter().filter(|&&b| b == b'\n').count();
+        self.last_map = (lines == origins.len()).then(|| LineMap::new(files, macros, origins));
+    }
+
+    /// The line map of the text the last `preprocess_file`/`preprocess` call
+    /// returned: which file, line and column each of its lines came from.
+    pub fn take_line_map(&mut self) -> Option<LineMap> {
+        self.last_map.take()
     }
 
     fn strip_comments(&self, source: &str) -> String {
@@ -616,18 +805,24 @@ impl Preprocessor {
     /// already stripped. A `\`define` and its backslash-continued body are left
     /// untouched — an `\`ifdef` there belongs to the macro body and must survive
     /// to expansion time.
-    fn split_inline_conditionals(source: &str) -> String {
+    fn split_inline_conditionals(source: &str) -> (String, Option<Vec<(u32, u32)>>) {
         if !source.contains('`') {
-            return source.to_string();
+            return (source.to_string(), None);
         }
         let mut out = String::with_capacity(source.len() + 64);
+        // For each output line: (0-based source line, character column in it
+        // where the output line starts). Directive pieces are trimmed, so
+        // their column is approximate; only text pieces need it exact.
+        let mut pos: Vec<(u32, u32)> = Vec::new();
         let mut in_define_cont = false;
-        for line in source.lines() {
+        for (ln, line) in source.lines().enumerate() {
+            let ln = ln as u32;
             let trimmed = line.trim_start();
             if in_define_cont || directive_word(trimmed, "`define") {
                 in_define_cont = line.trim_end().ends_with('\\');
                 out.push_str(line);
                 out.push('\n');
+                pos.push((ln, 0));
                 continue;
             }
             // A line STARTING with a conditional directive may still carry
@@ -639,8 +834,10 @@ impl Preprocessor {
             if (trimmed.starts_with('`') && !starts_cond) || !line.contains('`') {
                 out.push_str(line);
                 out.push('\n');
+                pos.push((ln, 0));
                 continue;
             }
+            let col_of = |byte: usize| line[..byte].chars().count() as u32;
             let b = line.as_bytes();
             let mut i = 0usize;
             let mut seg = 0usize;
@@ -669,9 +866,11 @@ impl Preprocessor {
                         if !before.trim().is_empty() {
                             out.push_str(before);
                             out.push('\n');
+                            pos.push((ln, col_of(seg)));
                         }
                         out.push_str(line[i..j].trim());
                         out.push('\n');
+                        pos.push((ln, col_of(i)));
                         seg = j;
                         i = j;
                         continue;
@@ -681,15 +880,24 @@ impl Preprocessor {
             }
             out.push_str(&line[seg..]);
             out.push('\n');
+            pos.push((ln, col_of(seg)));
         }
-        out
+        (out, Some(pos))
     }
 
-    fn resolve_directives(&mut self, source: &str, source_path: Option<&Path>) -> String {
-        let source = Self::split_inline_conditionals(source);
+    /// Resolve directives in `source` and expand macros. Returns the text and
+    /// the origin of each of its lines (see `crate::source_map`).
+    fn resolve_directives(
+        &mut self,
+        source: &str,
+        source_path: Option<&Path>,
+        ctx: Ctx,
+    ) -> (String, Vec<LineOrigin>) {
+        let (source, split_pos) = Self::split_inline_conditionals(source);
         let source = source.as_str();
         let mut output = String::with_capacity(source.len());
-        let mut lines = source.lines().peekable();
+        let mut sink = OriginSink::default();
+        let mut lines = source.lines().enumerate().peekable();
         let mut ifdef_stack: Vec<IfdefState> = Vec::new();
 
         // Directory of the current source file (for relative `include resolution)
@@ -697,15 +905,52 @@ impl Preprocessor {
 
         // Save the caller's `__FILE__` / `__LINE__` cursor (so nested
         // `include returns leave it untouched), then point it at this source.
-        let saved_file = std::mem::take(&mut self.current_file);
+        let saved_file = self.current_file.clone();
         let saved_line = self.current_line;
-        self.current_file = source_path
-            .map(|p| p.to_string_lossy().into_owned())
-            .unwrap_or_default();
-        self.current_line = 0;
+        let saved_file_idx = self.cur_file_idx;
+        let saved_line_text = std::mem::take(&mut self.cur_line_text);
+        let saved_col_off = self.cur_col_off;
+        // Text re-resolved after a macro expansion stays at the invocation:
+        // every line it emits maps there, and the cursor does not move.
+        let fixed = match ctx {
+            Ctx::Macro(o) => Some(o),
+            Ctx::File { included_from } => {
+                self.current_file = source_path
+                    .map(|p| p.to_string_lossy().into_owned())
+                    .unwrap_or_default();
+                self.current_line = 0;
+                self.map_files.push(MapFile {
+                    path: if self.current_file.is_empty() {
+                        "<input>".to_string()
+                    } else {
+                        self.current_file.clone()
+                    },
+                    included_from,
+                });
+                self.cur_file_idx = self.map_files.len() as u32 - 1;
+                None
+            }
+        };
+        // Source line of output line `li` of the split text, and the column
+        // it starts at.
+        let src_pos =
+            |li: usize| -> (u32, u32) { split_pos.as_ref().map_or((li as u32, 0), |p| p[li]) };
+        let mut last_src: i64 = -1;
+        // Origin for lines emitted on behalf of the current source line.
+        let mut here = fixed.unwrap_or(LineOrigin::plain(self.cur_file_idx, 1, 0));
+        let mut joined: Vec<usize> = Vec::new();
 
-        while let Some(line) = lines.next() {
-            self.current_line += 1;
+        while let Some((li, line)) = lines.next() {
+            sink.fill(&output, here);
+            let (src, col) = src_pos(li);
+            if fixed.is_none() {
+                self.current_line += (src as i64 - last_src) as u32;
+                last_src = src as i64;
+            }
+            self.cur_col_off = col;
+            self.cur_line_text.clear();
+            self.cur_line_text.push_str(line);
+            here = fixed.unwrap_or(LineOrigin::plain(self.cur_file_idx, self.current_line, col));
             let trimmed = line.trim();
 
             // Strip (* ... *) attributes (IEEE 1800-2017 §5.12)
@@ -717,6 +962,7 @@ impl Preprocessor {
             if directive_word(trimmed, "`define") {
                 // Join backslash-continuation lines (IEEE 1800-2017 §22.5.1)
                 let mut consumed_lines = 1;
+                let mut continuation: Vec<usize> = Vec::new();
 
                 // For the directive, we want to strip the \ and the newline
                 let mut clean_line = String::new();
@@ -729,7 +975,7 @@ impl Preprocessor {
                     if let Some(pos) = text.trim_end().rfind('\\') {
                         if text[pos + 1..].chars().all(|c| c.is_ascii_whitespace()) {
                             clean_line.push_str(&text[..pos]);
-                            if let Some(next) = lines.next() {
+                            if let Some((next_li, next)) = lines.next() {
                                 // Preserve the line break between continuation
                                 // lines of a multi-line `define body. Without
                                 // it, a body line like `\`ifndef X` is flattened
@@ -740,6 +986,7 @@ impl Preprocessor {
                                 // the parser.
                                 clean_line.push('\n');
                                 consumed_lines += 1;
+                                continuation.push(next_li);
                                 current = next.to_string();
                                 continue;
                             }
@@ -762,8 +1009,22 @@ impl Preprocessor {
                     self.parse_define(&clean_line);
                 }
                 // Don't output `define lines, but preserve line numbers
-                for _ in 0..consumed_lines {
+                debug_assert_eq!(consumed_lines, 1 + continuation.len());
+                output.push('\n');
+                sink.fill(&output, here);
+                for lj in continuation {
+                    let (src, col) = src_pos(lj);
+                    if fixed.is_none() {
+                        self.current_line += (src as i64 - last_src) as u32;
+                        last_src = src as i64;
+                    }
+                    here = fixed.unwrap_or(LineOrigin::plain(
+                        self.cur_file_idx,
+                        self.current_line,
+                        col,
+                    ));
                     output.push('\n');
+                    sink.fill(&output, here);
                 }
                 continue;
             }
@@ -874,10 +1135,9 @@ impl Preprocessor {
                     let expanded = self.expand_macros_once(trimmed);
                     Self::parse_include_path(expanded.trim())
                 });
+                self.flush_expansion_diagnostics();
                 if parsed.is_none() {
-                    self.errors
-                        .push(format!("malformed `include directive: {}", trimmed));
-                    eprintln!("[PP] error: malformed `include directive: {}", trimmed);
+                    self.push_error_here(format!("malformed `include directive: {}", trimmed));
                 }
                 if let Some(inc_file) = parsed {
                     if self.include_depth < MAX_INCLUDE_DEPTH {
@@ -892,10 +1152,17 @@ impl Preprocessor {
                                 Ok(contents) => {
                                     self.include_depth += 1;
                                     let stripped = self.strip_comments(&contents);
-                                    let included =
-                                        self.resolve_directives(&stripped, Some(&resolved));
+                                    let site = (here.file, here.line);
+                                    let (included, origins) = self.resolve_directives(
+                                        &stripped,
+                                        Some(&resolved),
+                                        Ctx::File {
+                                            included_from: Some(site),
+                                        },
+                                    );
                                     self.include_depth -= 1;
                                     output.push_str(&included);
+                                    sink.extend(&output, origins);
                                     // Don't push extra newline — included content has its own
                                     continue;
                                 }
@@ -903,16 +1170,11 @@ impl Preprocessor {
                                     // FATAL: the design text that follows may
                                     // silently depend on declarations from this
                                     // file — every mainstream tool errors here.
-                                    self.errors.push(format!(
+                                    self.push_error_here(format!(
                                         "cannot read `include file '{}': {}",
                                         resolved.display(),
                                         e
                                     ));
-                                    eprintln!(
-                                        "[PP] error: cannot read `include file '{}': {}",
-                                        resolved.display(),
-                                        e
-                                    );
                                 }
                             }
                         } else {
@@ -922,21 +1184,16 @@ impl Preprocessor {
                             // undeclared port actual became a silent implicit
                             // net and a whole testbench checked garbage. The
                             // reference tooling hard-errors here; so do we.
-                            self.errors.push(format!(
+                            self.push_error_here(format!(
                                 "cannot find `include file '{}' (searched the including file's directory and {} include dir(s))",
                                 inc_file, self.include_dirs.len()
                             ));
-                            eprintln!("[PP] error: cannot find `include file '{}'", inc_file);
                         }
                     } else {
-                        self.errors.push(format!(
+                        self.push_error_here(format!(
                             "`include depth limit ({}) exceeded for '{}' — recursive include?",
                             MAX_INCLUDE_DEPTH, inc_file
                         ));
-                        eprintln!(
-                            "[PP] error: `include depth limit ({}) exceeded for '{}'",
-                            MAX_INCLUDE_DEPTH, inc_file
-                        );
                     }
                 }
                 output.push('\n');
@@ -1005,12 +1262,12 @@ impl Preprocessor {
                     if VALID.contains(&ver) {
                         self.keywords_stack.push(ver.to_string());
                     } else {
-                        eprintln!(
-                            "[PP] warning: `begin_keywords \"{}\" — unknown version string \
+                        self.warn_here(&format!(
+                            "`begin_keywords \"{}\" — unknown version string \
                              (IEEE 1800-2023 §22.14); accepted set is {}",
                             ver,
                             VALID.join(", ")
-                        );
+                        ));
                         // Push anyway so end_keywords stays balanced.
                         self.keywords_stack.push(ver.to_string());
                     }
@@ -1026,9 +1283,9 @@ impl Preprocessor {
             if directive_word(trimmed, "`end_keywords") {
                 if ifdef_stack.iter().all(|s| s.active) {
                     if self.keywords_stack.pop().is_none() {
-                        eprintln!(
-                            "[PP] warning: `end_keywords without matching `begin_keywords \
-                             (IEEE 1800-2023 §22.14)"
+                        self.warn_here(
+                            "`end_keywords without matching `begin_keywords \
+                             (IEEE 1800-2023 §22.14)",
                         );
                     }
                     output.push_str("`end_keywords");
@@ -1083,15 +1340,26 @@ impl Preprocessor {
                         let fname = &after_num[1..1 + end];
                         let level = after_num[1 + end + 1..].trim();
                         if !matches!(level, "0" | "1" | "2") && !crate::strict_checks() {
-                            eprintln!(
-                                "[PP] warning: {}:{}: `line level `{}` is not 0/1/2                                  (IEEE 1800-2017 §22.12) — ignored",
-                                self.current_file, self.current_line, level
-                            );
+                            self.warn_here(&format!(
+                                "`line level `{}` is not 0/1/2 (IEEE 1800-2017 §22.12) — ignored",
+                                level
+                            ));
                         }
                         self.current_file = fname.to_string();
                         // The NEXT source line must read as `n`; the loop
                         // increments before use.
                         self.current_line = n.saturating_sub(1);
+                        if fixed.is_none() {
+                            let included_from = self
+                                .map_files
+                                .get(self.cur_file_idx as usize)
+                                .and_then(|f| f.included_from);
+                            self.map_files.push(MapFile {
+                                path: fname.to_string(),
+                                included_from,
+                            });
+                            self.cur_file_idx = self.map_files.len() as u32 - 1;
+                        }
                     }
                 }
                 output.push('\n');
@@ -1115,8 +1383,18 @@ impl Preprocessor {
                 // skipped line so diagnostics keep their line numbers.
                 if Self::protect_envelope_opens(args) {
                     output.push('\n');
-                    for skipped in lines.by_ref() {
-                        self.current_line += 1;
+                    for (lj, skipped) in lines.by_ref() {
+                        sink.fill(&output, here);
+                        let (src, col) = src_pos(lj);
+                        if fixed.is_none() {
+                            self.current_line += (src as i64 - last_src) as u32;
+                            last_src = src as i64;
+                        }
+                        here = fixed.unwrap_or(LineOrigin::plain(
+                            self.cur_file_idx,
+                            self.current_line,
+                            col,
+                        ));
                         output.push('\n');
                         let st = skipped.trim();
                         if Self::is_directive(st, "pragma")
@@ -1160,32 +1438,63 @@ impl Preprocessor {
             }
 
             let mut logical_line = line.to_string();
-            let mut consumed_lines = 1;
+            // Split-text indices of the lines joined into `logical_line`.
+            joined.clear();
+            joined.push(li);
             while logical_line.contains('`') && Self::has_unclosed_paren(&logical_line) {
-                if let Some(next) = lines.next() {
+                if let Some((lj, next)) = lines.next() {
                     logical_line.push('\n');
                     logical_line.push_str(next);
-                    consumed_lines += 1;
+                    joined.push(lj);
                 } else {
                     break;
                 }
             }
+            if joined.len() > 1 {
+                self.cur_line_text.clear();
+                self.cur_line_text.push_str(&logical_line);
+            }
 
             let expanded = self.expand_macros(&logical_line);
-            // Promote any macro-expansion-time strict errors collected behind
-            // `&self` into the main error list.
-            if !self.expansion_errors.borrow().is_empty() {
-                let drained: Vec<String> = self.expansion_errors.borrow_mut().drain(..).collect();
-                self.errors.extend(drained);
-            }
-            let expanded = if Self::contains_preprocessor_directive(&expanded) {
-                self.resolve_directives(&expanded, source_path)
-            } else {
-                expanded
+            self.flush_expansion_diagnostics();
+            // Origins for the joined lines, and for macro text: the first
+            // user macro invoked on a line names the expansion.
+            let joined_origin = |this: &mut Self, k: usize| -> LineOrigin {
+                if let Some(o) = fixed {
+                    return o;
+                }
+                let (src, col) = src_pos(joined[k]);
+                let (src0, _) = src_pos(joined[0]);
+                LineOrigin::plain(this.cur_file_idx, this.current_line + (src - src0), col)
             };
+            let macro_origin = |this: &mut Self, k: usize, text: &str| -> Option<LineOrigin> {
+                let base = joined_origin(this, k);
+                if fixed.is_some() {
+                    return Some(base);
+                }
+                let (mcol, name) = this.first_user_macro(text)?;
+                Some(LineOrigin {
+                    mac: this.macro_index(name),
+                    mcol,
+                    mfirst: true,
+                    ..base
+                })
+            };
+            let (expanded, sub_origins) = if Self::contains_preprocessor_directive(&expanded) {
+                let inv =
+                    macro_origin(self, 0, &logical_line).unwrap_or_else(|| joined_origin(self, 0));
+                let (text, origins) =
+                    self.resolve_directives(&expanded, source_path, Ctx::Macro(inv));
+                (text, Some(origins))
+            } else {
+                (expanded, None)
+            };
+            sink.fill(&output, here);
             if expanded.trim().is_empty() {
-                for _ in 0..consumed_lines {
+                for k in 0..joined.len() {
                     output.push('\n');
+                    let o = joined_origin(self, k);
+                    sink.fill(&output, o);
                 }
             } else {
                 // Capture the timescale in effect for any design element this
@@ -1221,20 +1530,140 @@ impl Preprocessor {
                 }
                 output.push_str(&expanded);
                 output.push('\n');
+                match sub_origins {
+                    Some(mut origins) => {
+                        let tail = macro_origin(self, 0, &logical_line)
+                            .unwrap_or_else(|| joined_origin(self, 0));
+                        origins.push(tail);
+                        sink.extend(&output, origins);
+                    }
+                    // Nothing expanded on a single line (the common case).
+                    None if joined.len() == 1 && expanded == logical_line => {
+                        let o = joined_origin(self, 0);
+                        sink.fill(&output, o);
+                    }
+                    None => {
+                        let out_n = expanded.matches('\n').count() + 1;
+                        let mut origins = Vec::with_capacity(out_n);
+                        if out_n == joined.len() {
+                            // Line-for-line: only lines the expansion changed
+                            // are macro text.
+                            for (k, (o, src)) in expanded
+                                .split('\n')
+                                .zip(logical_line.split('\n'))
+                                .enumerate()
+                            {
+                                let org = if o == src {
+                                    None
+                                } else {
+                                    macro_origin(self, k, src)
+                                };
+                                origins.push(org.unwrap_or_else(|| joined_origin(self, k)));
+                            }
+                        } else {
+                            // A multi-line body: every line maps to the
+                            // invocation; only the first keeps a prefix of
+                            // original text.
+                            let first = macro_origin(self, 0, &logical_line)
+                                .unwrap_or_else(|| joined_origin(self, 0));
+                            origins.push(first);
+                            let rest = LineOrigin {
+                                mfirst: false,
+                                ..first
+                            };
+                            origins.resize(out_n, rest);
+                        }
+                        sink.extend(&output, origins);
+                    }
+                }
             }
             // Account for additional physical lines consumed by paren-spanning
             // continuations so __LINE__ on subsequent lines stays correct.
-            if consumed_lines > 1 {
-                self.current_line += (consumed_lines - 1) as u32;
+            if fixed.is_none() {
+                if let Some(&last) = joined.last() {
+                    let (src, _) = src_pos(last);
+                    self.current_line += (src as i64 - last_src) as u32;
+                    last_src = src as i64;
+                }
             }
+            here = fixed.unwrap_or(LineOrigin::plain(
+                self.cur_file_idx,
+                self.current_line,
+                self.cur_col_off,
+            ));
         }
+        sink.fill(&output, here);
 
         // Restore caller's cursor (so a returning `include leaves the outer
         // file's __FILE__/__LINE__ intact).
         self.current_file = saved_file;
         self.current_line = saved_line;
+        self.cur_file_idx = saved_file_idx;
+        self.cur_line_text = saved_line_text;
+        self.cur_col_off = saved_col_off;
 
-        output
+        (output, sink.origins)
+    }
+
+    /// Report what expanding the current line collected behind `&self`:
+    /// strict macro-invocation errors (into the error list) and undefined
+    /// macro warnings, each located at the invocation.
+    fn flush_expansion_diagnostics(&mut self) {
+        if !self.expansion_errors.borrow().is_empty() {
+            let drained: Vec<(String, String)> =
+                self.expansion_errors.borrow_mut().drain(..).collect();
+            for (name, msg) in drained {
+                let loc = self.here_at(&format!("`{}", name));
+                self.errors.push(diagnostics::render("error", &msg, &loc));
+            }
+        }
+        if !self.undefined_seen.borrow().is_empty() {
+            self.flush_undefined_macros();
+        }
+    }
+
+    /// Column (relative to the line start) and name of the first user macro
+    /// invoked in `text`; `__FILE__`/`__LINE__` do not count.
+    fn first_user_macro<'a>(&self, text: &'a str) -> Option<(u32, &'a str)> {
+        let mut in_str = false;
+        let b = text.as_bytes();
+        let mut i = 0;
+        while i < b.len() {
+            match b[i] {
+                b'"' if i == 0 || b[i - 1] != b'\\' => in_str = !in_str,
+                b'`' if !in_str => {
+                    let start = i + 1;
+                    let mut j = start;
+                    while j < b.len() && (b[j].is_ascii_alphanumeric() || b[j] == b'_') {
+                        j += 1;
+                    }
+                    let name = &text[start..j];
+                    if !name.is_empty()
+                        && name != "__FILE__"
+                        && name != "__LINE__"
+                        && self.defines.contains_key(name)
+                    {
+                        return Some((text[..i].chars().count() as u32, name));
+                    }
+                    i = j.max(i + 1);
+                    continue;
+                }
+                _ => {}
+            }
+            i += 1;
+        }
+        None
+    }
+
+    /// Index of `name` in the line map's macro table, plus one.
+    fn macro_index(&mut self, name: &str) -> u32 {
+        if let Some(&k) = self.map_macro_idx.get(name) {
+            return k;
+        }
+        self.map_macros.push(name.to_string());
+        let k = self.map_macros.len() as u32;
+        self.map_macro_idx.insert(name.to_string(), k);
+        k
     }
 
     /// Extract the filename from an `include directive.
@@ -1648,12 +2077,15 @@ impl Preprocessor {
                         // actuals, or a non-defaulted formal left without one.
                         if crate::strict_checks() {
                             if args.len() > params.len() {
-                                self.expansion_errors.borrow_mut().push(format!(
-                                    "macro `{}` invoked with {} arguments but only \
+                                self.expansion_errors.borrow_mut().push((
+                                    macro_name.to_string(),
+                                    format!(
+                                        "macro `{}` invoked with {} arguments but only \
                                      {} are declared (IEEE 1800-2017 §22.5.1)",
-                                    macro_name,
-                                    args.len(),
-                                    params.len()
+                                        macro_name,
+                                        args.len(),
+                                        params.len()
+                                    ),
                                 ));
                             } else {
                                 // §22.5.1: an actual at a position (even empty,
@@ -1662,10 +2094,13 @@ impl Preprocessor {
                                 // default is "fewer actual arguments than formals".
                                 for (pi, (pname, default)) in params.iter().enumerate() {
                                     if pi >= args.len() && default.is_none() {
-                                        self.expansion_errors.borrow_mut().push(format!(
-                                            "macro `{}` missing required argument `{}` \
+                                        self.expansion_errors.borrow_mut().push((
+                                            macro_name.to_string(),
+                                            format!(
+                                                "macro `{}` missing required argument `{}` \
                                              (IEEE 1800-2017 §22.5.1)",
-                                            macro_name, pname
+                                                macro_name, pname
+                                            ),
                                         ));
                                     }
                                 }
@@ -1794,10 +2229,13 @@ impl Preprocessor {
                         // §22.5.1: a macro defined with a formal list must be
                         // invoked with parentheses, even when empty.
                         if crate::strict_checks() && def.params.is_some() {
-                            self.expansion_errors.borrow_mut().push(format!(
-                                "macro `{}` requires parentheses (it is defined with \
+                            self.expansion_errors.borrow_mut().push((
+                                macro_name.to_string(),
+                                format!(
+                                    "macro `{}` requires parentheses (it is defined with \
                                  arguments) (IEEE 1800-2017 §22.5.1)",
-                                macro_name
+                                    macro_name
+                                ),
                             ));
                         }
                         let body_pasted = Self::apply_token_pasting(&def.body);
@@ -1964,8 +2402,11 @@ impl Preprocessor {
                     j += 1;
                 }
                 if found {
-                    // Replace attribute with space to preserve spacing
-                    result.push(' ');
+                    // Blank the attribute out character for character, so
+                    // line and column numbers after it are unchanged.
+                    for ch in line[i..j].chars() {
+                        result.push(if ch == '\n' { '\n' } else { ' ' });
+                    }
                     i = j;
                     continue;
                 }

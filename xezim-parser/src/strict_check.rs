@@ -17,11 +17,21 @@ use crate::ast::decl::{
     ParamConnection, ParameterDeclaration, ParameterKind, TaskDeclaration,
 };
 use crate::ast::stmt::{Statement, StatementKind};
+use crate::diagnostics::Diagnostic;
 use std::collections::{HashMap, HashSet};
 
 /// Run all enabled strict checks over one file's parsed descriptions. Returns
 /// human-readable violation messages (empty = clean). No-op when disabled.
 pub fn strict_violations(descriptions: &[Description]) -> Vec<String> {
+    strict_diagnostics(descriptions)
+        .into_iter()
+        .map(|d| d.message)
+        .collect()
+}
+
+/// As [`strict_violations`], as error diagnostics spanning the offending
+/// construct.
+pub fn strict_diagnostics(descriptions: &[Description]) -> Vec<Diagnostic> {
     if !crate::strict_checks() {
         return Vec::new();
     }
@@ -95,7 +105,7 @@ fn add_overridable_param_names(pd: &ParameterDeclaration, out: &mut HashSet<Stri
 fn check_param_overrides(
     items: &[ModuleItem],
     overridable: &HashMap<String, HashSet<String>>,
-    out: &mut Vec<String>,
+    out: &mut Vec<Diagnostic>,
 ) {
     for it in items {
         if let ModuleItem::ModuleInstantiation(inst) = it {
@@ -107,9 +117,12 @@ fn check_param_overrides(
                 for c in conns {
                     if let ParamConnection::Named { name, .. } = c {
                         if !params.contains(&name.name) {
-                            out.push(format!(
-                                "cannot override '{}' of module '{}' — not an overridable parameter",
-                                name.name, inst.module_name.name
+                            out.push(Diagnostic::error(
+                                format!(
+                                    "cannot override '{}' of module '{}' — not an overridable parameter",
+                                    name.name, inst.module_name.name
+                                ),
+                                name.span,
                             ));
                         }
                     }
@@ -119,7 +132,7 @@ fn check_param_overrides(
     }
 }
 
-fn walk_module_items(items: &[ModuleItem], out: &mut Vec<String>) {
+fn walk_module_items(items: &[ModuleItem], out: &mut Vec<Diagnostic>) {
     for it in items {
         match it {
             ModuleItem::FunctionDeclaration(fd) => check_function(fd, out),
@@ -145,13 +158,13 @@ fn walk_module_items(items: &[ModuleItem], out: &mut Vec<String>) {
     }
 }
 
-fn walk_package_items(items: &[PackageItem], out: &mut Vec<String>) {
+fn walk_package_items(items: &[PackageItem], out: &mut Vec<Diagnostic>) {
     for it in items {
         walk_package_item(it, out);
     }
 }
 
-fn walk_package_item(it: &PackageItem, out: &mut Vec<String>) {
+fn walk_package_item(it: &PackageItem, out: &mut Vec<Diagnostic>) {
     match it {
         PackageItem::Function(fd) => check_function(fd, out),
         PackageItem::Task(td) => check_task(td, out),
@@ -160,7 +173,7 @@ fn walk_package_item(it: &PackageItem, out: &mut Vec<String>) {
     }
 }
 
-fn walk_class_items(items: &[ClassItem], out: &mut Vec<String>) {
+fn walk_class_items(items: &[ClassItem], out: &mut Vec<Diagnostic>) {
     for it in items {
         if let ClassItem::Method(m) = it {
             match &m.kind {
@@ -173,7 +186,7 @@ fn walk_class_items(items: &[ClassItem], out: &mut Vec<String>) {
     }
 }
 
-fn check_function(fd: &FunctionDeclaration, out: &mut Vec<String>) {
+fn check_function(fd: &FunctionDeclaration, out: &mut Vec<Diagnostic>) {
     check_dup_ports(
         "function",
         &fd.name.name.name,
@@ -184,7 +197,7 @@ fn check_function(fd: &FunctionDeclaration, out: &mut Vec<String>) {
     check_decl_order_list(&fd.items, out);
 }
 
-fn check_task(td: &TaskDeclaration, out: &mut Vec<String>) {
+fn check_task(td: &TaskDeclaration, out: &mut Vec<Diagnostic>) {
     check_dup_ports(
         "task",
         &td.name.name.name,
@@ -200,7 +213,7 @@ fn check_task(td: &TaskDeclaration, out: &mut Vec<String>) {
 /// statement. A null statement does not end the declaration region here (a
 /// stray `;` between declarations is common and harmless), nor do the
 /// parser's internal lowering nodes.
-fn check_decl_order_list(stmts: &[Statement], out: &mut Vec<String>) {
+fn check_decl_order_list(stmts: &[Statement], out: &mut Vec<Diagnostic>) {
     let mut seen_stmt = false;
     for st in stmts {
         match &st.kind {
@@ -210,17 +223,21 @@ fn check_decl_order_list(stmts: &[Statement], out: &mut Vec<String>) {
                         .first()
                         .map(|d| d.name.name.as_str())
                         .unwrap_or("");
-                    out.push(format!(
-                        "declaration of '{name}' follows a statement; block item declarations must precede the statements of a block (§9.3.1)"
+                    let span = declarators.first().map_or(st.span, |d| d.name.span);
+                    out.push(Diagnostic::error(
+                        format!(
+                            "declaration of '{name}' follows a statement; block item declarations must precede the statements of a block (§9.3.1)"
+                        ),
+                        span,
                     ));
                 }
             }
             StatementKind::Typedef(_) => {
                 if seen_stmt {
-                    out.push(
-                        "typedef follows a statement; block item declarations must precede the statements of a block (§9.3.1)"
-                            .to_string(),
-                    );
+                    out.push(Diagnostic::error(
+                        "typedef follows a statement; block item declarations must precede the statements of a block (§9.3.1)",
+                        st.span,
+                    ));
                 }
             }
             StatementKind::Null
@@ -234,7 +251,7 @@ fn check_decl_order_list(stmts: &[Statement], out: &mut Vec<String>) {
     }
 }
 
-fn check_decl_order_stmt(st: &Statement, out: &mut Vec<String>) {
+fn check_decl_order_stmt(st: &Statement, out: &mut Vec<Diagnostic>) {
     match &st.kind {
         StatementKind::SeqBlock { stmts, .. } | StatementKind::ParBlock { stmts, .. } => {
             check_decl_order_list(stmts, out)
@@ -274,19 +291,20 @@ fn check_dup_ports(
     sub_name: &str,
     ports: &[FunctionPort],
     body_ports: &[crate::ast::Identifier],
-    out: &mut Vec<String>,
+    out: &mut Vec<Diagnostic>,
 ) {
     let mut seen: Vec<&str> = Vec::new();
-    let names = ports
-        .iter()
-        .map(|p| p.name.name.as_str())
-        .chain(body_ports.iter().map(|i| i.name.as_str()));
-    for n in names {
+    let names = ports.iter().map(|p| &p.name).chain(body_ports.iter());
+    for id in names {
+        let n = id.name.as_str();
         if n.is_empty() {
             continue;
         }
         if seen.contains(&n) {
-            out.push(format!("duplicate port '{}' in {} '{}'", n, kind, sub_name));
+            out.push(Diagnostic::error(
+                format!("duplicate port '{}' in {} '{}'", n, kind, sub_name),
+                id.span,
+            ));
         } else {
             seen.push(n);
         }

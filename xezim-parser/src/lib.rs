@@ -24,6 +24,7 @@ pub mod diagnostics;
 pub mod lexer;
 pub mod parse;
 pub mod preprocessor;
+pub mod source_map;
 pub mod strict_check;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -162,6 +163,12 @@ pub struct ParseResult {
     pub errors: Vec<diagnostics::Diagnostic>,
     /// Parse warnings.
     pub warnings: Vec<diagnostics::Diagnostic>,
+    /// Preprocessor errors (missing `include files, illegal directives),
+    /// each already rendered with its location.
+    pub preprocess_errors: Vec<String>,
+    /// Where each line of `source_text` came from; see
+    /// [`diagnostics::render_diagnostic`].
+    pub line_map: Option<source_map::LineMap>,
 }
 
 /// Parse a SystemVerilog source string.
@@ -180,6 +187,15 @@ pub fn parse_with_options(
     include_dirs: &[&str],
     defines: &[(&str, &str)],
 ) -> ParseResult {
+    parse_impl(source, None, include_dirs, defines)
+}
+
+fn parse_impl(
+    source: &str,
+    path: Option<&Path>,
+    include_dirs: &[&str],
+    defines: &[(&str, &str)],
+) -> ParseResult {
     // Preprocess
     let mut pp = preprocessor::Preprocessor::new();
     for dir in include_dirs {
@@ -195,7 +211,11 @@ pub fn parse_with_options(
             },
         );
     }
-    let processed = pp.preprocess(source);
+    let processed = match path {
+        Some(p) => pp.preprocess_file(source, Some(p)),
+        None => pp.preprocess(source),
+    };
+    let line_map = pp.take_line_map();
 
     // Lex
     let tokens = lexer::Lexer::new(&processed).tokenize();
@@ -211,6 +231,8 @@ pub fn parse_with_options(
         source: source_text,
         errors,
         warnings,
+        preprocess_errors: pp.errors().to_vec(),
+        line_map,
     }
 }
 
@@ -234,7 +256,7 @@ pub fn parse_file(
         .unwrap_or(".");
     dirs.push(parent);
 
-    Ok(parse_with_options(&content, &dirs, defines))
+    Ok(parse_impl(&content, Some(Path::new(path)), &dirs, defines))
 }
 
 /// Parse multiple SystemVerilog source strings.
@@ -245,6 +267,7 @@ pub fn parse_multi(sources: &[&str]) -> ParseResult {
     let mut all_descriptions = Vec::new();
     let mut all_errors = Vec::new();
     let mut all_warnings = Vec::new();
+    let mut all_pp_errors = Vec::new();
     let mut all_source = String::new();
 
     for source in sources {
@@ -252,6 +275,7 @@ pub fn parse_multi(sources: &[&str]) -> ParseResult {
         all_descriptions.extend(result.source.descriptions);
         all_errors.extend(result.errors);
         all_warnings.extend(result.warnings);
+        all_pp_errors.extend(result.preprocess_errors);
         all_source.push_str(&result.source_text);
     }
 
@@ -263,6 +287,9 @@ pub fn parse_multi(sources: &[&str]) -> ParseResult {
         },
         errors: all_errors,
         warnings: all_warnings,
+        preprocess_errors: all_pp_errors,
+        // Spans index each source's own text; there is no one map.
+        line_map: None,
     }
 }
 

@@ -2705,13 +2705,21 @@ impl Parser {
     }
 
     /// Attach string-escape diagnostics (from `decode_string_escapes_checked`)
-    /// at the given span. `is_error == true` becomes an Error, otherwise Warning.
+    /// at the given span. `is_error == true` becomes an Error, otherwise an
+    /// Info note: an unknown escape is implementation-defined (§5.9), common
+    /// in library code (UVM writes `\%m`), and decoded the way the reference
+    /// simulator decodes it, which accepts it silently — so it is shown only
+    /// on request (`--verbose`), not in every run's transcript.
     fn push_string_escape_diags(&mut self, diags: Vec<(bool, String)>, span: Span) {
         for (is_error, msg) in diags {
             self.diagnostics.push(if is_error {
                 Diagnostic::error(msg, span)
             } else {
-                Diagnostic::warning(msg, span)
+                Diagnostic {
+                    severity: crate::diagnostics::Severity::Info,
+                    message: msg,
+                    span,
+                }
             });
         }
     }

@@ -523,7 +523,8 @@ impl Parser {
         let mut rows: Vec<UdpTableRow> = Vec::new();
         let mut table_ok = true;
         let mut fail_detail = String::new();
-        let table_line = self.current_line();
+        // Where the warning points: the row that failed, else the table.
+        let mut fail_span = self.current().span;
         if self.eat(TokenKind::KwTable).is_some() {
             // Gather raw table tokens up to `endtable`.
             let mut toks: Vec<Token> = Vec::new();
@@ -555,6 +556,9 @@ impl Parser {
                                 .collect::<Vec<_>>()
                                 .join(" ");
                             fail_detail = txt;
+                            if let (Some(f), Some(l)) = (slice.first(), slice.last()) {
+                                fail_span = Span::new(f.span.start, l.span.end);
+                            }
                             break;
                         }
                     }
@@ -590,25 +594,17 @@ impl Parser {
         } else {
             // FAIL LOUD: name exactly what could not be parsed and the
             // consequence, then fall back to an empty-module stub (output
-            // net left undriven) for this UDP only.
-            eprintln!(
-                "\n========================================================================\n\
-                 Warning: UNSUPPORTED UDP TABLE — primitive '{}' (near source byte {})\n\
-                 xezim could not parse the truth-table row: `{}`\n\
-                 Consequence: this primitive is treated as an EMPTY module; every\n\
-                 instance's output net is left UNDRIVEN (floats to x/z).\n\
-                 (IEEE 1800-2017 §29 — please report this table to the xezim authors.)\n\
-                 ========================================================================\n",
-                name.name, table_line, fail_detail
-            );
+            // net left undriven) for this UDP only. The driver prints parser
+            // warnings with their source location.
             self.diagnostics
                 .push(crate::diagnostics::Diagnostic::warning(
                     format!(
-                        "unsupported UDP truth-table in primitive '{}' (row: {}); \
-                         instances left undriven",
+                        "UNSUPPORTED UDP TABLE in primitive '{}': could not parse the \
+                         row `{}`; the primitive is treated as an EMPTY module, so every \
+                         instance's output net is left undriven (IEEE 1800-2017 §29)",
                         name.name, fail_detail
                     ),
-                    span,
+                    fail_span,
                 ));
             Description::Module(crate::ast::module::ModuleDeclaration {
                 attrs: Vec::new(),
@@ -637,13 +633,6 @@ impl Parser {
     }
 
     /// 1-based source line of the current token (best-effort).
-    fn current_line(&self) -> usize {
-        let off = self.current().span.start;
-        // We don't have the source here; approximate with byte offset so the
-        // message is still actionable. Kept small to avoid pulling source in.
-        off
-    }
-
     /// Parse one truth-table row from a raw token slice (columns are
     /// `:`-separated; combinational = 2 fields, sequential = 3). Returns
     /// `None` on any unrecognised symbol or shape so the caller can fall back.

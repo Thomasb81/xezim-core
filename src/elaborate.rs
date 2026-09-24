@@ -2237,6 +2237,12 @@ pub struct ElaboratedModule {
     /// cannot exist.
     #[serde(default)]
     pub source_orig_lines: Vec<u32>,
+    /// Line map of each of `source_texts` back to the original files (the
+    /// `include`d file and line a span's text came from, and whether it is
+    /// macro text), for `file:line:col` diagnostics. Not serialized, like
+    /// `source_texts`.
+    #[serde(skip)]
+    pub source_line_maps: Vec<Option<sv_parser::source_map::LineMap>>,
 }
 
 /// A `tran` / `tranif0` / `tranif1` primitive: two terminals and an optional
@@ -2449,6 +2455,7 @@ impl ElaboratedModule {
             source_files: Vec::new(),
             src_file_of_module: HashMap::default(),
             source_orig_lines: Vec::new(),
+            source_line_maps: Vec::new(),
         }
     }
 
@@ -9690,20 +9697,22 @@ fn validate_constant_part_select_bounds(elab: &ElaboratedModule) -> Result<(), S
                 match kind {
                     RangeKind::Constant => {
                         if !bound_is_const(left, elab) || !bound_is_const(right, elab) {
-                            return Err(format!(
-                                "error: the bounds of a part-select `[l:r]` must be constant \
+                            return Err(span_error(
+                                elab,
+                                e.span,
+                                "the bounds of a part-select `[l:r]` must be constant \
                                  expressions; use `[base +: width]` or `[base -: width]` for a \
-                                 variable base (IEEE 1800-2017 §11.5.1) at byte {}",
-                                e.span.start
+                                 variable base (IEEE 1800-2017 §11.5.1)",
                             ));
                         }
                     }
                     RangeKind::IndexedUp | RangeKind::IndexedDown => {
                         if !bound_is_const(right, elab) {
-                            return Err(format!(
-                                "error: the width of an indexed part-select must be a constant \
-                                 expression (IEEE 1800-2017 §11.5.1) at byte {}",
-                                e.span.start
+                            return Err(span_error(
+                                elab,
+                                e.span,
+                                "the width of an indexed part-select must be a constant \
+                                 expression (IEEE 1800-2017 §11.5.1)",
                             ));
                         }
                     }
@@ -11321,10 +11330,11 @@ fn validate_expr_idents(
                    // §19.7.1 `cg::type_option.f` scopes on the covergroup name.
                    !elab.covergroups.contains_key(name) &&
                    !locals.contains(name) {
-                   let loc = span_location(elab, expr.span)
-                       .map(|l| format!(" at {}", l))
-                       .unwrap_or_default();
-                   return Err(format!("Undeclared identifier '{}'{}", name, loc));
+                   return Err(span_error(
+                       elab,
+                       expr.span,
+                       &format!("Undeclared identifier '{}'", name),
+                   ));
                 }            }
         ExprKind::Unary { operand, .. } => validate_expr_idents(operand, elab, locals)?,
         ExprKind::Binary { left, right, .. } => { validate_expr_idents(left, elab, locals)?; validate_expr_idents(right, elab, locals)?; }
@@ -11546,10 +11556,11 @@ fn validate_event_idents(
                 && id.name != "__xz_default_clocking"
                 && id.name != "__xz_default_clocking0"
             => {
-                let loc = span_location(elab, id.span)
-                    .map(|l| format!(" at {}", l))
-                    .unwrap_or_default();
-                return Err(format!("Undeclared identifier '{}'{}", id.name, loc));
+                return Err(span_error(
+                    elab,
+                    id.span,
+                    &format!("Undeclared identifier '{}'", id.name),
+                ));
             }
         EventControl::HierIdentifier(e) => validate_expr_idents(e, elab, locals)?,
         _ => {}
@@ -15104,9 +15115,12 @@ pub fn resolve_type_width(
             // --dump-merged-sv output at that offset).
             if total > SANE_MAX_PACKED_WIDTH as u64 && culprit.is_none() {
                 culprit = Some(format!(
-                    "dims {} at byte {}",
+                    "dims {} at {}",
                     dims_desc,
-                    first_span.unwrap_or(0)
+                    published_span_location(Span::new(
+                        first_span.unwrap_or(0) as usize,
+                        first_span.unwrap_or(0) as usize
+                    ))
                 ));
             }
             clamp_packed_width(total, "IntegerVector", culprit.as_deref().unwrap_or(""))
@@ -15180,7 +15194,11 @@ pub fn resolve_type_width(
                         }
                     }
                 }
-                let detail = format!("type '{}' at byte {}", name.name.name, name.span.start);
+                let detail = format!(
+                    "type '{}' at {}",
+                    name.name.name,
+                    published_span_location(name.span)
+                );
                 base_width = clamp_packed_width(total, "TypeReference", &detail);
             }
             if traced {
@@ -29972,6 +29990,19 @@ thread_local! {
     /// module being elaborated resolves that.
     static ELAB_MODULE_FILES_TLS: std::cell::RefCell<HashMap<String, u32>> =
         std::cell::RefCell::new(HashMap::default());
+    /// Line maps of the published sources (parallel to them).
+    static ELAB_LINE_MAPS_TLS: std::cell::RefCell<Vec<Option<sv_parser::source_map::LineMap>>> =
+        const { std::cell::RefCell::new(Vec::new()) };
+}
+
+/// Publish the line maps of the sources passed to `set_elab_sources`.
+pub fn set_elab_line_maps(maps: Vec<Option<sv_parser::source_map::LineMap>>) {
+    ELAB_LINE_MAPS_TLS.with(|c| *c.borrow_mut() = maps);
+}
+
+/// Move the published line maps back out.
+pub fn take_elab_line_maps() -> Vec<Option<sv_parser::source_map::LineMap>> {
+    ELAB_LINE_MAPS_TLS.with(|c| std::mem::take(&mut *c.borrow_mut()))
 }
 
 /// Publish the preprocessed sources for elaboration-time diagnostics. Takes
@@ -29995,7 +30026,9 @@ pub fn take_elab_sources() -> (Vec<String>, Vec<String>) {
 }
 
 /// Resolve a `Span` (a byte offset into its own file's PREPROCESSED text) to
-/// `file:line`, for elaboration diagnostics. Mirrors the simulator's
+/// `file:line:col` (`file:line` without a line map), for elaboration
+/// diagnostics. The file is the one the text came from — an `include`d file,
+/// not the file that included it. Mirrors the simulator's
 /// `span_file_line_in`: when several retained sources could contain the
 /// offset the location is ambiguous, and printing a wrong file is worse than
 /// printing none.
@@ -30029,6 +30062,25 @@ fn span_location_impl_owned(
     hint: bool,
     owner: Option<&str>,
 ) -> Option<String> {
+    span_locate_owned(elab, span, hint, owner).map(|l| match l {
+        SpanLoc::Mapped(loc) => loc.short(),
+        SpanLoc::Plain(s) => s,
+    })
+}
+
+/// Where a span resolved to: through a line map (full location), or only to
+/// `file:line` of the preprocessed text.
+enum SpanLoc {
+    Mapped(sv_parser::diagnostics::Location),
+    Plain(String),
+}
+
+fn span_locate_owned(
+    elab: &ElaboratedModule,
+    span: Span,
+    hint: bool,
+    owner: Option<&str>,
+) -> Option<SpanLoc> {
     if span.start == 0 && span.end == 0 {
         return None; // Span::dummy() — synthesized, no source
     }
@@ -30050,7 +30102,10 @@ fn span_location_impl_owned(
     };
     // During elaboration the module's own copy is still empty; the sources
     // live in the TLS published by `set_elab_sources`.
-    let resolve = |texts: &[String], files: &[String]| -> Option<String> {
+    let resolve = |texts: &[String],
+                   files: &[String],
+                   maps: &[Option<sv_parser::source_map::LineMap>]|
+     -> Option<SpanLoc> {
         let mut hit: Option<usize> = None;
         if let Some(p) = preferred {
             if texts.get(p).is_some_and(|t| span.start < t.len()) {
@@ -30068,22 +30123,60 @@ fn span_location_impl_owned(
             }
         }
         let i = hit?;
+        if let Some(loc) = maps
+            .get(i)
+            .and_then(|m| m.as_ref())
+            .and_then(|m| m.locate(&texts[i], span))
+        {
+            return Some(SpanLoc::Mapped(loc));
+        }
         let line = 1 + texts[i].as_bytes()[..span.start]
             .iter()
             .filter(|&&b| b == b'\n')
             .count();
         match files.get(i).filter(|f| !f.is_empty()) {
-            Some(f) => Some(format!("{}:{}", f, line)),
-            None => Some(format!("line {}", line)),
+            Some(f) => Some(SpanLoc::Plain(format!("{}:{}", f, line))),
+            None => Some(SpanLoc::Plain(format!("line {}", line))),
         }
     };
     if !elab.source_texts.is_empty() {
-        return resolve(&elab.source_texts, &elab.source_files);
+        return resolve(
+            &elab.source_texts,
+            &elab.source_files,
+            &elab.source_line_maps,
+        );
     }
     ELAB_SOURCES_TLS.with(|c| {
         let b = c.borrow();
-        resolve(&b.0, &b.1)
+        ELAB_LINE_MAPS_TLS.with(|m| resolve(&b.0, &b.1, &m.borrow()))
     })
+}
+
+/// `file:line:col` of `span` from the sources published for the current
+/// elaboration, when exactly one of them can hold it (no module to hint
+/// with); otherwise `byte N`.
+fn published_span_location(span: Span) -> String {
+    let found = ELAB_SOURCES_TLS.with(|c| {
+        let b = c.borrow();
+        let mut fits = b.0.iter().enumerate().filter(|(_, t)| span.start < t.len());
+        let (i, text) = fits.next()?;
+        if fits.next().is_some() {
+            return None;
+        }
+        ELAB_LINE_MAPS_TLS.with(|m| m.borrow().get(i)?.as_ref()?.location_string(text, span))
+    });
+    found.unwrap_or_else(|| format!("byte {}", span.start))
+}
+
+/// An elaboration error at `span`, rendered like a parser diagnostic: the
+/// `file:line:col:` header, the source line and a caret under the span.
+/// Without a location it is just the message.
+pub fn span_error(elab: &ElaboratedModule, span: Span, message: &str) -> String {
+    match span_locate_owned(elab, span, true, None) {
+        Some(SpanLoc::Mapped(loc)) => sv_parser::diagnostics::render("error", message, &loc),
+        Some(SpanLoc::Plain(s)) => format!("{} at {}", message, s),
+        None => message.to_string(),
+    }
 }
 
 /// Build the message for an illegal re-declaration (§6.x). The bare
