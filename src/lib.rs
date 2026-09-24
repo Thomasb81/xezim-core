@@ -94,6 +94,11 @@ pub use value::Value;
 /// \x01 = uncompressed fixint).
 pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1a";
 
+/// Name of the synthetic root that instantiates every top of a multi-top
+/// design (§23.3.3), each instance named after its module. It is not part of
+/// the user's hierarchy: printed paths start at the top below it.
+pub const MULTI_TOP_WRAPPER: &str = "__xezim_multi_top";
+
 /// zstd compression level used for `.xez` artifacts. Level 3 is zstd's own
 /// default — strong compression at high throughput. Empirically shrinks
 /// the elaborated-bincode stream ~27×, which more than pays for the
@@ -2430,6 +2435,16 @@ fn parse_and_elaborate(
     let named_top_found = top_module_name.is_some_and(|n| definitions.contains_key(n));
     if let (Some(name), true) = (top_module_name, named_top_found) {
         top_module = Some(name.to_string());
+        // Several tops named on the command line arrive as a wrapper the
+        // driver wrote; hoist their module-local declarations as below.
+        if name == MULTI_TOP_WRAPPER {
+            let mut tops = std::collections::HashSet::new();
+            if let Some(w) = definitions.get(name) {
+                collect_instantiated_modules(w.items(), &mut tops);
+            }
+            multi_top_modules = tops.into_iter().collect();
+            multi_top_modules.sort();
+        }
     } else {
         // No top named, OR the named top wasn't found — auto-detect the
         // hierarchy root (a module instantiated by no other). This recovers
@@ -3014,7 +3029,7 @@ fn make_multi_top_wrapper(modules: &[String]) -> ast::module::ModuleDeclaration 
         kind: ast::module::ModuleKind::Module,
         lifetime: None,
         name: ast::Identifier {
-            name: "__xezim_multi_top".to_string(),
+            name: MULTI_TOP_WRAPPER.to_string(),
             span: ast::Span::dummy(),
         },
         params: vec![],
