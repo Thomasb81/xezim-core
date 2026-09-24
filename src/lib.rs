@@ -62,7 +62,9 @@ pub use sv_parser::{self, ParseResult, ast, diagnostics, lexer, parse, preproces
 pub use value::Value;
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x1a = \x19 + ElabInstance.src_pos (time-0 process order);
+/// Version byte: \x1b = \x1a + SpecifyPath terminal lists/condition/delay
+/// list and ElaboratedModule.module_paths (§30.4 module paths);
+/// \x1a = \x19 + ElabInstance.src_pos (time-0 process order);
 /// \x13 = \x12 + ExprKind::ShallowCopy, ForeachTail.key_type,
 /// ElaboratedClass.assoc_index_props, ElaboratedModule.assoc_index_widths
 /// (PR #112/#24 integration);
@@ -79,8 +81,6 @@ pub use value::Value;
 /// signing precedence, signed genvars, tf-port implicit-name unpacked dims)
 /// — cached parses/elaborations from \x13 carry the old results;
 /// \x09 = \x08 + ForeverTail StatementKind variant;
-/// \x1a = \x19 + SpecifyPath terminal lists/condition/delay list and
-/// ElaboratedModule.module_paths (§30.4 module paths);
 /// \x19 = \x18 + SpecifyBlock.timing_checks and
 /// ElaboratedModule.timing_checks (§31 timing checks);
 /// \x18 = \x17 + DataType::Interface type_args (virtual-interface
@@ -92,7 +92,7 @@ pub use value::Value;
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1a";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1b";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
