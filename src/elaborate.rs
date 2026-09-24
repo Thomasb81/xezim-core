@@ -1873,6 +1873,11 @@ pub struct ElabInstance {
     pub def_name: String,
     /// Dotted path of the containing scope; empty for a child of the top.
     pub parent: String,
+    /// Source offset of the instantiation among the parent's items, for the
+    /// simulator's time-0 process order. A bound instance (appended to its
+    /// host's items by `bind`) sorts after every item that precedes it.
+    #[serde(default)]
+    pub src_pos: usize,
 }
 
 /// Elaborated module ready for simulation.
@@ -25145,7 +25150,18 @@ fn inline_module_items(
             }
         }
     }
+    // End offset of the process/instance items seen so far (see
+    // `ElabInstance::src_pos`).
+    let mut items_end = 0usize;
     for item in &prepared_source.effective_items {
+        let item_floor = items_end;
+        items_end = items_end.max(match item {
+            ModuleItem::InitialConstruct(ic) => ic.span.end,
+            ModuleItem::AlwaysConstruct(ac) => ac.span.end,
+            ModuleItem::AssertionItem(a) => a.span.end,
+            ModuleItem::ModuleInstantiation(mi) => mi.span.end,
+            _ => 0,
+        });
         if let ModuleItem::ModuleInstantiation(inst) = item {
             let sub_mod_name = &inst.module_name.name;
             let __inst_t0 = std::time::Instant::now();
@@ -29227,6 +29243,7 @@ fn inline_module_items(
                     path: inst_prefix.trim_end_matches('.').to_string(),
                     def_name: sub_mod_name.clone(),
                     parent: prefix.trim_end_matches('.').to_string(),
+                    src_pos: hi.span.start.max(item_floor),
                 });
 
                 // Recurse into sub-module instantiations

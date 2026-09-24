@@ -62,7 +62,8 @@ pub use sv_parser::{self, ParseResult, ast, diagnostics, lexer, parse, preproces
 pub use value::Value;
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x13 = \x12 + ExprKind::ShallowCopy, ForeachTail.key_type,
+/// Version byte: \x1a = \x19 + ElabInstance.src_pos (time-0 process order);
+/// \x13 = \x12 + ExprKind::ShallowCopy, ForeachTail.key_type,
 /// ElaboratedClass.assoc_index_props, ElaboratedModule.assoc_index_widths
 /// (PR #112/#24 integration);
 /// \x12 = \x11 + PackageItem::Export (§26.6);
@@ -89,7 +90,7 @@ pub use value::Value;
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x19";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1a";
 
 /// zstd compression level used for `.xez` artifacts. Level 3 is zstd's own
 /// default — strong compression at high throughput. Empirically shrinks
