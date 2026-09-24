@@ -902,6 +902,9 @@ impl Parser {
                     );
                 } else if matches!(&lhs.kind, ExprKind::Ident(h)
                     if h.path.len() == 1 && h.path[0].selects.is_empty())
+                    || matches!(&lhs.kind, ExprKind::MemberAccess { expr, .. }
+                        if matches!(&expr.kind, ExprKind::Ident(h)
+                            if h.path.len() == 1 && h.path[0].selects.is_empty()))
                 {
                     // §6.24.1: `id'(v)` where `id` is a bare identifier is either
                     // a TYPE cast (id is a typedef) or a SIZE cast (id is a
@@ -909,7 +912,9 @@ impl Parser {
                     // the type/parameter tables, so defer to the simulator via a
                     // named-cast intrinsic that carries the identifier. Formerly
                     // this dropped the cast entirely (`size1'(x)` kept x's width,
-                    // `my_t'(x)` skipped the conversion).
+                    // `my_t'(x)` skipped the conversion). A package-scoped name
+                    // (`pkg::my_t'(v)`, parsed as a member access) is carried the
+                    // same way; it was dropped too.
                     lhs = Expression::new(
                         ExprKind::SystemCall {
                             name: "$__xz_named_cast".to_string(),

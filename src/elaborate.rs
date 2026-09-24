@@ -19662,13 +19662,26 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             // §6.24.1: `id'(v)` where `id` resolves to a CONSTANT — a size
             // cast at that width (`localparam [AW-1:0] TOP = AW'(6);` read 0
             // because this intrinsic had no const arm at all).
-            let nm = match &args[0].kind {
-                ExprKind::Ident(h) if h.path.len() == 1 => Some(h.path[0].name.name.clone()),
-                _ => None,
+            // A package-scoped target (`pkg::T'(v)`) prefers its qualified
+            // `pkg::T` registration.
+            let (nm, scoped) = match &args[0].kind {
+                ExprKind::Ident(h) if h.path.len() == 1 => {
+                    (Some(h.path[0].name.name.clone()), None)
+                }
+                ExprKind::MemberAccess { expr: base, member } => match &base.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 => (
+                        Some(member.name.clone()),
+                        Some(format!("{}::{}", h.path[0].name.name, member.name)),
+                    ),
+                    _ => (None, None),
+                },
+                _ => (None, None),
             };
             if let Some(nm) = nm {
-                if let Some(w) = params
-                    .get(&nm)
+                if let Some(w) = scoped
+                    .as_ref()
+                    .and_then(|k| params.get(k))
+                    .or_else(|| params.get(&nm))
                     .and_then(|v| v.to_u64())
                     .or_else(|| param_fallback_get(&nm).and_then(|v| v.to_u64()))
                 {
@@ -19682,8 +19695,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 // operator expression can observe a context, and the width
                 // table cannot tell an integral typedef from a string one, so
                 // a bare operand keeps its pass-through.
-                let td =
-                    TYPEDEFS_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(&nm).copied()));
+                let td = TYPEDEFS_TLS.with(|c| {
+                    c.borrow().as_ref().and_then(|m| {
+                        scoped
+                            .as_ref()
+                            .and_then(|k| m.get(k))
+                            .or_else(|| m.get(&nm))
+                            .copied()
+                    })
+                });
                 if let Some(w) = td.filter(|&w| w > 0 && is_context_operator(&args[1])) {
                     let v = eval_const_expr_val_ctx(&args[1], params, w);
                     if !v.is_real {
