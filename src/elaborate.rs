@@ -3629,7 +3629,11 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     } else {
                         init
                     };
-                    let mut v = eval_init_for_width(init, &elab.parameters, width);
+                    let mut v = if is_string_data_type(data_type) {
+                        string_param_value(init, &elab.parameters)
+                    } else {
+                        eval_init_for_width(init, &elab.parameters, width)
+                    };
                     if !v.is_real {
                         v.is_signed = pkg_param_is_signed(
                             data_type,
@@ -5025,6 +5029,13 @@ pub fn elaborate_module_with_defs(
                     if init_is_real {
                         width = 64;
                         is_real = true;
+                    } else if let Some(w) = assign
+                        .init
+                        .as_ref()
+                        .filter(|e| matches!(e.kind, ExprKind::StringLiteral(_)))
+                        .and_then(string_literal_width)
+                    {
+                        width = w;
                     } else {
                         width = assign
                             .init
@@ -5426,8 +5437,11 @@ pub fn elaborate_module_with_defs(
                                 } else {
                                     init
                                 };
-                                let mut v =
-                                    eval_init_for_width(init_eval, &elab.parameters, eff_width);
+                                let mut v = if is_string_data_type(data_type) {
+                                    string_param_value(init_eval, &elab.parameters)
+                                } else {
+                                    eval_init_for_width(init_eval, &elab.parameters, eff_width)
+                                };
                                 if !v.is_real {
                                     v.is_signed = pkg_param_is_signed(
                                         data_type,
@@ -8419,11 +8433,15 @@ pub fn elaborate_module_with_defs(
                                     substitute_const_fn_calls(init, &elab.parameters, &elab, 0)
                                         .filter(|e| !expr_has_call(e))
                                 {
-                                    let mut v = eval_init_for_width(
-                                        &subbed,
-                                        &elab.parameters,
-                                        current_width,
-                                    );
+                                    let mut v = if is_string_data_type(data_type) {
+                                        string_param_value(&subbed, &elab.parameters)
+                                    } else {
+                                        eval_init_for_width(
+                                            &subbed,
+                                            &elab.parameters,
+                                            current_width,
+                                        )
+                                    };
                                     // §6.20.2: the DECLARED signedness is authoritative. Assigning
                                     // only when true let a signed INIT LITERAL leak its
                                     // signedness into an unsigned parameter — `parameter
@@ -8481,6 +8499,9 @@ pub fn elaborate_module_with_defs(
                             val.is_signed = current_signed;
                             if is_type_two_state(data_type) {
                                 val = val.to_two_state();
+                            }
+                            if is_string_data_type(data_type) {
+                                current_width = val.width;
                             }
                         }
 
@@ -18521,6 +18542,15 @@ pub fn packed_inner_elem_width(
     None
 }
 
+/// §5.9: a string literal is 8 bits per character, and an empty one still
+/// occupies a byte, so `parameter P = "untyped"` keeps all its text.
+fn string_literal_width(init: &Expression) -> Option<u32> {
+    match &init.kind {
+        ExprKind::StringLiteral(s) => Some(Value::from_string(s).width.max(8)),
+        _ => None,
+    }
+}
+
 /// §6.20.2: a parameter with no type and no range takes the type of its
 /// final value — the SELF-DETERMINED width (§11.6.1, Table 11-21) of its
 /// initializer. Known for literals (sized, unsized 32, string 8 per
@@ -18627,6 +18657,23 @@ fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> Optio
         },
         _ => None,
     }
+}
+
+fn is_string_data_type(dt: &DataType) -> bool {
+    matches!(
+        dt,
+        DataType::Simple {
+            kind: SimpleType::String,
+            ..
+        }
+    )
+}
+
+/// §6.16: a `string` parameter holds its text at the text's own length. A
+/// string has no declared width, and fitting the value to the 1024-bit
+/// placeholder made `%s` print it behind 125 leading spaces.
+fn string_param_value(init: &Expression, params: &HashMap<String, Value>) -> Value {
+    Value::from_string(&eval_const_expr_val(init, params).to_sv_string())
 }
 
 /// Detect whether struct/union type `target` (body `dt`) transitively contains
@@ -18996,6 +19043,9 @@ fn eval_param_init(
     typedef_types: &HashMap<String, DataType>,
     width: u32,
 ) -> Value {
+    if is_string_data_type(dt) {
+        return string_param_value(init, params);
+    }
     let typed = !matches!(dt, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
         && !is_type_real_resolved(dt, typedef_types);
     if typed
@@ -27284,6 +27334,9 @@ fn inline_module_items(
                                                         if val.is_real {
                                                             val = Value::from_f64(val.to_f64());
                                                         }
+                                                    } else if is_string_data_type(data_type) {
+                                                        val =
+                                                            Value::from_string(&val.to_sv_string());
                                                     } else if !val.is_real {
                                                         // §5.7.1/§10.9: a DECLARED
                                                         // shape sizes the init —
@@ -35221,8 +35274,11 @@ fn process_import(
                                             } else {
                                                 init
                                             };
-                                            let mut v =
-                                                eval_init_for_width(init, &elab.parameters, width);
+                                            let mut v = if is_string_data_type(data_type) {
+                                                string_param_value(init, &elab.parameters)
+                                            } else {
+                                                eval_init_for_width(init, &elab.parameters, width)
+                                            };
                                             if !v.is_real {
                                                 v.is_signed = pkg_param_is_signed(
                                                     data_type,
