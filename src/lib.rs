@@ -1628,20 +1628,26 @@ fn parse_and_elaborate(
     // real instantiation) and fold it into `top_level_binds`.
     let mut inmodule_binds: Vec<ast::decl::BindDirective> = Vec::new();
     for def in definitions.values_mut() {
-        if let SourceDefinition::Module(m) = def {
-            if !m
-                .items
-                .iter()
-                .any(|it| matches!(it, ast::decl::ModuleItem::Bind(_)))
-            {
-                continue;
-            }
-            let m = Rc::make_mut(m);
-            for it in m.items.iter_mut() {
-                if let ast::decl::ModuleItem::Bind(b) = it {
-                    inmodule_binds.push(b.clone());
-                    *it = ast::decl::ModuleItem::Null;
-                }
+        let items = match def {
+            SourceDefinition::Module(m) => &m.items,
+            SourceDefinition::Interface(i) => &i.items,
+            _ => continue,
+        };
+        if !items
+            .iter()
+            .any(|it| matches!(it, ast::decl::ModuleItem::Bind(_)))
+        {
+            continue;
+        }
+        let items = match def {
+            SourceDefinition::Module(m) => &mut Rc::make_mut(m).items,
+            SourceDefinition::Interface(i) => &mut Rc::make_mut(i).items,
+            _ => continue,
+        };
+        for it in items.iter_mut() {
+            if let ast::decl::ModuleItem::Bind(b) = it {
+                inmodule_binds.push(b.clone());
+                *it = ast::decl::ModuleItem::Null;
             }
         }
     }
@@ -1682,12 +1688,7 @@ fn parse_and_elaborate(
             deferred_module_binds.push(b);
             continue;
         };
-        if let SourceDefinition::Module(m) = def {
-            let m = Rc::make_mut(m);
-            m.items.push(ast::decl::ModuleItem::ModuleInstantiation(
-                b.instantiation.clone(),
-            ));
-        }
+        push_bound_instantiation(def, b);
     }
     for b in &top_level_binds {
         if b.target_path.len() >= 2 {
@@ -1953,12 +1954,10 @@ fn parse_and_elaborate(
     // produce a spurious warning).
     for b in deferred_module_binds.drain(..) {
         let tname = b.target_module.name.clone();
-        if let Some(SourceDefinition::Module(m)) = definitions.get_mut(&tname) {
-            let m = Rc::make_mut(m);
-            m.items.push(ast::decl::ModuleItem::ModuleInstantiation(
-                b.instantiation.clone(),
-            ));
-        } else {
+        if !definitions
+            .get_mut(&tname)
+            .is_some_and(|def| push_bound_instantiation(def, b))
+        {
             eprintln!(
                 "[elab] bind target module '{}' is not a module definition; bind ignored",
                 tname
@@ -2514,6 +2513,22 @@ pub fn bind_spec_base(name: &str) -> &str {
     name
 }
 
+/// §23.11: append a module-name bind's instantiation to its target
+/// definition. The target may be a module or an interface (a monitor BFM
+/// interface is the usual host of bound assertion interfaces); anything else
+/// is not a bind target.
+fn push_bound_instantiation(def: &mut SourceDefinition, b: &ast::decl::BindDirective) -> bool {
+    let items = match def {
+        SourceDefinition::Module(m) => &mut Rc::make_mut(m).items,
+        SourceDefinition::Interface(i) => &mut Rc::make_mut(i).items,
+        _ => return false,
+    };
+    items.push(ast::decl::ModuleItem::ModuleInstantiation(
+        b.instantiation.clone(),
+    ));
+    true
+}
+
 /// §23.11 per-instance bind: `bind top.a.b.inst bound_mod m ();`.
 ///
 /// Walks the definition tree along `target_path` (first segment must name a
@@ -2591,20 +2606,24 @@ fn apply_instance_bind(
     *counter += 1;
     let target_def = cur;
     let spec_of = |base: &str| format!("{base}__bind{n}");
-    let Some(SourceDefinition::Module(tm)) = definitions.get(&target_def) else {
-        return false;
+    let bound = ast::decl::ModuleItem::ModuleInstantiation(b.instantiation.clone());
+    let tclone = match definitions.get(&target_def) {
+        Some(SourceDefinition::Module(tm)) => {
+            let mut tclone = (**tm).clone();
+            tclone.name.name = spec_of(&target_def);
+            tclone.items.push(bound);
+            SourceDefinition::Module(Rc::new(tclone))
+        }
+        // The bound host may be an interface instance.
+        Some(SourceDefinition::Interface(ti)) => {
+            let mut tclone = (**ti).clone();
+            tclone.name.name = spec_of(&target_def);
+            tclone.items.push(bound);
+            SourceDefinition::Interface(Rc::new(tclone))
+        }
+        _ => return false,
     };
-    let mut tclone = (**tm).clone();
-    tclone.name.name = spec_of(&target_def);
-    tclone
-        .items
-        .push(ast::decl::ModuleItem::ModuleInstantiation(
-            b.instantiation.clone(),
-        ));
-    definitions.insert(
-        tclone.name.name.clone(),
-        SourceDefinition::Module(Rc::new(tclone)),
-    );
+    definitions.insert(spec_of(&target_def), tclone);
     // Rewrite parents bottom-up. Retargeting an instantiation that declares
     // several comma-listed instances must split the named one out, so the
     // siblings keep the original definition.
