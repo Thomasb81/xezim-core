@@ -20868,17 +20868,22 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
                     }
                 }
                 ModuleItem::GenerateRegion(gr) => module_items(&gr.items, out),
+                // §27.6: a generate block's label is a scope name, legal as the
+                // root of a hierarchical reference (`blk.f(0)`, `g[i-1].t`).
                 ModuleItem::GenerateIf(gi) => {
+                    out.extend(gi.branch_labels.iter().flatten().cloned());
                     for (_, items) in &gi.branches {
                         module_items(items, out);
                     }
                 }
                 ModuleItem::GenerateFor(gf) => {
                     out.insert(gf.var.clone());
+                    out.extend(gf.name.iter().cloned());
                     module_items(&gf.items, out);
                 }
                 ModuleItem::GenerateCase(gc) => {
                     for arm in &gc.arms {
+                        out.extend(arm.label.iter().cloned());
                         module_items(&arm.items, out);
                     }
                 }
