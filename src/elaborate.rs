@@ -2832,6 +2832,30 @@ fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<()
     Ok(())
 }
 
+/// A constant `Value` as a literal expression (sized, with x/z digits), for
+/// substituting an elaboration-time constant into another scope's expression.
+fn const_value_literal(v: &Value, span: Span) -> Option<Expression> {
+    if v.is_real {
+        return Some(Expression::new(
+            ExprKind::Number(NumberLiteral::Real(v.to_f64())),
+            span,
+        ));
+    }
+    if v.width == 0 {
+        return None;
+    }
+    Some(Expression::new(
+        ExprKind::Number(NumberLiteral::Integer {
+            size: Some(v.width),
+            signed: v.is_signed,
+            base: crate::ast::expr::NumberBase::Binary,
+            value: v.to_bin(),
+            cached_val: std::cell::Cell::new(None),
+        }),
+        span,
+    ))
+}
+
 fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
     match &expr.kind {
         ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
@@ -25668,8 +25692,9 @@ fn inline_module_items(
                 // §23.2.2.4: an input port left unconnected (empty ordered
                 // slot `dut(,x)`, named `.i()`, or absent from a short
                 // connection list) that declares a default value is driven by
-                // that default. Its sub-scope constant is substituted verbatim
-                // for the port name throughout the inlined body.
+                // that default. Its sub-scope constant is substituted for the
+                // port name throughout the inlined body.
+                let mut port_defaults: Vec<(String, Expression, bool)> = Vec::new();
                 if let PortList::Ansi(ports) = sub_mod.ports() {
                     // §22.9: if this module was declared inside an active
                     // `unconnected_drive region, its unconnected INPUT ports
@@ -25689,16 +25714,16 @@ fn inline_module_items(
                             continue;
                         }
                         if let Some(def) = &port.default {
-                            // §23.2.2.4: the default must be a CONSTANT
-                            // expression (ivtest sv_default_port_value3 — a
-                            // reference to a runtime variable is rejected).
-                            if !is_const_expr(def, &elab.parameters) {
-                                return Err(format!(
-                                    "Value assigned to default of port '{}' of module '{}' must be a constant expression (§23.2.2.4)",
-                                    name, sub_mod_name
-                                ));
-                            }
-                            port_map.insert(name.clone(), def.clone());
+                            // Resolved below, once this instance's own
+                            // parameters are known.
+                            let is_string = matches!(
+                                port.data_type,
+                                Some(DataType::Simple {
+                                    kind: crate::ast::types::SimpleType::String,
+                                    ..
+                                })
+                            );
+                            port_defaults.push((name.clone(), def.clone(), is_string));
                         } else if let Some(pull1) = pulled {
                             let lit = Expression::new(
                                 ExprKind::Number(NumberLiteral::UnbasedUnsized(if pull1 {
@@ -26641,6 +26666,30 @@ fn inline_module_items(
                     }
                 }
                 iprof_add("param_typedef_fixpoint", __tb.elapsed());
+
+                // §23.2.2.4: a port default is a constant expression of the
+                // CHILD's scope (`input logic i = F` reads the child's own
+                // parameter `F`, per instance). The port map holds PARENT-scope
+                // actuals, so a default that names anything is folded to its
+                // value here; a literal default is kept as written.
+                for (name, def, is_string) in port_defaults {
+                    let child_const = is_const_expr(&def, &sub_local_params);
+                    if !child_const && !is_const_expr(&def, &elab.parameters) {
+                        return Err(format!(
+                            "Value assigned to default of port '{}' of module '{}' must be a constant expression (§23.2.2.4)",
+                            name, sub_mod_name
+                        ));
+                    }
+                    let mut names = Vec::new();
+                    collect_ident_names(&def, &mut names);
+                    let actual = if names.is_empty() || is_string || !child_const {
+                        def
+                    } else {
+                        let v = eval_const_expr_val(&def, &sub_local_params);
+                        const_value_literal(&v, def.span).unwrap_or(def)
+                    };
+                    port_map.insert(name, actual);
+                }
 
                 let __tp = std::time::Instant::now();
                 let prepared_sub = prepare_module_items(
