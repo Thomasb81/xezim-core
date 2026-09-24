@@ -23373,6 +23373,7 @@ pub fn inline_instantiations(
     // resolve imported package parameters like black-parrot's `all_cfgs_gp`.
     set_param_fallback(&top_params);
     let mut cache = HashMap::default();
+    let root_defparams = absolute_defparams(&module_name, definitions, &top_params);
     inline_module_items(
         elab,
         top_def,
@@ -23382,7 +23383,7 @@ pub fn inline_instantiations(
         &top_params,
         &mut cache,
         &HashMap::default(),
-        &[],
+        &root_defparams,
     )?;
     if elab_trace_enabled() {
         eprintln!("[xezim][elab] finished inline top={}", module_name);
@@ -25948,6 +25949,98 @@ fn explain_conn_width(actual: &Expression, elab: &ElaboratedModule, parent_def: 
              parameter P resolved to 0 collapses to 1 bit. Re-run with \
              XEZIM_TRACE_PARAM=<param> to see where that parameter was resolved.",
         );
+    }
+    out
+}
+
+/// §23.10.1: a `defparam` whose path starts at a top-level module
+/// (`defparam tb.u.P = 3` inside `tb`, or `other.u.P` naming another top)
+/// resolves from the root, not from the scope that declares it, where it
+/// matched no child and was dropped. Collected from every definition the root
+/// reaches, as the root scope's pending defparams: with a single top its own
+/// name is dropped (the root's children are its instances); under the
+/// multi-top wrapper each top is a child of the root. Only values constant
+/// without the declaring scope's own parameters are taken.
+fn absolute_defparams(
+    root: &str,
+    definitions: &HashMap<String, Definition>,
+    root_params: &HashMap<String, Value>,
+) -> Vec<(Vec<String>, Value)> {
+    fn instances<'i>(items: &'i [ModuleItem], out: &mut Vec<&'i ModuleInstantiation>) {
+        for it in items {
+            match it {
+                ModuleItem::ModuleInstantiation(mi) => out.push(mi),
+                ModuleItem::GenerateRegion(r) => instances(&r.items, out),
+                ModuleItem::GenerateIf(g) => {
+                    for (_, items) in &g.branches {
+                        instances(items, out);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => instances(&g.items, out),
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &g.arms {
+                        instances(&arm.items, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let inst_names = |items: &[ModuleItem]| -> HashSet<String> {
+        let mut mis = Vec::new();
+        instances(items, &mut mis);
+        mis.iter()
+            .flat_map(|mi| mi.instances.iter().map(|hi| hi.name.name.clone()))
+            .collect()
+    };
+    let Some(root_def) = definitions.get(root) else {
+        return Vec::new();
+    };
+    let wrapper = root == crate::MULTI_TOP_WRAPPER;
+    let tops: HashSet<String> = if wrapper {
+        inst_names(root_def.items())
+    } else {
+        std::iter::once(root.to_string()).collect()
+    };
+    let no_params = HashMap::default();
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::default();
+    let mut stack = vec![root.to_string()];
+    while let Some(name) = stack.pop() {
+        if !seen.insert(name.clone()) {
+            continue;
+        }
+        let Some(def) = definitions.get(&name) else {
+            continue;
+        };
+        let mut mis = Vec::new();
+        instances(def.items(), &mut mis);
+        stack.extend(mis.iter().map(|mi| mi.module_name.name.clone()));
+        let own = inst_names(def.items());
+        let params = if name == root {
+            root_params
+        } else {
+            &no_params
+        };
+        for it in def.items() {
+            let ModuleItem::Defparam(assigns) = it else {
+                continue;
+            };
+            for (lhs, rhs) in assigns {
+                let Some(path) = defparam_path_segments(lhs) else {
+                    continue;
+                };
+                if path.len() < 3
+                    || !tops.contains(&path[0])
+                    || own.contains(&path[0])
+                    || !is_const_expr(rhs, params)
+                {
+                    continue;
+                }
+                let path = if wrapper { path } else { path[1..].to_vec() };
+                out.push((path, eval_const_expr_val(rhs, params)));
+            }
+        }
     }
     out
 }
