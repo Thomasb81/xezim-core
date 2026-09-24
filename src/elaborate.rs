@@ -12135,8 +12135,8 @@ fn create_implicit_nets(
 ) -> Result<(), String> {
     let mut implicit_names = Vec::new();
     for ca in &elab.continuous_assigns {
-        collect_ident_names(&ca.lhs, &mut implicit_names);
-        collect_ident_names(&ca.rhs, &mut implicit_names);
+        collect_assign_net_names(&ca.lhs, &mut implicit_names);
+        collect_assign_net_names(&ca.rhs, &mut implicit_names);
     }
     // §6.10 also covers an identifier that appears ONLY as an instance port
     // actual — `.out(net)` on one instance and `.in(net)` on another, with
@@ -12346,47 +12346,60 @@ fn collect_implicit_net_candidates(expr: &Expression, out: &mut Vec<String>) {
 
 /// Collect all plain identifier names from an expression tree.
 fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
+    collect_ident_names_in(expr, out, true);
+}
+
+/// §6.10 implicit-net candidates of a continuous assignment: like
+/// `collect_ident_names`, but the root of a dotted reference (`blk.x`,
+/// `u.sig`, `s.field`) names a scope or a declared struct, never an implicit
+/// net. A select base (`arr[0].f`) is still collected.
+fn collect_assign_net_names(expr: &Expression, out: &mut Vec<String>) {
+    collect_ident_names_in(expr, out, false);
+}
+
+fn collect_ident_names_in(expr: &Expression, out: &mut Vec<String>, member_roots: bool) {
+    let rec = |e: &Expression, out: &mut Vec<String>| collect_ident_names_in(e, out, member_roots);
     match &expr.kind {
         ExprKind::Ident(hier) if hier.path.len() == 1 && hier.path[0].selects.is_empty() => {
             out.push(hier.path[0].name.name.clone());
         }
-        ExprKind::Unary { operand, .. } => collect_ident_names(operand, out),
+        ExprKind::Unary { operand, .. } => rec(operand, out),
         ExprKind::Binary { left, right, .. } => {
-            collect_ident_names(left, out);
-            collect_ident_names(right, out);
+            rec(left, out);
+            rec(right, out);
         }
         ExprKind::Conditional {
             condition,
             then_expr,
             else_expr,
         } => {
-            collect_ident_names(condition, out);
-            collect_ident_names(then_expr, out);
-            collect_ident_names(else_expr, out);
+            rec(condition, out);
+            rec(then_expr, out);
+            rec(else_expr, out);
         }
         ExprKind::Concatenation(parts) => {
             for p in parts {
-                collect_ident_names(p, out);
+                rec(p, out);
             }
         }
         ExprKind::Replication { count, exprs } => {
-            collect_ident_names(count, out);
+            rec(count, out);
             for e in exprs {
-                collect_ident_names(e, out);
+                rec(e, out);
             }
         }
         ExprKind::Index { expr, index } => {
-            collect_ident_names(expr, out);
-            collect_ident_names(index, out);
+            rec(expr, out);
+            rec(index, out);
         }
         ExprKind::RangeSelect {
             expr, left, right, ..
         } => {
-            collect_ident_names(expr, out);
-            collect_ident_names(left, out);
-            collect_ident_names(right, out);
+            rec(expr, out);
+            rec(left, out);
+            rec(right, out);
         }
-        ExprKind::Paren(inner) => collect_ident_names(inner, out),
+        ExprKind::Paren(inner) => rec(inner, out),
         // Only the CALL ARGUMENTS can name nets — the callee (`func`) is a
         // function/task name, never an implicit net. Collecting it created a
         // phantom 1-bit net for const functions like a user `clog2(N)`, which
@@ -12394,10 +12407,16 @@ fn collect_ident_names(expr: &Expression, out: &mut Vec<String>) {
         // converged (black-parrot HardFloat / BSG width helpers).
         ExprKind::Call { func: _, args } => {
             for a in args {
-                collect_ident_names(a, out);
+                rec(a, out);
             }
         }
-        ExprKind::MemberAccess { expr, .. } => collect_ident_names(expr, out),
+        ExprKind::MemberAccess { expr, .. } => {
+            let bare_root = matches!(&expr.kind,
+                ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty());
+            if member_roots || !bare_root {
+                rec(expr, out);
+            }
+        }
         _ => {}
     }
 }
