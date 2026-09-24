@@ -1131,9 +1131,11 @@ impl Preprocessor {
                 // §22.4: the filename may come from a text macro
                 // (`include `DEFINED_PATH). Silently dropping the line left
                 // the file un-included and everything downstream undefined.
+                // Expand fully: a function-like macro's body (`` `"f`" ``)
+                // only turns into a string literal on a later rescan.
                 let parsed = Self::parse_include_path(trimmed).or_else(|| {
-                    let expanded = self.expand_macros_once(trimmed);
-                    Self::parse_include_path(expanded.trim())
+                    let expanded = self.expand_macros(trimmed["`include".len()..].trim());
+                    Self::parse_include_path(&format!("`include {}", expanded.trim()))
                 });
                 self.flush_expansion_diagnostics();
                 if parsed.is_none() {
