@@ -9199,7 +9199,8 @@ pub fn elaborate_module_with_defs(
     validate_driver_conflicts(&elab)?;
 
     // IEEE 1800-2017 §8.21/§8.26: class instantiation legality.
-    validate_class_usage(&elab)?;
+    let scope_typedefs = all_defs.map(|defs| non_class_typedef_names(defs, &module));
+    validate_class_usage(&elab, scope_typedefs.as_ref())?;
 
     // IEEE 1800-2023 §8.20.5: a derived class may not override a `final`
     // method of any ancestor class; `:extends`/`:initial` markers must
@@ -10798,7 +10799,55 @@ fn data_type_kind_name(dt: &DataType) -> String {
     }
 }
 
-fn validate_class_usage(elab: &ElaboratedModule) -> Result<(), String> {
+/// Typedef names declared OUTSIDE any class — in a module/interface/program
+/// (generate blocks included), a package, or `$unit`. Class-local typedefs
+/// also land in the bare `elab.typedefs` table, so that table cannot tell
+/// whether a name is visible to a class from its enclosing scopes.
+fn non_class_typedef_names(
+    defs: &HashMap<String, Definition>,
+    module: &Definition,
+) -> HashSet<String> {
+    fn items(its: &[ModuleItem], out: &mut HashSet<String>) {
+        for it in its {
+            match it {
+                ModuleItem::TypedefDeclaration(t) => {
+                    out.insert(t.name.name.clone());
+                }
+                ModuleItem::GenerateRegion(g) => items(&g.items, out),
+                ModuleItem::GenerateIf(g) => g.branches.iter().for_each(|(_, b)| items(b, out)),
+                ModuleItem::GenerateFor(g) => items(&g.items, out),
+                ModuleItem::GenerateCase(g) => g.arms.iter().for_each(|a| items(&a.items, out)),
+                ModuleItem::NestedModule(m) => items(&m.items, out),
+                _ => {}
+            }
+        }
+    }
+    let mut out = HashSet::default();
+    for def in defs.values().chain(std::iter::once(module)) {
+        match def {
+            Definition::Module(_) | Definition::Interface(_) | Definition::Program(_) => {
+                items(def.items(), &mut out)
+            }
+            Definition::Package(p) => {
+                for it in &p.items {
+                    if let PackageItem::Typedef(t) = it {
+                        out.insert(t.name.name.clone());
+                    }
+                }
+            }
+            Definition::Typedef(t) => {
+                out.insert(t.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+    out
+}
+
+fn validate_class_usage(
+    elab: &ElaboratedModule,
+    scope_typedefs: Option<&HashSet<String>>,
+) -> Result<(), String> {
     // §8.26.4: `implements T` where T is a class type parameter is illegal.
     for cls in elab.classes.values() {
         for imp in &cls.implements {
@@ -10890,8 +10939,13 @@ fn validate_class_usage(elab: &ElaboratedModule) -> Result<(), String> {
                 break;
             }
         }
-        for t in elab.typedefs.keys() {
-            iface_only_typedefs.remove(t);
+        match scope_typedefs {
+            Some(names) => iface_only_typedefs.retain(|t| !names.contains(t)),
+            None => {
+                for t in elab.typedefs.keys() {
+                    iface_only_typedefs.remove(t);
+                }
+            }
         }
         if iface_only_typedefs.is_empty() {
             continue;
