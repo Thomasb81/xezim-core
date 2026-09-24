@@ -24356,6 +24356,13 @@ fn prepare_module_items(
             ModuleItem::TaskDeclaration(td) => {
                 local_names.insert(td.name.name.name.clone());
             }
+            // Named properties / sequences are registered per instance.
+            ModuleItem::PropertyDeclaration(pd) => {
+                local_names.insert(pd.name.name.clone());
+            }
+            ModuleItem::SequenceDeclaration(sd) => {
+                local_names.insert(sd.name.name.clone());
+            }
             // §6.19: enum MEMBERS are named constants of this scope. Absent
             // from this set, an inlined expression kept the bare member name
             // and resolved through the flat first-wins slot, so a later
@@ -28852,6 +28859,45 @@ fn inline_module_items(
                             })
                             .collect();
                         elab.functions.insert(new_fd.name.name.name.clone(), new_fd);
+                    }
+                    // §16.6/§16.8: a named property or sequence of an INLINED
+                    // instance was never registered, so `assert property
+                    // (p(a))` in a sub-module or interface found no body and
+                    // degraded to an unclocked probe that never ran its
+                    // action. Register it under the instance-prefixed name
+                    // the rewritten references use, with the body rewritten
+                    // into this instance's scope (formals shadow ports and
+                    // locals and stay bare for the call-site substitution).
+                    let named_sva = match sub_item {
+                        ModuleItem::PropertyDeclaration(pd) => {
+                            Some((&pd.name.name, &pd.ports, &pd.body))
+                        }
+                        ModuleItem::SequenceDeclaration(sd) => {
+                            Some((&sd.name.name, &sd.ports, &sd.body))
+                        }
+                        _ => None,
+                    };
+                    if let Some((name, ports, body)) = named_sva {
+                        let key = format!("{}{}", inst_prefix, name);
+                        elab.sequences.insert(key.clone());
+                        if let Some(body) = body {
+                            let mut sva_locals = (*prepared_sub.local_names).clone();
+                            let mut sva_ports = rewrite_port_map.clone();
+                            for p in ports {
+                                sva_locals.remove(&p.name);
+                                sva_ports.remove(&p.name);
+                            }
+                            let body = rewrite_expr(
+                                body,
+                                &inst_prefix,
+                                &sva_ports,
+                                &sva_locals,
+                                &sub_interface_map,
+                            );
+                            elab.property_decls.insert(key.clone(), body);
+                            elab.property_params
+                                .insert(key, ports.iter().map(|p| p.name.clone()).collect());
+                        }
                     }
                     // §35.4: a DPI import declared inside a CHILD module was
                     // never registered — only the top module's and packages'
