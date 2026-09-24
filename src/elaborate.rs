@@ -1863,7 +1863,10 @@ fn elaborate_class_in_scope(
                         DataType::Implicit { dimensions, .. } if dimensions.is_empty()
                     );
                     let width = if implicit_no_dims {
-                        a.init.as_ref().and_then(sized_literal_width).unwrap_or(32)
+                        a.init
+                            .as_ref()
+                            .and_then(|i| untyped_param_width(i, &const_scope))
+                            .unwrap_or(32)
                     } else {
                         resolve_type_width(data_type, Some(&const_scope), None)
                     };
@@ -3600,7 +3603,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 for assign in assignments {
                     let Some(init) = &assign.init else { continue };
                     let width = if is_implicit {
-                        sized_literal_width(init).unwrap_or(32)
+                        untyped_param_width(init, &elab.parameters).unwrap_or(32)
                     } else {
                         base_width
                     };
@@ -3628,8 +3631,12 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                     };
                     let mut v = eval_init_for_width(init, &elab.parameters, width);
                     if !v.is_real {
-                        v.is_signed =
-                            pkg_param_is_signed(data_type, Some(init), &elab.typedef_types);
+                        v.is_signed = pkg_param_is_signed(
+                            data_type,
+                            Some(init),
+                            &elab.typedef_types,
+                            &elab.parameters,
+                        );
                     }
                     if is_type_real(data_type) {
                         v = Value::from_f64(v.to_f64());
@@ -5019,8 +5026,25 @@ pub fn elaborate_module_with_defs(
                         width = 64;
                         is_real = true;
                     } else {
-                        width = 32;
-                        signed = true;
+                        width = assign
+                            .init
+                            .as_ref()
+                            .filter(|_| !param_overrides.contains_key(&assign.name.name))
+                            .and_then(|i| untyped_param_width(i, &elab.parameters))
+                            .unwrap_or(32);
+                        // An explicit `signed`/`unsigned` wins over the value.
+                        signed = match (data_type, &assign.init) {
+                            (
+                                DataType::Implicit {
+                                    signing: Some(_), ..
+                                },
+                                _,
+                            ) => is_type_signed(data_type),
+                            (_, Some(i)) if !param_overrides.contains_key(&assign.name.name) => {
+                                untyped_param_is_signed(i, &elab.parameters)
+                            }
+                            _ => true,
+                        };
                     }
                 }
 
@@ -5083,11 +5107,14 @@ pub fn elaborate_module_with_defs(
                     // §6.20.2: an EXPLICIT type's signedness is authoritative.
                     // Only setting it when signed let a signed init literal
                     // leak through, so `parameter bit [7:0] P = 200` read -56
-                    // (the body-item path already assigns it).
+                    // (the body-item path already assigns it). An untyped
+                    // parameter's signedness was decided above (`parameter
+                    // unsigned P = 5` is unsigned); the value's own flag must
+                    // not survive it.
                     if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
                     {
-                        if signed {
-                            v.is_signed = true;
+                        if signed || !is_real {
+                            v.is_signed = signed;
                         }
                     } else if !v.is_real {
                         v.is_signed = is_type_signed_resolved(data_type, &elab.typedef_types);
@@ -5373,7 +5400,7 @@ pub fn elaborate_module_with_defs(
                                 // pkg::OPCODE_OPIMM };` was emitting NOP
                                 // because OPCODE_OPIMM took 32 bits.)
                                 let eff_width = if is_implicit_no_dims {
-                                    sized_literal_width(init).unwrap_or(32)
+                                    untyped_param_width(init, &elab.parameters).unwrap_or(32)
                                 } else {
                                     width
                                 };
@@ -5406,6 +5433,7 @@ pub fn elaborate_module_with_defs(
                                         data_type,
                                         Some(init_eval),
                                         &elab.typedef_types,
+                                        &elab.parameters,
                                     );
                                 }
                                 alias_pkg_param(&mut elab, &p.name.name, &assign.name.name, &v);
@@ -5636,7 +5664,7 @@ pub fn elaborate_module_with_defs(
                     resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
                 {
-                    width = 32;
+                    width = untyped_param_width(init, &elab.parameters).unwrap_or(32);
                 }
                 let subbed;
                 let init_eval: &Expression = if expr_has_call(init) {
@@ -5671,7 +5699,8 @@ pub fn elaborate_module_with_defs(
                 let declared_signed = is_type_signed(data_type)
                     || matches!(data_type,
                         DataType::Implicit { dimensions, signing: None, .. }
-                            if dimensions.is_empty());
+                            if dimensions.is_empty())
+                        && untyped_param_is_signed(init, &elab.parameters);
                 if !v.is_real {
                     v.is_signed = declared_signed;
                 }
@@ -8076,7 +8105,14 @@ pub fn elaborate_module_with_defs(
                     let implicit_untyped = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                     if implicit_untyped {
                         width = 32;
-                        signed = true;
+                        // `localparam unsigned U = -4'sd1` is unsigned (15).
+                        signed = !matches!(
+                            data_type,
+                            DataType::Implicit {
+                                signing: Some(Signing::Unsigned),
+                                ..
+                            }
+                        );
                     }
                     for assign in assignments {
                         // The pre-seed exemption only vouches for the
@@ -8238,7 +8274,11 @@ pub fn elaborate_module_with_defs(
                         // this; the module path pinned 32.)
                         if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
                         {
-                            if let Some(w) = assign.init.as_ref().and_then(sized_literal_width) {
+                            if let Some(w) = assign
+                                .init
+                                .as_ref()
+                                .and_then(|i| untyped_param_width(i, &elab.parameters))
+                            {
                                 current_width = w;
                             }
                             // §5.7.1: the value's SIGNEDNESS comes with its
@@ -8257,7 +8297,8 @@ pub fn elaborate_module_with_defs(
                                     }
                                 );
                                 if !declared_signing {
-                                    current_signed = untyped_param_is_signed(init);
+                                    current_signed =
+                                        untyped_param_is_signed(init, &elab.parameters);
                                 }
                             }
                         }
@@ -13400,11 +13441,29 @@ fn elaborate_items(
                     let mut width =
                         resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     let signed = is_type_signed(data_type);
-                    if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
-                    {
+                    let implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
+                    if implicit {
                         width = 32;
                     }
                     for assign in assignments {
+                        let width = match &assign.init {
+                            Some(i) if implicit => {
+                                untyped_param_width(i, &elab.parameters).unwrap_or(width)
+                            }
+                            _ => width,
+                        };
+                        let signed = match &assign.init {
+                            Some(i)
+                                if implicit
+                                    && matches!(
+                                        data_type,
+                                        DataType::Implicit { signing: None, .. }
+                                    ) =>
+                            {
+                                untyped_param_is_signed(i, &elab.parameters)
+                            }
+                            _ => signed,
+                        };
                         if elab.signals.contains_key(&assign.name.name)
                             || elab.parameters.contains_key(&assign.name.name)
                         {
@@ -16068,16 +16127,86 @@ pub fn is_type_signed_resolved(dt: &DataType, typedef_types: &HashMap<String, Da
 /// An unsized decimal (`parameter P = 240;`) is a signed int, but a SIZED
 /// literal is unsigned unless it carries the `s` designator — so
 /// `parameter P = 8'hF0;` is 240, not -16. Untyped parameters were marked
-/// signed unconditionally, which made `P > 100` false. Non-literal
-/// initializers keep the signed default (the prior behaviour).
-fn untyped_param_is_signed(init: &Expression) -> bool {
+/// signed unconditionally, which made `P > 100` false.
+///
+/// An expression follows §11.8.1 over the shapes `untyped_param_width` sizes:
+/// signed only when every operand is. Now that such a parameter keeps its
+/// self-determined width, the old signed default for them would turn
+/// `UP + SP` (8-bit, one operand unsigned) into -6 instead of 250. Any other
+/// shape keeps the signed default.
+fn untyped_param_is_signed(init: &Expression, params: &HashMap<String, Value>) -> bool {
+    let s = |x: &Expression| untyped_param_is_signed(x, params);
+    let lookup = |name: &str| params.get(name).filter(|v| !v.is_real).map(|v| v.is_signed);
     match &init.kind {
-        ExprKind::Number(NumberLiteral::Integer {
-            size: Some(_),
-            signed,
+        // An unsized decimal is signed, an unsized based literal (`'hFF`)
+        // is not unless it carries `s` (§5.7.1) — the parser records both.
+        ExprKind::Number(NumberLiteral::Integer { signed, .. }) => *signed,
+        ExprKind::Paren(inner) => s(inner),
+        ExprKind::StringLiteral(_)
+        | ExprKind::Concatenation(_)
+        | ExprKind::Replication { .. }
+        | ExprKind::RangeSelect { .. } => false,
+        ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+            if !h.path[0].selects.is_empty() {
+                return true;
+            }
+            let raw = h.path[0].name.name.as_str();
+            lookup(crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw)).unwrap_or(true)
+        }
+        ExprKind::MemberAccess { expr, member } => match &expr.kind {
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                lookup(&format!("{}::{}", h.path[0].name.name, member.name)).unwrap_or(true)
+            }
+            _ => true,
+        },
+        ExprKind::Unary { op, operand } => match op {
+            UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => s(operand),
+            UnaryOp::LogNot
+            | UnaryOp::BitAnd
+            | UnaryOp::BitNand
+            | UnaryOp::BitOr
+            | UnaryOp::BitNor
+            | UnaryOp::BitXor
+            | UnaryOp::BitXnor => false,
+            _ => true,
+        },
+        ExprKind::Binary { op, left, right } => match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::BitXnor => s(left) && s(right),
+            BinaryOp::Eq
+            | BinaryOp::Neq
+            | BinaryOp::CaseEq
+            | BinaryOp::CaseNeq
+            | BinaryOp::WildcardEq
+            | BinaryOp::WildcardNeq
+            | BinaryOp::Lt
+            | BinaryOp::Leq
+            | BinaryOp::Gt
+            | BinaryOp::Geq
+            | BinaryOp::LogAnd
+            | BinaryOp::LogOr
+            | BinaryOp::LogImplies
+            | BinaryOp::LogEquiv => false,
+            BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::ArithShiftLeft
+            | BinaryOp::ArithShiftRight
+            | BinaryOp::Power => s(left),
+            _ => true,
+        },
+        ExprKind::Conditional {
+            then_expr,
+            else_expr,
             ..
-        }) => *signed,
-        ExprKind::Paren(inner) => untyped_param_is_signed(inner),
+        } => s(then_expr) && s(else_expr),
+        ExprKind::SystemCall { name, .. } if name == "$unsigned" => false,
         _ => true,
     }
 }
@@ -16091,13 +16220,16 @@ fn pkg_param_is_signed(
     dt: &DataType,
     init: Option<&Expression>,
     typedef_types: &HashMap<String, DataType>,
+    params: &HashMap<String, Value>,
 ) -> bool {
     match dt {
         DataType::Implicit {
             signing: None,
             dimensions,
             ..
-        } if dimensions.is_empty() => init.map(untyped_param_is_signed).unwrap_or(true),
+        } if dimensions.is_empty() => init
+            .map(|i| untyped_param_is_signed(i, params))
+            .unwrap_or(true),
         _ => is_type_signed_resolved(dt, typedef_types),
     }
 }
@@ -18389,27 +18521,111 @@ pub fn packed_inner_elem_width(
     None
 }
 
-/// Recover the declared width of a sized number literal in `init` (`7'h13`
-/// → Some(7), `32'd5` → Some(32), unsized `5` → None). Used to size
-/// implicit-typed parameters from their initializer so they don't default
-/// to 32-bit and break later concat width math.
-fn sized_literal_width(init: &Expression) -> Option<u32> {
-    let mut cur = init;
-    loop {
-        match &cur.kind {
-            ExprKind::Paren(inner) => cur = inner,
-            // §11.4.3/§11.6.1: unary +/- keeps the operand's size, so
-            // `localparam P = -4'sd1` is a 4-bit parameter (ivtest
-            // localparam_type2 nnvm1/snvm1 — the reference sizes them 4).
-            ExprKind::Unary {
-                op: UnaryOp::Plus | UnaryOp::Minus,
-                operand,
-            } => cur = operand,
-            ExprKind::Number(crate::ast::expr::NumberLiteral::Integer {
-                size: Some(s), ..
-            }) => return Some(*s),
-            _ => return None,
+/// §6.20.2: a parameter with no type and no range takes the type of its
+/// final value — the SELF-DETERMINED width (§11.6.1, Table 11-21) of its
+/// initializer. Known for literals (sized, unsized 32, string 8 per
+/// character), other parameters in `params`, and the operators whose result
+/// width follows from their operands'. `None` when an operand's width is not
+/// known here (a function call, an element select, a cast), which keeps the
+/// 32-bit default. Only sized literals were handled, so `localparam C =
+/// {8'h1, 8'h2}` was 32 bits where the reference simulator gives 16.
+fn untyped_param_width(e: &Expression, params: &HashMap<String, Value>) -> Option<u32> {
+    let w = |x: &Expression| untyped_param_width(x, params);
+    match &e.kind {
+        ExprKind::Number(NumberLiteral::Integer { size, .. }) => Some(size.unwrap_or(32)),
+        ExprKind::StringLiteral(t) if !t.is_empty() && !t.contains('\\') => {
+            Some(8 * t.len() as u32)
         }
+        ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+            if !h.path[0].selects.is_empty() {
+                return None;
+            }
+            let raw = h.path[0].name.name.as_str();
+            let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+            params.get(name).filter(|v| !v.is_real).map(|v| v.width)
+        }
+        // `pkg::P`
+        ExprKind::MemberAccess { expr, member } => match &expr.kind {
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => params
+                .get(&format!("{}::{}", h.path[0].name.name, member.name))
+                .filter(|v| !v.is_real)
+                .map(|v| v.width),
+            _ => None,
+        },
+        ExprKind::Paren(inner) => w(inner),
+        // §11.4.3: unary +/- keeps the operand's size, so `localparam P =
+        // -4'sd1` is 4 bits (ivtest localparam_type2 nnvm1/snvm1).
+        ExprKind::Unary { op, operand } => match op {
+            UnaryOp::Plus | UnaryOp::Minus | UnaryOp::BitNot => w(operand),
+            UnaryOp::LogNot
+            | UnaryOp::BitAnd
+            | UnaryOp::BitNand
+            | UnaryOp::BitOr
+            | UnaryOp::BitNor
+            | UnaryOp::BitXor
+            | UnaryOp::BitXnor => Some(1),
+            _ => None,
+        },
+        ExprKind::Binary { op, left, right } => match op {
+            BinaryOp::Add
+            | BinaryOp::Sub
+            | BinaryOp::Mul
+            | BinaryOp::Div
+            | BinaryOp::Mod
+            | BinaryOp::BitAnd
+            | BinaryOp::BitOr
+            | BinaryOp::BitXor
+            | BinaryOp::BitXnor => Some(w(left)?.max(w(right)?)),
+            BinaryOp::Eq
+            | BinaryOp::Neq
+            | BinaryOp::CaseEq
+            | BinaryOp::CaseNeq
+            | BinaryOp::WildcardEq
+            | BinaryOp::WildcardNeq
+            | BinaryOp::Lt
+            | BinaryOp::Leq
+            | BinaryOp::Gt
+            | BinaryOp::Geq
+            | BinaryOp::LogAnd
+            | BinaryOp::LogOr
+            | BinaryOp::LogImplies
+            | BinaryOp::LogEquiv => Some(1),
+            BinaryOp::ShiftLeft
+            | BinaryOp::ShiftRight
+            | BinaryOp::ArithShiftLeft
+            | BinaryOp::ArithShiftRight
+            | BinaryOp::Power => w(left),
+            _ => None,
+        },
+        ExprKind::Conditional {
+            then_expr,
+            else_expr,
+            ..
+        } => Some(w(then_expr)?.max(w(else_expr)?)),
+        ExprKind::Concatenation(parts) => parts.iter().map(w).sum(),
+        ExprKind::Replication { count, exprs } => {
+            let n = const_eval_i64_with_params(count, Some(params))?;
+            let inner: u32 = exprs.iter().map(w).sum::<Option<u32>>()?;
+            u32::try_from(n).ok()?.checked_mul(inner).filter(|&t| t > 0)
+        }
+        ExprKind::RangeSelect {
+            kind, left, right, ..
+        } => match kind {
+            RangeKind::Constant => {
+                let l = const_eval_i64_with_params(left, Some(params))?;
+                let r = const_eval_i64_with_params(right, Some(params))?;
+                u32::try_from((l - r).abs() + 1).ok()
+            }
+            RangeKind::IndexedUp | RangeKind::IndexedDown => {
+                u32::try_from(const_eval_i64_with_params(right, Some(params))?).ok()
+            }
+        },
+        ExprKind::SystemCall { name, args } => match name.as_str() {
+            "$signed" | "$unsigned" => w(args.first()?),
+            "$clog2" | "$bits" | "$size" | "$countones" => Some(32),
+            _ => None,
+        },
+        _ => None,
     }
 }
 
@@ -22544,7 +22760,9 @@ pub fn inline_instantiations(
                                             assign
                                                 .init
                                                 .as_ref()
-                                                .and_then(sized_literal_width)
+                                                .and_then(|i| {
+                                                    untyped_param_width(i, &elab.parameters)
+                                                })
                                                 .unwrap_or(32)
                                         } else {
                                             base_width
@@ -22588,6 +22806,7 @@ pub fn inline_instantiations(
                                                     data_type,
                                                     Some(init),
                                                     &elab.typedef_types,
+                                                    &elab.parameters,
                                                 );
                                             }
                                             alias_pkg_param(elab, name, &assign.name.name, &v);
@@ -22700,7 +22919,7 @@ pub fn inline_instantiations(
                                         assign
                                             .init
                                             .as_ref()
-                                            .and_then(sized_literal_width)
+                                            .and_then(|i| untyped_param_width(i, &elab.parameters))
                                             .unwrap_or(32)
                                     } else {
                                         base_width
@@ -22750,6 +22969,7 @@ pub fn inline_instantiations(
                                                 data_type,
                                                 Some(init),
                                                 &elab.typedef_types,
+                                                &elab.parameters,
                                             );
                                         }
                                         params_insert_traced(
@@ -34887,6 +35107,7 @@ fn process_import(
                                             data_type,
                                             assign.init.as_ref(),
                                             &elab.typedef_types,
+                                            &elab.parameters,
                                         );
                                         let is_real = is_type_real(data_type);
                                         if matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty())
@@ -34899,7 +35120,9 @@ fn process_import(
                                             width = assign
                                                 .init
                                                 .as_ref()
-                                                .and_then(sized_literal_width)
+                                                .and_then(|i| {
+                                                    untyped_param_width(i, &elab.parameters)
+                                                })
                                                 .unwrap_or(32);
                                         }
                                         let v = if let Some(init) = &assign.init {
@@ -34930,6 +35153,7 @@ fn process_import(
                                                     data_type,
                                                     Some(init),
                                                     &elab.typedef_types,
+                                                    &elab.parameters,
                                                 );
                                             }
                                             if is_real {
@@ -35268,6 +35492,7 @@ fn process_import(
                                         data_type,
                                         assign.init.as_ref(),
                                         &elab.typedef_types,
+                                        &elab.parameters,
                                     );
                                     // Per-assignment width: implicit-typed
                                     // parameters take the sized-literal
@@ -35277,7 +35502,7 @@ fn process_import(
                                         assign
                                             .init
                                             .as_ref()
-                                            .and_then(sized_literal_width)
+                                            .and_then(|i| untyped_param_width(i, &elab.parameters))
                                             .unwrap_or(32)
                                     } else {
                                         base_width
@@ -35321,6 +35546,7 @@ fn process_import(
                                                 data_type,
                                                 Some(init),
                                                 &elab.typedef_types,
+                                                &elab.parameters,
                                             );
                                         }
                                         if is_real {
