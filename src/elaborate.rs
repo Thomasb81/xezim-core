@@ -249,6 +249,104 @@ pub struct UdpInstance {
     pub span: crate::ast::Span,
 }
 
+/// IEEE 1800-2017 §31 timing check of one instance, flattened: terminals,
+/// conditions and the notifier are rewritten into the parent namespace (the
+/// simulator resolves them like a UDP terminal), and the limit and flag
+/// arguments are evaluated.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct TimingCheckInstance {
+    /// System task name (`$setuphold`).
+    pub name: String,
+    /// Instance scope (`u_a.u_b`), empty for the top module.
+    pub scope: String,
+    /// Module definition (locates its source file for diagnostics).
+    pub def_name: String,
+    /// Arguments in source order, `None` where omitted.
+    pub args: Vec<Option<crate::ast::decl::TimingCheckArg>>,
+    /// Per argument: a limit in simulation ticks, or an integer flag
+    /// (`timing_check_limit_args` / `timing_check_flag_args`).
+    pub consts: Vec<Option<i64>>,
+    pub span: crate::ast::Span,
+}
+
+/// §31: argument positions holding time limits. They count the module's
+/// time unit like any delay and are pre-scaled to ticks with it.
+pub fn timing_check_limit_args(name: &str) -> &'static [usize] {
+    match name {
+        "$setup" | "$hold" | "$recovery" | "$removal" | "$skew" | "$timeskew" => &[2],
+        "$setuphold" | "$recrem" | "$fullskew" | "$nochange" => &[2, 3],
+        "$period" => &[1],
+        "$width" => &[1, 2],
+        _ => &[],
+    }
+}
+
+/// §31.4.4/§31.4.5: `event_based_flag` / `remain_active_flag` positions.
+pub fn timing_check_flag_args(name: &str) -> &'static [usize] {
+    match name {
+        "$timeskew" => &[4, 5],
+        "$fullskew" => &[5, 6],
+        _ => &[],
+    }
+}
+
+/// Flatten one specify block's timing checks into `elab.timing_checks`.
+/// `params` evaluates the limits in the instance's own parameter scope;
+/// `rewrite` maps a module-local expression into the flat namespace.
+fn elaborate_timing_checks(
+    elab: &mut ElaboratedModule,
+    checks: &[crate::ast::decl::TimingCheck],
+    scope: &str,
+    def_name: &str,
+    params: &HashMap<String, Value>,
+    rewrite: &dyn Fn(&Expression) -> Expression,
+) {
+    for tc in checks {
+        let limits = timing_check_limit_args(&tc.name);
+        let flags = timing_check_flag_args(&tc.name);
+        let consts = tc
+            .args
+            .iter()
+            .enumerate()
+            .map(|(i, a)| {
+                let a = a.as_ref()?;
+                if !limits.contains(&i) && !flags.contains(&i) {
+                    return None;
+                }
+                let v = eval_const_expr_val(&a.expr, params);
+                if v.is_real {
+                    let f = v.to_f64();
+                    f.is_finite().then(|| f.round() as i64)
+                } else if v.has_xz() {
+                    None
+                } else {
+                    v.to_i64()
+                }
+            })
+            .collect();
+        let args = tc
+            .args
+            .iter()
+            .map(|a| {
+                a.as_ref().map(|a| crate::ast::decl::TimingCheckArg {
+                    edges: a.edges,
+                    expr: rewrite(&a.expr),
+                    cond: a.cond.as_ref().map(rewrite),
+                    text: a.text.clone(),
+                })
+            })
+            .collect();
+        elab.timing_checks.push(TimingCheckInstance {
+            name: tc.name.clone(),
+            scope: scope.to_string(),
+            def_name: def_name.to_string(),
+            args,
+            consts,
+            span: tc.span,
+        });
+    }
+}
+
 /// An always block for combinatorial logic.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct AlwaysBlock {
@@ -1900,6 +1998,9 @@ pub struct ElaboratedModule {
     pub clocking_signal_dirs: HashMap<String, HashMap<String, PortDirection>>,
     /// Specify path delays: destination signal name -> delay (time units).
     pub specify_delays: HashMap<String, u64>,
+    /// §31 timing checks, one entry per check per instance.
+    #[serde(default)]
+    pub timing_checks: Vec<TimingCheckInstance>,
     /// §6.6.2/§6.6.3 nets whose MULTI-DRIVER resolution or undriven value is
     /// not plain `wire`: wand/triand, wor/trior, tri0, tri1. Only these kinds
     /// are recorded — a plain wire needs no entry. Consumed by
@@ -2393,6 +2494,7 @@ impl ElaboratedModule {
             modport_views: HashMap::default(),
             clocking_signal_dirs: HashMap::default(),
             specify_delays: HashMap::default(),
+            timing_checks: Vec::new(),
             resolved_net_kinds: HashMap::default(),
             gate_fall_delays: HashMap::default(),
             gate_driven_nets: std::collections::HashSet::default(),
@@ -8652,6 +8754,18 @@ pub fn elaborate_module_with_defs(
                         delay_off: None,
                     });
                 }
+                if !sb.timing_checks.is_empty() {
+                    let params = elab.parameters.clone();
+                    let def_name = elab.name.clone();
+                    elaborate_timing_checks(
+                        &mut elab,
+                        &sb.timing_checks,
+                        "",
+                        &def_name,
+                        &params,
+                        &|e| e.clone(),
+                    );
+                }
             }
             ModuleItem::ModuleInstantiation(inst) => {
                 for hi in &inst.instances {
@@ -13280,6 +13394,18 @@ fn elaborate_items(
                         delay_off: None,
                     });
                 }
+                if !sb.timing_checks.is_empty() {
+                    let params = elab.parameters.clone();
+                    let def_name = elab.name.clone();
+                    elaborate_timing_checks(
+                        elab,
+                        &sb.timing_checks,
+                        "",
+                        &def_name,
+                        &params,
+                        &|e| e.clone(),
+                    );
+                }
             }
             ModuleItem::FunctionDeclaration(fd) => {
                 if matches!(fd.return_type, DataType::Void(_)) {
@@ -14523,6 +14649,16 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
             // invisible in a pure-RTL design and breaks every class-based
             // testbench that paces itself with `#`.
             ModuleItem::ClassDeclaration(cd) => rewrite_class_delays(cd, unit_s, prec_s, tick_s),
+            // §31 timing check limits count the module's time unit too.
+            ModuleItem::SpecifyBlock(sb) => {
+                for tc in sb.timing_checks.iter_mut() {
+                    for &i in timing_check_limit_args(&tc.name) {
+                        if let Some(Some(arg)) = tc.args.get_mut(i) {
+                            rewrite_delay_expr(&mut arg.expr, unit_s, prec_s, tick_s);
+                        }
+                    }
+                }
+            }
             ModuleItem::GenerateFor(gf) => {
                 rewrite_module_item_delays(&mut gf.items, unit_s, prec_s, tick_s)
             }
@@ -28708,6 +28844,25 @@ fn inline_module_items(
                                 delay_fall: None,
                                 delay_off: None,
                             });
+                        }
+                        if !sb.timing_checks.is_empty() {
+                            let scope = inst_prefix.strip_suffix('.').unwrap_or(&inst_prefix);
+                            elaborate_timing_checks(
+                                elab,
+                                &sb.timing_checks,
+                                scope,
+                                sub_mod_name,
+                                &sub_merged_params,
+                                &|e| {
+                                    rewrite_expr(
+                                        e,
+                                        &inst_prefix,
+                                        &rewrite_port_map,
+                                        &prepared_sub.local_names,
+                                        &sub_interface_map,
+                                    )
+                                },
+                            );
                         }
                     }
                     if matches!(sub_item, ModuleItem::AlwaysConstruct(_)) {

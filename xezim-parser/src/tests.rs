@@ -154,3 +154,55 @@ fn test_semaphores() {
     let result = parse(source);
     assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
 }
+
+/// §31 timing checks: edge controls (keyword and descriptor list), `&&&`
+/// conditions, omitted arguments, and a specify-block `specparam` hoisted
+/// to a module-level localparam.
+#[test]
+fn test_specify_timing_checks() {
+    use crate::ast::decl::{TIMING_NEGEDGE, TIMING_POSEDGE, timing_edge_bit};
+    let source = "
+        module ff(input d, input clk, input en);
+          reg n;
+          specify
+            specparam tSU = 1.5;
+            $setuphold(posedge clk &&& en, d, tSU, 1, n, , , dclk, dd);
+            $width(negedge clk, 2);
+            $setup(d, edge[01, x1] clk, 3);
+          endspecify
+        endmodule
+    ";
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "Errors: {:?}", result.errors);
+    let Some(Description::Module(m)) = result.source.descriptions.first() else {
+        panic!("module expected");
+    };
+    assert!(
+        m.items
+            .iter()
+            .any(|i| matches!(i, ModuleItem::LocalparamDeclaration(_)))
+    );
+    let sb = m
+        .items
+        .iter()
+        .find_map(|i| match i {
+            ModuleItem::SpecifyBlock(sb) => Some(sb),
+            _ => None,
+        })
+        .expect("specify block");
+    let tc = &sb.timing_checks;
+    assert_eq!(tc.len(), 3);
+    assert_eq!(tc[0].name, "$setuphold");
+    assert_eq!(tc[0].args.len(), 9);
+    let r = tc[0].args[0].as_ref().unwrap();
+    assert_eq!(r.edges, Some(TIMING_POSEDGE));
+    assert!(r.cond.is_some());
+    assert_eq!(r.text, "posedge clk &&& en");
+    assert!(tc[0].args[5].is_none() && tc[0].args[6].is_none());
+    assert_eq!(sb.delayed_nets.len(), 2);
+    assert_eq!(tc[1].args[0].as_ref().unwrap().edges, Some(TIMING_NEGEDGE));
+    assert_eq!(
+        tc[2].args[1].as_ref().unwrap().edges,
+        Some(timing_edge_bit(0, 1) | timing_edge_bit(2, 1))
+    );
+}

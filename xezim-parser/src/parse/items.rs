@@ -460,6 +460,7 @@ impl Parser {
             let before = self.pos;
             if let Some(item) = self.parse_module_item() {
                 items.push(item);
+                items.append(&mut self.pending_module_items);
             } else if self.pos == before {
                 // parse_module_item returned None WITHOUT consuming anything —
                 // genuinely stuck; report and force progress. A None that DID
@@ -1841,15 +1842,16 @@ impl Parser {
             TokenKind::KwSpecify => {
                 // §28.2 specify block. The path grammar is rich (`=>`/`*>`
                 // parallel/full, edge-sensitive, state-dependent, `if (...)`
-                // conditional, $setup/$hold timing checks). We parse only the
-                // common SIMPLE module path — `( src => dst ) = ( d {, d} ) ;`
-                // (or a bare delay) with plain-identifier endpoints — into a
-                // SpecifyPath so the elaborator can model its delay. Every
-                // other form is skipped to the next `;`, preserving the prior
-                // robust whole-block skip behavior.
+                // conditional). We parse only the common SIMPLE module path —
+                // `( src => dst ) = ( d {, d} ) ;` (or a bare delay) with
+                // plain-identifier endpoints — into a SpecifyPath so the
+                // elaborator can model its delay, plus the §31 timing checks
+                // and `specparam`s. Every other form is skipped to the next
+                // `;`, preserving the prior robust whole-block skip behavior.
                 self.bump();
                 let mut paths = Vec::new();
                 let mut delayed_nets: Vec<(String, String)> = Vec::new();
+                let mut timing_checks = Vec::new();
                 while !self.at(TokenKind::KwEndspecify) && !self.at(TokenKind::Eof) {
                     if self.at(TokenKind::LParen) {
                         if let Some(p) = self.try_parse_simple_specify_path() {
@@ -1857,13 +1859,29 @@ impl Parser {
                             continue;
                         }
                     }
-                    // §15.6 negative-timing-check tasks carry `delayed_reference`
-                    // / `delayed_data` OUTPUT nets that the cell's functional
-                    // path uses — extract those so the elaborator can drive them.
                     if self.at(TokenKind::SystemIdentifier)
-                        && Self::is_timing_check_name(self.current().text.as_str())
+                        && Self::is_timing_check_task(self.current().text.as_str())
                     {
-                        self.parse_timing_check_delayed_nets(&mut delayed_nets);
+                        let check_pos = self.pos;
+                        let check = self.parse_timing_check();
+                        // §15.6 negative-timing-check tasks carry `delayed_reference`
+                        // / `delayed_data` OUTPUT nets that the cell's functional
+                        // path uses — extract those so the elaborator can drive them.
+                        if Self::is_timing_check_name(self.tokens[check_pos].text.as_str()) {
+                            let end_pos = self.pos;
+                            self.pos = check_pos;
+                            self.parse_timing_check_delayed_nets(&mut delayed_nets);
+                            self.pos = end_pos;
+                        }
+                        timing_checks.extend(check);
+                        continue;
+                    }
+                    // §31.2 a specparam declared in the specify block is a
+                    // module-scoped constant, like one at module level: emit
+                    // it through the module-level specparam handling.
+                    if self.at(TokenKind::KwSpecparam) {
+                        let item = self.parse_module_item();
+                        self.pending_module_items.extend(item);
                         continue;
                     }
                     // Unrecognized specify item: skip to (and past) the next ';'.
@@ -1878,6 +1896,7 @@ impl Parser {
                 Some(ModuleItem::SpecifyBlock(SpecifyBlock {
                     paths,
                     delayed_nets,
+                    timing_checks,
                     span: self.span_from(start),
                 }))
             }
@@ -2235,6 +2254,218 @@ impl Parser {
             name,
             "$setuphold" | "$recrem" | "$setup" | "$hold" | "$recovery" | "$removal"
         )
+    }
+
+    /// IEEE 1800-2017 §31 timing check system tasks.
+    fn is_timing_check_task(name: &str) -> bool {
+        matches!(
+            name,
+            "$setup"
+                | "$hold"
+                | "$setuphold"
+                | "$recovery"
+                | "$removal"
+                | "$recrem"
+                | "$skew"
+                | "$timeskew"
+                | "$fullskew"
+                | "$period"
+                | "$width"
+                | "$nochange"
+        )
+    }
+
+    /// Parse a §31 timing check `$name ( arg {, arg} ) ;` into its argument
+    /// list, consuming through the `;`. Each argument is split out at the
+    /// top-level commas and parsed on its own (see `parse_timing_check_arg`);
+    /// an argument that does not parse becomes `None`, like an omitted one.
+    /// Returns None (after skipping the item) when the list is malformed.
+    fn parse_timing_check(&mut self) -> Option<TimingCheck> {
+        let start = self.current().span.start;
+        let name = self.bump().text;
+        if !self.at(TokenKind::LParen) {
+            self.skip_to_semi();
+            return None;
+        }
+        self.bump();
+        let mut ranges: Vec<(usize, usize)> = Vec::new();
+        let mut arg_start = self.pos;
+        let mut depth = 0i32;
+        loop {
+            match self.current_kind() {
+                TokenKind::Eof | TokenKind::KwEndspecify => return None,
+                TokenKind::Semicolon if depth == 0 => {
+                    self.bump();
+                    return None;
+                }
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen if depth == 0 => {
+                    ranges.push((arg_start, self.pos));
+                    self.bump();
+                    break;
+                }
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => depth -= 1,
+                TokenKind::Comma if depth == 0 => {
+                    ranges.push((arg_start, self.pos));
+                    self.bump();
+                    arg_start = self.pos;
+                    continue;
+                }
+                _ => {}
+            }
+            self.bump();
+        }
+        self.eat(TokenKind::Semicolon);
+        let span = self.span_from(start);
+        let args = ranges
+            .into_iter()
+            .map(|(a, b)| Self::parse_timing_check_arg(&self.tokens[a..b]))
+            .collect();
+        Some(TimingCheck { name, args, span })
+    }
+
+    /// One timing check argument (§31.2 `timing_check_event` or a plain
+    /// expression): `[posedge | negedge | edge [descriptors]] terminal
+    /// [&&& condition]`. `&&&` lexes as `&&` followed by `&`. A limit may be a
+    /// `min:typ:max` triplet, resolved by `+mindelays/+typdelays/+maxdelays`.
+    fn parse_timing_check_arg(toks: &[crate::lexer::token::Token]) -> Option<TimingCheckArg> {
+        if toks.is_empty() {
+            return None;
+        }
+        let text = Self::tokens_source_text(toks);
+        let mut i = 0usize;
+        let mut edges = None;
+        match toks[0].kind {
+            TokenKind::KwPosedge => {
+                edges = Some(TIMING_POSEDGE);
+                i = 1;
+            }
+            TokenKind::KwNegedge => {
+                edges = Some(TIMING_NEGEDGE);
+                i = 1;
+            }
+            TokenKind::KwEdge => {
+                i = 1;
+                if toks.get(1).map(|t| t.kind) == Some(TokenKind::LBracket) {
+                    let close = toks.iter().position(|t| t.kind == TokenKind::RBracket)?;
+                    let mut mask = 0u16;
+                    for desc in toks[2..close].split(|t| t.kind == TokenKind::Comma) {
+                        let d: String = desc.iter().map(|t| t.text.to_ascii_lowercase()).collect();
+                        let level = |c: char| match c {
+                            '0' => Some(0u8),
+                            '1' => Some(1u8),
+                            'x' | 'z' => Some(2u8),
+                            _ => None,
+                        };
+                        let mut cs = d.chars();
+                        let (Some(from), Some(to), None) = (
+                            cs.next().and_then(level),
+                            cs.next().and_then(level),
+                            cs.next(),
+                        ) else {
+                            return None;
+                        };
+                        if from == to {
+                            return None;
+                        }
+                        mask |= timing_edge_bit(from, to);
+                    }
+                    edges = Some(mask);
+                    i = close + 1;
+                } else {
+                    edges = Some(TIMING_POSEDGE | TIMING_NEGEDGE);
+                }
+            }
+            _ => {}
+        }
+        let mut depth = 0i32;
+        let mut split = None;
+        for k in i..toks.len() {
+            match toks[k].kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => depth -= 1,
+                TokenKind::LogAnd
+                    if depth == 0 && toks.get(k + 1).map(|t| t.kind) == Some(TokenKind::BitAnd) =>
+                {
+                    split = Some(k);
+                    break;
+                }
+                _ => {}
+            }
+        }
+        let (expr_toks, cond) = match split {
+            Some(k) => (&toks[i..k], Some(Self::parse_token_expr(&toks[k + 2..])?)),
+            None => (&toks[i..], None),
+        };
+        let expr = Self::parse_token_expr(Self::select_mintypmax(expr_toks))?;
+        Some(TimingCheckArg {
+            edges,
+            expr,
+            cond,
+            text,
+        })
+    }
+
+    /// Pick the `+mindelays/+typdelays/+maxdelays` element of a `min:typ:max`
+    /// token run (optionally parenthesized); any other run is returned whole.
+    fn select_mintypmax(toks: &[crate::lexer::token::Token]) -> &[crate::lexer::token::Token] {
+        let inner = if toks.len() >= 2
+            && toks[0].kind == TokenKind::LParen
+            && toks[toks.len() - 1].kind == TokenKind::RParen
+        {
+            &toks[1..toks.len() - 1]
+        } else {
+            toks
+        };
+        let mut depth = 0i32;
+        let mut colons = Vec::new();
+        for (k, t) in inner.iter().enumerate() {
+            match t.kind {
+                TokenKind::LParen | TokenKind::LBracket | TokenKind::LBrace => depth += 1,
+                TokenKind::RParen | TokenKind::RBracket | TokenKind::RBrace => depth -= 1,
+                TokenKind::Question if depth == 0 => return toks,
+                TokenKind::Colon if depth == 0 => colons.push(k),
+                _ => {}
+            }
+        }
+        if colons.len() != 2 {
+            return toks;
+        }
+        match crate::delay_select() {
+            0 => &inner[..colons[0]],
+            2 => &inner[colons[1] + 1..],
+            _ => &inner[colons[0] + 1..colons[1]],
+        }
+    }
+
+    /// Parse a complete expression from a token run with a private parser, so
+    /// a run that is not one expression is rejected without diagnostics.
+    fn parse_token_expr(toks: &[crate::lexer::token::Token]) -> Option<Expression> {
+        if toks.is_empty() {
+            return None;
+        }
+        let end = toks[toks.len() - 1].span.end;
+        let mut run = toks.to_vec();
+        run.push(crate::lexer::token::Token::new(
+            TokenKind::Eof,
+            String::new(),
+            crate::ast::Span::new(end, end),
+        ));
+        let mut p = super::Parser::new(run);
+        let e = p.parse_expression();
+        (p.at(TokenKind::Eof) && !p.has_errors()).then_some(e)
+    }
+
+    /// Token texts joined with a single space wherever the source had one.
+    fn tokens_source_text(toks: &[crate::lexer::token::Token]) -> String {
+        let mut s = String::new();
+        for (k, t) in toks.iter().enumerate() {
+            if k > 0 && toks[k - 1].span.end < t.span.start {
+                s.push(' ');
+            }
+            s.push_str(&t.text);
+        }
+        s
     }
 
     /// Parse a `$setuphold(...)` / `$recrem(...)` timing check ONLY to recover
@@ -2869,6 +3100,7 @@ impl Parser {
         while !self.at(end) && !self.at(TokenKind::Eof) {
             if let Some(item) = self.parse_module_item() {
                 items.push(item);
+                items.append(&mut self.pending_module_items);
             } else {
                 self.error(format!("unexpected: {:?}", self.current().text));
                 self.bump();

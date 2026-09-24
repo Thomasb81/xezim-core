@@ -78,6 +78,8 @@ pub use value::Value;
 /// signing precedence, signed genvars, tf-port implicit-name unpacked dims)
 /// — cached parses/elaborations from \x13 carry the old results;
 /// \x09 = \x08 + ForeverTail StatementKind variant;
+/// \x19 = \x18 + SpecifyBlock.timing_checks and
+/// ElaboratedModule.timing_checks (§31 timing checks);
 /// \x18 = \x17 + DataType::Interface type_args (virtual-interface
 /// parameterization, §25.9); \x17 = \x16 + elab interconnect_nets set (§6.6.8);
 /// \x08 = \x07 + genblk branch labels + elab implicit_nets set;
@@ -87,7 +89,7 @@ pub use value::Value;
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x18";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x19";
 
 /// zstd compression level used for `.xez` artifacts. Level 3 is zstd's own
 /// default — strong compression at high throughput. Empirically shrinks

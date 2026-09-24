@@ -203,8 +203,49 @@ pub struct SpecifyBlock {
     /// zero-delay, i.e. `assign delayed_net = source_signal`. Without this the
     /// cell's clock is undriven (x) and its flops never evaluate.
     pub delayed_nets: Vec<(String, String)>,
+    /// §31 timing checks (`$setup`, `$hold`, `$width`, ...), in source order.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub timing_checks: Vec<TimingCheck>,
     pub span: Span,
 }
+
+/// IEEE 1800-2017 §31 timing check: the system task name (`$setuphold`) and
+/// its arguments in source order. An omitted argument (`, ,`) is `None`.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TimingCheck {
+    pub name: String,
+    pub args: Vec<Option<TimingCheckArg>>,
+    pub span: Span,
+}
+
+/// One timing check argument. Event arguments may carry an edge control and
+/// a `&&&` condition; limits, notifiers and flags are plain expressions.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TimingCheckArg {
+    /// §31.5 edge control as a transition mask (see [`timing_edge_bit`]);
+    /// `None` when the argument has no edge control (any value change).
+    pub edges: Option<u16>,
+    pub expr: Expression,
+    pub cond: Option<Expression>,
+    /// Source spelling (`posedge clk &&& en`), for diagnostics.
+    pub text: String,
+}
+
+/// Bit of a [`TimingCheckArg::edges`] mask for the `from -> to` transition,
+/// levels encoded 0, 1, 2. §31.5 treats z like x, so 2 stands for both.
+pub const fn timing_edge_bit(from: u8, to: u8) -> u16 {
+    1u16 << ((from as u16) * 3 + to as u16)
+}
+
+/// `posedge`: 0->1, 0->x, x->1 (§31.5, same set as §9.4.2).
+pub const TIMING_POSEDGE: u16 =
+    timing_edge_bit(0, 1) | timing_edge_bit(0, 2) | timing_edge_bit(2, 1);
+
+/// `negedge`: 1->0, 1->x, x->0.
+pub const TIMING_NEGEDGE: u16 =
+    timing_edge_bit(1, 0) | timing_edge_bit(1, 2) | timing_edge_bit(2, 0);
 
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]

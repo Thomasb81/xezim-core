@@ -38,6 +38,9 @@ pub struct Parser {
         Vec<crate::ast::decl::ConstraintRange>,
         Vec<Option<crate::ast::decl::DistWeight>>,
     )>,
+    /// Extra module items produced while parsing another one (a `specparam`
+    /// inside a specify block), appended right after it by the item loops.
+    pub(super) pending_module_items: Vec<ModuleItem>,
 }
 
 impl Parser {
@@ -50,6 +53,7 @@ impl Parser {
             in_sva_seq: false,
             in_constraint: false,
             pending_paren_dist: Vec::new(),
+            pending_module_items: Vec::new(),
         }
     }
 
