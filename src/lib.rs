@@ -424,6 +424,18 @@ pub fn strict_top() -> bool {
     STRICT_TOP.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// Command-line parameter overrides (`-gNAME=VALUE`), in order: the module a
+/// `/<top>/NAME` path names (None: every module), the parameter, the value.
+static PARAM_OVERRIDES: std::sync::Mutex<Vec<(Option<String>, String, String)>> =
+    std::sync::Mutex::new(Vec::new());
+
+/// Install the command-line parameter overrides; replaces any earlier set.
+/// Each value becomes the parameter's declared default, so a value given at
+/// an instantiation or by `defparam` still wins.
+pub fn set_param_overrides(overrides: Vec<(Option<String>, String, String)>) {
+    *PARAM_OVERRIDES.lock().unwrap() = overrides;
+}
+
 /// `--verbose`: per-file compile progress — which file is being parsed and
 /// which definitions it contributed to the working library. The point is
 /// debuggability of big `-f` builds ("did my testbench actually get compiled,
@@ -1035,6 +1047,185 @@ pub fn parse_and_elaborate_multi(
     Ok((defs, elab))
 }
 
+/// Where the overridable value parameter `name` of a module, interface or
+/// program is declared: a parameter-port-list entry, or a body `parameter`
+/// when there is no port list (§6.20.1 makes body parameters local
+/// otherwise). Returns (in the port list, declaration index, assignment
+/// index, declared `string`).
+fn find_overridable_param(
+    params: &[ast::decl::ParameterDeclaration],
+    items: &[ast::decl::ModuleItem],
+    name: &str,
+) -> Option<(bool, usize, usize, bool)> {
+    use ast::decl::{ModuleItem, ParameterKind};
+    let header = !params.is_empty();
+    let decls = params
+        .iter()
+        .enumerate()
+        .map(|(i, pd)| (true, i, pd))
+        .chain(items.iter().enumerate().filter_map(|(i, it)| match it {
+            ModuleItem::ParameterDeclaration(pd) if !header => Some((false, i, pd)),
+            _ => None,
+        }));
+    for (in_header, di, pd) in decls {
+        let ParameterKind::Data {
+            data_type,
+            assignments,
+        } = &pd.kind
+        else {
+            continue;
+        };
+        if pd.local {
+            continue;
+        }
+        if let Some(ai) = assignments.iter().position(|a| a.name.name == name) {
+            let is_string = matches!(
+                data_type,
+                ast::types::DataType::Simple {
+                    kind: ast::types::SimpleType::String,
+                    ..
+                }
+            );
+            return Some((in_header, di, ai, is_string));
+        }
+    }
+    None
+}
+
+/// Set the default of the parameter `find_overridable_param` located.
+fn set_param_default(
+    params: &mut [ast::decl::ParameterDeclaration],
+    items: &mut [ast::decl::ModuleItem],
+    (in_header, di, ai): (bool, usize, usize),
+    value: ast::expr::Expression,
+) {
+    let pd = if in_header {
+        Some(&mut params[di])
+    } else {
+        match &mut items[di] {
+            ast::decl::ModuleItem::ParameterDeclaration(pd) => Some(pd),
+            _ => None,
+        }
+    };
+    if let Some(ast::decl::ParameterDeclaration {
+        kind: ast::decl::ParameterKind::Data { assignments, .. },
+        ..
+    }) = pd
+    {
+        assignments[ai].init = Some(value);
+    }
+}
+
+/// Parse a `-g` value as a constant expression; None when it is not one.
+fn parse_override_value(text: &str) -> Option<ast::expr::Expression> {
+    use ast::decl::{ModuleItem, ParameterKind};
+    let src = format!(
+        "module __xezim_param_value; localparam __xezim_v = {};\nendmodule\n",
+        text
+    );
+    let mut parser = sv_parser::parse::Parser::new(lexer::Lexer::new(&src).tokenize());
+    let parsed = parser.parse_source_text();
+    if parser
+        .diagnostics()
+        .iter()
+        .any(|d| d.severity == diagnostics::Severity::Error)
+    {
+        return None;
+    }
+    let Some(ast::Description::Module(m)) = parsed.descriptions.into_iter().next() else {
+        return None;
+    };
+    m.items.into_iter().find_map(|it| match it {
+        ModuleItem::LocalparamDeclaration(pd) | ModuleItem::ParameterDeclaration(pd) => {
+            match pd.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    assignments.into_iter().next().and_then(|a| a.init)
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    })
+}
+
+/// Apply the `-g` overrides (see `set_param_overrides`) to the parsed
+/// definitions. A `string` parameter takes an unquoted value as its text.
+fn apply_param_overrides(
+    definitions: &mut crate::hasher::HashMap<String, SourceDefinition>,
+) -> Result<(), String> {
+    let overrides = PARAM_OVERRIDES.lock().unwrap().clone();
+    for (module, name, text) in &overrides {
+        let expr = parse_override_value(text);
+        let mut applied = 0usize;
+        for (dname, def) in definitions.iter_mut() {
+            if module.as_ref().is_some_and(|m| m != dname) {
+                continue;
+            }
+            let found = match def {
+                SourceDefinition::Module(m) => find_overridable_param(&m.params, &m.items, name),
+                SourceDefinition::Interface(m) => find_overridable_param(&m.params, &m.items, name),
+                SourceDefinition::Program(m) => find_overridable_param(&m.params, &m.items, name),
+                _ => None,
+            };
+            let Some((in_header, di, ai, is_string)) = found else {
+                continue;
+            };
+            let value = match &expr {
+                Some(e)
+                    if !is_string || matches!(e.kind, ast::expr::ExprKind::StringLiteral(_)) =>
+                {
+                    e.clone()
+                }
+                _ if is_string => ast::expr::Expression::new(
+                    ast::expr::ExprKind::StringLiteral(text.clone()),
+                    ast::Span::dummy(),
+                ),
+                _ => {
+                    return Err(format!(
+                        "-g{}={}: '{}' is not a valid parameter value",
+                        name, text, text
+                    ));
+                }
+            };
+            let at = (in_header, di, ai);
+            match def {
+                SourceDefinition::Module(m) => {
+                    let m = Rc::make_mut(m);
+                    set_param_default(&mut m.params, &mut m.items, at, value);
+                }
+                SourceDefinition::Interface(m) => {
+                    let m = Rc::make_mut(m);
+                    set_param_default(&mut m.params, &mut m.items, at, value);
+                }
+                SourceDefinition::Program(m) => {
+                    let m = Rc::make_mut(m);
+                    set_param_default(&mut m.params, &mut m.items, at, value);
+                }
+                _ => {}
+            }
+            applied += 1;
+        }
+        if applied == 0 {
+            let path = module
+                .as_ref()
+                .map(|m| format!("/{}/", m))
+                .unwrap_or_default();
+            eprintln!(
+                "[xezim][warning] -g{}{}={}: no {} declares an overridable parameter '{}'; ignored",
+                path,
+                name,
+                text,
+                module
+                    .as_ref()
+                    .map(|m| format!("module '{}'", m))
+                    .unwrap_or_else(|| "module".to_string()),
+                name
+            );
+        }
+    }
+    Ok(())
+}
+
 /// Every name a module declares in its OWN scope: ports, nets, variables,
 /// parameters and genvars. Used to decide whether a compilation-unit (`$unit`)
 /// declaration is shadowed here (§3.12.1) — items nested in a generate region
@@ -1624,6 +1815,10 @@ fn parse_and_elaborate(
             _ => {}
         }
     }
+
+    // Before binds clone any definition, so a specialized clone carries the
+    // overridden default too.
+    apply_param_overrides(&mut definitions)?;
 
     // §23.11: a `bind` written as a module item (not at compilation-unit
     // scope) is applied identically. Lift every `ModuleItem::Bind` out of the
