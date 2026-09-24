@@ -5830,6 +5830,7 @@ pub fn elaborate_module_with_defs(
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
+                check_net_data_type(nd, &elab)?;
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed(&nd.data_type);
@@ -11521,6 +11522,35 @@ fn validate_stmt_idents(
     Ok(())
 }
 
+/// §6.7.1: a net's data type is 4-state integral or an aggregate of such; a
+/// class handle, `string`, `chandle` or `event` can never be a net.
+fn check_net_data_type(
+    nd: &crate::ast::decl::NetDeclaration,
+    elab: &ElaboratedModule,
+) -> Result<(), String> {
+    let bad = match &nd.data_type {
+        DataType::TypeReference { name, .. }
+            if elab.classes.contains_key(&name.name.name)
+                && elab
+                    .typedef_types
+                    .get(&name.name.name)
+                    .is_none_or(|dt| matches!(dt, DataType::Void(_))) =>
+        {
+            Some(format!("class type '{}'", name.name.name))
+        }
+        DataType::Simple { kind, .. } => Some(format!("{:?}", kind).to_lowercase()),
+        _ => None,
+    };
+    match bad {
+        Some(what) => Err(span_error(
+            elab,
+            nd.span,
+            &format!("illegal net data type: {} (IEEE 1800-2017 §6.7.1)", what),
+        )),
+        None => Ok(()),
+    }
+}
+
 fn validate_expr_idents(
     expr: &Expression,
     elab: &ElaboratedModule,
@@ -12667,6 +12697,7 @@ fn elaborate_items(
                 }
             }
             ModuleItem::NetDeclaration(nd) => {
+                check_net_data_type(nd, elab)?;
                 let width =
                     resolve_type_width(&nd.data_type, Some(&elab.parameters), Some(&elab.typedefs));
                 let is_signed = is_type_signed(&nd.data_type);
