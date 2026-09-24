@@ -333,10 +333,15 @@ impl Parser {
                     Statement::new(StatementKind::Disable(name), self.span_from(start))
                 }
             }
-            TokenKind::KwAssert
-            | TokenKind::KwAssume
-            | TokenKind::KwCover
-            | TokenKind::KwExpect => Statement::new(
+            TokenKind::KwExpect => {
+                let a = self.parse_assertion_statement();
+                let span = self.span_from(start);
+                match Self::lower_expect(&a, span) {
+                    Some(lowered) => lowered,
+                    None => Statement::new(StatementKind::Assertion(a), span),
+                }
+            }
+            TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => Statement::new(
                 StatementKind::Assertion(self.parse_assertion_statement()),
                 self.span_from(start),
             ),
@@ -2008,6 +2013,189 @@ impl Parser {
             else_action,
             is_property,
             span: self.span_from(start),
+        }
+    }
+
+    /// §16.17 `expect (@(clk) b0 ##d1 b1 ...) pass else fail;` BLOCKS the
+    /// process: one attempt starts at the next clocking event and the
+    /// statement completes when that attempt passes or fails. A property that
+    /// is a fixed-delay chain of boolean expressions is lowered here to the
+    /// equivalent procedural wait-and-check sequence. Any other shape (no
+    /// explicit clock, `disable iff`, ranges, repetition, sampled-value
+    /// functions, implication) returns `None` and keeps the assertion form.
+    fn lower_expect(a: &AssertionStatement, span: crate::ast::Span) -> Option<Statement> {
+        let ExprKind::SvaClocked {
+            clock,
+            edge,
+            iff,
+            body,
+        } = &a.expr.kind
+        else {
+            return None;
+        };
+        let mut steps: Vec<(u64, Expression)> = Vec::new();
+        let mut pending = 0u64;
+        if !Self::expect_steps(body, &mut steps, &mut pending) || pending != 0 || steps.is_empty() {
+            return None;
+        }
+        let edge = match edge {
+            0 => Some(Edge::Posedge),
+            1 => Some(Edge::Negedge),
+            _ => None,
+        };
+        let stmt = |kind: StatementKind| Statement::new(kind, span);
+        let wait = stmt(StatementKind::TimingControl {
+            control: TimingControl::Event(EventControl::EventExpr(vec![EventExpr {
+                edge,
+                expr: (**clock).clone(),
+                iff: iff.as_deref().cloned(),
+                span,
+            }])),
+            stmt: Box::new(stmt(StatementKind::Null)),
+        });
+        let pass = a
+            .action
+            .as_deref()
+            .cloned()
+            .unwrap_or_else(|| stmt(StatementKind::Null));
+        // §16.17: with no else clause a failure calls `$error`.
+        let fail = a.else_action.as_deref().cloned().unwrap_or_else(|| {
+            stmt(StatementKind::Expr(Expression::new(
+                ExprKind::SystemCall {
+                    name: "$error".to_string(),
+                    args: vec![Expression::new(
+                        ExprKind::StringLiteral("expect property failed".to_string()),
+                        span,
+                    )],
+                },
+                span,
+            )))
+        });
+        let mut inner = pass;
+        for (delay, cond) in steps.into_iter().rev() {
+            inner = stmt(StatementKind::If {
+                unique_priority: None,
+                condition: cond,
+                then_stmt: Box::new(inner),
+                else_stmt: Some(Box::new(fail.clone())),
+            });
+            if delay > 0 {
+                let count = Expression::new(
+                    ExprKind::Number(NumberLiteral::Integer {
+                        size: None,
+                        signed: false,
+                        base: NumberBase::Decimal,
+                        value: delay.to_string(),
+                        cached_val: Cell::new(None),
+                    }),
+                    span,
+                );
+                let cycles = stmt(StatementKind::Repeat {
+                    count,
+                    body: Box::new(wait.clone()),
+                });
+                inner = stmt(StatementKind::SeqBlock {
+                    name: None,
+                    stmts: vec![cycles, inner],
+                });
+            }
+        }
+        Some(stmt(StatementKind::SeqBlock {
+            name: None,
+            stmts: vec![wait, inner],
+        }))
+    }
+
+    /// Flatten `b0 ##d1 b1 ##d2 b2` (as parsed: `SeqAnd` over `HashHash`
+    /// nodes) into `(cycles-before, boolean)` steps. False for anything that
+    /// is not a constant-delay chain of plain boolean expressions.
+    fn expect_steps(e: &Expression, out: &mut Vec<(u64, Expression)>, pending: &mut u64) -> bool {
+        match &e.kind {
+            ExprKind::Binary {
+                op: BinaryOp::SeqAnd,
+                left,
+                right,
+            } => Self::expect_steps(left, out, pending) && Self::expect_steps(right, out, pending),
+            ExprKind::Binary {
+                op: BinaryOp::HashHash,
+                left,
+                right,
+            } => {
+                let ExprKind::Number(NumberLiteral::Integer { value, .. }) = &left.kind else {
+                    return false;
+                };
+                let Ok(n) = value.replace('_', "").parse::<u64>() else {
+                    return false;
+                };
+                *pending += n;
+                Self::expect_steps(right, out, pending)
+            }
+            ExprKind::Paren(inner) if !Self::expect_bool(inner) => {
+                Self::expect_steps(inner, out, pending)
+            }
+            _ if Self::expect_bool(e) => {
+                out.push((std::mem::take(pending), e.clone()));
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// A plain boolean expression: no sequence/property operator and no
+    /// sampled-value function (those need the assertion engine's history).
+    fn expect_bool(e: &Expression) -> bool {
+        use crate::ast::expr::UnaryOp;
+        match &e.kind {
+            ExprKind::Number(_) | ExprKind::Ident(_) | ExprKind::StringLiteral(_) => true,
+            ExprKind::Paren(x) => Self::expect_bool(x),
+            ExprKind::Unary { op, operand } => {
+                !matches!(
+                    op,
+                    UnaryOp::HashHash | UnaryOp::SEventually | UnaryOp::SAlways
+                ) && Self::expect_bool(operand)
+            }
+            ExprKind::Binary { op, left, right } => {
+                !matches!(
+                    op,
+                    BinaryOp::Assign
+                        | BinaryOp::OrMinusArrow
+                        | BinaryOp::OrFatArrow
+                        | BinaryOp::HashHash
+                        | BinaryOp::Iff
+                        | BinaryOp::Throughout
+                        | BinaryOp::Within
+                        | BinaryOp::Intersect
+                        | BinaryOp::SeqAnd
+                        | BinaryOp::SeqOr
+                        | BinaryOp::Until
+                        | BinaryOp::SUntil
+                        | BinaryOp::SvaAnd
+                        | BinaryOp::SvaDisableIff
+                ) && Self::expect_bool(left)
+                    && Self::expect_bool(right)
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expect_bool(condition)
+                    && Self::expect_bool(then_expr)
+                    && Self::expect_bool(else_expr)
+            }
+            ExprKind::Index { expr, index } => Self::expect_bool(expr) && Self::expect_bool(index),
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => Self::expect_bool(expr) && Self::expect_bool(left) && Self::expect_bool(right),
+            ExprKind::MemberAccess { expr, .. } => Self::expect_bool(expr),
+            ExprKind::Concatenation(xs) => xs.iter().all(Self::expect_bool),
+            ExprKind::SystemCall { name, args } => {
+                !matches!(
+                    name.as_str(),
+                    "$rose" | "$fell" | "$stable" | "$changed" | "$past" | "$sampled"
+                ) && args.iter().all(Self::expect_bool)
+            }
+            _ => false,
         }
     }
 
