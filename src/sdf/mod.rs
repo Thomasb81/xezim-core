@@ -7,6 +7,8 @@
 //! Supported constructs:
 //!   - IOPATH delays (rise/fall, min:typ:max)
 //!   - INTERCONNECT delays
+//!   - TIMINGCHECK limits (SETUP, HOLD, SETUPHOLD, RECOVERY, REMOVAL, RECREM,
+//!     SKEW, WIDTH, PERIOD, NOCHANGE)
 //!   - TIMESCALE
 //!   - CELL/INSTANCE hierarchy
 
@@ -46,6 +48,34 @@ pub enum SdfDelay {
         rise: DelayTriple,
         fall: DelayTriple,
     },
+    /// TIMINGCHECK entry (`SETUP`, `HOLD`, `SETUPHOLD`, ...) with its ports
+    /// in SDF order and its limit values; an empty `()` value is `None`.
+    TimingCheck {
+        kind: String,
+        ports: Vec<SdfTimingPort>,
+        values: Vec<Option<DelayTriple>>,
+    },
+}
+
+/// A TIMINGCHECK port: `D`, `(posedge CK)` or `(COND expr (posedge CK))`.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SdfTimingPort {
+    pub port: String,
+    /// Edge identifier as written (`posedge`, `negedge`, `01`, ...).
+    pub edge: Option<String>,
+    /// `COND` expression text.
+    pub cond: Option<String>,
+}
+
+/// A TIMINGCHECK limit for one cell instance, scaled to simulation ticks.
+#[derive(Debug, Clone)]
+pub struct SdfTimingLimit {
+    pub cell_type: String,
+    /// Instance path as written (`*` for every instance of `cell_type`).
+    pub instance: String,
+    pub kind: String,
+    pub ports: Vec<SdfTimingPort>,
+    pub limits: Vec<Option<i64>>,
 }
 
 /// A min:typ:max delay triple. Values in SDF timescale units.
@@ -99,6 +129,8 @@ pub struct SdfAnnotation {
     pub signal_delays: HashMap<String, u64>,
     /// Detailed per-pin delays: (instance.output) → Vec<(input_pin, rise_delay, fall_delay)>
     pub pin_delays: HashMap<String, Vec<PinDelay>>,
+    /// TIMINGCHECK limits, applied to the matching specify timing checks.
+    pub timing_limits: Vec<SdfTimingLimit>,
 }
 
 #[derive(Debug, Clone)]
@@ -119,6 +151,7 @@ impl SdfAnnotation {
         Self {
             signal_delays: HashMap::new(),
             pin_delays: HashMap::new(),
+            timing_limits: Vec::new(),
         }
     }
 
@@ -383,6 +416,9 @@ impl<'a> SdfParser<'a> {
                         "DELAY" => {
                             self.parse_delay_section(&mut cell)?;
                         }
+                        "TIMINGCHECK" => {
+                            self.parse_timingcheck_section(&mut cell)?;
+                        }
                         _ => {
                             self.skip_to_close_paren();
                         }
@@ -475,6 +511,118 @@ impl<'a> SdfParser<'a> {
                 }
             }
         }
+    }
+
+    /// `(TIMINGCHECK tchk ...)`: each check's ports and values; trailing
+    /// SCOND/CCOND and unknown checks are skipped.
+    fn parse_timingcheck_section(&mut self, cell: &mut SdfCell) -> Result<(), String> {
+        loop {
+            self.skip_ws();
+            match self.peek() {
+                Some(')') => {
+                    self.pos += 1;
+                    return Ok(());
+                }
+                Some('(') => {
+                    self.pos += 1;
+                    let kind = self.read_token().to_ascii_uppercase();
+                    let (n_ports, n_values) = match kind.as_str() {
+                        "SETUP" | "HOLD" | "RECOVERY" | "REMOVAL" | "SKEW" => (2, 1),
+                        "SETUPHOLD" | "RECREM" | "NOCHANGE" => (2, 2),
+                        "WIDTH" | "PERIOD" => (1, 1),
+                        _ => {
+                            self.skip_to_close_paren();
+                            continue;
+                        }
+                    };
+                    let mut ports = Vec::with_capacity(n_ports);
+                    for _ in 0..n_ports {
+                        ports.push(self.parse_timing_port()?);
+                    }
+                    let mut values = Vec::with_capacity(n_values);
+                    for _ in 0..n_values {
+                        self.skip_ws();
+                        values.push(if self.input[self.pos..].starts_with("()") {
+                            self.pos += 2;
+                            None
+                        } else {
+                            Some(self.parse_delay_value()?)
+                        });
+                    }
+                    self.skip_to_close_paren();
+                    cell.delays.push(SdfDelay::TimingCheck {
+                        kind,
+                        ports,
+                        values,
+                    });
+                }
+                None => return Ok(()),
+                _ => {
+                    self.pos += 1;
+                }
+            }
+        }
+    }
+
+    /// `port`, `(edge port)` or `(COND [name] expr port_spec)`.
+    fn parse_timing_port(&mut self) -> Result<SdfTimingPort, String> {
+        self.skip_ws();
+        if self.peek() != Some('(') {
+            return Ok(SdfTimingPort {
+                port: self.read_token(),
+                edge: None,
+                cond: None,
+            });
+        }
+        let open = self.pos;
+        self.pos += 1;
+        let kw = self.read_token();
+        if kw.eq_ignore_ascii_case("COND") {
+            // Balanced body; the port spec is its last element.
+            let start = self.pos;
+            self.skip_to_close_paren();
+            let body = self.input[start..self.pos - 1].trim();
+            let (cond, spec) = match body.strip_suffix(')') {
+                Some(inner) => {
+                    let mut depth = 0i32;
+                    let mut at = None;
+                    for (i, c) in inner.char_indices().rev() {
+                        match c {
+                            ')' => depth += 1,
+                            '(' if depth == 0 => {
+                                at = Some(i);
+                                break;
+                            }
+                            '(' => depth -= 1,
+                            _ => {}
+                        }
+                    }
+                    let at = at.ok_or_else(|| format!("SDF: bad COND at pos {}", open))?;
+                    (&body[..at], &body[at..])
+                }
+                None => match body.rfind(char::is_whitespace) {
+                    Some(i) => (&body[..i], &body[i + 1..]),
+                    None => return Err(format!("SDF: bad COND at pos {}", open)),
+                },
+            };
+            let mut sub = SdfParser::new(spec);
+            let mut p = sub.parse_timing_port()?;
+            let cond = cond.trim();
+            // An optional QSTRING name precedes the condition.
+            let cond = match cond.strip_prefix('"').and_then(|c| c.split_once('"')) {
+                Some((_, rest)) => rest.trim(),
+                None => cond,
+            };
+            p.cond = Some(cond.to_string());
+            return Ok(p);
+        }
+        let port = self.read_token();
+        self.expect_char(')')?;
+        Ok(SdfTimingPort {
+            port,
+            edge: Some(kw.to_ascii_lowercase()),
+            cond: None,
+        })
     }
 
     /// Parse a delay value: either (min:typ:max) or (value)
@@ -579,6 +727,22 @@ pub fn annotate_sdf(sdf: &SdfFile, sim_timescale: f64, delay_select: DelaySelect
                     let existing = annotation.signal_delays.entry(dest.clone()).or_insert(0);
                     *existing = (*existing).max(max_delay);
                 }
+                SdfDelay::TimingCheck {
+                    kind,
+                    ports,
+                    values,
+                } => {
+                    annotation.timing_limits.push(SdfTimingLimit {
+                        cell_type: cell.cell_type.clone(),
+                        instance: cell.instance.clone(),
+                        kind: kind.clone(),
+                        ports: ports.clone(),
+                        limits: values
+                            .iter()
+                            .map(|v| v.map(|t| (delay_select.pick(&t) * scale).round() as i64))
+                            .collect(),
+                    });
+                }
             }
         }
     }
@@ -655,5 +819,48 @@ mod tests {
         // With ps timescale (1e-12), 0.25ns = 250ps = 250 ticks
         let ann_ps = annotate_sdf(&sdf, 1e-12, DelaySelect::Typ);
         assert_eq!(ann_ps.get_delay("top.buf1.X"), 250);
+    }
+
+    #[test]
+    fn test_timingcheck_entries() {
+        let sdf_content = r#"
+(DELAYFILE
+  (TIMESCALE 1ns)
+  (CELL
+    (CELLTYPE "DFF")
+    (INSTANCE top.u1)
+    (TIMINGCHECK
+      (SETUPHOLD D (posedge CK) (0.3:0.4:0.5) (-0.1))
+      (HOLD (COND SE==0 D) (posedge CK) ())
+      (WIDTH (negedge CK) (1.2))
+      (BIDIRECTSKEW A B (1) (1))
+    )
+  )
+)
+"#;
+        let sdf = parse_sdf(sdf_content).unwrap();
+        assert_eq!(sdf.cells[0].delays.len(), 3);
+        let ann = annotate_sdf(&sdf, 1e-12, DelaySelect::Typ);
+        let l = &ann.timing_limits;
+        assert_eq!(l.len(), 3);
+        assert_eq!(
+            (l[0].kind.as_str(), l[0].instance.as_str()),
+            ("SETUPHOLD", "top.u1")
+        );
+        assert_eq!(
+            l[0].ports[0],
+            SdfTimingPort {
+                port: "D".into(),
+                edge: None,
+                cond: None
+            }
+        );
+        assert_eq!(l[0].ports[1].edge.as_deref(), Some("posedge"));
+        assert_eq!(l[0].limits, vec![Some(400), Some(-100)]);
+        assert_eq!(l[1].ports[0].cond.as_deref(), Some("SE==0"));
+        assert_eq!(l[1].ports[0].port, "D");
+        assert_eq!(l[1].limits, vec![None]);
+        assert_eq!(l[2].ports[0].edge.as_deref(), Some("negedge"));
+        assert_eq!(l[2].limits, vec![Some(1200)]);
     }
 }
