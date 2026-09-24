@@ -16340,12 +16340,16 @@ fn default_port_value(
     if let Some(net_type) = net_type {
         return default_net_value(net_type, width, false);
     }
+    let two_state = data_type.map(is_type_two_state).unwrap_or(false);
     if matches!(direction, Some(PortDirection::Input | PortDirection::Inout)) {
-        if data_type.map(is_type_two_state).unwrap_or(false) {
+        if two_state {
             Value::zero(width)
         } else {
             Value::all_z(width)
         }
+    } else if two_state {
+        // §6.8: an `output bit` port is a 2-state variable, 0 until written.
+        Value::zero(width)
     } else {
         Value::new(width)
     }
