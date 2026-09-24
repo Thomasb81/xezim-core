@@ -23846,34 +23846,6 @@ fn rename_item_decls(
     }
 }
 
-/// Genvar-substitute the expressions inside packed dimensions (`[left:right]`).
-/// A declaration inside a generate-for can size itself from the genvar
-/// (`logic [i*8+7:0] byte_i;`); without this the range keeps the bare genvar
-/// ident and resolves to a wrong/underflowed width once the loop var is gone.
-fn rewrite_packed_dims_genvar(
-    dims: &[PackedDimension],
-    port_map: &HashMap<String, Expression>,
-    local_names: &std::collections::HashSet<String>,
-    interface_map: &HashMap<String, String>,
-) -> Vec<PackedDimension> {
-    dims.iter()
-        .map(|d| match d {
-            PackedDimension::Range { left, right, span } => PackedDimension::Range {
-                left: Box::new(rewrite_expr(left, "", port_map, local_names, interface_map)),
-                right: Box::new(rewrite_expr(
-                    right,
-                    "",
-                    port_map,
-                    local_names,
-                    interface_map,
-                )),
-                span: *span,
-            },
-            other => other.clone(),
-        })
-        .collect()
-}
-
 /// Genvar-substitute the expressions inside unpacked dimensions.
 fn rewrite_unpacked_dims_genvar(
     dims: &[UnpackedDimension],
@@ -23881,27 +23853,49 @@ fn rewrite_unpacked_dims_genvar(
     local_names: &std::collections::HashSet<String>,
     interface_map: &HashMap<String, String>,
 ) -> Vec<UnpackedDimension> {
+    rewrite_unpacked_dims_scoped(dims, "", port_map, local_names, interface_map)
+}
+
+/// Genvar-substitute the dimension expressions carried by a data type (packed
+/// ranges on vectors/typerefs, and recursively into packed-struct members).
+fn rewrite_data_type_genvar(
+    dt: &DataType,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> DataType {
+    rewrite_data_type_scoped(dt, "", port_map, local_names, interface_map)
+}
+
+/// Genvar-substitute the expressions inside packed dimensions (`[left:right]`).
+/// A declaration inside a generate-for can size itself from the genvar
+/// (`logic [i*8+7:0] byte_i;`); without this the range keeps the bare genvar
+/// ident and resolves to a wrong/underflowed width once the loop var is gone.
+/// `prefix` scopes instance-local names (the `*_genvar` wrappers pass none).
+fn rewrite_packed_dims_scoped(
+    dims: &[PackedDimension],
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Vec<PackedDimension> {
     dims.iter()
         .map(|d| match d {
-            UnpackedDimension::Range { left, right, span } => UnpackedDimension::Range {
-                left: Box::new(rewrite_expr(left, "", port_map, local_names, interface_map)),
-                right: Box::new(rewrite_expr(
-                    right,
-                    "",
+            PackedDimension::Range { left, right, span } => PackedDimension::Range {
+                left: Box::new(rewrite_expr(
+                    left,
+                    prefix,
                     port_map,
                     local_names,
                     interface_map,
                 )),
-                span: *span,
-            },
-            UnpackedDimension::Expression { expr, span } => UnpackedDimension::Expression {
-                expr: Box::new(rewrite_expr(expr, "", port_map, local_names, interface_map)),
-                span: *span,
-            },
-            UnpackedDimension::Queue { max_size, span } => UnpackedDimension::Queue {
-                max_size: max_size
-                    .as_ref()
-                    .map(|e| Box::new(rewrite_expr(e, "", port_map, local_names, interface_map))),
+                right: Box::new(rewrite_expr(
+                    right,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                )),
                 span: *span,
             },
             other => other.clone(),
@@ -23909,10 +23903,62 @@ fn rewrite_unpacked_dims_genvar(
         .collect()
 }
 
-/// Genvar-substitute the dimension expressions carried by a data type (packed
-/// ranges on vectors/typerefs, and recursively into packed-struct members).
-fn rewrite_data_type_genvar(
+fn rewrite_unpacked_dims_scoped(
+    dims: &[UnpackedDimension],
+    prefix: &str,
+    port_map: &HashMap<String, Expression>,
+    local_names: &std::collections::HashSet<String>,
+    interface_map: &HashMap<String, String>,
+) -> Vec<UnpackedDimension> {
+    dims.iter()
+        .map(|d| match d {
+            UnpackedDimension::Range { left, right, span } => UnpackedDimension::Range {
+                left: Box::new(rewrite_expr(
+                    left,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                )),
+                right: Box::new(rewrite_expr(
+                    right,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                )),
+                span: *span,
+            },
+            UnpackedDimension::Expression { expr, span } => UnpackedDimension::Expression {
+                expr: Box::new(rewrite_expr(
+                    expr,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                )),
+                span: *span,
+            },
+            UnpackedDimension::Queue { max_size, span } => UnpackedDimension::Queue {
+                max_size: max_size.as_ref().map(|e| {
+                    Box::new(rewrite_expr(
+                        e,
+                        prefix,
+                        port_map,
+                        local_names,
+                        interface_map,
+                    ))
+                }),
+                span: *span,
+            },
+            other => other.clone(),
+        })
+        .collect()
+}
+
+fn rewrite_data_type_scoped(
     dt: &DataType,
+    prefix: &str,
     port_map: &HashMap<String, Expression>,
     local_names: &std::collections::HashSet<String>,
     interface_map: &HashMap<String, String>,
@@ -23926,8 +23972,9 @@ fn rewrite_data_type_genvar(
         } => DataType::IntegerVector {
             kind: *kind,
             signing: *signing,
-            dimensions: rewrite_packed_dims_genvar(
+            dimensions: rewrite_packed_dims_scoped(
                 dimensions,
+                prefix,
                 port_map,
                 local_names,
                 interface_map,
@@ -23941,15 +23988,16 @@ fn rewrite_data_type_genvar(
             span,
         } => DataType::TypeReference {
             name: name.clone(),
-            dimensions: rewrite_packed_dims_genvar(
+            dimensions: rewrite_packed_dims_scoped(
                 dimensions,
+                prefix,
                 port_map,
                 local_names,
                 interface_map,
             ),
             type_args: type_args
                 .iter()
-                .map(|e| rewrite_expr(e, "", port_map, local_names, interface_map))
+                .map(|e| rewrite_expr(e, prefix, port_map, local_names, interface_map))
                 .collect(),
             span: *span,
         },
@@ -23959,8 +24007,9 @@ fn rewrite_data_type_genvar(
             span,
         } => DataType::Implicit {
             signing: *signing,
-            dimensions: rewrite_packed_dims_genvar(
+            dimensions: rewrite_packed_dims_scoped(
                 dimensions,
+                prefix,
                 port_map,
                 local_names,
                 interface_map,
@@ -23969,39 +24018,46 @@ fn rewrite_data_type_genvar(
         },
         DataType::Struct(su) => {
             let mut new_su = su.clone();
-            new_su.dimensions =
-                rewrite_packed_dims_genvar(&su.dimensions, port_map, local_names, interface_map);
-            new_su.members =
-                su.members
-                    .iter()
-                    .map(|m| StructMember {
-                        rand_qualifier: m.rand_qualifier,
-                        data_type: rewrite_data_type_genvar(
-                            &m.data_type,
-                            port_map,
-                            local_names,
-                            interface_map,
-                        ),
-                        declarators: m
-                            .declarators
-                            .iter()
-                            .map(|sd| StructDeclarator {
-                                name: sd.name.clone(),
-                                dimensions: rewrite_unpacked_dims_genvar(
-                                    &sd.dimensions,
-                                    port_map,
-                                    local_names,
-                                    interface_map,
-                                ),
-                                init: sd.init.as_ref().map(|e| {
-                                    rewrite_expr(e, "", port_map, local_names, interface_map)
-                                }),
-                                span: sd.span,
-                            })
-                            .collect(),
-                        span: m.span,
-                    })
-                    .collect();
+            new_su.dimensions = rewrite_packed_dims_scoped(
+                &su.dimensions,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            );
+            new_su.members = su
+                .members
+                .iter()
+                .map(|m| StructMember {
+                    rand_qualifier: m.rand_qualifier,
+                    data_type: rewrite_data_type_scoped(
+                        &m.data_type,
+                        prefix,
+                        port_map,
+                        local_names,
+                        interface_map,
+                    ),
+                    declarators: m
+                        .declarators
+                        .iter()
+                        .map(|sd| StructDeclarator {
+                            name: sd.name.clone(),
+                            dimensions: rewrite_unpacked_dims_scoped(
+                                &sd.dimensions,
+                                prefix,
+                                port_map,
+                                local_names,
+                                interface_map,
+                            ),
+                            init: sd.init.as_ref().map(|e| {
+                                rewrite_expr(e, prefix, port_map, local_names, interface_map)
+                            }),
+                            span: sd.span,
+                        })
+                        .collect(),
+                    span: m.span,
+                })
+                .collect();
             DataType::Struct(new_su)
         }
         other => other.clone(),
@@ -33659,6 +33715,16 @@ fn rewrite_expr_impl(
                 })
                 .collect(),
         ),
+        // `$bits(logic [W-1:0])`: the type's bounds name this instance's
+        // parameters like any other expression. Left bare, they resolved
+        // against the root module's (or none, under the multi-top wrapper).
+        ExprKind::TypeLiteral(dt) => ExprKind::TypeLiteral(Box::new(rewrite_data_type_scoped(
+            dt,
+            prefix,
+            port_map,
+            local_names,
+            interface_map,
+        ))),
         other => other.clone(),
     };
     Expression::new(new_kind, expr.span)
