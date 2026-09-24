@@ -1083,22 +1083,24 @@ pub fn parse_and_elaborate_multi(
 }
 
 /// Where the overridable value parameter `name` of a module, interface or
-/// program is declared: a non-local parameter-port-list entry or a body
-/// `parameter` — the set an instantiation can override in the elaborator.
-/// Returns (in the port list, declaration index, assignment index, declared
-/// `string`).
+/// program is declared: a non-local parameter-port-list entry, or a body
+/// `parameter` of a definition without a port list (§6.20.1: with one, a
+/// body `parameter` is local). Parameters in generate blocks are local too
+/// and are never looked at. Returns (in the port list, declaration index,
+/// assignment index, declared `string`).
 fn find_overridable_param(
     params: &[ast::decl::ParameterDeclaration],
     items: &[ast::decl::ModuleItem],
     name: &str,
 ) -> Option<(bool, usize, usize, bool)> {
     use ast::decl::{ModuleItem, ParameterKind};
+    let body_overridable = params.is_empty();
     let decls = params
         .iter()
         .enumerate()
         .map(|(i, pd)| (true, i, pd))
         .chain(items.iter().enumerate().filter_map(|(i, it)| match it {
-            ModuleItem::ParameterDeclaration(pd) => Some((false, i, pd)),
+            ModuleItem::ParameterDeclaration(pd) if body_overridable => Some((false, i, pd)),
             _ => None,
         }));
     for (in_header, di, pd) in decls {
