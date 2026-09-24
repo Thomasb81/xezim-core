@@ -963,6 +963,38 @@ pub fn elaborate_class_with_params(
     c: &ClassDeclaration,
     scope_params: Option<&HashMap<String, Value>>,
 ) -> ElaboratedClass {
+    // §8.25: the generic declaration is its default specialization, so a type
+    // parameter stands for its DEFAULT type — `$bits(T)` in a class constant
+    // (`localparam M = {$bits(T) - 1{1'b1}};`) reads that type's width.
+    // Unbound it read 0, and `0 - 1` replicated ~4 G bits.
+    let type_defaults: Vec<(String, u32)> = typedefs_snapshot(|td| {
+        let mut v = Vec::new();
+        for p in &c.params {
+            if let crate::ast::decl::ParameterKind::Type { assignments } = &p.kind {
+                for a in assignments {
+                    if let Some(dt) = &a.init {
+                        v.push((
+                            a.name.name.clone(),
+                            resolve_type_width(dt, scope_params, td),
+                        ));
+                    }
+                }
+            }
+        }
+        v
+    });
+    if type_defaults.is_empty() {
+        return elaborate_class_in_scope(c, scope_params);
+    }
+    let mut table = typedefs_snapshot(|td| td.cloned()).unwrap_or_default();
+    table.extend(type_defaults);
+    with_typedefs(&table, || elaborate_class_in_scope(c, scope_params))
+}
+
+fn elaborate_class_in_scope(
+    c: &ClassDeclaration,
+    scope_params: Option<&HashMap<String, Value>>,
+) -> ElaboratedClass {
     let const_scope = class_const_scope(c, scope_params);
     let class_params = Some(&const_scope);
     // Scope for sizing UNPACKED dimensions (`bit [7:0] mem [N];`): the
