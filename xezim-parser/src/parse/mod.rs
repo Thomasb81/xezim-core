@@ -45,6 +45,10 @@ pub struct Parser {
     /// is a `module_or_generate_item` (§A.1.4), which excludes `specparam`
     /// and module declarations.
     pub(super) generate_depth: u32,
+    /// Port expressions of the non-ANSI port list just parsed (`.a(b[3:0])`,
+    /// `{a, b}`, `a[7:0]`), by position in that list. The enclosing module
+    /// declaration lowers them once its body is parsed.
+    pub(super) port_exprs: Vec<(usize, crate::ast::expr::Expression)>,
 }
 
 impl Parser {
@@ -59,6 +63,7 @@ impl Parser {
             pending_paren_dist: Vec::new(),
             pending_module_items: Vec::new(),
             generate_depth: 0,
+            port_exprs: Vec::new(),
         }
     }
 

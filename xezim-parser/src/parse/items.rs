@@ -22,6 +22,7 @@ impl Parser {
         let header_imports = self.parse_module_header_imports();
         let params = self.parse_parameter_port_list();
         let ports = self.parse_port_list();
+        let port_exprs = std::mem::take(&mut self.port_exprs);
         self.expect(TokenKind::Semicolon);
 
         let mut items = self.parse_module_items();
@@ -31,6 +32,7 @@ impl Parser {
             prefixed.extend(items);
             items = prefixed;
         }
+        self.lower_port_expressions(&ports, &mut items, port_exprs);
 
         self.expect(TokenKind::KwEndmodule);
         let endlabel = self.parse_end_label_checked(&name.name);
@@ -56,6 +58,7 @@ impl Parser {
         let header_imports = self.parse_module_header_imports();
         let params = self.parse_parameter_port_list();
         let ports = self.parse_port_list();
+        let port_exprs = std::mem::take(&mut self.port_exprs);
         self.expect(TokenKind::Semicolon);
 
         let mut items = self.parse_module_items();
@@ -65,6 +68,7 @@ impl Parser {
             prefixed.extend(items);
             items = prefixed;
         }
+        self.lower_port_expressions(&ports, &mut items, port_exprs);
 
         self.expect(TokenKind::KwEndinterface);
         let endlabel = self.parse_end_label();
@@ -89,6 +93,7 @@ impl Parser {
         let header_imports = self.parse_module_header_imports();
         let params = self.parse_parameter_port_list();
         let ports = self.parse_port_list();
+        let port_exprs = std::mem::take(&mut self.port_exprs);
         self.expect(TokenKind::Semicolon);
 
         let mut items = self.parse_module_items();
@@ -98,6 +103,7 @@ impl Parser {
             prefixed.extend(items);
             items = prefixed;
         }
+        self.lower_port_expressions(&ports, &mut items, port_exprs);
 
         self.expect(TokenKind::KwEndprogram);
         let endlabel = self.parse_end_label();
@@ -208,6 +214,7 @@ impl Parser {
     }
 
     pub(super) fn parse_port_list(&mut self) -> PortList {
+        self.port_exprs.clear();
         if self.eat(TokenKind::LParen).is_none() {
             return PortList::Empty;
         }
@@ -287,6 +294,10 @@ impl Parser {
             PortList::Ansi(ports)
         } else {
             let mut names = Vec::new();
+            let null_port = |names: &Vec<Identifier>, span| crate::ast::Identifier {
+                name: format!("__xz_null_port_{}", names.len()),
+                span,
+            };
             loop {
                 if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                     break;
@@ -299,21 +310,377 @@ impl Parser {
                 // null port is ignored".
                 if self.at(TokenKind::Comma) {
                     let sp = self.current().span;
-                    names.push(crate::ast::Identifier {
-                        name: format!("__xz_null_port_{}", names.len()),
-                        span: sp,
-                    });
+                    names.push(null_port(&names, sp));
                     self.bump(); // consume the comma standing in for the port
+                    if self.at(TokenKind::RParen) {
+                        names.push(null_port(&names, sp));
+                    }
                     continue;
                 }
-                names.push(self.parse_identifier());
+                // §23.2.2.1 port expressions: `.name(expr)`, an unnamed
+                // concatenation `{a, b}` or a select `a[7:0]`. Lowered by the
+                // module declaration once the body declares the signals.
+                if self.at(TokenKind::Dot) {
+                    self.bump();
+                    let name = self.parse_identifier();
+                    self.expect(TokenKind::LParen);
+                    if self.at(TokenKind::RParen) {
+                        names.push(null_port(&names, name.span));
+                    } else {
+                        let e = self.parse_expression();
+                        self.port_exprs.push((names.len(), e));
+                        names.push(name);
+                    }
+                    self.expect(TokenKind::RParen);
+                } else if self.at(TokenKind::LBrace)
+                    || (self.at(TokenKind::Identifier) && self.peek_kind() == TokenKind::LBracket)
+                {
+                    let e = self.parse_expression();
+                    let span = e.span;
+                    self.port_exprs.push((names.len(), e));
+                    names.push(crate::ast::Identifier {
+                        name: format!("__xz_port_expr_{}", names.len()),
+                        span,
+                    });
+                } else {
+                    names.push(self.parse_identifier());
+                }
                 if self.eat(TokenKind::Comma).is_none() {
                     break;
+                }
+                // A trailing `, )` leaves one more null port.
+                if self.at(TokenKind::RParen) {
+                    let sp = self.current().span;
+                    names.push(null_port(&names, sp));
                 }
             }
             self.expect(TokenKind::RParen);
             PortList::NonAnsi(names)
         }
+    }
+
+    /// §23.2.2.1: lower the port expressions of a non-ANSI header
+    /// (`.b(a[2:1])`, `{a, b}`, `a[7:0]`) to plain ports. Each becomes a port
+    /// as wide as its expression, joined to the signals it names by a
+    /// continuous assignment (driving them for an input, reading them for an
+    /// output). Those signals stop being ports and keep their declared type
+    /// as nets or variables.
+    fn lower_port_expressions(
+        &mut self,
+        ports: &PortList,
+        items: &mut Vec<ModuleItem>,
+        exprs: Vec<(usize, Expression)>,
+    ) {
+        if exprs.is_empty() {
+            return;
+        }
+        let PortList::NonAnsi(names) = ports else {
+            return;
+        };
+        let plain: Vec<String> = names
+            .iter()
+            .enumerate()
+            .filter(|(i, _)| !exprs.iter().any(|(j, _)| j == i))
+            .map(|(_, n)| n.name.clone())
+            .collect();
+        let mut demoted = Vec::new();
+        for (idx, e) in exprs {
+            let port = names[idx].clone();
+            if let Err(msg) = Self::lower_port_expression(&port, &e, &plain, items, &mut demoted) {
+                self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                    format!(
+                        "unsupported port expression for port '{}': {msg} \
+                         (IEEE 1800-2017 §23.2.2.1)",
+                        port.name
+                    ),
+                    e.span,
+                ));
+            }
+        }
+        // Port declarations whose every name moved to a net or variable.
+        items
+            .retain(|it| !matches!(it, ModuleItem::PortDeclaration(d) if d.declarators.is_empty()));
+    }
+
+    fn lower_port_expression(
+        port: &Identifier,
+        e: &Expression,
+        plain: &[String],
+        items: &mut Vec<ModuleItem>,
+        demoted: &mut Vec<(String, PortDirection, DataType)>,
+    ) -> Result<(), String> {
+        let span = e.span;
+        let num = |v: i64| {
+            Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: true,
+                    base: NumberBase::Decimal,
+                    value: v.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                span,
+            )
+        };
+        let bin = |op, l: Expression, r: Expression| {
+            Expression::new(
+                ExprKind::Binary {
+                    op,
+                    left: Box::new(l),
+                    right: Box::new(r),
+                },
+                span,
+            )
+        };
+        // |l - r| + 1
+        let range_width = |l: &Expression, r: &Expression| {
+            Expression::new(
+                ExprKind::Conditional {
+                    condition: Box::new(bin(BinaryOp::Geq, l.clone(), r.clone())),
+                    then_expr: Box::new(bin(BinaryOp::Sub, l.clone(), r.clone())),
+                    else_expr: Box::new(bin(BinaryOp::Sub, r.clone(), l.clone())),
+                },
+                span,
+            )
+        };
+        // The signals named by the expression, each with the width of its
+        // part when that is a select.
+        fn leaves<'e>(
+            e: &'e Expression,
+            out: &mut Vec<(
+                &'e Identifier,
+                Option<(&'e Expression, &'e Expression, RangeKind)>,
+                bool,
+            )>,
+        ) -> Result<(), String> {
+            let base = |x: &'e Expression| -> Result<&'e Identifier, String> {
+                match &x.kind {
+                    ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                        Ok(&h.path[0].name)
+                    }
+                    _ => {
+                        Err("only names, selects of names and concatenations are supported".into())
+                    }
+                }
+            };
+            match &e.kind {
+                ExprKind::Concatenation(parts) => {
+                    for p in parts {
+                        leaves(p, out)?;
+                    }
+                }
+                ExprKind::Index { expr, .. } => out.push((base(expr)?, None, true)),
+                ExprKind::RangeSelect {
+                    expr,
+                    kind,
+                    left,
+                    right,
+                } => out.push((base(expr)?, Some((left, right, *kind)), false)),
+                _ => out.push((base(e)?, None, false)),
+            }
+            Ok(())
+        }
+        let mut parts = Vec::new();
+        leaves(e, &mut parts)?;
+        let decl_of = |items: &[ModuleItem], n: &str| {
+            items.iter().find_map(|it| match it {
+                ModuleItem::PortDeclaration(d)
+                    if d.declarators.iter().any(|v| v.name.name == n) =>
+                {
+                    Some(d.clone())
+                }
+                _ => None,
+            })
+        };
+        // A separate net or variable declaration completing the port.
+        let completion = |items: &[ModuleItem], n: &str| {
+            items.iter().find_map(|it| match it {
+                ModuleItem::NetDeclaration(d) if d.declarators.iter().any(|v| v.name.name == n) => {
+                    Some(d.data_type.clone())
+                }
+                ModuleItem::DataDeclaration(d)
+                    if d.declarators.iter().any(|v| v.name.name == n) =>
+                {
+                    Some(d.data_type.clone())
+                }
+                _ => None,
+            })
+        };
+        let packed = |dt: &DataType| match dt {
+            DataType::Implicit { dimensions, .. } | DataType::IntegerVector { dimensions, .. } => {
+                Some(dimensions.clone())
+            }
+            _ => None,
+        };
+        let mut direction = None;
+        let mut width: Option<Expression> = None;
+        for (id, sel, bit) in &parts {
+            if plain.contains(&id.name) || id.name == port.name {
+                return Err(format!("'{}' is also a port of its own", id.name));
+            }
+            // A signal already demoted by an earlier port expression keeps
+            // the direction and type it was declared with.
+            let (dir, dt) = match demoted.iter().find(|(n, ..)| *n == id.name) {
+                Some((_, dir, dt)) => (*dir, dt.clone()),
+                None => {
+                    let d = decl_of(items, &id.name).ok_or_else(|| {
+                        format!("'{}' has no input or output declaration", id.name)
+                    })?;
+                    (d.direction, d.data_type)
+                }
+            };
+            if dir == PortDirection::Inout || direction.is_some_and(|d| d != dir) {
+                return Err("an inout or mixed-direction port expression".into());
+            }
+            direction = Some(dir);
+            let w = if *bit {
+                num(1)
+            } else if let Some((l, r, kind)) = sel {
+                match kind {
+                    RangeKind::Constant => bin(BinaryOp::Add, range_width(l, r), num(1)),
+                    _ => (*r).clone(),
+                }
+            } else {
+                // The range may sit on the completing declaration instead.
+                let own = packed(&dt);
+                let dims = match own {
+                    Some(d) if !d.is_empty() => d,
+                    _ => completion(items, &id.name)
+                        .as_ref()
+                        .and_then(packed)
+                        .or(own)
+                        .ok_or_else(|| format!("'{}' has no vector type", id.name))?,
+                };
+                match dims.as_slice() {
+                    [] => num(1),
+                    [PackedDimension::Range { left, right, .. }] => {
+                        bin(BinaryOp::Add, range_width(left, right), num(1))
+                    }
+                    _ => return Err(format!("'{}' has more than one packed dimension", id.name)),
+                }
+            };
+            width = Some(match width {
+                None => w,
+                Some(acc) => bin(BinaryOp::Add, acc, w),
+            });
+        }
+        let (Some(direction), Some(width)) = (direction, width) else {
+            return Err("an empty port expression".into());
+        };
+        // The named signals leave the port list: each keeps its declared type
+        // as a net or variable unless another declaration already completes it.
+        for (id, _, _) in &parts {
+            if demoted.iter().any(|(n, ..)| *n == id.name) {
+                continue;
+            }
+            let completed = completion(items, &id.name).is_some();
+            let Some(at) = items.iter().position(|it| {
+                matches!(it, ModuleItem::PortDeclaration(d)
+                    if d.declarators.iter().any(|v| v.name.name == id.name))
+            }) else {
+                continue;
+            };
+            let ModuleItem::PortDeclaration(d) = &mut items[at] else {
+                continue;
+            };
+            let pos = d.declarators.iter().position(|v| v.name.name == id.name);
+            let v = d.declarators.remove(pos.unwrap_or_default());
+            let (net_type, data_type, dspan) = (d.net_type, d.data_type.clone(), d.span);
+            demoted.push((id.name.clone(), direction, data_type.clone()));
+            if completed {
+                continue;
+            }
+            let is_var = net_type.is_none() && !matches!(data_type, DataType::Implicit { .. });
+            // In the port declaration's place, so later items see it.
+            items.insert(
+                at + 1,
+                if is_var {
+                    ModuleItem::DataDeclaration(DataDeclaration {
+                        const_kw: false,
+                        var_kw: false,
+                        lifetime: None,
+                        data_type,
+                        declarators: vec![v],
+                        span: dspan,
+                    })
+                } else {
+                    ModuleItem::NetDeclaration(NetDeclaration {
+                        net_type: net_type.unwrap_or(NetType::Wire),
+                        strength: None,
+                        data_type,
+                        delay: None,
+                        declarators: vec![NetDeclarator {
+                            name: v.name,
+                            dimensions: v.dimensions,
+                            init: None,
+                            span: v.span,
+                        }],
+                        span: dspan,
+                    })
+                },
+            );
+        }
+        // The new port follows the declarations of the signals it joins
+        // (their ranges may use parameters declared before them).
+        let joined = |it: &ModuleItem| {
+            let named = |n: &str| parts.iter().any(|(id, ..)| id.name == n);
+            match it {
+                ModuleItem::PortDeclaration(d) => d.declarators.iter().any(|v| named(&v.name.name)),
+                ModuleItem::NetDeclaration(d) => d.declarators.iter().any(|v| named(&v.name.name)),
+                ModuleItem::DataDeclaration(d) => d.declarators.iter().any(|v| named(&v.name.name)),
+                _ => false,
+            }
+        };
+        let at = items.iter().rposition(joined).map_or(0, |i| i + 1);
+        let port_ref = Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path: vec![HierPathSegment {
+                    name: port.clone(),
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        );
+        items.insert(
+            at,
+            ModuleItem::PortDeclaration(PortDeclaration {
+                direction,
+                net_type: None,
+                data_type: DataType::Implicit {
+                    signing: None,
+                    dimensions: vec![PackedDimension::Range {
+                        left: Box::new(bin(BinaryOp::Sub, width, num(1))),
+                        right: Box::new(num(0)),
+                        span,
+                    }],
+                    span,
+                },
+                declarators: vec![crate::ast::stmt::VarDeclarator {
+                    name: port.clone(),
+                    dimensions: Vec::new(),
+                    init: None,
+                    span,
+                }],
+                span,
+            }),
+        );
+        let (lhs, rhs) = match direction {
+            PortDirection::Input => (e.clone(), port_ref),
+            _ => (port_ref, e.clone()),
+        };
+        items.push(ModuleItem::ContinuousAssign(ContinuousAssign {
+            strength: None,
+            delay: None,
+            delay_fall: None,
+            delay_off: None,
+            assignments: vec![(lhs, rhs)],
+            span,
+        }));
+        Ok(())
     }
 
     fn parse_ansi_port(&mut self) -> AnsiPort {
