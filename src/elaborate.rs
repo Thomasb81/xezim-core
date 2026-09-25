@@ -6074,7 +6074,7 @@ pub fn elaborate_module_with_defs(
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: init_expr.clone(),
-                                    delay: 0,
+                                    delay: net_decl_delay(nd, &elab.parameters),
                                     rhs_parent_scoped: false,
                                     delay_fall: None,
                                     delay_off: None,
@@ -6297,7 +6297,7 @@ pub fn elaborate_module_with_defs(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
-                            delay: 0,
+                            delay: net_decl_delay(nd, &elab.parameters),
                             rhs_parent_scoped: false,
                             delay_fall: None,
                             delay_off: None,
@@ -13013,7 +13013,7 @@ fn elaborate_items_numbered(
                         elab.continuous_assigns.push(ContinuousAssignment {
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
-                            delay: 0,
+                            delay: net_decl_delay(nd, &elab.parameters),
                             rhs_parent_scoped: false,
                             delay_fall: None,
                             delay_off: None,
@@ -15248,6 +15248,12 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
                     rewrite_delay_expr(d, unit_s, prec_s, tick_s);
                 }
             }
+            // `wire #2 w = a;` — a net declaration delay likewise.
+            ModuleItem::NetDeclaration(nd) => {
+                if let Some(d) = nd.delay.as_mut() {
+                    rewrite_delay_expr(d, unit_s, prec_s, tick_s);
+                }
+            }
             // `buf #(4) g(y, a);` — gate delays likewise count timeunits.
             ModuleItem::GateInstantiation(gi) => {
                 if let Some(d) = gi.delay.as_mut() {
@@ -15740,6 +15746,15 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
             }
         }
     }
+}
+
+/// §10.3.1: a net declaration assignment with a net delay (`wire #2 w = a;`)
+/// drives the net through that delay, like `assign #2 w = a;`.
+fn net_decl_delay(nd: &crate::ast::decl::NetDeclaration, params: &HashMap<String, Value>) -> u64 {
+    nd.delay
+        .as_ref()
+        .map(|d| eval_const_expr(d, params))
+        .unwrap_or(0)
 }
 
 /// §9.4.5 intra-assignment delays are canonicalized pre-parse into

@@ -1957,23 +1957,9 @@ impl Parser {
             self.bump();
         }
         // §10.3.3: optional net delay `wire #10 w;` / `wire #(d1,d2) w;`.
-        // Parse-accept; xezim doesn't model net delays.
-        if self.at(TokenKind::Hash) {
-            self.bump();
-            if self.eat(TokenKind::LParen).is_some() {
-                let mut depth = 1i32;
-                while depth > 0 && !self.at(TokenKind::Eof) {
-                    match self.current_kind() {
-                        TokenKind::LParen => depth += 1,
-                        TokenKind::RParen => depth -= 1,
-                        _ => {}
-                    }
-                    self.bump();
-                }
-            } else {
-                self.bump(); // #10 / #delay_id
-            }
-        }
+        // The LRM places it after the data type (below); this position is
+        // accepted too.
+        let mut delay = self.parse_net_delay();
         let data_type = if self.is_data_type_keyword() {
             self.parse_data_type()
         }
@@ -2035,16 +2021,42 @@ impl Parser {
         };
         let wreal_span = self.span_from(start);
         let data_type = self.wreal_data_type(net_type, data_type, wreal_span);
+        // §6.7: `net_type data_type_or_implicit [delay3] list_of_net_decl_assignments`
+        // — `wire [5:0] #1 w = a + b;`.
+        if delay.is_none() {
+            delay = self.parse_net_delay();
+        }
         let declarators = self.parse_net_declarator_list();
         self.expect(TokenKind::Semicolon);
         NetDeclaration {
             net_type,
             strength: None,
             data_type,
-            delay: None,
+            delay,
             declarators,
             span: self.span_from(start),
         }
+    }
+
+    /// Optional `#d` / `#(rise[, fall[, turn-off]])` net delay; the rise
+    /// (typical) value is kept.
+    fn parse_net_delay(&mut self) -> Option<Expression> {
+        self.eat(TokenKind::Hash)?;
+        if self.eat(TokenKind::LParen).is_none() {
+            return Some(self.parse_delay_value());
+        }
+        let first = self.parse_expression();
+        let rise = self.parse_mintypmax_rest(first);
+        let mut depth = 1i32;
+        while depth > 0 && !self.at(TokenKind::Eof) {
+            match self.current_kind() {
+                TokenKind::LParen => depth += 1,
+                TokenKind::RParen => depth -= 1,
+                _ => {}
+            }
+            self.bump();
+        }
+        Some(rise)
     }
 
     fn parse_net_declarator_list(&mut self) -> Vec<NetDeclarator> {
