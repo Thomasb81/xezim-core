@@ -3261,6 +3261,20 @@ impl Parser {
                 break;
             }
         }
+        // §23.3.2: connections are all by position or all by name.
+        if crate::strict_checks()
+            && conns
+                .iter()
+                .any(|c| matches!(c, PortConnection::Ordered(Some(_))))
+            && conns
+                .iter()
+                .any(|c| !matches!(c, PortConnection::Ordered(_)))
+        {
+            self.error(
+                "port connections by position and by name cannot be mixed in one \
+                 instance (IEEE 1800-2017 §23.3.2)",
+            );
+        }
         self.expect(TokenKind::RParen);
         conns
     }
