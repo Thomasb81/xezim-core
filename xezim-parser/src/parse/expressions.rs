@@ -1571,15 +1571,16 @@ impl Parser {
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
 
-            // §18.7.1 local::name — qualified reference to a variable in the
-            // owning class of a constraint block (used inside `with { ... }`
-            // to disambiguate from the rand vars of the object being
-            // randomized). Treat the same as `name` — name resolution falls
-            // back to enclosing class fields, which is the desired effect.
+            // §18.7.1 local::name — inside `obj.randomize() with { ... }` the
+            // name binds in the scope of the randomize() CALL, never in the
+            // object's class. The qualifier is kept as the identifier's root
+            // (`"local"`) so the solver can bind it there; a resolver that
+            // does not know the root falls back to the plain name.
             TokenKind::KwLocal if self.peek_kind() == TokenKind::DoubleColon => {
                 self.bump(); // local
                 self.bump(); // ::
-                let hier = self.parse_hierarchical_identifier();
+                let mut hier = self.parse_hierarchical_identifier();
+                hier.root = Some(LOCAL_SCOPE_ROOT.to_string());
                 Expression::new(ExprKind::Ident(hier), self.span_from(start))
             }
 

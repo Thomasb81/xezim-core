@@ -307,6 +307,9 @@ pub enum BinaryOp {
     SvaDisableIff,
 }
 
+/// `HierarchicalIdentifier::root` of a §18.7.1 `local::name` reference.
+pub const LOCAL_SCOPE_ROOT: &str = "local";
+
 #[derive(Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct HierarchicalIdentifier {
