@@ -31280,21 +31280,26 @@ fn gate_inst_to_assign_pairs(gi: &GateInstantiation) -> Vec<(Expression, Express
                 );
                 pairs.push((out, rhs));
             }
+            // §28.4: `buf` and `not` have one or more outputs and one input,
+            // the last terminal (`buf (o1, o2, i);`).
             GateType::Not => {
-                let rhs = Expression::new(
-                    ExprKind::Unary {
-                        op: UnaryOp::BitNot,
-                        operand: Box::new(in1),
-                    },
-                    out.span,
-                );
-                pairs.push((out, rhs));
+                let (input, outs) = inst.terminals.split_last().unwrap_or((&in1, &[]));
+                for o in outs {
+                    let rhs = Expression::new(
+                        ExprKind::Unary {
+                            op: UnaryOp::BitNot,
+                            operand: Box::new(input.clone()),
+                        },
+                        o.span,
+                    );
+                    pairs.push((o.clone(), rhs));
+                }
             }
             GateType::Buf => {
-                // Single-input buffer: out = in. Multi-output `buf` with
-                // (out1, out2, ..., in) is rare; for now only the
-                // two-terminal form is supported.
-                pairs.push((out, in1));
+                let (input, outs) = inst.terminals.split_last().unwrap_or((&in1, &[]));
+                for o in outs {
+                    pairs.push((o.clone(), input.clone()));
+                }
             }
             _ => {}
         }
