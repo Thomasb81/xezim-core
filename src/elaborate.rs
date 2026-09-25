@@ -5812,6 +5812,8 @@ pub fn elaborate_module_with_defs(
     // `extends` when their constraints are validated.
     let local_defs = defs_with_local_classes(module.items(), all_defs);
     let cls_defs = local_defs.as_ref().or(all_defs);
+    // §27.6: generate constructs of this scope, numbered for `genblk<n>`.
+    let mut gen_ordinal = 0u32;
     for item in module.items() {
         match item {
             ModuleItem::PortDeclaration(pd) => {
@@ -8996,17 +8998,22 @@ pub fn elaborate_module_with_defs(
                 });
             }
             ModuleItem::GenerateRegion(gr) => {
-                // Recursively process generate region items
-                elaborate_items(&gr.items, &mut elab, all_defs)?;
+                // Recursively process generate region items. A region is not
+                // a scope (§27.3): its constructs share this scope's genblk
+                // numbering.
+                elaborate_items_numbered(&gr.items, &mut elab, all_defs, &mut gen_ordinal)?;
             }
             ModuleItem::GenerateIf(gi) => {
-                elaborate_generate_if(gi, &mut elab, all_defs)?;
+                gen_ordinal += 1;
+                elaborate_generate_if(gi, &mut elab, all_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateCase(gc) => {
-                elaborate_generate_case(gc, &mut elab, all_defs)?;
+                gen_ordinal += 1;
+                elaborate_generate_case(gc, &mut elab, all_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateFor(gf) => {
-                elaborate_generate_for(gf, &mut elab, all_defs)?;
+                gen_ordinal += 1;
+                elaborate_generate_for(gf, &mut elab, all_defs, gen_ordinal)?;
             }
             ModuleItem::CovergroupDeclaration(cg) => {
                 elab.covergroups.insert(cg.name.name.clone(), cg.clone());
@@ -12846,6 +12853,18 @@ fn elaborate_items(
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
 ) -> Result<(), String> {
+    let mut gen_ordinal = 0u32;
+    elaborate_items_numbered(items, elab, all_defs, &mut gen_ordinal)
+}
+
+/// `elaborate_items` with the scope's generate-construct counter (§27.6
+/// `genblk<n>` names) threaded through generate regions.
+fn elaborate_items_numbered(
+    items: &[ModuleItem],
+    elab: &mut ElaboratedModule,
+    all_defs: Option<&HashMap<String, Definition>>,
+    gen_ordinal: &mut u32,
+) -> Result<(), String> {
     // Classes declared in THIS body must be visible to each other's `extends`.
     let local_defs = defs_with_local_classes(items, all_defs);
     let cls_defs = local_defs.as_ref().or(all_defs);
@@ -13764,16 +13783,19 @@ fn elaborate_items(
                 process_typedef(td, elab);
             }
             ModuleItem::GenerateRegion(gr) => {
-                elaborate_items(&gr.items, elab, all_defs)?;
+                elaborate_items_numbered(&gr.items, elab, all_defs, gen_ordinal)?;
             }
             ModuleItem::GenerateIf(gi) => {
-                elaborate_generate_if(gi, elab, all_defs)?;
+                *gen_ordinal += 1;
+                elaborate_generate_if(gi, elab, all_defs, *gen_ordinal)?;
             }
             ModuleItem::GenerateCase(gc) => {
-                elaborate_generate_case(gc, elab, all_defs)?;
+                *gen_ordinal += 1;
+                elaborate_generate_case(gc, elab, all_defs, *gen_ordinal)?;
             }
             ModuleItem::GenerateFor(gf) => {
-                elaborate_generate_for(gf, elab, all_defs)?;
+                *gen_ordinal += 1;
+                elaborate_generate_for(gf, elab, all_defs, *gen_ordinal)?;
             }
 
             ModuleItem::ClassDeclaration(cd) => {
@@ -14072,6 +14094,7 @@ fn elaborate_generate_if(
     gi: &GenerateIf,
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
+    ordinal: u32,
 ) -> Result<(), String> {
     // §27.6: a LABELED branch is a scope — rename its declarations to their
     // hierarchical name (`g.x`), the same convention for-generate now uses.
@@ -14089,9 +14112,14 @@ fn elaborate_generate_if(
         Some(label) => {
             let mut renamed = rename_decls_in_iter(items, &GenRename::Scope(label));
             alias_labelled_subroutines(&mut renamed, label);
+            stamp_gen_scope(&mut renamed, label);
             elaborate_items(&renamed, elab, all_defs)
         }
-        None => elaborate_items(items, elab, all_defs),
+        None => {
+            let mut scoped = items.clone();
+            stamp_gen_scope(&mut scoped, &gen_scope_name(None, ordinal));
+            elaborate_items(&scoped, elab, all_defs)
+        }
     };
     for (bi, (cond, items)) in gi.branches.iter().enumerate() {
         match cond {
@@ -14117,6 +14145,7 @@ fn elaborate_generate_case(
     gc: &GenerateCase,
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
+    ordinal: u32,
 ) -> Result<(), String> {
     if !is_const_expr(&gc.selector, &elab.parameters) {
         return Err("Generate case selector must be a constant expression".to_string());
@@ -14132,14 +14161,14 @@ fn elaborate_generate_case(
                 return Err("Generate case value must be a constant expression".to_string());
             }
             if eval_const_expr(v, &elab.parameters) == sel {
-                return elaborate_generate_case_arm(arm, elab, all_defs);
+                return elaborate_generate_case_arm(arm, elab, all_defs, ordinal);
             }
         }
     }
     // No non-default match — fall through to default arm if present.
     for arm in &gc.arms {
         if arm.values.is_empty() {
-            return elaborate_generate_case_arm(arm, elab, all_defs);
+            return elaborate_generate_case_arm(arm, elab, all_defs, ordinal);
         }
     }
     Ok(())
@@ -14151,14 +14180,53 @@ fn elaborate_generate_case_arm(
     arm: &GenerateCaseArm,
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
+    ordinal: u32,
 ) -> Result<(), String> {
     match &arm.label {
         Some(label) => {
             let mut renamed = rename_decls_in_iter(&arm.items, &GenRename::Scope(label));
             alias_labelled_subroutines(&mut renamed, label);
+            stamp_gen_scope(&mut renamed, label);
             elaborate_items(&renamed, elab, all_defs)
         }
-        None => elaborate_items(&arm.items, elab, all_defs),
+        None => {
+            let mut scoped = arm.items.clone();
+            stamp_gen_scope(&mut scoped, &gen_scope_name(None, ordinal));
+            elaborate_items(&scoped, elab, all_defs)
+        }
+    }
+}
+
+/// §21.2.1.7: the processes of a generate block of the ROOT module run in
+/// the block's scope (`tb.g`, `tb.fl[0]`) — the inlining path does the same
+/// for instances through `prefix_gen_scope`. Applied outermost first, so a
+/// nested block appends its own name (`g.h`).
+fn stamp_gen_scope(items: &mut [ModuleItem], scope: &str) {
+    let stamp = |gs: &mut String| {
+        *gs = if gs.is_empty() {
+            scope.to_string()
+        } else {
+            format!("{}.{}", gs, scope)
+        };
+    };
+    for item in items.iter_mut() {
+        match item {
+            ModuleItem::AlwaysConstruct(ac) => stamp(&mut ac.gen_scope),
+            ModuleItem::InitialConstruct(ic) => stamp(&mut ic.gen_scope),
+            ModuleItem::GenerateRegion(gr) => stamp_gen_scope(&mut gr.items, scope),
+            ModuleItem::GenerateIf(gi) => {
+                for (_, branch) in &mut gi.branches {
+                    stamp_gen_scope(branch, scope);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &mut gc.arms {
+                    stamp_gen_scope(&mut arm.items, scope);
+                }
+            }
+            ModuleItem::GenerateFor(gf) => stamp_gen_scope(&mut gf.items, scope),
+            _ => {}
+        }
     }
 }
 
@@ -14258,6 +14326,7 @@ fn elaborate_generate_for(
     gf: &GenerateFor,
     elab: &mut ElaboratedModule,
     all_defs: Option<&HashMap<String, Definition>>,
+    ordinal: u32,
 ) -> Result<(), String> {
     let var = &gf.var;
     let mut i = gf.init_val;
@@ -14303,6 +14372,10 @@ fn elaborate_generate_for(
         if let Some(label) = &gf.name {
             scope_generated_subroutines(&mut renamed, &format!("{}[{}]", label, i));
         }
+        stamp_gen_scope(
+            &mut renamed,
+            &format!("{}[{}]", gen_scope_name(gf.name.as_ref(), ordinal), i),
+        );
         elaborate_items(&renamed, elab, all_defs)?;
         // §27.6: a generate-block localparam is also visible hierarchically
         // as `<label>[i].<name>`. The per-iteration rename above stores it
@@ -24393,21 +24466,22 @@ fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
                     }
                 }
             }
+            // §21.2.1.7: generate block scope prefix for the %m hierarchy.
+            // Inner blocks were expanded first, so the enclosing block's name
+            // goes in front of theirs (`g.h`).
             ModuleItem::AlwaysConstruct(ac) => {
-                // §21.2.1.7: generate block scope prefix for %m hierarchy.
-                // If this always block is inside a generate block, set gen_scope
-                // to the generate block's scope name so it appears in %m output.
-                if ac.gen_scope.is_empty() {
-                    ac.gen_scope = scope.to_string();
-                }
+                ac.gen_scope = if ac.gen_scope.is_empty() {
+                    scope.to_string()
+                } else {
+                    format!("{}.{}", scope, ac.gen_scope)
+                };
             }
             ModuleItem::InitialConstruct(ic) => {
-                // §21.2.1.7: generate block scope prefix for %m hierarchy.
-                // If this initial block is inside a generate block, set gen_scope
-                // to the generate block's scope name so it appears in %m output.
-                if ic.gen_scope.is_empty() {
-                    ic.gen_scope = scope.to_string();
-                }
+                ic.gen_scope = if ic.gen_scope.is_empty() {
+                    scope.to_string()
+                } else {
+                    format!("{}.{}", scope, ic.gen_scope)
+                };
             }
             _ => {}
         }
