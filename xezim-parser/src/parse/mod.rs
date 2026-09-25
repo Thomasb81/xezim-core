@@ -22,6 +22,9 @@ pub struct Parser {
     /// variable declarations so the binding is in scope in the matched
     /// statement. Drained at each consumption point.
     pending_pattern_bindings: Vec<Identifier>,
+    /// Indices of the generate loops of the design element being parsed that
+    /// do not declare `genvar` in their header.
+    pub(super) plain_loop_vars: Vec<Identifier>,
     /// IEEE 1800-2017 §16.9: true while parsing a property/sequence body, so
     /// the keyword sequence operators `and`/`or` are recognised as binary SVA
     /// operators. Outside this context `or` stays an event-list separator
@@ -58,6 +61,7 @@ impl Parser {
             pos: 0,
             diagnostics: Vec::new(),
             pending_pattern_bindings: Vec::new(),
+            plain_loop_vars: Vec::new(),
             in_sva_seq: false,
             in_constraint: false,
             pending_paren_dist: Vec::new(),

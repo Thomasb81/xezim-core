@@ -11,6 +11,7 @@ use crate::lexer::token::TokenKind;
 impl Parser {
     pub(super) fn parse_module_declaration(&mut self) -> ModuleDeclaration {
         let start = self.current().span.start;
+        let outer_loops = std::mem::take(&mut self.plain_loop_vars);
         let kind = if self.eat(TokenKind::KwMacromodule).is_some() {
             ModuleKind::Macromodule
         } else {
@@ -36,6 +37,8 @@ impl Parser {
 
         self.expect(TokenKind::KwEndmodule);
         let endlabel = self.parse_end_label_checked(&name.name);
+        let loops = std::mem::replace(&mut self.plain_loop_vars, outer_loops);
+        self.check_generate_loop_vars(&loops, &items);
 
         ModuleDeclaration {
             attrs: Vec::new(),
@@ -52,6 +55,7 @@ impl Parser {
 
     pub(super) fn parse_interface_declaration(&mut self) -> InterfaceDeclaration {
         let start = self.current().span.start;
+        let outer_loops = std::mem::take(&mut self.plain_loop_vars);
         self.expect(TokenKind::KwInterface);
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_identifier();
@@ -72,6 +76,8 @@ impl Parser {
 
         self.expect(TokenKind::KwEndinterface);
         let endlabel = self.parse_end_label();
+        let loops = std::mem::replace(&mut self.plain_loop_vars, outer_loops);
+        self.check_generate_loop_vars(&loops, &items);
 
         InterfaceDeclaration {
             attrs: Vec::new(),
@@ -87,6 +93,7 @@ impl Parser {
 
     pub(super) fn parse_program_declaration(&mut self) -> ProgramDeclaration {
         let start = self.current().span.start;
+        let outer_loops = std::mem::take(&mut self.plain_loop_vars);
         self.expect(TokenKind::KwProgram);
         let lifetime = self.parse_optional_lifetime();
         let name = self.parse_identifier();
@@ -107,6 +114,8 @@ impl Parser {
 
         self.expect(TokenKind::KwEndprogram);
         let endlabel = self.parse_end_label();
+        let loops = std::mem::replace(&mut self.plain_loop_vars, outer_loops);
+        self.check_generate_loop_vars(&loops, &items);
 
         ProgramDeclaration {
             attrs: Vec::new(),
@@ -210,6 +219,58 @@ impl Parser {
             items,
             endlabel,
             span: self.span_from(start),
+        }
+    }
+
+    /// §27.4: the index of a generate loop is a genvar. One that names a
+    /// variable of the enclosing design element (`integer i; ... for (i = 0;
+    /// ...) begin : U`) and no genvar is an error.
+    fn check_generate_loop_vars(&mut self, loops: &[Identifier], items: &[ModuleItem]) {
+        if !crate::strict_checks() || loops.is_empty() {
+            return;
+        }
+        fn walk<'a>(
+            items: &'a [ModuleItem],
+            top: bool,
+            vars: &mut Vec<&'a str>,
+            genvars: &mut Vec<&'a str>,
+        ) {
+            for it in items {
+                match it {
+                    ModuleItem::DataDeclaration(d) if top => {
+                        vars.extend(d.declarators.iter().map(|v| v.name.name.as_str()))
+                    }
+                    ModuleItem::GenvarDeclaration(g) => {
+                        genvars.extend(g.names.iter().map(|n| n.name.as_str()))
+                    }
+                    ModuleItem::GenerateRegion(gr) => walk(&gr.items, top, vars, genvars),
+                    ModuleItem::GenerateFor(gf) => walk(&gf.items, false, vars, genvars),
+                    ModuleItem::GenerateIf(gi) => {
+                        for (_, b) in &gi.branches {
+                            walk(b, false, vars, genvars);
+                        }
+                    }
+                    ModuleItem::GenerateCase(gc) => {
+                        for a in &gc.arms {
+                            walk(&a.items, false, vars, genvars);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let (mut vars, mut genvars) = (Vec::new(), Vec::new());
+        walk(items, true, &mut vars, &mut genvars);
+        for v in loops {
+            if vars.contains(&v.name.as_str()) && !genvars.contains(&v.name.as_str()) {
+                self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                    format!(
+                        "generate loop index '{}' is a variable, not a genvar (IEEE 1800-2017 §27.4)",
+                        v.name
+                    ),
+                    v.span,
+                ));
+            }
         }
     }
 
@@ -2038,9 +2099,16 @@ impl Parser {
                 self.bump();
                 self.expect(TokenKind::LParen);
                 // Parse init: genvar i = 0 or i = 0
-                let _has_genvar = self.eat(TokenKind::KwGenvar).is_some();
+                let has_genvar = self.eat(TokenKind::KwGenvar).is_some();
                 let var_name = if self.at(TokenKind::Identifier) {
                     let n = self.current().text.clone();
+                    if !has_genvar {
+                        let span = self.current().span;
+                        self.plain_loop_vars.push(Identifier {
+                            name: n.clone(),
+                            span,
+                        });
+                    }
                     self.bump();
                     n
                 } else {
