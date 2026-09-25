@@ -520,9 +520,17 @@ impl Parser {
             // `timeunit 1ns / 10ps;` / `timeprecision …;` inside a module —
             // already parsed at top-level via Description::TimeunitsDecl;
             // accept and discard inside modules too (LRM allows both).
-            TokenKind::KwTimeunit | TokenKind::KwTimeprecision => Some(ModuleItem::TimeunitsDecl(
-                self.parse_timeunits_declaration(),
-            )),
+            TokenKind::KwTimeunit | TokenKind::KwTimeprecision => {
+                if self.generate_depth > 0 && crate::strict_checks() {
+                    self.error(
+                        "a timeunit or timeprecision declaration is not allowed inside a \
+                         generate block (IEEE 1800-2017 §3.14.2.2, §27)",
+                    );
+                }
+                Some(ModuleItem::TimeunitsDecl(
+                    self.parse_timeunits_declaration(),
+                ))
+            }
             // A `program … endprogram` block nested inside a module (LRM §24.3).
             // A program shares the enclosing scope for cross-references (its
             // `initial`/`final` blocks drive the module's nets), so inline its
@@ -843,6 +851,12 @@ impl Parser {
                 }))
             }
             TokenKind::KwGenerate => {
+                if self.generate_depth > 0 && crate::strict_checks() {
+                    self.error(
+                        "generate regions do not nest: `generate` is not allowed inside a \
+                         generate region or block (IEEE 1800-2017 §27.3)",
+                    );
+                }
                 self.bump();
                 self.generate_depth += 1;
                 let items = self.parse_module_items_until(TokenKind::KwEndgenerate);
@@ -1854,6 +1868,12 @@ impl Parser {
                 self.parse_gate_instantiation(),
             )),
             TokenKind::KwSpecify => {
+                if self.generate_depth > 0 && crate::strict_checks() {
+                    self.error(
+                        "a specify block is not allowed inside a generate block \
+                         (IEEE 1800-2017 §30, §27)",
+                    );
+                }
                 // §30 specify block: module paths (every §30.4 form) into
                 // SpecifyPaths so the elaborator can model their delays, plus
                 // the §31 timing checks and `specparam`s. Anything else
