@@ -2108,123 +2108,27 @@ impl Preprocessor {
                                 }
                             }
                         }
-                        let mut body = def.body.clone();
+                        let mut actuals: Vec<(&str, String)> = Vec::with_capacity(params.len());
                         for (pi, (pname, default)) in params.iter().enumerate() {
                             // An actual arg that is missing or blank falls back
                             // to the formal's default (SV LRM 22.5.1). e.g.
                             // `DV_CHECK(expr)` leaves the optional trailing
                             // `WITH_C_=` constraint empty.
-                            let arg_owned: String;
-                            let arg: Option<&String> = match args.get(pi) {
-                                Some(a) if !a.trim().is_empty() => Some(a),
-                                _ => match default {
-                                    Some(d) => {
-                                        arg_owned = d.clone();
-                                        Some(&arg_owned)
-                                    }
-                                    // §22.5.1: an empty (or white-space) actual
-                                    // with no default substitutes NOTHING.
-                                    // Leaving the formal name in the body
-                                    // corrupted the expansion (`F(1,)` of
-                                    // `a b` produced `1 b`, a parse error)
-                                    // and stringified as the formal's own
-                                    // name (`` `"b`" `` gave "b", the
-                                    // reference gives "").
-                                    None => {
-                                        arg_owned = String::new();
-                                        Some(&arg_owned)
-                                    }
-                                },
+                            let arg = match args.get(pi) {
+                                Some(a) if !a.trim().is_empty() => a.clone(),
+                                // §22.5.1: an empty (or white-space) actual
+                                // with no default substitutes NOTHING.
+                                // Leaving the formal name in the body
+                                // corrupted the expansion (`F(1,)` of
+                                // `a b` produced `1 b`, a parse error)
+                                // and stringified as the formal's own
+                                // name (`` `"b`" `` gave "b", the
+                                // reference gives "").
+                                _ => default.clone().unwrap_or_default(),
                             };
-                            {
-                                if let Some(arg) = arg {
-                                    // Replace only whole words, and only outside
-                                    // string literals (so a parameter name that
-                                    // also appears in a format string in the
-                                    // body — e.g. `actual` in
-                                    // `"actual=%0d"` — isn't substituted away,
-                                    // which would corrupt the string when the
-                                    // arg itself contains a `"`).
-                                    let mut new_body = String::with_capacity(body.len());
-                                    let mut last = 0;
-                                    let body_bytes = body.as_bytes();
-                                    let mut string_ranges: Vec<(usize, usize)> = Vec::new();
-                                    {
-                                        let mut i = 0;
-                                        while i < body_bytes.len() {
-                                            // A `"` preceded by a backtick is the
-                                            // preprocessor stringify-quote delimiter
-                                            // (`\`"..."\``), NOT a regular string
-                                            // literal. Per IEEE 1800-2017 §22.5.1,
-                                            // macro formals inside `\`"..."\`` MUST be
-                                            // substituted (then stringized), so do not
-                                            // open an opaque string range here — else
-                                            // `uvm_type_name_decl(\`"T\`")` leaves `T`
-                                            // unsubstituted and get_type_name returns
-                                            // the literal "T" instead of the class name.
-                                            if body_bytes[i] == b'"'
-                                                && !(i > 0 && body_bytes[i - 1] == b'`')
-                                            {
-                                                let start = i;
-                                                i += 1;
-                                                while i < body_bytes.len() {
-                                                    if body_bytes[i] == b'\\'
-                                                        && i + 1 < body_bytes.len()
-                                                    {
-                                                        i += 2;
-                                                        continue;
-                                                    }
-                                                    if body_bytes[i] == b'"' {
-                                                        i += 1;
-                                                        break;
-                                                    }
-                                                    i += 1;
-                                                }
-                                                // A `` inside these quotes does NOT
-                                                // reopen the region to substitution:
-                                                // §22.5.1 says argument substitution
-                                                // shall not occur within a string
-                                                // literal, and `\`"` is the construct
-                                                // for building a string from an
-                                                // argument. `"``x``"` therefore stays
-                                                // literal (GitHub #62 asked for it to
-                                                // expand; a reference simulator
-                                                // leaves it alone too, so expanding
-                                                // would be a divergence).
-                                                string_ranges.push((start, i));
-                                            } else {
-                                                i += 1;
-                                            }
-                                        }
-                                    }
-                                    let in_string = |pos: usize| -> bool {
-                                        string_ranges.iter().any(|(lo, hi)| pos >= *lo && pos < *hi)
-                                    };
-                                    for (start, part) in body.match_indices(pname) {
-                                        let before = body_bytes
-                                            .get(start.wrapping_sub(1))
-                                            .copied()
-                                            .unwrap_or(0);
-                                        let after = body_bytes
-                                            .get(start + part.len())
-                                            .copied()
-                                            .unwrap_or(0);
-                                        new_body.push_str(&body[last..start]);
-                                        if !(before.is_ascii_alphanumeric() || before == b'_')
-                                            && !(after.is_ascii_alphanumeric() || after == b'_')
-                                            && !in_string(start)
-                                        {
-                                            new_body.push_str(arg);
-                                        } else {
-                                            new_body.push_str(part);
-                                        }
-                                        last = start + part.len();
-                                    }
-                                    new_body.push_str(&body[last..]);
-                                    body = new_body;
-                                }
-                            }
+                            actuals.push((pname.as_str(), arg));
                         }
+                        let body = Self::substitute_formals(&def.body, &actuals);
                         let body_pasted = Self::apply_token_pasting(&body);
                         result.push_str(&body_pasted);
                     } else {
@@ -2267,6 +2171,82 @@ impl Preprocessor {
             }
         }
         result
+    }
+}
+
+impl Preprocessor {
+    /// Replace every formal of a macro body with its actual text, in ONE pass
+    /// over the body as written: substituting the formals one after another
+    /// rescanned text an earlier actual had inserted, so a quote in that
+    /// actual (`STOP_``a1` with `"hello"`) shifted the string-literal ranges
+    /// and a later formal (`a2`) was left in the expansion.
+    ///
+    /// Only whole words outside string literals are replaced, so a formal
+    /// name that also appears in a format string in the body — e.g. `actual`
+    /// in `"actual=%0d"` — is kept.
+    fn substitute_formals(body: &str, actuals: &[(&str, String)]) -> String {
+        let b = body.as_bytes();
+        // A `"` preceded by a backtick is the preprocessor stringify-quote
+        // delimiter (`\`"..."\``), NOT a regular string literal. Per IEEE
+        // 1800-2017 §22.5.1, macro formals inside `\`"..."\`` MUST be
+        // substituted (then stringized), so it opens no opaque range — else
+        // `uvm_type_name_decl(\`"T\`")` leaves `T` unsubstituted and
+        // get_type_name returns the literal "T" instead of the class name.
+        //
+        // A `` inside ordinary quotes does NOT reopen the region to
+        // substitution: §22.5.1 says argument substitution shall not occur
+        // within a string literal, and `\`"` is the construct for building a
+        // string from an argument. `"``x``"` therefore stays literal (GitHub
+        // #62 asked for it to expand; a reference simulator leaves it alone
+        // too, so expanding would be a divergence).
+        let mut string_ranges: Vec<(usize, usize)> = Vec::new();
+        let mut i = 0;
+        while i < b.len() {
+            if b[i] == b'"' && !(i > 0 && b[i - 1] == b'`') {
+                let start = i;
+                i += 1;
+                while i < b.len() {
+                    if b[i] == b'\\' && i + 1 < b.len() {
+                        i += 2;
+                        continue;
+                    }
+                    if b[i] == b'"' {
+                        i += 1;
+                        break;
+                    }
+                    i += 1;
+                }
+                string_ranges.push((start, i));
+            } else {
+                i += 1;
+            }
+        }
+        let in_string = |pos: usize| string_ranges.iter().any(|(lo, hi)| pos >= *lo && pos < *hi);
+        let is_word = |c: u8| c.is_ascii_alphanumeric() || c == b'_';
+        let mut out = String::with_capacity(body.len());
+        let mut last = 0;
+        let mut i = 0;
+        while i < b.len() {
+            if !is_word(b[i]) {
+                i += 1;
+                continue;
+            }
+            let start = i;
+            while i < b.len() && is_word(b[i]) {
+                i += 1;
+            }
+            let word = &body[start..i];
+            if in_string(start) {
+                continue;
+            }
+            if let Some((_, arg)) = actuals.iter().find(|(name, _)| *name == word) {
+                out.push_str(&body[last..start]);
+                out.push_str(arg);
+                last = i;
+            }
+        }
+        out.push_str(&body[last..]);
+        out
     }
 }
 
