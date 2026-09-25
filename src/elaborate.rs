@@ -8119,6 +8119,18 @@ pub fn elaborate_module_with_defs(
                         resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     let mut signed = is_type_signed(data_type);
                     let is_real = is_type_real(data_type);
+                    // A `string` parameter renders as text (`%p` quotes it).
+                    if matches!(
+                        data_type,
+                        DataType::Simple {
+                            kind: SimpleType::String,
+                            ..
+                        }
+                    ) {
+                        for a in assignments {
+                            elab.string_signals.insert(a.name.name.clone());
+                        }
+                    }
                     // IEEE 1800-2017 §6.20.2: an implicit-typed parameter takes
                     // the type of its VALUE. Width is refined per-assignment
                     // below (sized literal keeps its own width); signedness
@@ -13494,6 +13506,17 @@ fn elaborate_items_numbered(
                     let mut width =
                         resolve_type_width(data_type, Some(&elab.parameters), Some(&elab.typedefs));
                     let signed = is_type_signed(data_type);
+                    if matches!(
+                        data_type,
+                        DataType::Simple {
+                            kind: SimpleType::String,
+                            ..
+                        }
+                    ) {
+                        for a in assignments {
+                            elab.string_signals.insert(a.name.name.clone());
+                        }
+                    }
                     let implicit = matches!(data_type, DataType::Implicit { dimensions, .. } if dimensions.is_empty());
                     if implicit {
                         width = 32;
@@ -23351,6 +23374,17 @@ pub fn inline_instantiations(
                                     elab.var_decl_types
                                         .entry(decl.name.name.clone())
                                         .or_insert_with(|| dd.data_type.clone());
+                                    // §6.16: a package `string` variable reads
+                                    // as text, like a module-scope one.
+                                    if matches!(
+                                        &dd.data_type,
+                                        DataType::Simple {
+                                            kind: SimpleType::String,
+                                            ..
+                                        }
+                                    ) {
+                                        elab.string_signals.insert(decl.name.name.clone());
+                                    }
                                     elab.signals
                                         .entry(decl.name.name.clone())
                                         .or_insert(Signal {
@@ -35686,8 +35720,18 @@ fn process_import(
                             let is_signed =
                                 is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                             let is_real = is_type_real_resolved(&dd.data_type, &elab.typedef_types);
+                            let is_string = matches!(
+                                &dd.data_type,
+                                DataType::Simple {
+                                    kind: SimpleType::String,
+                                    ..
+                                }
+                            );
                             for decl in &dd.declarators {
                                 if &decl.name.name == sym_name {
+                                    if is_string {
+                                        elab.string_signals.insert(decl.name.name.clone());
+                                    }
                                     let v = if let Some(init) = &decl.init {
                                         eval_init_for_width(init, &elab.parameters, width)
                                     } else {
@@ -36012,7 +36056,17 @@ fn process_import(
                             register_anonymous_enum_members(&dd.data_type, elab);
                             let anon_members =
                                 anon_enum_members_ordered(&dd.data_type, &elab.parameters);
+                            let is_string = matches!(
+                                &dd.data_type,
+                                DataType::Simple {
+                                    kind: SimpleType::String,
+                                    ..
+                                }
+                            );
                             for decl in &dd.declarators {
+                                if is_string {
+                                    elab.string_signals.insert(decl.name.name.clone());
+                                }
                                 if let Some(members) = &anon_members {
                                     elab.enum_members
                                         .entry(decl.name.name.clone())
