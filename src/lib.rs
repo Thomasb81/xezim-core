@@ -1527,6 +1527,10 @@ fn parse_and_elaborate(
     let mut typedef_defs: crate::hasher::HashMap<String, Rc<ast::decl::TypedefDeclaration>> =
         crate::hasher::HashMap::default();
     let mut top_module = None;
+    // Source position of each module/interface/program declaration: several
+    // auto-detected tops elaborate in this order, as the reference does.
+    let mut def_source_pos: crate::hasher::HashMap<String, usize> =
+        crate::hasher::HashMap::default();
     /// When the design has multiple uninstantiated top-level modules, this
     /// holds their names so that — after elaboration of the synthetic
     /// `__xezim_multi_top` wrapper — each one's module-local static
@@ -1574,6 +1578,16 @@ fn parse_and_elaborate(
         } else {
             None
         };
+        let decl_name = match &desc {
+            ast::Description::Module(m) => Some(&m.name.name),
+            ast::Description::Interface(i) => Some(&i.name.name),
+            ast::Description::Program(p) => Some(&p.name.name),
+            _ => None,
+        };
+        if let Some(n) = decl_name {
+            let pos = def_source_pos.len();
+            def_source_pos.entry(n.clone()).or_insert(pos);
+        }
         match desc {
             ast::Description::Module(mut m) => {
                 // §23.4: hoist NESTED module declarations (recursively) into
@@ -2530,7 +2544,7 @@ fn parse_and_elaborate(
         // not hierarchy roots. This fixes multi-top testbenches (e.g. UVM's
         // 35objections/03basic/04module) where the previous heuristic ran only
         // one module's initial blocks.
-        let module_candidates: Vec<String> = candidates
+        let mut module_candidates: Vec<String> = candidates
             .iter()
             .filter(|c| {
                 matches!(
@@ -2542,6 +2556,9 @@ fn parse_and_elaborate(
             })
             .cloned()
             .collect();
+        // §23.3.3: the tops elaborate (and their time-0 processes start) in
+        // source order, not name order; library-adopted ones go last.
+        module_candidates.sort_by_key(|c| def_source_pos.get(c).copied().unwrap_or(usize::MAX));
         if module_candidates.len() > 1 {
             // Multi-top design: synthesize `__xezim_multi_top` instantiating
             // every top-level module and elaborate that as the root.
