@@ -21511,89 +21511,108 @@ fn for_each_sub_expr(e: &Expression, f: &mut dyn FnMut(&Expression)) {
 /// parameters, typedefs and their enum members, genvars, subroutines, class
 /// properties and methods, clocking/let/property/sequence/covergroup names —
 /// across modules, interfaces, programs, packages, classes, generate blocks.
-fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> HashSet<String> {
-    fn data_type_names(dt: &DataType, out: &mut HashSet<String>) {
-        if let DataType::Enum(e) = dt {
-            for m in &e.members {
-                out.insert(m.name.name.clone());
+fn decl_enum_member_names(dt: &DataType, out: &mut HashSet<String>) {
+    if let DataType::Enum(e) = dt {
+        for m in &e.members {
+            out.insert(m.name.name.clone());
+        }
+    }
+}
+fn decl_param_names(p: &ParameterDeclaration, out: &mut HashSet<String>) {
+    match &p.kind {
+        ParameterKind::Data {
+            data_type,
+            assignments,
+        } => {
+            decl_enum_member_names(data_type, out);
+            for a in assignments {
+                out.insert(a.name.name.clone());
+            }
+        }
+        // `parameter type T` — `$bits(T)` names it like a value.
+        ParameterKind::Type { assignments } => {
+            for a in assignments {
+                out.insert(a.name.name.clone());
             }
         }
     }
-    fn param(p: &ParameterDeclaration, out: &mut HashSet<String>) {
-        match &p.kind {
-            ParameterKind::Data {
-                data_type,
-                assignments,
-            } => {
-                data_type_names(data_type, out);
-                for a in assignments {
-                    out.insert(a.name.name.clone());
-                }
-            }
-            // `parameter type T` — `$bits(T)` names it like a value.
-            ParameterKind::Type { assignments } => {
-                for a in assignments {
-                    out.insert(a.name.name.clone());
-                }
+}
+fn decl_typedef_names(t: &crate::ast::decl::TypedefDeclaration, out: &mut HashSet<String>) {
+    out.insert(t.name.name.clone());
+    decl_enum_member_names(&t.data_type, out);
+}
+fn decl_port_names(pl: &PortList, out: &mut HashSet<String>) {
+    match pl {
+        PortList::Ansi(ps) => {
+            for p in ps {
+                out.insert(p.name.name.clone());
             }
         }
+        PortList::NonAnsi(ids) => {
+            for id in ids {
+                out.insert(id.name.clone());
+            }
+        }
+        PortList::Empty => {}
     }
-    fn typedef(t: &crate::ast::decl::TypedefDeclaration, out: &mut HashSet<String>) {
-        out.insert(t.name.name.clone());
-        data_type_names(&t.data_type, out);
+}
+/// Every name a class declares for bare use inside its own methods.
+fn decl_class_member_names(c: &crate::ast::decl::ClassDeclaration, out: &mut HashSet<String>) {
+    use crate::ast::decl::ClassItem as CI;
+    out.insert(c.name.name.clone());
+    for p in &c.params {
+        decl_param_names(p, out);
     }
-    fn ports(pl: &PortList, out: &mut HashSet<String>) {
-        match pl {
-            PortList::Ansi(ps) => {
-                for p in ps {
-                    out.insert(p.name.name.clone());
+    for it in &c.items {
+        match it {
+            CI::Property(p) => {
+                decl_enum_member_names(&p.data_type, out);
+                for d in &p.declarators {
+                    out.insert(d.name.name.clone());
                 }
             }
-            PortList::NonAnsi(ids) => {
-                for id in ids {
-                    out.insert(id.name.clone());
+            CI::Method(m) => match &m.kind {
+                crate::ast::decl::ClassMethodKind::Function(fd)
+                | crate::ast::decl::ClassMethodKind::PureVirtual(fd) => {
+                    out.insert(fd.name.name.name.clone());
                 }
-            }
-            PortList::Empty => {}
-        }
-    }
-    fn class_items(c: &crate::ast::decl::ClassDeclaration, out: &mut HashSet<String>) {
-        use crate::ast::decl::ClassItem as CI;
-        out.insert(c.name.name.clone());
-        for p in &c.params {
-            param(p, out);
-        }
-        for it in &c.items {
-            match it {
-                CI::Property(p) => {
-                    data_type_names(&p.data_type, out);
-                    for d in &p.declarators {
-                        out.insert(d.name.name.clone());
-                    }
+                crate::ast::decl::ClassMethodKind::Task(td) => {
+                    out.insert(td.name.name.name.clone());
                 }
-                CI::Method(m) => match &m.kind {
-                    crate::ast::decl::ClassMethodKind::Function(fd)
-                    | crate::ast::decl::ClassMethodKind::PureVirtual(fd) => {
-                        out.insert(fd.name.name.name.clone());
-                    }
-                    crate::ast::decl::ClassMethodKind::Task(td) => {
-                        out.insert(td.name.name.name.clone());
-                    }
-                    #[allow(unreachable_patterns)]
-                    _ => {}
-                },
-                CI::Typedef(t) => typedef(t, out),
-                CI::Parameter(p) => param(p, out),
-                CI::Class(inner) => class_items(inner, out),
-                CI::Covergroup(cg) => {
-                    out.insert(cg.name.name.clone());
-                }
-                // `c_addr.constraint_mode(0)` inside a method.
-                CI::Constraint(c) => {
-                    out.insert(c.name.name.clone());
-                }
+                #[allow(unreachable_patterns)]
                 _ => {}
+            },
+            CI::Typedef(t) => decl_typedef_names(t, out),
+            CI::Parameter(p) => decl_param_names(p, out),
+            CI::Class(inner) => decl_class_member_names(inner, out),
+            CI::Covergroup(cg) => {
+                out.insert(cg.name.name.clone());
             }
+            // `c_addr.constraint_mode(0)` inside a method.
+            CI::Constraint(c) => {
+                out.insert(c.name.name.clone());
+            }
+            _ => {}
+        }
+    }
+}
+/// Names declared anywhere in the design. Without `class_members`, a class
+/// contributes only its own name: its members are visible bare only inside
+/// its own hierarchy (see `validate_subroutine_bodies`).
+fn collect_design_declared_names(
+    definitions: &HashMap<String, Definition>,
+    class_members: bool,
+) -> HashSet<String> {
+    /// A class's own name, and with `members` everything it declares.
+    fn class_names(
+        c: &crate::ast::decl::ClassDeclaration,
+        out: &mut HashSet<String>,
+        members: bool,
+    ) {
+        if members {
+            decl_class_member_names(c, out);
+        } else {
+            out.insert(c.name.name.clone());
         }
     }
     fn dpi_name(di: &crate::ast::decl::DPIImport) -> String {
@@ -21602,31 +21621,31 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
             crate::ast::decl::DPIProto::Task(td) => td.name.name.name.clone(),
         }
     }
-    fn module_items(items: &[ModuleItem], out: &mut HashSet<String>) {
+    fn module_items(items: &[ModuleItem], out: &mut HashSet<String>, members: bool) {
         for it in items {
             match it {
                 ModuleItem::PortDeclaration(pd) => {
-                    data_type_names(&pd.data_type, out);
+                    decl_enum_member_names(&pd.data_type, out);
                     for d in &pd.declarators {
                         out.insert(d.name.name.clone());
                     }
                 }
                 ModuleItem::NetDeclaration(nd) => {
-                    data_type_names(&nd.data_type, out);
+                    decl_enum_member_names(&nd.data_type, out);
                     for d in &nd.declarators {
                         out.insert(d.name.name.clone());
                     }
                 }
                 ModuleItem::DataDeclaration(dd) => {
-                    data_type_names(&dd.data_type, out);
+                    decl_enum_member_names(&dd.data_type, out);
                     for d in &dd.declarators {
                         out.insert(d.name.name.clone());
                     }
                 }
                 ModuleItem::ParameterDeclaration(p) | ModuleItem::LocalparamDeclaration(p) => {
-                    param(p, out);
+                    decl_param_names(p, out);
                 }
-                ModuleItem::TypedefDeclaration(t) => typedef(t, out),
+                ModuleItem::TypedefDeclaration(t) => decl_typedef_names(t, out),
                 ModuleItem::GenvarDeclaration(g) => {
                     for n in &g.names {
                         out.insert(n.name.clone());
@@ -21641,7 +21660,7 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
                 ModuleItem::DPIImport(di) => {
                     out.insert(dpi_name(di));
                 }
-                ModuleItem::ClassDeclaration(c) => class_items(c, out),
+                ModuleItem::ClassDeclaration(c) => class_names(c, out, members),
                 ModuleItem::ClockingDeclaration(c) => {
                     out.insert(c.name.name.clone());
                 }
@@ -21665,32 +21684,32 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
                         out.insert(hi.name.name.clone());
                     }
                 }
-                ModuleItem::GenerateRegion(gr) => module_items(&gr.items, out),
+                ModuleItem::GenerateRegion(gr) => module_items(&gr.items, out, members),
                 // §27.6: a generate block's label is a scope name, legal as the
                 // root of a hierarchical reference (`blk.f(0)`, `g[i-1].t`).
                 ModuleItem::GenerateIf(gi) => {
                     out.extend(gi.branch_labels.iter().flatten().cloned());
                     for (_, items) in &gi.branches {
-                        module_items(items, out);
+                        module_items(items, out, members);
                     }
                 }
                 ModuleItem::GenerateFor(gf) => {
                     out.insert(gf.var.clone());
                     out.extend(gf.name.iter().cloned());
-                    module_items(&gf.items, out);
+                    module_items(&gf.items, out, members);
                 }
                 ModuleItem::GenerateCase(gc) => {
                     for arm in &gc.arms {
                         out.extend(arm.label.iter().cloned());
-                        module_items(&arm.items, out);
+                        module_items(&arm.items, out, members);
                     }
                 }
                 ModuleItem::NestedModule(m) => {
                     for p in &m.params {
-                        param(p, out);
+                        decl_param_names(p, out);
                     }
-                    ports(&m.ports, out);
-                    module_items(&m.items, out);
+                    decl_port_names(&m.ports, out);
+                    module_items(&m.items, out, members);
                 }
                 ModuleItem::ModportDeclaration(md) => {
                     for mi in &md.items {
@@ -21699,8 +21718,8 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
                 }
                 ModuleItem::CheckerDeclaration(cd) => {
                     out.insert(cd.name.name.clone());
-                    ports(&cd.ports, out);
-                    module_items(&cd.items, out);
+                    decl_port_names(&cd.ports, out);
+                    module_items(&cd.items, out, members);
                 }
                 ModuleItem::Bind(b) => {
                     for hi in &b.instantiation.instances {
@@ -21715,19 +21734,19 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
     for def in definitions.values() {
         out.insert(def.name().to_string());
         for p in def.params() {
-            param(p, &mut out);
+            decl_param_names(p, &mut out);
         }
-        ports(def.ports(), &mut out);
+        decl_port_names(def.ports(), &mut out);
         match def {
             Definition::Module(_) | Definition::Interface(_) | Definition::Program(_) => {
-                module_items(def.items(), &mut out);
+                module_items(def.items(), &mut out, class_members);
             }
             Definition::Package(p) => {
                 use crate::ast::decl::PackageItem as PI;
                 for it in &p.items {
                     match it {
-                        PI::Parameter(pd) => param(pd, &mut out),
-                        PI::Typedef(t) => typedef(t, &mut out),
+                        PI::Parameter(pd) => decl_param_names(pd, &mut out),
+                        PI::Typedef(t) => decl_typedef_names(t, &mut out),
                         PI::Function(fd) => {
                             out.insert(fd.name.name.name.clone());
                         }
@@ -21738,12 +21757,12 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
                             out.insert(dpi_name(di));
                         }
                         PI::Data(dd) => {
-                            data_type_names(&dd.data_type, &mut out);
+                            decl_enum_member_names(&dd.data_type, &mut out);
                             for d in &dd.declarators {
                                 out.insert(d.name.name.clone());
                             }
                         }
-                        PI::Class(c) => class_items(c, &mut out),
+                        PI::Class(c) => class_names(c, &mut out, class_members),
                         PI::Let(l) => {
                             out.insert(l.name.name.clone());
                         }
@@ -21760,8 +21779,8 @@ fn collect_design_declared_names(definitions: &HashMap<String, Definition>) -> H
                     }
                 }
             }
-            Definition::Class(c) => class_items(c, &mut out),
-            Definition::Typedef(t) => typedef(t, &mut out),
+            Definition::Class(c) => class_names(c, &mut out, class_members),
+            Definition::Typedef(t) => decl_typedef_names(t, &mut out),
             _ => {}
         }
     }
@@ -22381,12 +22400,14 @@ fn validate_inlined_bodies(
     elab: &ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
-    let mut known = collect_design_declared_names(definitions);
+    let mut known = collect_design_declared_names(definitions, true);
+    let mut outside_classes = collect_design_declared_names(definitions, false);
     // Leaf of every scoped elaboration key: `c.x`, `top.u.arr[3]` → `x`, `arr`.
+    let mut leaves: HashSet<String> = HashSet::default();
     let mut add_key = |k: &str| {
         let leaf = k.rsplit('.').next().unwrap_or(k);
         let base = leaf.split('[').next().unwrap_or(leaf);
-        known.insert(base.to_string());
+        leaves.insert(base.to_string());
     };
     for k in elab.signals.keys() {
         add_key(k);
@@ -22449,6 +22470,8 @@ fn validate_inlined_bodies(
             add_key(n);
         }
     }
+    known.extend(leaves.iter().cloned());
+    outside_classes.extend(leaves);
     let known = known;
 
     // One check per distinct source body: sibling instances share the Rc.
@@ -22540,7 +22563,7 @@ fn validate_inlined_bodies(
             .unwrap_or_default();
         return Err(format!("Undeclared identifier '{}'{}", name, loc));
     }
-    validate_subroutine_bodies(elab, definitions, &known)
+    validate_subroutine_bodies(elab, definitions, &known, &outside_classes)
 }
 
 /// One task/function body to check.
@@ -22590,10 +22613,20 @@ impl<'a> SubroutineBody<'a> {
 /// A method is skipped when its class derives (directly or not) from a class
 /// the design does not declare — `extends mailbox #(T)` or a type-parameter
 /// base — since the members it may name bare are then unknown.
+///
+/// §8/§23.9: a class member is visible bare only inside its own class
+/// hierarchy (and nested classes). A method body is therefore checked
+/// against `outside_classes` — every name declared anywhere except class
+/// members — plus the members of its own class, its ancestors, the
+/// interface classes it implements and its enclosing classes. With the
+/// plain "declared anywhere" bar, UVM 1.2 code naming the removed global
+/// `factory` compiled because an unrelated class has a `factory` member,
+/// and `factory.set_inst_override_by_name(...)` then did nothing.
 fn validate_subroutine_bodies(
     elab: &ElaboratedModule,
     definitions: &HashMap<String, Definition>,
     known: &HashSet<String>,
+    outside_classes: &HashSet<String>,
 ) -> Result<(), String> {
     use crate::ast::decl::{ClassItem, ClassMethodKind, PackageItem};
 
@@ -22638,11 +22671,18 @@ fn validate_subroutine_bodies(
             }
         }
     }
-    fn all_classes<'a>(c: &'a ClassDeclaration, out: &mut HashMap<&'a str, &'a ClassDeclaration>) {
+    fn all_classes<'a>(
+        c: &'a ClassDeclaration,
+        out: &mut HashMap<&'a str, &'a ClassDeclaration>,
+        outer: &mut HashMap<&'a str, &'a str>,
+        same_name: &mut HashMap<&'a str, Vec<&'a ClassDeclaration>>,
+    ) {
         out.insert(c.name.name.as_str(), c);
+        same_name.entry(c.name.name.as_str()).or_default().push(c);
         for it in &c.items {
             if let ClassItem::Class(inner) = it {
-                all_classes(inner, out);
+                outer.insert(inner.name.name.as_str(), c.name.name.as_str());
+                all_classes(inner, out, outer, same_name);
             }
         }
     }
@@ -22670,6 +22710,8 @@ fn validate_subroutine_bodies(
     let mut names: Vec<&String> = definitions.keys().collect();
     names.sort();
     let mut classes: HashMap<&str, &ClassDeclaration> = HashMap::default();
+    let mut outer: HashMap<&str, &str> = HashMap::default();
+    let mut same_name: HashMap<&str, Vec<&ClassDeclaration>> = HashMap::default();
     let mut bodies: Vec<SubroutineBody> = Vec::new();
     for name in names {
         let def = &definitions[name];
@@ -22681,7 +22723,7 @@ fn validate_subroutine_bodies(
                 for it in items {
                     match it {
                         ModuleItem::ClassDeclaration(c) => {
-                            all_classes(c, &mut classes);
+                            all_classes(c, &mut classes, &mut outer, &mut same_name);
                             if checked {
                                 class_bodies(name, c, &mut bodies);
                             }
@@ -22704,7 +22746,7 @@ fn validate_subroutine_bodies(
                             bodies.push(SubroutineBody::function(name, "", f))
                         }
                         PackageItem::Class(c) => {
-                            all_classes(c, &mut classes);
+                            all_classes(c, &mut classes, &mut outer, &mut same_name);
                             class_bodies(name, c, &mut bodies);
                         }
                         _ => {}
@@ -22712,7 +22754,7 @@ fn validate_subroutine_bodies(
                 }
             }
             Definition::Class(c) => {
-                all_classes(c, &mut classes);
+                all_classes(c, &mut classes, &mut outer, &mut same_name);
                 class_bodies(name, c, &mut bodies);
             }
             _ => {}
@@ -22731,11 +22773,43 @@ fn validate_subroutine_bodies(
         }
         false
     };
+    // Members a method of `class` may name bare (see the doc comment).
+    let class_scope = |class: &str| -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::default();
+        let mut todo: Vec<&str> = vec![class];
+        let mut seen: HashSet<&str> = HashSet::default();
+        while let Some(c) = todo.pop() {
+            if !seen.insert(c) {
+                continue;
+            }
+            // Same-named classes of different packages: take them all.
+            for cd in same_name.get(c).into_iter().flatten() {
+                decl_class_member_names(cd, &mut out);
+                if let Some(ext) = &cd.extends {
+                    todo.push(ext.name.name.as_str());
+                }
+                todo.extend(cd.implements.iter().map(|i| i.name.as_str()));
+            }
+            if let Some(o) = outer.get(c) {
+                todo.push(o);
+            }
+        }
+        out
+    };
+    let mut scopes: HashMap<&str, HashSet<String>> = HashMap::default();
     for body in &bodies {
         if !body.class.is_empty() && !bases_declared(body.class) {
             continue;
         }
-        if let Some((name, span)) = first_undeclared_in_subroutine(body, known) {
+        let found = if body.class.is_empty() {
+            first_undeclared_in_subroutine(body, known, None)
+        } else {
+            let scope = scopes
+                .entry(body.class)
+                .or_insert_with(|| class_scope(body.class));
+            first_undeclared_in_subroutine(body, outside_classes, Some(scope))
+        };
+        if let Some((name, span)) = found {
             return Err(span_error_of(
                 elab,
                 span,
@@ -22753,6 +22827,7 @@ fn validate_subroutine_bodies(
 fn first_undeclared_in_subroutine(
     body: &SubroutineBody,
     known: &HashSet<String>,
+    class_scope: Option<&HashSet<String>>,
 ) -> Option<(String, Span)> {
     let mut locals: HashSet<String> = HashSet::default();
     locals.insert(body.name.to_string());
@@ -22805,6 +22880,7 @@ fn first_undeclared_in_subroutine(
                     || name.contains('.')
                     || locals.contains(name)
                     || known.contains(name)
+                    || class_scope.is_some_and(|c| c.contains(name))
                     || is_builtin_bare_name(name)
                 {
                     return;
