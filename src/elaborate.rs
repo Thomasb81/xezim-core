@@ -33753,6 +33753,38 @@ fn rewrite_expr_impl(
                 .map(|p| rewrite_expr_impl(p, prefix, port_map, local_names, interface_map))
                 .collect(),
         ),
+        // §11.4.13: the tested operand and the set members are references
+        // like any other — `bus.addr inside {[LO:HI]}` over an interface
+        // port kept the port name and read x, so the test was always false.
+        ExprKind::Inside { expr: e, ranges } => ExprKind::Inside {
+            expr: Box::new(rewrite_expr_impl(
+                e,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+            ranges: ranges
+                .iter()
+                .map(|r| rewrite_expr_impl(r, prefix, port_map, local_names, interface_map))
+                .collect(),
+        },
+        ExprKind::Range(lo, hi) => ExprKind::Range(
+            Box::new(rewrite_expr_impl(
+                lo,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+            Box::new(rewrite_expr_impl(
+                hi,
+                prefix,
+                port_map,
+                local_names,
+                interface_map,
+            )),
+        ),
         ExprKind::Replication { count, exprs } => ExprKind::Replication {
             count: Box::new(rewrite_expr_impl(
                 count,
