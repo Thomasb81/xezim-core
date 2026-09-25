@@ -264,6 +264,20 @@ impl Parser {
                     last_net_type = port.net_type;
                 }
                 last_var_kw = port.var_kw;
+                // §23.2.2.4: only an input port takes a default value; an
+                // inout is a net.
+                if crate::strict_checks()
+                    && port.direction == Some(PortDirection::Inout)
+                    && let Some(d) = &port.default
+                {
+                    self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                        format!(
+                            "inout port '{}' cannot have a default value (IEEE 1800-2017 §23.2.2.4)",
+                            port.name.name
+                        ),
+                        d.span,
+                    ));
+                }
                 ports.push(port);
                 if self.eat(TokenKind::Comma).is_none() {
                     break;
