@@ -2011,6 +2011,175 @@ impl Value {
 
     // === Arithmetic ===
 
+    /// Two-state little-endian words of the value at `w` bits (x/z read as
+    /// 0), sign-extended from the value's own width when `sext`. The
+    /// multi-word arithmetic below works on these for results wider than
+    /// 128 bits, where the `u128` paths silently dropped every higher bit.
+    fn arith_words(&self, w: u32, sext: bool) -> Vec<u64> {
+        let n = WidePlanes::nwords(w);
+        let mut out = vec![0u64; n];
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => out[0] = *val_bits & !*xz_bits,
+            ValueStorage::Wide(bits) => {
+                for (i, o) in out.iter_mut().enumerate() {
+                    *o = bits.val.get(i).copied().unwrap_or(0)
+                        & !bits.xz.get(i).copied().unwrap_or(0);
+                }
+            }
+        }
+        let sw = self.width.min(w) as usize;
+        let neg = sext && sw > 0 && (out[(sw - 1) / 64] >> ((sw - 1) % 64)) & 1 == 1;
+        for (i, o) in out.iter_mut().enumerate() {
+            let lo = i * 64;
+            if lo + 64 <= sw {
+                continue;
+            }
+            let keep = if lo >= sw { 0 } else { (1u64 << (sw - lo)) - 1 };
+            *o &= keep;
+            if neg {
+                *o |= !keep;
+            }
+        }
+        out
+    }
+
+    fn words_add(a: &[u64], b: &[u64]) -> Vec<u64> {
+        let mut carry = 0u64;
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let (s1, c1) = x.overflowing_add(*y);
+                let (s2, c2) = s1.overflowing_add(carry);
+                carry = (c1 | c2) as u64;
+                s2
+            })
+            .collect()
+    }
+
+    fn words_sub(a: &[u64], b: &[u64]) -> Vec<u64> {
+        let mut borrow = 0u64;
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let (d1, b1) = x.overflowing_sub(*y);
+                let (d2, b2) = d1.overflowing_sub(borrow);
+                borrow = (b1 | b2) as u64;
+                d2
+            })
+            .collect()
+    }
+
+    /// Product modulo 2^(64·len).
+    fn words_mul(a: &[u64], b: &[u64]) -> Vec<u64> {
+        let n = a.len();
+        let mut out = vec![0u64; n];
+        for (i, &ai) in a.iter().enumerate() {
+            if ai == 0 {
+                continue;
+            }
+            let mut carry = 0u128;
+            for j in 0..n - i {
+                let t = (ai as u128) * (b[j] as u128) + out[i + j] as u128 + carry;
+                out[i + j] = t as u64;
+                carry = t >> 64;
+            }
+        }
+        out
+    }
+
+    fn words_neg(a: &[u64]) -> Vec<u64> {
+        Self::words_sub(&vec![0u64; a.len()], a)
+    }
+
+    fn words_is_zero(a: &[u64]) -> bool {
+        a.iter().all(|w| *w == 0)
+    }
+
+    /// Unsigned quotient and remainder (shift-subtract, one bit per step).
+    fn words_divmod(a: &[u64], b: &[u64]) -> (Vec<u64>, Vec<u64>) {
+        let n = a.len();
+        let mut q = vec![0u64; n];
+        let mut r = vec![0u64; n];
+        let top = a
+            .iter()
+            .rposition(|w| *w != 0)
+            .map(|i| i * 64 + 64 - a[i].leading_zeros() as usize)
+            .unwrap_or(0);
+        for bit in (0..top).rev() {
+            let mut c = (a[bit / 64] >> (bit % 64)) & 1;
+            for w in r.iter_mut() {
+                let nc = *w >> 63;
+                *w = (*w << 1) | c;
+                c = nc;
+            }
+            if Self::words_cmp(&r, b) != std::cmp::Ordering::Less {
+                r = Self::words_sub(&r, b);
+                q[bit / 64] |= 1u64 << (bit % 64);
+            }
+        }
+        (q, r)
+    }
+
+    fn words_cmp(a: &[u64], b: &[u64]) -> std::cmp::Ordering {
+        for (x, y) in a.iter().rev().zip(b.iter().rev()) {
+            if x != y {
+                return x.cmp(y);
+            }
+        }
+        std::cmp::Ordering::Equal
+    }
+
+    fn words_msb(a: &[u64], w: u32) -> bool {
+        w > 0 && (a[(w as usize - 1) / 64] >> ((w - 1) % 64)) & 1 == 1
+    }
+
+    /// `a / b` (or `a % b` when `rem`) at `w > 128` bits. Signed when both
+    /// operands are: magnitudes divide, the quotient takes the XOR of the
+    /// signs and the remainder the dividend's (§11.4.2).
+    fn wide_divmod(&self, other: &Value, w: u32, rem: bool) -> Value {
+        let signed = self.is_signed && other.is_signed;
+        let a = self.arith_words(w, signed);
+        let b = other.arith_words(w, signed);
+        if Self::words_is_zero(&b) {
+            return Value::new(w);
+        }
+        let an = signed && Self::words_msb(&a, w);
+        let bn = signed && Self::words_msb(&b, w);
+        let am = if an { Self::words_neg(&a) } else { a };
+        let bm = if bn { Self::words_neg(&b) } else { b };
+        let (q, r) = Self::words_divmod(&am, &bm);
+        let res = if rem {
+            if an { Self::words_neg(&r) } else { r }
+        } else if an != bn {
+            Self::words_neg(&q)
+        } else {
+            q
+        };
+        let mut v = Value::from_words(&res, w);
+        v.is_signed = signed;
+        v
+    }
+
+    /// Relational compare of x/z-free operands at their common width (the
+    /// wider side's); signed only when both are.
+    fn wide_cmp(&self, other: &Value) -> std::cmp::Ordering {
+        let w = self.width.max(other.width);
+        let signed = self.is_signed && other.is_signed;
+        let a = self.arith_words(w, signed);
+        let b = other.arith_words(w, signed);
+        if signed {
+            let (an, bn) = (Self::words_msb(&a, w), Self::words_msb(&b, w));
+            if an != bn {
+                return if an {
+                    std::cmp::Ordering::Less
+                } else {
+                    std::cmp::Ordering::Greater
+                };
+            }
+        }
+        Self::words_cmp(&a, &b)
+    }
+
     #[inline]
     pub fn negate(&self) -> Value {
         if self.is_real {
@@ -2020,6 +2189,11 @@ impl Value {
             return Value::new(self.width);
         }
         let w = self.width;
+        if w > 64 {
+            let mut r = Value::from_words(&Self::words_neg(&self.arith_words(w, false)), w);
+            r.is_signed = true;
+            return r;
+        }
         let v = self.to_u64().unwrap_or(0);
         let mut r = Value::from_u64(v.wrapping_neg(), w);
         r.is_signed = true;
@@ -2122,6 +2296,8 @@ impl Value {
     fn operand_bits_u128(&self, signed_expr: bool, w: u32) -> u128 {
         if signed_expr && self.width < w && self.width < 64 {
             self.to_i64().unwrap_or(0) as i128 as u128
+        } else if signed_expr && self.width < w {
+            Self::i128_at_width(self.to_u128(), self.width) as u128
         } else {
             self.to_u128()
         }
@@ -2147,10 +2323,14 @@ impl Value {
             let a = self.operand_bits_u64(result_signed, w);
             let b = other.operand_bits_u64(result_signed, w);
             Value::from_u64(a.wrapping_add(b), w)
-        } else {
+        } else if w <= 128 {
             let a = self.operand_bits_u128(result_signed, w);
             let b = other.operand_bits_u128(result_signed, w);
             Value::from_u128(a.wrapping_add(b), w)
+        } else {
+            let a = self.arith_words(w, result_signed);
+            let b = other.arith_words(w, result_signed);
+            Value::from_words(&Self::words_add(&a, &b), w)
         };
         v.is_signed = result_signed;
         v
@@ -2173,10 +2353,14 @@ impl Value {
             let a = self.operand_bits_u64(result_signed, w);
             let b = other.operand_bits_u64(result_signed, w);
             Value::from_u64(a.wrapping_sub(b), w)
-        } else {
+        } else if w <= 128 {
             let a = self.operand_bits_u128(result_signed, w);
             let b = other.operand_bits_u128(result_signed, w);
             Value::from_u128(a.wrapping_sub(b), w)
+        } else {
+            let a = self.arith_words(w, result_signed);
+            let b = other.arith_words(w, result_signed);
+            Value::from_words(&Self::words_sub(&a, &b), w)
         };
         v.is_signed = result_signed;
         v
@@ -2199,10 +2383,14 @@ impl Value {
             let a = self.operand_bits_u64(result_signed, w);
             let b = other.operand_bits_u64(result_signed, w);
             Value::from_u64(a.wrapping_mul(b), w)
-        } else {
+        } else if w <= 128 {
             let a = self.operand_bits_u128(result_signed, w);
             let b = other.operand_bits_u128(result_signed, w);
             Value::from_u128(a.wrapping_mul(b), w)
+        } else {
+            let a = self.arith_words(w, result_signed);
+            let b = other.arith_words(w, result_signed);
+            Value::from_words(&Self::words_mul(&a, &b), w)
         };
         v.is_signed = result_signed;
         v
@@ -2239,6 +2427,8 @@ impl Value {
             } else {
                 Value::from_u64(a / b, w)
             }
+        } else if w > 128 {
+            self.wide_divmod(other, w, false)
         } else {
             let a = self.to_u128();
             let b = other.to_u128();
@@ -2308,6 +2498,8 @@ impl Value {
                 let a = self.to_u64().unwrap_or(0);
                 Value::from_u64(a % b, w)
             }
+        } else if w > 128 {
+            self.wide_divmod(other, w, true)
         } else {
             let a = self.to_u128();
             let b = other.to_u128();
@@ -2365,8 +2557,27 @@ impl Value {
             // grows with the width (an even base saturates to 0 well before
             // it; an odd base cycles, and real designs don't raise to
             // astronomic exponents).
-            let base = self.to_u128();
             let exp = other.to_u64().unwrap_or(0);
+            if self.width > 128 {
+                // Square-and-multiply modulo 2^width.
+                let mut base = self.arith_words(self.width, false);
+                let mut acc = vec![0u64; base.len()];
+                acc[0] = 1;
+                let mut e = exp;
+                while e != 0 {
+                    if e & 1 == 1 {
+                        acc = Self::words_mul(&acc, &base);
+                    }
+                    e >>= 1;
+                    if e != 0 {
+                        base = Self::words_mul(&base, &base);
+                    }
+                }
+                let mut v = Value::from_words(&acc, self.width);
+                v.is_signed = result_signed;
+                return v;
+            }
+            let base = self.to_u128();
             let mut r: u128 = 1;
             for _ in 0..exp.min(4096) {
                 r = r.wrapping_mul(base);
@@ -2831,6 +3042,8 @@ impl Value {
                     0,
                     self.width.saturating_sub(amt) as usize,
                 );
+                // The result has the left operand's type, as the inline arm.
+                result.is_signed = self.is_signed;
                 result
             }
         }
@@ -2866,6 +3079,7 @@ impl Value {
                     amt as usize,
                     self.width.saturating_sub(amt) as usize,
                 );
+                result.is_signed = self.is_signed;
                 result
             }
         }
@@ -3410,6 +3624,9 @@ impl Value {
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() < other.to_f64()) as u64, 1);
         }
+        if self.width > 64 || other.width > 64 {
+            return Value::from_u64((self.wide_cmp(other) == std::cmp::Ordering::Less) as u64, 1);
+        }
         // Per IEEE 1364-2005 §5.5.1 (preserved through SystemVerilog): if
         // EITHER operand is unsigned, the relational comparison is unsigned.
         // Only when BOTH operands are signed do we use signed compare.
@@ -3434,6 +3651,12 @@ impl Value {
         }
         if self.is_real || other.is_real {
             return Value::from_u64((self.to_f64() <= other.to_f64()) as u64, 1);
+        }
+        if self.width > 64 || other.width > 64 {
+            return Value::from_u64(
+                (self.wide_cmp(other) != std::cmp::Ordering::Greater) as u64,
+                1,
+            );
         }
         if self.is_signed && other.is_signed {
             Value::from_u64(
@@ -6145,5 +6368,71 @@ mod packed_string_tests {
         let value = Value::from_string(text);
         assert_eq!(value.width, text.chars().count() as u32 * 8);
         assert_eq!(value.to_sv_string(), text.trim_start_matches('\0'));
+    }
+}
+
+#[cfg(test)]
+mod wide_arith_tests {
+    use super::*;
+
+    fn s(v: i64, w: u32) -> Value {
+        let mut x = Value::from_u64(v as u64, 64);
+        x.is_signed = true;
+        x.resize(w)
+    }
+
+    /// §11.4.2/§11.4.4: arithmetic and relational operators on operands
+    /// wider than 128 bits keep every bit (expectations cross-checked
+    /// against the reference simulator).
+    #[test]
+    fn arithmetic_past_128_bits() {
+        let w = 200;
+        let one = s(1, w);
+        let a = one.shift_left(&Value::from_u64(150, 32));
+        let b = s(3, w).shift_left(&Value::from_u64(140, 32));
+        assert_eq!(
+            a.add(&b).to_hex_string(),
+            "00000000000040300000000000000000000000000000000000"
+        );
+        assert_eq!(
+            b.sub(&a).to_dec_string(),
+            "-1423066302981235389219248022273373568600375296"
+        );
+        let m = one
+            .shift_left(&Value::from_u64(70, 32))
+            .mul(&s(3, w).shift_left(&Value::from_u64(70, 32)));
+        assert_eq!(
+            m.to_hex_string(),
+            "00000000000000300000000000000000000000000000000000"
+        );
+        let n = s(7, w).shift_left(&Value::from_u64(130, 32)).negate();
+        assert_eq!(
+            n.div(&s(3, w)).to_dec_string(),
+            "-3175968757928758992324829669363169973589"
+        );
+        assert_eq!(n.modulo(&s(3, w)).to_dec_string(), "-1");
+        assert_eq!(s(0, w).sub(&s(1, w)).to_dec_string(), "-1");
+        assert_eq!(
+            s(-1, 4096).mul(&s(3, 32).resize(4096)).to_dec_string(),
+            "-3"
+        );
+        assert_eq!(
+            s(2, w).power(&Value::from_u64(150, 32)).to_hex_string(),
+            a.to_hex_string()
+        );
+        assert_eq!(a.less_than(&b).to_u64(), Some(0));
+        assert_eq!(b.less_than(&a).to_u64(), Some(1));
+        assert_eq!(a.negate().less_than(&b).to_u64(), Some(1));
+        assert_eq!(a.less_equal(&a).to_u64(), Some(1));
+        let mut ua = Value::from_u64(1, w).shift_left(&Value::from_u64(199, 32));
+        ua = ua.add(&Value::from_u64(12345, w));
+        let ub = Value::from_u64(1000, w);
+        assert_eq!(
+            ua.div(&ub).to_dec_string(),
+            "803469022129495137770981046170581301261101496891396417663"
+        );
+        assert_eq!(ua.modulo(&ub).to_dec_string(), "33");
+        assert_eq!(ub.less_than(&ua).to_u64(), Some(1));
+        assert!(ua.div(&Value::zero(w)).has_xz());
     }
 }
