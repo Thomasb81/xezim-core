@@ -62,7 +62,10 @@ pub use sv_parser::{self, ParseResult, ast, diagnostics, lexer, parse, preproces
 pub use value::Value;
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x1d = \x1c + AssertionStatement.label and
+/// Version byte: \x1e = \x1d + `local::` kept as HierarchicalIdentifier.root
+/// and the parity round's parser/elaboration semantics changes (cached
+/// parses from \x1d or earlier carry the old results);
+/// \x1d = \x1c + AssertionStatement.label and
 /// ElaboratedModule.class_decl_pkg (§21.2.1.7 `%m` scopes);
 /// \x1c = \x1b + AssertionStatement.deferred (§16.4 deferred
 /// assertions);
@@ -96,7 +99,7 @@ pub use value::Value;
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1d";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1e";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
