@@ -29657,7 +29657,16 @@ fn inline_module_items(
                                             width,
                                             is_signed,
                                             direction: None,
-                                            value: init_val,
+                                            // §6.8: the declared signedness,
+                                            // not the initializer literal's
+                                            // (`logic q = 1;` read back -1).
+                                            value: {
+                                                let mut v = init_val;
+                                                if !v.is_real {
+                                                    v.is_signed = is_signed;
+                                                }
+                                                v
+                                            },
                                             is_real: is_type_real_resolved(
                                                 &dd.data_type,
                                                 &elab.typedef_types,
