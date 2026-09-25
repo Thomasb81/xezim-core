@@ -23497,7 +23497,8 @@ pub fn inline_instantiations(
     // resolve imported package parameters like black-parrot's `all_cfgs_gp`.
     set_param_fallback(&top_params);
     let mut cache = HashMap::default();
-    let root_defparams = absolute_defparams(&module_name, definitions, &top_params);
+    let mut root_defparams = absolute_defparams(&module_name, definitions, &top_params);
+    root_defparams.extend(upward_defparams(&module_name, definitions));
     inline_module_items(
         elab,
         top_def,
@@ -26164,6 +26165,185 @@ fn absolute_defparams(
                 }
                 let path = if wrapper { path } else { path[1..].to_vec() };
                 out.push((path, eval_const_expr_val(rhs, params)));
+            }
+        }
+    }
+    out
+}
+
+/// §23.10.1/§23.8: a `defparam` path that starts neither at a child of the
+/// declaring scope nor at a top is resolved UPWARD, like any hierarchical
+/// name: its first segment names a child of an enclosing instance (the
+/// parent, the grandparent, …) or the definition name of an enclosing
+/// instance (`defparam mid.l.P` inside `mid`'s sub-instance). Such paths
+/// matched nothing top-down and were dropped. Each is resolved per
+/// declaring instance (walking the instance tree from `root`) into a path
+/// from the root, and returned as root-scope pending defparams in the same
+/// form as `absolute_defparams`. Instances inside generate blocks and
+/// instance arrays are not walked; only constant values are taken.
+fn upward_defparams(
+    root: &str,
+    definitions: &HashMap<String, Definition>,
+) -> Vec<(Vec<String>, Value)> {
+    /// Plain (non-generate, non-array) child instances: (name, definition).
+    fn children(items: &[ModuleItem]) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        for it in items {
+            match it {
+                ModuleItem::ModuleInstantiation(mi) => {
+                    for hi in &mi.instances {
+                        if hi.dimensions.is_empty() {
+                            out.push((hi.name.name.clone(), mi.module_name.name.clone()));
+                        }
+                    }
+                }
+                ModuleItem::GenerateRegion(r) => out.extend(children(&r.items)),
+                _ => {}
+            }
+        }
+        out
+    }
+    /// Every name a path can start with inside a scope: its instances in
+    /// any generate branch, and its generate block labels.
+    fn scope_names(items: &[ModuleItem], out: &mut HashSet<String>) {
+        for it in items {
+            match it {
+                ModuleItem::ModuleInstantiation(mi) => {
+                    out.extend(mi.instances.iter().map(|hi| hi.name.name.clone()));
+                }
+                ModuleItem::GenerateRegion(r) => scope_names(&r.items, out),
+                ModuleItem::GenerateIf(g) => {
+                    out.extend(g.branch_labels.iter().flatten().cloned());
+                    for (_, b) in &g.branches {
+                        scope_names(b, out);
+                    }
+                }
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &g.arms {
+                        out.extend(arm.label.iter().cloned());
+                        scope_names(&arm.items, out);
+                    }
+                }
+                ModuleItem::GenerateFor(g) => {
+                    out.extend(g.name.iter().cloned());
+                    scope_names(&g.items, out);
+                }
+                _ => {}
+            }
+        }
+    }
+    let names_of = |d: &Definition| {
+        let mut n = HashSet::default();
+        scope_names(d.items(), &mut n);
+        n
+    };
+    let Some(root_def) = definitions.get(root) else {
+        return Vec::new();
+    };
+    let tops: HashSet<String> = if root == crate::MULTI_TOP_WRAPPER {
+        names_of(root_def)
+    } else {
+        std::iter::once(root.to_string()).collect()
+    };
+    let upward_head = |p: &[String], own: &HashSet<String>| {
+        p.len() >= 2 && !own.contains(&p[0]) && !tops.contains(&p[0])
+    };
+    // Definitions declaring a candidate.
+    let mut candidates: HashSet<&str> = HashSet::default();
+    for (name, def) in definitions {
+        let mut own: Option<HashSet<String>> = None;
+        let has = def.items().iter().any(|it| {
+            let ModuleItem::Defparam(assigns) = it else {
+                return false;
+            };
+            let own = own.get_or_insert_with(|| names_of(def));
+            assigns
+                .iter()
+                .any(|(lhs, _)| defparam_path_segments(lhs).is_some_and(|p| upward_head(&p, own)))
+        });
+        if has {
+            candidates.insert(name.as_str());
+        }
+    }
+    if candidates.is_empty() {
+        return Vec::new();
+    }
+    // Definitions whose subtree reaches a candidate: the only ones walked.
+    fn reaches(
+        name: &str,
+        definitions: &HashMap<String, Definition>,
+        candidates: &HashSet<&str>,
+        memo: &mut HashMap<String, bool>,
+    ) -> bool {
+        if let Some(&r) = memo.get(name) {
+            return r;
+        }
+        memo.insert(name.to_string(), false);
+        let r = candidates.contains(name)
+            || definitions.get(name).is_some_and(|d| {
+                children(d.items())
+                    .iter()
+                    .any(|(_, dn)| reaches(dn, definitions, candidates, memo))
+            });
+        memo.insert(name.to_string(), r);
+        r
+    }
+    let mut memo: HashMap<String, bool> = HashMap::default();
+    let no_params = HashMap::default();
+    let mut out = Vec::new();
+    // (instance path below the root, definitions from the root down).
+    let mut stack: Vec<(Vec<String>, Vec<String>)> = vec![(Vec::new(), vec![root.to_string()])];
+    while let Some((path, chain)) = stack.pop() {
+        let Some(def) = definitions.get(chain.last().unwrap()) else {
+            continue;
+        };
+        let depth = chain.len() - 1;
+        if depth > 0 && candidates.contains(chain[depth].as_str()) {
+            let own = names_of(def);
+            for it in def.items() {
+                let ModuleItem::Defparam(assigns) = it else {
+                    continue;
+                };
+                for (lhs, rhs) in assigns {
+                    let Some(p) = defparam_path_segments(lhs) else {
+                        continue;
+                    };
+                    if !upward_head(&p, &own) || !is_const_expr(rhs, &no_params) {
+                        continue;
+                    }
+                    // Nearest enclosing scope first: a name declared in that
+                    // scope, else that scope's own definition name.
+                    let mut target: Option<Vec<String>> = None;
+                    for j in (0..depth).rev() {
+                        if definitions
+                            .get(&chain[j])
+                            .is_some_and(|d| names_of(d).contains(&p[0]))
+                        {
+                            let mut t = path[..j].to_vec();
+                            t.extend(p.iter().cloned());
+                            target = Some(t);
+                            break;
+                        }
+                        if chain[j] == p[0] {
+                            let mut t = path[..j].to_vec();
+                            t.extend(p[1..].iter().cloned());
+                            target = Some(t);
+                            break;
+                        }
+                    }
+                    if let Some(t) = target.filter(|t| t.len() >= 2) {
+                        out.push((t, eval_const_expr_val(rhs, &no_params)));
+                    }
+                }
+            }
+        }
+        for (inst, dn) in children(def.items()) {
+            if reaches(&dn, definitions, &candidates, &mut memo) {
+                let mut np = path.clone();
+                np.push(inst);
+                let mut nc = chain.clone();
+                nc.push(dn);
+                stack.push((np, nc));
             }
         }
     }
