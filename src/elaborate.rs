@@ -25726,6 +25726,13 @@ fn prepare_module_items(
                 // first one's, and the second sampled x-data too early.
                 for hi in &inst.instances {
                     local_names.insert(hi.name.name.clone());
+                    // An expanded instance-array element (`INT[0]`) is
+                    // referenced as `INT[0].irq`: the ident's head segment is
+                    // the ARRAY name with a select, so that name must prefix
+                    // too, or the reference stays unscoped and reads x.
+                    if let Some((base, _)) = hi.name.name.split_once('[') {
+                        local_names.insert(base.to_string());
+                    }
                 }
                 // §6.10: a bare undeclared identifier used as an instance PORT
                 // CONNECTION is an implicit net local to THIS module. It must be
