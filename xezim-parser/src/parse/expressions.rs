@@ -1783,6 +1783,30 @@ impl Parser {
                         self.span_from(start),
                     ),
                     TokenKind::KwVoid => {
+                        // §13.4.1: `void'` discards a function call's result;
+                        // an operator or literal operand is no call at all.
+                        let mut e = &inner;
+                        while let ExprKind::Paren(p) = &e.kind {
+                            e = p;
+                        }
+                        if crate::strict_checks()
+                            && matches!(
+                                e.kind,
+                                ExprKind::Number(_)
+                                    | ExprKind::StringLiteral(_)
+                                    | ExprKind::Unary { .. }
+                                    | ExprKind::Binary { .. }
+                                    | ExprKind::Conditional { .. }
+                                    | ExprKind::Concatenation(_)
+                                    | ExprKind::Replication { .. }
+                            )
+                        {
+                            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                                "the operand of a void cast must be a function call \
+                                 (IEEE 1800-2017 §13.4.1)",
+                                inner.span,
+                            ));
+                        }
                         Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
                     }
                     // §6.24.1: every other type cast CONVERTS — `int'(2.7)` is 3
