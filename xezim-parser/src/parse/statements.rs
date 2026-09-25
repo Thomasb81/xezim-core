@@ -1507,6 +1507,19 @@ impl Parser {
                     matches!(self.current_kind(), TokenKind::KwVar | TokenKind::KwConst);
                 if var_prefix {
                     self.bump();
+                    // §12.7.1: a for-loop variable declaration names a data
+                    // type; `var` with only a range or signing has none.
+                    if crate::strict_checks()
+                        && matches!(
+                            self.current_kind(),
+                            TokenKind::LBracket | TokenKind::KwSigned | TokenKind::KwUnsigned
+                        )
+                    {
+                        self.error(
+                            "a for-loop variable declaration needs a data type \
+                             (IEEE 1800-2017 §12.7.1)",
+                        );
+                    }
                 }
                 if var_prefix
                     || self.is_data_type_keyword()
