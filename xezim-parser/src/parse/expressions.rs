@@ -1684,26 +1684,35 @@ impl Parser {
                 // Check for function call
                 if self.at(TokenKind::LParen) {
                     let args = self.parse_call_args();
-                    if self.eat(TokenKind::KwWith).is_some() {
-                        if self.eat(TokenKind::LBrace).is_some() {
-                            let mut depth = 1;
-                            while depth > 0 && !self.at(TokenKind::Eof) {
-                                if self.at(TokenKind::LBrace) {
-                                    depth += 1;
-                                } else if self.at(TokenKind::RBrace) {
-                                    depth -= 1;
-                                }
-                                self.bump();
-                            }
-                        }
-                    }
-                    Expression::new(
+                    let call = Expression::new(
                         ExprKind::Call {
                             func: Box::new(expr),
                             args,
                         },
                         self.span_from(start),
-                    )
+                    );
+                    // §18.7: a receiver-less `randomize(…) with { … }` (inside
+                    // a class method) carries its inline constraint block
+                    // like `obj.randomize() with` does; skipping the block
+                    // left the call unconstrained.
+                    if self.at(TokenKind::KwWith) && self.peek_kind() == TokenKind::LBrace {
+                        self.bump(); // with
+                        self.bump(); // {
+                        let mut constraints = Vec::new();
+                        while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                            constraints.push(self.parse_constraint_item());
+                        }
+                        self.expect(TokenKind::RBrace);
+                        Expression::new(
+                            ExprKind::RandomizeWith {
+                                call: Box::new(call),
+                                constraints,
+                            },
+                            self.span_from(start),
+                        )
+                    } else {
+                        call
+                    }
                 } else {
                     expr
                 }
