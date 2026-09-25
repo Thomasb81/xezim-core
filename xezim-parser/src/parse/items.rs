@@ -2145,7 +2145,7 @@ impl Parser {
                     }
                 }
             } else {
-                delay = Some(self.parse_expression());
+                delay = Some(self.parse_delay_value());
             }
         }
         let mut instances = Vec::new();

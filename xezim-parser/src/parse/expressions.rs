@@ -2512,6 +2512,40 @@ impl Parser {
             cached_resolved_name: std::cell::OnceCell::new(),
         }
     }
+    /// §A.2.2.3 `delay_value` after a bare `#`: a number, a time literal or an
+    /// identifier — one primary. Parsed as a full expression, the terminal
+    /// list of `and #6 (q, a, b);` or `buf #d (o, i);` became the arguments
+    /// of a call.
+    pub(super) fn parse_delay_value(&mut self) -> Expression {
+        let start = self.current().span.start;
+        match self.current_kind() {
+            TokenKind::IntegerLiteral | TokenKind::RealLiteral | TokenKind::TimeLiteral => {
+                let tok = self.bump();
+                Expression::new(
+                    ExprKind::Number(parse_number_literal(&tok.text)),
+                    self.span_from(start),
+                )
+            }
+            TokenKind::Identifier
+                if !matches!(self.peek_kind(), TokenKind::DoubleColon | TokenKind::Dot) =>
+            {
+                let id = self.parse_identifier();
+                let hier = HierarchicalIdentifier {
+                    root: None,
+                    path: vec![HierPathSegment {
+                        name: id,
+                        selects: Vec::new(),
+                    }],
+                    span: self.span_from(start),
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                Expression::new(ExprKind::Ident(hier), self.span_from(start))
+            }
+            _ => self.parse_expr_bp(3),
+        }
+    }
+
     /// Handles indices [expr] as well.
     pub(super) fn parse_hierarchical_identifier_expr(&mut self) -> Expression {
         let start = self.current().span.start;
