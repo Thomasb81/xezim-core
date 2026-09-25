@@ -14,8 +14,9 @@
 use crate::ast::Description;
 use crate::ast::decl::{
     ClassItem, ClassMethodKind, FunctionDeclaration, FunctionPort, ModuleItem, PackageItem,
-    ParamConnection, ParameterDeclaration, ParameterKind, TaskDeclaration,
+    ParamConnection, ParamValue, ParameterDeclaration, ParameterKind, TaskDeclaration,
 };
+use crate::ast::expr::{ExprKind, Expression};
 use crate::ast::stmt::{Statement, StatementKind};
 use crate::diagnostics::Diagnostic;
 use std::collections::{HashMap, HashSet};
@@ -47,10 +48,10 @@ pub fn strict_diagnostics(descriptions: &[Description]) -> Vec<Diagnostic> {
             _ => {}
         }
     }
-    // §6.20.2 / §23.10: a named parameter override must name an *overridable*
-    // parameter (not a localparam, and it must exist). Built from the modules
-    // declared in THIS file; instantiations of modules defined elsewhere are
-    // skipped (can't resolve, so no false positive).
+    // §6.20.2 / §23.10: a named parameter override or a defparam must name an
+    // *overridable* parameter (not a localparam, and it must exist). Built
+    // from the modules declared in THIS file; instantiations of modules
+    // defined elsewhere are skipped (can't resolve, so no false positive).
     let overridable = build_module_overridable_params(descriptions);
     for d in descriptions {
         if let Description::Module(m) = d {
@@ -60,28 +61,63 @@ pub fn strict_diagnostics(descriptions: &[Description]) -> Vec<Diagnostic> {
     out
 }
 
-/// name -> set of overridable parameter names for every module in this file.
-/// "Overridable" excludes localparams (header `localparam` / body
-/// `localparam`); both header `#(...)` and body `parameter` decls are included.
-fn build_module_overridable_params(
-    descriptions: &[Description],
-) -> HashMap<String, HashSet<String>> {
+/// The parameters of one module, as an instantiation sees them.
+#[derive(Default)]
+struct ModuleParams {
+    /// Overridable parameter names (not localparams).
+    overridable: HashSet<String>,
+    /// `parameter type` names.
+    types: HashSet<String>,
+    /// Header parameters in order (a positional override binds by position),
+    /// with whether each has a default value.
+    header: Vec<(String, bool)>,
+}
+
+/// name -> parameters for every module in this file. "Overridable" excludes
+/// localparams (header `localparam` / body `localparam`) and, when the module
+/// has a parameter port list, body `parameter`s too: §6.20.1 makes those
+/// local parameters.
+fn build_module_overridable_params(descriptions: &[Description]) -> HashMap<String, ModuleParams> {
     let mut map = HashMap::new();
     for d in descriptions {
         if let Description::Module(m) = d {
-            let mut params = HashSet::new();
+            let mut params = ModuleParams::default();
             for pd in &m.params {
-                add_overridable_param_names(pd, &mut params);
+                add_overridable_param_names(pd, &mut params.overridable);
+                add_type_param_names(pd, &mut params.types);
+                if !pd.local {
+                    if let ParameterKind::Data { assignments, .. } = &pd.kind {
+                        for a in assignments {
+                            params.header.push((a.name.name.clone(), a.init.is_some()));
+                        }
+                    }
+                    if let ParameterKind::Type { assignments } = &pd.kind {
+                        for a in assignments {
+                            params.header.push((a.name.name.clone(), a.init.is_some()));
+                        }
+                    }
+                }
             }
             for it in &m.items {
                 if let ModuleItem::ParameterDeclaration(pd) = it {
-                    add_overridable_param_names(pd, &mut params);
+                    if m.params.is_empty() {
+                        add_overridable_param_names(pd, &mut params.overridable);
+                    }
+                    add_type_param_names(pd, &mut params.types);
                 }
             }
             map.insert(m.name.name.clone(), params);
         }
     }
     map
+}
+
+fn add_type_param_names(pd: &ParameterDeclaration, out: &mut HashSet<String>) {
+    if let ParameterKind::Type { assignments } = &pd.kind {
+        for a in assignments {
+            out.insert(a.name.name.clone());
+        }
+    }
 }
 
 fn add_overridable_param_names(pd: &ParameterDeclaration, out: &mut HashSet<String>) {
@@ -104,27 +140,108 @@ fn add_overridable_param_names(pd: &ParameterDeclaration, out: &mut HashSet<Stri
 
 fn check_param_overrides(
     items: &[ModuleItem],
-    overridable: &HashMap<String, HashSet<String>>,
+    overridable: &HashMap<String, ModuleParams>,
     out: &mut Vec<Diagnostic>,
 ) {
+    // `defparam inst.P = v;` targets, by instance name.
+    let mut defparams: HashMap<&str, Vec<(&str, &Expression)>> = HashMap::new();
+    for it in items {
+        if let ModuleItem::Defparam(list) = it {
+            for (target, _) in list {
+                if let ExprKind::MemberAccess { expr, member } = &target.kind
+                    && let ExprKind::Ident(h) = &expr.kind
+                    && h.root.is_none()
+                    && h.path.len() == 1
+                    && h.path[0].selects.is_empty()
+                {
+                    defparams
+                        .entry(h.path[0].name.name.as_str())
+                        .or_default()
+                        .push((member.name.as_str(), target));
+                }
+            }
+        }
+    }
     for it in items {
         if let ModuleItem::ModuleInstantiation(inst) = it {
             // Only check when the target module is defined in this file.
             let Some(params) = overridable.get(&inst.module_name.name) else {
                 continue;
             };
+            let mut given: HashSet<&str> = HashSet::new();
             if let Some(conns) = &inst.params {
+                let mut pos = 0usize;
                 for c in conns {
-                    if let ParamConnection::Named { name, .. } = c {
-                        if !params.contains(&name.name) {
-                            out.push(Diagnostic::error(
-                                format!(
-                                    "cannot override '{}' of module '{}' — not an overridable parameter",
-                                    name.name, inst.module_name.name
-                                ),
-                                name.span,
-                            ));
+                    match c {
+                        ParamConnection::Named { name, value } => {
+                            given.insert(name.name.as_str());
+                            if !params.overridable.contains(&name.name) {
+                                out.push(Diagnostic::error(
+                                    format!(
+                                        "cannot override '{}' of module '{}' — not an overridable parameter",
+                                        name.name, inst.module_name.name
+                                    ),
+                                    name.span,
+                                ));
+                            } else if params.types.contains(&name.name)
+                                && matches!(value, Some(ParamValue::Expr(e))
+                                    if matches!(e.kind, ExprKind::Number(_)))
+                            {
+                                out.push(Diagnostic::error(
+                                    format!(
+                                        "type parameter '{}' of module '{}' takes a data type, \
+                                         not a value (IEEE 1800-2017 §6.20.3)",
+                                        name.name, inst.module_name.name
+                                    ),
+                                    name.span,
+                                ));
+                            }
                         }
+                        ParamConnection::Ordered(_) => {
+                            if let Some((n, _)) = params.header.get(pos) {
+                                given.insert(n.as_str());
+                            }
+                            pos += 1;
+                        }
+                    }
+                }
+            }
+            for hi in &inst.instances {
+                let dps = defparams.get(hi.name.name.as_str());
+                for (p, target) in dps.into_iter().flatten() {
+                    if !params.overridable.contains(*p) {
+                        out.push(Diagnostic::error(
+                            format!(
+                                "defparam cannot override '{}' of module '{}' — not an \
+                                 overridable parameter (IEEE 1800-2017 §23.10.1)",
+                                p, inst.module_name.name
+                            ),
+                            target.span,
+                        ));
+                    } else if params.types.contains(*p) {
+                        out.push(Diagnostic::error(
+                            format!(
+                                "defparam cannot override type parameter '{}' of module '{}' \
+                                 (IEEE 1800-2017 §23.10.1)",
+                                p, inst.module_name.name
+                            ),
+                            target.span,
+                        ));
+                    }
+                }
+                // §6.20.1: a parameter declared without a default must get a
+                // value from every instantiation.
+                for (n, has_default) in &params.header {
+                    let by_defparam = dps.is_some_and(|d| d.iter().any(|(p, _)| p == n));
+                    if !has_default && !given.contains(n.as_str()) && !by_defparam {
+                        out.push(Diagnostic::error(
+                            format!(
+                                "parameter '{}' of module '{}' has no default value, and \
+                                 instance '{}' does not override it (IEEE 1800-2017 §6.20.1)",
+                                n, inst.module_name.name, hi.name.name
+                            ),
+                            hi.span,
+                        ));
                     }
                 }
             }
