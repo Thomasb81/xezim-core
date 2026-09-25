@@ -9487,21 +9487,7 @@ pub fn elaborate_module_with_defs(
     // declared members. Casts bypass the check.
     validate_enum_assignments(&elab)?;
 
-    // LRM §6.20.3 / §8.4: any module-scope signal whose declared
-    // `type_name` resolves to a known class default-initialises to 0
-    // (the null handle) rather than X. Without this, untouched class
-    // handle declarations read as X, defeating `if (h == null)` and
-    // similar guards.
-    {
-        let cls_names: std::collections::HashSet<String> = elab.classes.keys().cloned().collect();
-        for sig in elab.signals.values_mut() {
-            if let Some(tn) = &sig.type_name {
-                if cls_names.contains(tn) {
-                    sig.value = Value::zero(sig.width);
-                }
-            }
-        }
-    }
+    null_init_class_handles(&mut elab);
 
     // LRM §20.7 — populate ARRAYS_TLS so any subsequent const-eval
     // (parameter-default rewrite, runtime const eval, etc.) of
@@ -9528,6 +9514,22 @@ pub fn elaborate_module_with_defs(
     }
 
     Ok(elab)
+}
+
+/// LRM §6.20.3 / §8.4: any signal whose declared `type_name` resolves to a
+/// known class default-initialises to 0 (the null handle) rather than X.
+/// Without this, untouched class handle declarations read as X, defeating
+/// `if (h == null)` and similar guards. Runs for the root module and again
+/// after inlining, which is where instance-scoped handles appear.
+pub fn null_init_class_handles(elab: &mut ElaboratedModule) {
+    let cls_names: std::collections::HashSet<String> = elab.classes.keys().cloned().collect();
+    for sig in elab.signals.values_mut() {
+        if let Some(tn) = &sig.type_name {
+            if cls_names.contains(tn) {
+                sig.value = Value::zero(sig.width);
+            }
+        }
+    }
 }
 
 /// Link out-of-class method bodies (`function ClassName::m(); ... endfunction`)

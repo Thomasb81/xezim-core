@@ -2746,6 +2746,9 @@ fn parse_and_elaborate(
             }
         }
     }
+    // Instance-scoped class handles (an interface's `proxy` handle) are only
+    // known after inlining; the root pass above never saw them.
+    elaborate::null_init_class_handles(&mut elab);
     if std::env::var("XEZIM_ELAB_STATS").is_ok() {
         eprintln!(
             "[elab-stats] always_blocks={} initial_blocks={} cont_assigns={} pending_always={} pending_initial={} pending_cont_assign={} signals={} parameters={} arrays={} arrays_2d={} arrays_nd={} packed_struct_fields={}",
