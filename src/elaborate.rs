@@ -22842,14 +22842,28 @@ fn first_undeclared_in_subroutine(
     for s in body.items {
         for_each_stmt_expr(s, &mut |e| {
             for_each_sub_expr(e, &mut |x| {
-                if let ExprKind::WithClause { expr, .. } = &x.kind {
-                    if let ExprKind::Call { args, .. } = &expr.kind {
-                        for a in args {
-                            if let ExprKind::Ident(h) = &a.kind {
-                                if h.path.len() == 1 {
-                                    locals.insert(h.path[0].name.name.clone());
-                                }
-                            }
+                let args = match &x.kind {
+                    ExprKind::WithClause { expr, .. } => match &expr.kind {
+                        ExprKind::Call { args, .. } => args,
+                        _ => return,
+                    },
+                    // §18.11: `obj.randomize(v, w)` names members of `obj`.
+                    ExprKind::Call { func, args } => match &func.kind {
+                        ExprKind::MemberAccess { member, .. } if member.name == "randomize" => args,
+                        ExprKind::Ident(h)
+                            if h.path.len() > 1
+                                && h.path.last().is_some_and(|s| s.name.name == "randomize") =>
+                        {
+                            args
+                        }
+                        _ => return,
+                    },
+                    _ => return,
+                };
+                for a in args {
+                    if let ExprKind::Ident(h) = &a.kind {
+                        if h.path.len() == 1 {
+                            locals.insert(h.path[0].name.name.clone());
                         }
                     }
                 }
