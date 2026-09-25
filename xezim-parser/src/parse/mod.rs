@@ -555,6 +555,16 @@ impl Parser {
                     if slice.iter().all(|t| t.kind == TokenKind::Semicolon) || slice.is_empty() {
                         continue;
                     }
+                    if crate::strict_checks()
+                        && !ports.is_empty()
+                        && let Some(msg) = Self::udp_row_shape_error(slice, n_inputs)
+                    {
+                        let span = Span::new(slice[0].span.start, slice[slice.len() - 1].span.end);
+                        self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                            format!("in primitive '{}': {}", name.name, msg),
+                            span,
+                        ));
+                    }
                     match Self::parse_udp_row(slice, n_inputs) {
                         Some(r) => rows.push(r),
                         None => {
@@ -639,6 +649,50 @@ impl Parser {
             self.bump();
         }
         self.eat(TokenKind::Semicolon);
+    }
+
+    /// §29.3.6: a combinational table entry is `inputs : output`, a sequential
+    /// one `inputs : state : output`, with one symbol per input and a single
+    /// state and output symbol. Symbols are counted per character (the lexer
+    /// may join adjacent ones into one token) and a parenthesized edge counts
+    /// once.
+    fn udp_row_shape_error(slice: &[Token], n_inputs: usize) -> Option<String> {
+        let mut fields: Vec<usize> = vec![0];
+        let mut in_edge = false;
+        for t in slice {
+            match t.kind {
+                TokenKind::Colon if !in_edge => fields.push(0),
+                TokenKind::LParen => {
+                    in_edge = true;
+                    *fields.last_mut().unwrap() += 1;
+                }
+                TokenKind::RParen => in_edge = false,
+                _ if !in_edge => *fields.last_mut().unwrap() += t.text.chars().count(),
+                _ => {}
+            }
+        }
+        if !(2..=3).contains(&fields.len()) {
+            return Some(format!(
+                "a UDP table entry has two or three ':'-separated fields, found {} \
+                 (IEEE 1800-2017 §29.3.6)",
+                fields.len()
+            ));
+        }
+        if fields[0] != n_inputs {
+            return Some(format!(
+                "UDP table entry has {} input symbol(s) but the primitive has {n_inputs} \
+                 input(s) (IEEE 1800-2017 §29.3.6)",
+                fields[0]
+            ));
+        }
+        if fields[1..].iter().any(|&n| n != 1) {
+            return Some(
+                "the current-state and output fields of a UDP table entry take a single \
+                 symbol (IEEE 1800-2017 §29.3.6)"
+                    .to_string(),
+            );
+        }
+        None
     }
 
     /// 1-based source line of the current token (best-effort).
