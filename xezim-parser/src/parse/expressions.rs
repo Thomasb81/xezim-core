@@ -1545,6 +1545,12 @@ impl Parser {
 
             // this
             TokenKind::KwThis => {
+                // §8.15: `this.super.x` names the member `super.x` names.
+                if self.peek_kind() == TokenKind::Dot && self.peek_kind_n(2) == TokenKind::KwSuper {
+                    self.bump();
+                    self.bump();
+                    return self.parse_prefix();
+                }
                 self.bump();
                 Expression::new(ExprKind::This, self.span_from(start))
             }
@@ -2427,6 +2433,14 @@ impl Parser {
 
     pub(super) fn parse_hierarchical_identifier(&mut self) -> HierarchicalIdentifier {
         let start = self.current().span.start;
+        // §8.15: `this.super.x` is `super.x`.
+        if self.at(TokenKind::KwThis)
+            && self.peek_kind() == TokenKind::Dot
+            && self.peek_kind_n(2) == TokenKind::KwSuper
+        {
+            self.bump();
+            self.bump();
+        }
         // IEEE 1800-2023 §23.6: `$root`, `$unit`, `local::`-style roots can
         // start a hierarchical reference. `$root.foo.bar` shows up frequently
         // in cv32e40p macros expanding to absolute paths.
