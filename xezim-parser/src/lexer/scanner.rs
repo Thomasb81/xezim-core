@@ -6,11 +6,18 @@ use crate::ast::Span;
 pub struct Lexer<'a> {
     input: &'a [u8],
     pos: usize,
-    /// IEEE 1800-2023 §22.14: stack of active `begin_keywords` regions; each
-    /// entry is `true` for a `1364-*` (legacy Verilog) keyword set. The
-    /// innermost region wins — while its top is `true`, SystemVerilog-only
-    /// keywords (`logic`, `bit`, …) lex as ordinary identifiers.
-    kw_stack: Vec<bool>,
+    /// IEEE 1800-2023 §22.14: stack of active `begin_keywords` regions. The
+    /// innermost region wins — in a `1364-*` (legacy Verilog) set,
+    /// SystemVerilog-only keywords (`logic`, `bit`, …) lex as ordinary
+    /// identifiers, and in a set without configurations so do `instance`,
+    /// `cell`, ….
+    kw_stack: Vec<KwRegion>,
+}
+
+#[derive(Clone, Copy, Default)]
+struct KwRegion {
+    verilog: bool,
+    no_config: bool,
 }
 
 impl<'a> Lexer<'a> {
@@ -655,11 +662,16 @@ impl<'a> Lexer<'a> {
                 if self.pos < self.input.len() {
                     self.pos += 1;
                 } // closing quote
-                self.kw_stack.push(ver.starts_with("1364"));
+                self.kw_stack.push(KwRegion {
+                    verilog: ver.starts_with("1364"),
+                    // Config keywords arrived in 1364-2001, and the
+                    // "-noconfig" set leaves them out (§22.14).
+                    no_config: ver == "1364-1995" || ver.ends_with("-noconfig"),
+                });
             } else {
                 // Malformed (no version) — keep the stack balanced anyway.
                 self.pos = save;
-                self.kw_stack.push(false);
+                self.kw_stack.push(KwRegion::default());
             }
             return Token::new(TokenKind::Directive, text, Span::new(start, self.pos));
         }
@@ -713,7 +725,10 @@ impl<'a> Lexer<'a> {
         // §22.14: inside a `begin_keywords "1364-*"` region, a SystemVerilog-
         // only keyword is a legal identifier (e.g. `reg logic;` declares a reg
         // named `logic` in Verilog-2001).
-        if self.kw_stack.last().copied().unwrap_or(false) && is_sv_only_keyword(&text) {
+        let region = self.kw_stack.last().copied().unwrap_or_default();
+        if (region.verilog && is_sv_only_keyword(&text))
+            || (region.no_config && is_config_keyword(&text))
+        {
             kind = TokenKind::Identifier;
         }
         Token::new(kind, text, Span::new(start, self.pos))
@@ -917,6 +932,24 @@ impl<'a> Lexer<'a> {
         let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
         Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos))
     }
+}
+
+/// §22.14: the library-map/configuration keywords, reserved from 1364-2001
+/// on but not in the 1364-1995 or "1364-2001-noconfig" sets.
+fn is_config_keyword(s: &str) -> bool {
+    matches!(
+        s,
+        "cell"
+            | "config"
+            | "design"
+            | "endconfig"
+            | "incdir"
+            | "include"
+            | "instance"
+            | "liblist"
+            | "library"
+            | "use"
+    )
 }
 
 /// IEEE 1800-2023 §B.1 vs §22.14: a keyword that SystemVerilog adds over
