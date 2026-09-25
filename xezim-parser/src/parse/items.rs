@@ -3772,7 +3772,8 @@ impl Parser {
         // IEEE 1800-2017 §8.26: `interface class <name>; … endclass`. The
         // leading `interface` keyword (mutually exclusive with `virtual`)
         // marks an interface class; the rest parses like a normal class.
-        let is_iface = self.eat(TokenKind::KwInterface).is_some();
+        let is_iface =
+            self.eat(TokenKind::KwInterface).is_some() || after(self, TokenKind::KwInterface);
         self.expect(TokenKind::KwClass);
         // IEEE 1800-2023 §8.20.5: `class :final <name>` — only `:final` is
         // legal on a class declaration. Gated on --sv2023.
@@ -3816,14 +3817,16 @@ impl Parser {
             // parse-accept the rest (consume `, base[::seg]…[#(args)]`).
             while self.at(TokenKind::Comma) {
                 self.bump();
-                let _ = self.parse_identifier();
+                let mut other = self.parse_identifier();
                 while self.at(TokenKind::DoubleColon) {
                     self.bump();
-                    let _ = self.parse_identifier();
+                    other = self.parse_identifier();
                 }
+                let at = self.pos;
                 if self.at(TokenKind::Hash) || self.at(TokenKind::LParen) {
                     let _ = self.parse_param_args();
                 }
+                bases.push((other.name, self.param_args_text(at)));
             }
             Some(ClassExtends {
                 name: base_name,
@@ -3900,6 +3903,9 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndclass);
         let endlabel = self.parse_end_label();
+        if crate::strict_checks() {
+            self.check_interface_class_names();
+        }
         ClassDeclaration {
             virtual_kw: virt,
             is_interface: is_iface,
@@ -3912,6 +3918,73 @@ impl Parser {
             endlabel,
             span: self.span_from(start),
         }
+    }
+
+    /// §8.26.6.2 / §8.26.6.3: an interface class that inherits one parameter
+    /// or type name from two different base classes, or from two
+    /// specializations of one, declares that name itself. Checked for the
+    /// class just parsed, against the classes before it in this file; a chain
+    /// through any other class is not followed.
+    fn check_interface_class_names(&mut self) {
+        let find = |n: &str| self.class_infos.iter().find(|c| c.name.name == n);
+        let mut errs = Vec::new();
+        for c in self
+            .class_infos
+            .last()
+            .filter(|c| c.is_interface && c.bases.len() > 1)
+        {
+            // (name, the specialized class it is inherited from)
+            let mut origin: Vec<(String, String)> = Vec::new();
+            let mut stack: Vec<(String, String, u32)> = c
+                .bases
+                .iter()
+                .map(|(b, a)| (b.clone(), a.clone(), 0))
+                .collect();
+            let mut complete = true;
+            while let Some((b, args, depth)) = stack.pop() {
+                let Some(bi) = find(&b) else {
+                    complete = false;
+                    break;
+                };
+                let from = format!("{b}#({args})");
+                for n in &bi.type_names {
+                    origin.push((n.clone(), from.clone()));
+                }
+                if depth < 32 {
+                    stack.extend(
+                        bi.bases
+                            .iter()
+                            .map(|(b, a)| (b.clone(), a.clone(), depth + 1)),
+                    );
+                }
+            }
+            if !complete {
+                continue;
+            }
+            origin.sort();
+            origin.dedup();
+            let mut names: Vec<&str> = origin.iter().map(|(n, _)| n.as_str()).collect();
+            names.dedup();
+            for n in names {
+                let from: Vec<&str> = origin
+                    .iter()
+                    .filter(|(o, _)| o == n)
+                    .map(|(_, f)| f.as_str())
+                    .collect();
+                if from.len() > 1 && !c.type_names.iter().any(|t| t == n) {
+                    errs.push(crate::diagnostics::Diagnostic::error(
+                        format!(
+                            "interface class '{}' inherits '{n}' from {} and must declare it \
+                             itself (IEEE 1800-2017 §8.26.6.2)",
+                            c.name.name,
+                            from.join(" and ")
+                        ),
+                        c.name.span,
+                    ));
+                }
+            }
+        }
+        self.diagnostics.extend(errs);
     }
 
     fn parse_class_item(&mut self) -> ClassItem {
