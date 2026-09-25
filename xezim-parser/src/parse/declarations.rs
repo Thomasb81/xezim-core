@@ -20,6 +20,20 @@ impl Parser {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                 break;
             }
+            // §A.1.3: without `parameter`/`localparam` an entry is a bare
+            // `name = value` or starts with a data type; a range or signing
+            // alone is an implicit type, which needs the keyword.
+            if crate::strict_checks()
+                && matches!(
+                    self.current_kind(),
+                    TokenKind::LBracket | TokenKind::KwSigned | TokenKind::KwUnsigned
+                )
+            {
+                self.error(
+                    "a parameter port declaration with only a range or signing needs the \
+                     `parameter` or `localparam` keyword (IEEE 1800-2017 §6.20.1, A.1.3)",
+                );
+            }
             params.push(self.parse_parameter_declaration());
             if self.eat(TokenKind::Comma).is_none() {
                 break;
