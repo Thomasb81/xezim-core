@@ -512,6 +512,7 @@ impl Parser {
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
         let mut ports = self.parse_function_ports();
+        let ansi_ports = ports.len();
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
         let mut strict_body_ports = Vec::new();
@@ -529,6 +530,7 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
+        self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
         FunctionDeclaration {
             lifetime,
@@ -662,6 +664,7 @@ impl Parser {
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
         let mut ports = self.parse_function_ports();
+        let ansi_ports = ports.len();
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
         let mut strict_body_ports = Vec::new();
@@ -677,6 +680,7 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
+        self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
         TaskDeclaration {
             lifetime,
@@ -688,6 +692,52 @@ impl Parser {
             strict_body_ports,
             span: self.span_from(start),
         }
+    }
+
+    /// §23.2.2.1 / §13.3: in a subroutine body, a non-ANSI port declaration may
+    /// be completed by ONE later variable declaration of the same name. A
+    /// second variable declaration, or a port declaration that follows a
+    /// variable declaration of the name, declares it again. (Two port
+    /// declarations of one name are reported by the strict-check pass.)
+    fn check_tf_body_redeclarations(
+        &mut self,
+        body_ports: &[FunctionPort],
+        items: &[super::super::ast::stmt::Statement],
+    ) {
+        use super::super::ast::stmt::StatementKind;
+        if !crate::strict_checks() {
+            return;
+        }
+        let mut decls: Vec<(&Identifier, bool)> =
+            body_ports.iter().map(|p| (&p.name, true)).collect();
+        for it in items {
+            if let StatementKind::VarDecl { declarators, .. } = &it.kind {
+                decls.extend(declarators.iter().map(|d| (&d.name, false)));
+            }
+        }
+        decls.sort_by_key(|(id, _)| id.span.start);
+        // name -> variable declarations seen so far
+        let mut vars: std::collections::HashMap<&str, u32> = Default::default();
+        let mut errs = Vec::new();
+        for (id, is_port) in decls {
+            let n = vars.entry(id.name.as_str()).or_default();
+            let redeclared = if is_port {
+                *n > 0
+            } else {
+                *n += 1;
+                *n > 1
+            };
+            if redeclared {
+                errs.push(crate::diagnostics::Diagnostic::error(
+                    format!(
+                        "'{}' is already declared in this subroutine (IEEE 1800-2017 §23.2.2.1)",
+                        id.name
+                    ),
+                    id.span,
+                ));
+            }
+        }
+        self.diagnostics.extend(errs);
     }
 
     /// §13.3: the non-ANSI style may declare a port's DIRECTION and its DATA
