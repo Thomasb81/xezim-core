@@ -532,6 +532,14 @@ impl Parser {
         let endlabel = self.parse_end_label_checked(&name.name.name);
         self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);
         Self::merge_nonansi_port_types(&mut ports, &mut items);
+        // §8.7: a class constructor takes its arguments in a port list only;
+        // its body has no tf_item_declaration.
+        if crate::strict_checks() && name.name.name == "new" && ports.len() > ansi_ports {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                "a class constructor cannot declare ports in its body (IEEE 1800-2017 §8.7)",
+                ports[ansi_ports].span,
+            ));
+        }
         FunctionDeclaration {
             lifetime,
             specifier,
