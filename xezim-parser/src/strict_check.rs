@@ -56,9 +56,96 @@ pub fn strict_diagnostics(descriptions: &[Description]) -> Vec<Diagnostic> {
     for d in descriptions {
         if let Description::Module(m) = d {
             check_param_overrides(&m.items, &overridable, &mut out);
+            if let Some(own) = overridable.get(&m.name.name) {
+                check_local_defparams(&m.items, own, &mut out);
+            }
         }
     }
     out
+}
+
+/// §23.10: a defparam naming a parameter of this module (`defparam foo = 3;`)
+/// or of one of its generate blocks (`defparam loop[0].A = 10;`) must name an
+/// overridable one. A module-level name that is no such parameter is not
+/// found, and a parameter declared in a generate block is a local parameter
+/// (§27.2).
+fn check_local_defparams(items: &[ModuleItem], own: &ModuleParams, out: &mut Vec<Diagnostic>) {
+    // generate-for label -> parameters declared directly in its block
+    fn collect<'a>(items: &'a [ModuleItem], out: &mut HashMap<&'a str, HashSet<&'a str>>) {
+        for it in items {
+            match it {
+                ModuleItem::GenerateFor(gf) => {
+                    let Some(label) = &gf.name else { continue };
+                    let names = out.entry(label.as_str()).or_default();
+                    for bi in &gf.items {
+                        if let ModuleItem::ParameterDeclaration(pd)
+                        | ModuleItem::LocalparamDeclaration(pd) = bi
+                            && let ParameterKind::Data { assignments, .. } = &pd.kind
+                        {
+                            names.extend(assignments.iter().map(|a| a.name.name.as_str()));
+                        }
+                    }
+                }
+                ModuleItem::GenerateRegion(gr) => collect(&gr.items, out),
+                _ => {}
+            }
+        }
+    }
+    let mut block_params: HashMap<&str, HashSet<&str>> = HashMap::new();
+    collect(items, &mut block_params);
+    fn bare(e: &Expression) -> Option<&str> {
+        match &e.kind {
+            ExprKind::Ident(h) if h.root.is_none() && h.path.len() == 1 => {
+                Some(h.path[0].name.name.as_str())
+            }
+            _ => None,
+        }
+    }
+    for it in items {
+        let ModuleItem::Defparam(list) = it else {
+            continue;
+        };
+        for (target, _) in list {
+            match &target.kind {
+                ExprKind::Ident(h)
+                    if h.root.is_none() && h.path.len() == 1 && h.path[0].selects.is_empty() =>
+                {
+                    let n = &h.path[0].name;
+                    if !own.overridable.contains(&n.name) {
+                        out.push(Diagnostic::error(
+                            format!(
+                                "defparam target '{}' is not an overridable parameter of this \
+                                 module (IEEE 1800-2017 §23.10)",
+                                n.name
+                            ),
+                            n.span,
+                        ));
+                    }
+                }
+                ExprKind::MemberAccess { expr, member } => {
+                    let scope = match &expr.kind {
+                        ExprKind::Index { expr, .. } => bare(expr),
+                        _ => bare(expr),
+                    };
+                    if let Some(scope) = scope
+                        && block_params
+                            .get(scope)
+                            .is_some_and(|ps| ps.contains(member.name.as_str()))
+                    {
+                        out.push(Diagnostic::error(
+                            format!(
+                                "defparam cannot override '{}': a parameter declared in a \
+                                 generate block is a local parameter (IEEE 1800-2017 §27.2)",
+                                member.name
+                            ),
+                            member.span,
+                        ));
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
 }
 
 /// The parameters of one module, as an instantiation sees them.
