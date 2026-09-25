@@ -2932,7 +2932,11 @@ impl Parser {
             });
         }
         if self.eat(TokenKind::Colon).is_some() {
-            return self.parse_module_item().unwrap_or(ModuleItem::Null);
+            let mut item = self.parse_module_item().unwrap_or(ModuleItem::Null);
+            if let ModuleItem::AssertionItem(a) = &mut item {
+                a.label = Some(first_name);
+            }
+            return item;
         }
         // §25.5: non-ANSI body port declaration with a MODPORT-qualified
         // interface type — `counter_if.counter_mp c_data;`. The lookahead is

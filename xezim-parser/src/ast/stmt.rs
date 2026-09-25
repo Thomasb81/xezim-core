@@ -353,6 +353,11 @@ pub struct AssertionStatement {
     /// §16.4 deferred immediate assertion: `assert #0` / `assert final`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub deferred: Option<DeferredAssertion>,
+    /// Label of a module-level assertion item (`ap: assert property ...`):
+    /// the assertion is a scope of that name (§16.2, §21.2.1.7 `%m`). A
+    /// labelled procedural assertion is wrapped in a named block instead.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub label: Option<Identifier>,
     pub span: Span,
 }
 

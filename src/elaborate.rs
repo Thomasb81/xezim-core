@@ -2154,6 +2154,10 @@ pub struct ElaboratedModule {
     /// function/task simple name (mirrors the `functions`/`tasks` maps).
     #[serde(default)]
     pub func_decl_scope: HashMap<String, String>,
+    /// Declaring package of each package-scope class (`C` -> `pk`), so `%m`
+    /// in one of its methods names `pk.C.m` (§21.2.1.7).
+    #[serde(default)]
+    pub class_decl_pkg: HashMap<String, String>,
     /// DPI imports by SV-visible symbol name.
     pub dpi_imports: HashMap<String, DpiImportSpec>,
     /// §35.5.4 exported SV functions/tasks (`export "DPI-C" function f;`), in
@@ -2715,6 +2719,7 @@ impl ElaboratedModule {
             functions: HashMap::default(),
             tasks: HashMap::default(),
             func_decl_scope: HashMap::default(),
+            class_decl_pkg: HashMap::default(),
             dpi_imports: HashMap::default(),
             dpi_exports: Vec::new(),
             dpi_export_c_names: Vec::new(),
@@ -9429,6 +9434,14 @@ pub fn elaborate_module_with_defs(
         // the runtime virtual-interface dispatch can consult them without
         // re-walking interface AST. LRM §25.4.
         for d in defs.values() {
+            if let Definition::Package(p) = d {
+                for item in &p.items {
+                    if let crate::ast::decl::PackageItem::Class(c) = item {
+                        elab.class_decl_pkg
+                            .insert(c.name.name.clone(), p.name.name.clone());
+                    }
+                }
+            }
             if let Definition::Interface(iface) = d {
                 let iface_name = iface.name.name.clone();
                 // LRM §25.9: register the interface name so runtime
@@ -34719,6 +34732,7 @@ fn rewrite_stmt(
                 }),
                 is_property: a.is_property,
                 deferred: a.deferred,
+                label: a.label.clone(),
                 span: a.span,
             })
         }

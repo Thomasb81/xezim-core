@@ -2016,6 +2016,7 @@ impl Parser {
             else_action,
             is_property,
             deferred,
+            label: None,
             span: self.span_from(start),
         }
     }
