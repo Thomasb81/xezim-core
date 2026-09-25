@@ -2793,11 +2793,17 @@ impl Parser {
     /// `begin : <label>` block name (needed to namespace generate-for renames).
     fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>) {
         self.generate_depth += 1;
+        let prefixed = self.after_block_label();
         let r = if self.eat(TokenKind::KwBegin).is_some() {
             let label = self.parse_end_label().map(|id| id.name);
             let items = self.parse_module_items_until(TokenKind::KwEnd);
             self.expect(TokenKind::KwEnd);
-            let _ = self.parse_end_label();
+            if let Some(l) = self.parse_end_label()
+                && label.is_none()
+                && !prefixed
+            {
+                self.unnamed_block_end_label(&l);
+            }
             (items, label)
         } else {
             (self.parse_module_item().into_iter().collect(), None)

@@ -1155,6 +1155,7 @@ impl Parser {
 
     fn parse_seq_block(&mut self) -> Statement {
         let start = self.current().span.start;
+        let prefixed = self.after_block_label();
         self.expect(TokenKind::KwBegin);
         let name = if self.eat(TokenKind::Colon).is_some() {
             Some(self.parse_identifier())
@@ -1172,7 +1173,11 @@ impl Parser {
                 let _ = self.parse_block_end_label_checked(&n.name);
             }
             None => {
-                let _ = self.parse_end_label();
+                if let Some(l) = self.parse_end_label()
+                    && !prefixed
+                {
+                    self.unnamed_block_end_label(&l);
+                }
             }
         }
         Statement::new(
@@ -1183,6 +1188,7 @@ impl Parser {
 
     fn parse_par_block(&mut self) -> Statement {
         let start = self.current().span.start;
+        let prefixed = self.after_block_label();
         self.expect(TokenKind::KwFork);
         let name = if self.eat(TokenKind::Colon).is_some() {
             Some(self.parse_identifier())
@@ -1218,7 +1224,11 @@ impl Parser {
                 let _ = self.parse_block_end_label_checked(&n.name);
             }
             None => {
-                let _ = self.parse_end_label();
+                if let Some(l) = self.parse_end_label()
+                    && !prefixed
+                {
+                    self.unnamed_block_end_label(&l);
+                }
             }
         }
         Statement::new(

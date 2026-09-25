@@ -192,6 +192,32 @@ impl Parser {
         label
     }
 
+    /// True when the `begin`/`fork` at the cursor follows a `label :` prefix,
+    /// which names the block (§9.3.5). Also true after a case-item label; an
+    /// end label is then simply not checked.
+    pub(super) fn after_block_label(&self) -> bool {
+        self.pos >= 2
+            && self.tokens[self.pos - 1].kind == TokenKind::Colon
+            && matches!(
+                self.tokens[self.pos - 2].kind,
+                TokenKind::Identifier | TokenKind::EscapedIdentifier
+            )
+    }
+
+    /// §9.3.4 / §27.3: only a named block may carry an end label.
+    pub(super) fn unnamed_block_end_label(&mut self, label: &Identifier) {
+        if crate::strict_checks() {
+            self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                format!(
+                    "end label '{}' on an unnamed block; only a named block may have an \
+                     end label (IEEE 1800-2017 §9.3.4)",
+                    label.name
+                ),
+                label.span,
+            ));
+        }
+    }
+
     /// Parse an optional `: <name>` end-label and, when SV-2023 is enabled,
     /// emit a diagnostic if the label disagrees with the enclosing decl's
     /// name (IEEE 1800-2023 §27.2.1).
