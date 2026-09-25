@@ -2122,9 +2122,11 @@ impl Parser {
         let mut delay_fall: Option<Expression> = None;
         if self.eat(TokenKind::Hash).is_some() {
             if self.eat(TokenKind::LParen).is_some() {
-                delay = Some(self.parse_expression());
+                let rise = self.parse_expression();
+                delay = Some(self.parse_mintypmax_rest(rise));
                 if self.eat(TokenKind::Comma).is_some() {
-                    delay_fall = Some(self.parse_expression());
+                    let fall = self.parse_expression();
+                    delay_fall = Some(self.parse_mintypmax_rest(fall));
                 }
                 let mut depth = 1;
                 while depth > 0 && !self.at(TokenKind::Eof) {

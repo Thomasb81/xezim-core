@@ -1815,7 +1815,8 @@ impl Parser {
             TokenKind::Hash => {
                 self.bump();
                 if self.eat(TokenKind::LParen).is_some() {
-                    let _ = self.parse_expression();
+                    let first = self.parse_expression();
+                    let _ = self.parse_mintypmax_rest(first);
                     self.expect(TokenKind::RParen);
                 } else {
                     // `#5`, `#delay_id`, `#1.5ns` — consume the single delay

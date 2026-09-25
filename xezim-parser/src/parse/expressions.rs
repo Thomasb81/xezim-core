@@ -1184,6 +1184,7 @@ impl Parser {
             TokenKind::LParen => {
                 self.bump();
                 let inner = self.parse_expression();
+                let inner = self.parse_mintypmax_rest(inner);
                 // §18.5.4 tolerated nonstandard form `( expr dist { ... } )`
                 // inside a constraint (a reference simulator warns and
                 // accepts). Capture the body for `parse_constraint_item`;
@@ -2409,6 +2410,21 @@ impl Parser {
 
     /// Parse a hierarchical identifier (handles pkg::name and obj.member).
     /// Handles internal indices [expr] as well (e.g. successors[s].m_predecessors).
+    /// §A.8.3 `mintypmax_expression`: after its first expression, an
+    /// optional `: typ : max` tail. The typical value is the one used, as by
+    /// the reference simulator's default. Not inside a constraint, where a
+    /// parenthesized expression is never a min:typ:max triple.
+    pub(super) fn parse_mintypmax_rest(&mut self, first: Expression) -> Expression {
+        if self.in_constraint || !self.at(TokenKind::Colon) {
+            return first;
+        }
+        self.bump();
+        let typ = self.parse_expression();
+        self.expect(TokenKind::Colon);
+        let _max = self.parse_expression();
+        typ
+    }
+
     pub(super) fn parse_hierarchical_identifier(&mut self) -> HierarchicalIdentifier {
         let start = self.current().span.start;
         // IEEE 1800-2023 §23.6: `$root`, `$unit`, `local::`-style roots can
