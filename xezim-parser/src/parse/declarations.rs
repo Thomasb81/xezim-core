@@ -746,7 +746,8 @@ impl Parser {
     /// LOCAL that shadowed the 1-bit implicit port. Merge such a declaration's
     /// type into the matching implicit-typed port and drop the statement.
     /// Only single-declarator, no-initializer declarations whose name matches
-    /// an IMPLICIT-typed port are merged — anything else really is a local.
+    /// an IMPLICIT-typed port are merged (a ranged port only by a ranged
+    /// vector declaration) — anything else really is a local.
     pub(super) fn merge_nonansi_port_types(
         ports: &mut [FunctionPort],
         items: &mut Vec<super::super::ast::stmt::Statement>,
@@ -769,12 +770,17 @@ impl Parser {
                 return true;
             }
             let Some(port) = ports.iter_mut().find(|p| {
-                p.name.name == d.name.name
-                    && matches!(&p.data_type, DataType::Implicit { dimensions, .. }
-                        if dimensions.is_empty())
+                p.name.name == d.name.name && matches!(&p.data_type, DataType::Implicit { .. })
             }) else {
                 return true;
             };
+            match (&port.data_type, data_type) {
+                (DataType::Implicit { dimensions, .. }, _) if dimensions.is_empty() => {}
+                // `input [3:0] x; reg [3:0] x;` — the vector declaration
+                // restates the port's range (§23.2.2.1).
+                (_, DataType::IntegerVector { dimensions, .. }) if !dimensions.is_empty() => {}
+                _ => return true,
+            }
             port.data_type = data_type.clone();
             false
         });
