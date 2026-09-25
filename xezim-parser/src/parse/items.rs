@@ -3024,6 +3024,41 @@ impl Parser {
                 span: self.span_from(start),
             });
         }
+        // §29.3 `udp_instance ::= [name_of_instance] ( terminals )`: a UDP
+        // instance may omit its name (`p (q, d);`). It is kept with an empty
+        // name; the elaborator rejects a nameless module instance (§23.3.2).
+        if self.at(TokenKind::LParen) {
+            let mut instances = Vec::new();
+            loop {
+                let inst_start = self.current().span.start;
+                let name = if self.at(TokenKind::Identifier) {
+                    self.parse_identifier()
+                } else {
+                    Identifier {
+                        name: String::new(),
+                        span: self.span_from(inst_start),
+                    }
+                };
+                let dims = self.parse_unpacked_dimensions();
+                let conns = self.parse_port_connections();
+                instances.push(HierarchicalInstance {
+                    name,
+                    dimensions: dims,
+                    connections: conns,
+                    span: self.span_from(inst_start),
+                });
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Semicolon);
+            return ModuleItem::ModuleInstantiation(ModuleInstantiation {
+                module_name: first_name,
+                params,
+                instances,
+                span: self.span_from(start),
+            });
+        }
         if self.at(TokenKind::Identifier) || self.at(TokenKind::EscapedIdentifier) {
             let initial_pos = self.pos;
             let mut is_data_decl = false;

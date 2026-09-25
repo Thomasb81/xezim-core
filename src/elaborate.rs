@@ -26796,6 +26796,18 @@ fn inline_module_items(
                 );
                 continue;
             }
+            // §23.3.2: only a primitive instance may omit its name.
+            if let Some(hi) = inst.instances.iter().find(|hi| hi.name.name.is_empty()) {
+                return Err(span_error(
+                    elab,
+                    hi.span,
+                    &format!(
+                        "instance of '{}' has no instance name; only gate and UDP instances \
+                         may omit it (IEEE 1800-2017 §23.3.2)",
+                        sub_mod_name
+                    ),
+                ));
+            }
             let sub_mod = match definitions.get(sub_mod_name) {
                 Some(m) => *m,
                 None => {
