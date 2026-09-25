@@ -30,6 +30,10 @@ pub struct Parser {
     /// operators. Outside this context `or` stays an event-list separator
     /// (`@(a or b)`) and `and` a gate primitive, so the flag is essential.
     in_sva_seq: bool,
+    /// The classes of this file so far, for the strict inheritance checks.
+    pub(super) class_infos: Vec<ClassInfo>,
+    /// `pure constraint` names of the class being parsed.
+    pub(super) pure_constraints: Vec<String>,
     /// True while parsing the expression of a CONSTRAINT item, so the
     /// parenthesized-primary parser accepts the nonstandard-but-tolerated
     /// `( expr dist { ... } )` form (§18.5.4; a reference simulator warns
@@ -63,6 +67,8 @@ impl Parser {
             pending_pattern_bindings: Vec::new(),
             plain_loop_vars: Vec::new(),
             in_sva_seq: false,
+            class_infos: Vec::new(),
+            pure_constraints: Vec::new(),
             in_constraint: false,
             pending_paren_dist: Vec::new(),
             pending_module_items: Vec::new(),
@@ -97,10 +103,51 @@ impl Parser {
             // A None that advanced (e.g. a stray top-level `;` consumed by the
             // Semicolon arm) is a clean skip, not an error.
         }
+        if crate::strict_checks() {
+            self.check_pure_constraints();
+        }
         SourceText {
             descriptions,
             span: self.span_from(start),
         }
+    }
+
+    /// §18.5.2: a non-virtual class implements every pure constraint it
+    /// inherits. A chain through a class of another file is not followed.
+    fn check_pure_constraints(&mut self) {
+        let find = |n: &str| self.class_infos.iter().find(|c| c.name.name == n);
+        let mut errs = Vec::new();
+        for c in self
+            .class_infos
+            .iter()
+            .filter(|c| !c.is_virtual && !c.is_interface)
+        {
+            let mut pure: Vec<&str> = Vec::new();
+            let mut defined: Vec<&str> = c.constraints.iter().map(|s| s.as_str()).collect();
+            let mut cur = c.bases.first().map(|b| b.0.as_str());
+            let mut complete = true;
+            for _ in 0..32 {
+                let Some(b) = cur else { break };
+                let Some(bi) = find(b) else {
+                    complete = false;
+                    break;
+                };
+                pure.extend(bi.pure_constraints.iter().map(|s| s.as_str()));
+                defined.extend(bi.constraints.iter().map(|s| s.as_str()));
+                cur = bi.bases.first().map(|b| b.0.as_str());
+            }
+            if complete && let Some(n) = pure.iter().find(|n| !defined.contains(n)) {
+                errs.push(Diagnostic::error(
+                    format!(
+                        "class '{}' does not implement the inherited pure constraint '{n}' \
+                         (IEEE 1800-2017 §18.5.2)",
+                        c.name.name
+                    ),
+                    c.name.span,
+                ));
+            }
+        }
+        self.diagnostics.extend(errs);
     }
 
     /// Parse the simple `bind <target> <bind_mod> <inst>(<ports>);` form
@@ -822,4 +869,17 @@ impl Parser {
             _ => None,
         }
     }
+}
+
+/// What the strict inheritance checks need to know about one class.
+pub(super) struct ClassInfo {
+    pub name: Identifier,
+    pub is_virtual: bool,
+    pub is_interface: bool,
+    /// Base classes with the text of their parameter value lists.
+    pub bases: Vec<(String, String)>,
+    /// Parameter and typedef names the class declares.
+    pub type_names: Vec<String>,
+    pub pure_constraints: Vec<String>,
+    pub constraints: Vec<String>,
 }

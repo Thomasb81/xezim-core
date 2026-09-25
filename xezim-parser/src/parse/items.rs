@@ -3742,9 +3742,33 @@ impl Parser {
         items
     }
 
+    /// The tokens of a parameter value list parsed from `start` on, as text,
+    /// to tell specializations apart (empty without a list).
+    fn param_args_text(&self, start: usize) -> String {
+        let toks = &self.tokens[start..self.pos];
+        let inner = match toks {
+            [h, l, rest @ .., _] if h.kind == TokenKind::Hash && l.kind == TokenKind::LParen => {
+                rest
+            }
+            [l, rest @ .., _] if l.kind == TokenKind::LParen => rest,
+            _ => toks,
+        };
+        inner
+            .iter()
+            .map(|t| t.text.as_str())
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
+
     pub(super) fn parse_class_declaration(&mut self) -> ClassDeclaration {
         let start = self.current().span.start;
-        let virt = self.eat(TokenKind::KwVirtual).is_some();
+        // A module item arrives here with `virtual` / `interface` already
+        // consumed; the caller sets the flags, but the class checks below
+        // need them too.
+        let after = |p: &Self, k: TokenKind| {
+            p.at(TokenKind::KwClass) && p.pos > 0 && p.tokens[p.pos - 1].kind == k
+        };
+        let virt = self.eat(TokenKind::KwVirtual).is_some() || after(self, TokenKind::KwVirtual);
         // IEEE 1800-2017 §8.26: `interface class <name>; … endclass`. The
         // leading `interface` keyword (mutually exclusive with `virtual`)
         // marks an interface class; the rest parses like a normal class.
@@ -3765,6 +3789,7 @@ impl Parser {
         let _lifetime = self.parse_optional_lifetime();
         let name = self.parse_identifier();
         let params = self.parse_parameter_port_list();
+        let mut bases = Vec::new();
         let extends = if self.eat(TokenKind::KwExtends).is_some() {
             let ext_start = self.current().span.start;
             // §8.13: the base class may be package/class-scoped —
@@ -3775,6 +3800,7 @@ impl Parser {
                 self.bump();
                 base_name = self.parse_identifier();
             }
+            let args_at = self.pos;
             let args = if self.at(TokenKind::Hash) {
                 self.parse_param_args()
             } else if self.at(TokenKind::LParen) {
@@ -3784,6 +3810,7 @@ impl Parser {
             else {
                 Vec::new()
             };
+            bases.push((base_name.name.clone(), self.param_args_text(args_at)));
             // §8.26: an interface class may extend MULTIPLE interface classes
             // (`extends ic1#(T), ic2#(T)`). Keep the first in the AST and
             // parse-accept the rest (consume `, base[::seg]…[#(args)]`).
@@ -3831,10 +3858,46 @@ impl Parser {
         // `type(this)` references resolve to this class (§6.20.2.1).
         crate::push_class_context(name.name.clone());
         let mut items = Vec::new();
+        let outer_pure = std::mem::take(&mut self.pure_constraints);
         while !self.at(TokenKind::KwEndclass) && !self.at(TokenKind::Eof) {
             items.push(self.parse_class_item());
         }
+        let pure_constraints = std::mem::replace(&mut self.pure_constraints, outer_pure);
         crate::pop_class_context();
+        {
+            let mut type_names = Vec::new();
+            let mut add_params = |pd: &ParameterDeclaration, out: &mut Vec<String>| match &pd.kind {
+                ParameterKind::Data { assignments, .. } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+                ParameterKind::Type { assignments } => {
+                    out.extend(assignments.iter().map(|a| a.name.name.clone()))
+                }
+            };
+            for pd in &params {
+                add_params(pd, &mut type_names);
+            }
+            let mut constraints = Vec::new();
+            for it in &items {
+                match it {
+                    ClassItem::Parameter(pd) => add_params(pd, &mut type_names),
+                    ClassItem::Typedef(t) => type_names.push(t.name.name.clone()),
+                    ClassItem::Constraint(c) if !pure_constraints.contains(&c.name.name) => {
+                        constraints.push(c.name.name.clone())
+                    }
+                    _ => {}
+                }
+            }
+            self.class_infos.push(super::ClassInfo {
+                name: name.clone(),
+                is_virtual: virt,
+                is_interface: is_iface,
+                bases,
+                type_names,
+                pure_constraints,
+                constraints,
+            });
+        }
         self.expect(TokenKind::KwEndclass);
         let endlabel = self.parse_end_label();
         ClassDeclaration {
@@ -3961,6 +4024,9 @@ impl Parser {
             TokenKind::KwConstraint => {
                 self.bump();
                 let cname = self.parse_identifier();
+                if qualifiers.contains(&ClassQualifier::Pure) {
+                    self.pure_constraints.push(cname.name.clone());
+                }
                 let (items, has_body) = if self.at(TokenKind::LBrace) {
                     self.bump();
                     let mut items = Vec::new();
