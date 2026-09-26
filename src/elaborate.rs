@@ -220,6 +220,13 @@ pub struct ContinuousAssignment {
     /// ^ 1`, a self-loop that read x forever).
     #[cfg_attr(feature = "serde", serde(default))]
     pub rhs_parent_scoped: bool,
+    /// A continuous assignment the source spells out (an `assign`, or a net
+    /// declaration assignment): the span of that statement and the instance
+    /// scope it was elaborated in (`""` for the top). `None` for the ones
+    /// elaboration synthesizes (port connections, gate primitives, delayed
+    /// nets). Code coverage counts only the former.
+    #[serde(default)]
+    pub origin: Option<(crate::ast::Span, String)>,
 }
 
 /// IEEE 1800-2017 §29 User-Defined Primitive instance, flattened during
@@ -611,6 +618,9 @@ pub struct PendingContAssign {
     /// §10.3.3 fall / turn-off delays of the `#(rise, fall[, turnoff])` form.
     pub delay_fall_source: Option<std::rc::Rc<Expression>>,
     pub delay_off_source: Option<std::rc::Rc<Expression>>,
+    /// Span of the source statement for an `assign` or a net declaration
+    /// assignment; see `ContinuousAssignment::origin`.
+    pub origin_span: Option<crate::ast::Span>,
 }
 
 impl PendingAlways {
@@ -717,7 +727,11 @@ impl PendingContAssign {
         let delay = eval_delay(&self.delay_source).unwrap_or(0);
         let delay_fall = eval_delay(&self.delay_fall_source);
         let delay_off = eval_delay(&self.delay_off_source);
+        let origin = self
+            .origin_span
+            .map(|sp| (sp, self.ctx.prefix.trim_end_matches('.').to_string()));
         ContinuousAssignment {
+            origin,
             lhs,
             rhs,
             delay,
@@ -6086,6 +6100,7 @@ pub fn elaborate_module_with_defs(
                             // `output p; wire p = 1'b1;` undriven (z).
                             if let Some(init_expr) = &decl.init {
                                 elab.continuous_assigns.push(ContinuousAssignment {
+                                    origin: Some((init_expr.span, String::new())),
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: init_expr.clone(),
                                     delay: net_decl_delay(nd, &elab.parameters),
@@ -6309,6 +6324,7 @@ pub fn elaborate_module_with_defs(
                     // Wire with initializer → continuous assign (not constant eval)
                     if let Some(init_expr) = &decl.init {
                         elab.continuous_assigns.push(ContinuousAssignment {
+                            origin: Some((init_expr.span, String::new())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
                             delay: net_decl_delay(nd, &elab.parameters),
@@ -8949,6 +8965,7 @@ pub fn elaborate_module_with_defs(
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, &mut elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
+                            origin: Some((ca.span, String::new())),
                             lhs: lhs.clone(),
                             rhs: rhs_final,
                             delay,
@@ -9139,6 +9156,7 @@ pub fn elaborate_module_with_defs(
                 // so a top-level cell's functional path through them works.
                 for (delayed, source) in &sb.delayed_nets {
                     elab.continuous_assigns.push(ContinuousAssignment {
+                        origin: None,
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
                         delay: 0,
@@ -13028,6 +13046,7 @@ fn elaborate_items_numbered(
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(init_expr) = &decl.init {
                         elab.continuous_assigns.push(ContinuousAssignment {
+                            origin: Some((init_expr.span, String::new())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
                             delay: net_decl_delay(nd, &elab.parameters),
@@ -13739,6 +13758,7 @@ fn elaborate_items_numbered(
                     root_mark_hier_ca_rhs(lhs, &mut rhs_final);
                     if !expand_whole_array_assign(lhs, &rhs_final, delay, elab) {
                         elab.continuous_assigns.push(ContinuousAssignment {
+                            origin: Some((ca.span, String::new())),
                             lhs: lhs.clone(),
                             rhs: rhs_final,
                             delay,
@@ -13929,6 +13949,7 @@ fn elaborate_items_numbered(
                 // so a top-level cell's functional path through them works.
                 for (delayed, source) in &sb.delayed_nets {
                     elab.continuous_assigns.push(ContinuousAssignment {
+                        origin: None,
                         lhs: make_ident_expr(delayed),
                         rhs: make_ident_expr(source),
                         delay: 0,
@@ -19567,6 +19588,7 @@ fn emit_struct_member_assigns(
     // Bounded against a malformed self-referential typedef.
     if depth > 16 {
         out.push(ContinuousAssignment {
+            origin: ca.origin.clone(),
             lhs: lhs_base.clone(),
             rhs: rhs.clone(),
             delay: ca.delay,
@@ -19655,6 +19677,7 @@ fn emit_struct_member_assigns(
                 emit_struct_member_assigns(&mlhs, &mrhs, &inner, ca, typedef_types, out, depth + 1);
             }
             _ => out.push(ContinuousAssignment {
+                origin: ca.origin.clone(),
                 lhs: mlhs,
                 rhs: mrhs,
                 delay: ca.delay,
@@ -27354,6 +27377,7 @@ fn inline_module_items(
                         port_map.get("clk_in").cloned(),
                     ) {
                         elab.continuous_assigns.push(ContinuousAssignment {
+                            origin: None,
                             lhs: clk_out_expr,
                             rhs: clk_in_expr,
                             delay: 0,
@@ -30106,6 +30130,7 @@ fn inline_module_items(
                             match prepared_sub.port_directions.get(port_name) {
                                 Some(PortDirection::Input) | Some(PortDirection::Inout) => {
                                     elab.continuous_assigns.push(ContinuousAssignment {
+                                        origin: None,
                                         lhs: sub_expr,
                                         rhs: parent_elem,
                                         delay: 0,
@@ -30116,6 +30141,7 @@ fn inline_module_items(
                                 }
                                 Some(PortDirection::Output) => {
                                     elab.continuous_assigns.push(ContinuousAssignment {
+                                        origin: None,
                                         lhs: parent_elem,
                                         rhs: sub_expr,
                                         delay: 0,
@@ -30194,6 +30220,7 @@ fn inline_module_items(
                                 }
                             }
                             elab.continuous_assigns.push(ContinuousAssignment {
+                                origin: None,
                                 lhs: sub_expr,
                                 rhs,
                                 delay: 0,
@@ -30204,6 +30231,7 @@ fn inline_module_items(
                         }
                         Some(PortDirection::Output) => {
                             elab.continuous_assigns.push(ContinuousAssignment {
+                                origin: None,
                                 lhs: parent_expr.clone(),
                                 rhs: sub_expr,
                                 delay: 0,
@@ -30214,6 +30242,7 @@ fn inline_module_items(
                         }
                         _ => {
                             elab.continuous_assigns.push(ContinuousAssignment {
+                                origin: None,
                                 lhs: sub_expr,
                                 rhs: parent_expr.clone(),
                                 delay: 0,
@@ -30799,6 +30828,7 @@ fn inline_module_items(
                                     delay_source: delay_rc.clone(),
                                     delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: delay_off_rc.clone(),
+                                    origin_span: Some(ca_item.span),
                                 });
                             }
                         }
@@ -30824,6 +30854,7 @@ fn inline_module_items(
                                     delay_source: None,
                                     delay_fall_source: None,
                                     delay_off_source: None,
+                                    origin_span: None,
                                 });
                             }
                         }
@@ -30840,6 +30871,7 @@ fn inline_module_items(
                                     delay_source: None,
                                     delay_fall_source: None,
                                     delay_off_source: None,
+                                    origin_span: Some(rhs_rc.span),
                                 });
                             }
                         }
@@ -30878,6 +30910,7 @@ fn inline_module_items(
                                 &sub_interface_map,
                             );
                             elab.continuous_assigns.push(ContinuousAssignment {
+                                origin: None,
                                 lhs,
                                 rhs,
                                 delay: 0,
@@ -32583,6 +32616,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
                     ),
                 };
                 out.push(ContinuousAssignment {
+                    origin: ca.origin.clone(),
                     lhs: Expression::new(
                         ExprKind::MemberAccess {
                             expr: Box::new(make_ident_expr(&base)),
@@ -32793,6 +32827,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                         span: Span::dummy(),
                     };
                     kept.push(ContinuousAssignment {
+                        origin: None,
                         lhs: Expression::new(
                             ExprKind::MemberAccess {
                                 expr: Box::new(make_ident_expr(lhs)),
@@ -32815,6 +32850,7 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
                 }
             }
             None => kept.push(ContinuousAssignment {
+                origin: None,
                 lhs: make_ident_expr(lhs),
                 rhs,
                 delay,
@@ -33116,6 +33152,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 (None, None) => make_z_expr(span),
             };
             elab.continuous_assigns.push(ContinuousAssignment {
+                origin: None,
                 lhs: acc.lhs,
                 rhs,
                 delay: acc.delay,
@@ -33194,6 +33231,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
         );
 
         elab.continuous_assigns.push(ContinuousAssignment {
+            origin: None,
             lhs: term_a,
             rhs: make_syscall(
                 "$__tranif",
@@ -33206,6 +33244,7 @@ pub fn resolve_bidirectional_switches(elab: &mut ElaboratedModule) {
             delay_off: None,
         });
         elab.continuous_assigns.push(ContinuousAssignment {
+            origin: None,
             lhs: term_b,
             rhs: make_syscall("$__tranif", vec![own_b, own_a, ctl, active], span),
             delay: 0,
@@ -33298,6 +33337,7 @@ fn gate_inst_to_assigns(gi: &GateInstantiation, elab: &mut ElaboratedModule) {
             }
         }
         elab.continuous_assigns.push(ContinuousAssignment {
+            origin: None,
             lhs: lhs.clone(),
             rhs,
             delay,
@@ -33563,6 +33603,7 @@ pub fn whole_array_assign_parts(
     Some(
         (0..=n)
             .map(|k| ContinuousAssignment {
+                origin: None,
                 lhs: make_index_expr(ln, llo + k),
                 rhs: make_index_expr(rn, rlo + k),
                 delay,

@@ -62,7 +62,9 @@ pub use sv_parser::{self, ParseResult, ast, diagnostics, lexer, parse, preproces
 pub use value::Value;
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x1f = \x1e + PackageItem::Covergroup (package and
+/// Version byte: \x20 = \x1f + ContinuousAssignment.origin (source span
+/// and scope of an `assign` or net declaration assignment, for code
+/// coverage); \x1f = \x1e + PackageItem::Covergroup (package and
 /// file-scope covergroups, §19.3), CoverBin.array_size, TransStep transitions,
 /// Cross.options and CrossBin selects (§19.5-§19.6),
 /// AssertionStatement.is_sequence (§16.14.3 `cover sequence`);
@@ -103,7 +105,7 @@ pub use value::Value;
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1f";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x20";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1040,6 +1042,12 @@ pub fn parse_and_elaborate_multi(
                 // (see `span_location_of`); without this entry a package
                 // span is ambiguous across files and reports no location.
                 ast::Description::Package(p) => Some(&p.name.name),
+                // File-scope classes, for the file:line of their methods in
+                // code coverage.
+                ast::Description::Class(c)
+                | ast::Description::PackageItem(ast::decl::PackageItem::Class(c)) => {
+                    Some(&c.name.name)
+                }
                 _ => None,
             };
             if let Some(name) = name {

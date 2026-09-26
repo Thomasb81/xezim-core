@@ -115,6 +115,14 @@ impl LineMap {
         Some(o)
     }
 
+    /// Original file and 1-based line of output line `out` (0-based); for
+    /// macro-expanded text, the line of the invocation. Lets a caller that
+    /// resolves many spans count output lines itself, once per text.
+    pub fn file_line(&self, out: usize) -> Option<(&str, u32)> {
+        let o = self.origin(out)?;
+        Some((self.files.get(o.file as usize)?.path.as_str(), o.line))
+    }
+
     /// Include chain of file `f`, innermost first.
     fn include_chain(&self, mut f: u32) -> Vec<(String, u32)> {
         let mut chain = Vec::new();
