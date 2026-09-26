@@ -62,7 +62,9 @@ pub use sv_parser::{self, ParseResult, ast, diagnostics, lexer, parse, preproces
 pub use value::Value;
 
 /// Magic bytes identifying a xezim compiled artifact.
-/// Version byte: \x1e = \x1d + `local::` kept as HierarchicalIdentifier.root
+/// Version byte: \x1f = \x1e + PackageItem::Covergroup (package and
+/// file-scope covergroups, §19.3);
+/// \x1e = \x1d + `local::` kept as HierarchicalIdentifier.root
 /// and the parity round's parser/elaboration semantics changes (cached
 /// parses from \x1d or earlier carry the old results);
 /// \x1d = \x1c + AssertionStatement.label and
@@ -99,7 +101,7 @@ pub use value::Value;
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1e";
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x1f";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of
@@ -1558,6 +1560,9 @@ fn parse_and_elaborate(
     let mut top_level_dpi_exports: Vec<ast::decl::DPIExport> = Vec::new();
     let mut top_level_params: Vec<ast::decl::ParameterDeclaration> = Vec::new();
     let mut top_level_vars: Vec<ast::decl::DataDeclaration> = Vec::new();
+    // §19.3 $unit-scope covergroups, injected into every module like the
+    // $unit subroutines.
+    let mut top_level_covergroups: Vec<ast::decl::CovergroupDeclaration> = Vec::new();
     let mut top_level_binds: Vec<ast::decl::BindDirective> = Vec::new();
     // §18.5.1 $unit-scope out-of-class constraint definitions (class, name).
     let mut top_level_ooc_constraints: Vec<(String, String, Vec<ast::decl::ConstraintItem>)> =
@@ -1864,6 +1869,9 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Data(d)) => {
                 top_level_vars.push(d);
             }
+            ast::Description::PackageItem(ast::decl::PackageItem::Covergroup(cg)) => {
+                top_level_covergroups.push(cg);
+            }
             ast::Description::Bind(b) => {
                 top_level_binds.push(b);
             }
@@ -2012,6 +2020,7 @@ fn parse_and_elaborate(
         || !top_level_nettypes.is_empty()
         || !top_level_params.is_empty()
         || !top_level_vars.is_empty()
+        || !top_level_covergroups.is_empty()
         || !top_level_dpi_imports.is_empty()
         || !top_level_dpi_exports.is_empty()
     {
@@ -2108,6 +2117,18 @@ fn parse_and_elaborate(
                 }
                 for e in top_level_dpi_exports.iter() {
                     m.items.push(ast::decl::ModuleItem::DPIExport(e.clone()));
+                }
+                // A module's own covergroup of the same name shadows the
+                // $unit one.
+                for cg in top_level_covergroups.iter().rev() {
+                    let own = m.items.iter().any(|it| {
+                        matches!(it, ast::decl::ModuleItem::CovergroupDeclaration(x)
+                            if x.name.name == cg.name.name)
+                    });
+                    if !own {
+                        m.items
+                            .insert(0, ast::decl::ModuleItem::CovergroupDeclaration(cg.clone()));
+                    }
                 }
                 // $unit-scope parameters become body localparams (constants):
                 // visible inside the module, not part of its override interface.

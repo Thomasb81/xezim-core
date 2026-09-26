@@ -359,6 +359,73 @@ pub struct CovergroupDeclaration {
     pub span: Span,
 }
 
+impl CovergroupDeclaration {
+    /// Every expression of the body and sampling event that names a design
+    /// object (not the constructor or sample formals' defaults): coverpoint
+    /// expressions and guards, bin values, options and cross guards.
+    pub fn for_each_expr_mut(&mut self, f: &mut dyn FnMut(&mut Expression)) {
+        fn range(r: &mut ConstraintRange, f: &mut dyn FnMut(&mut Expression)) {
+            match r {
+                ConstraintRange::Value(e) => f(e),
+                ConstraintRange::Range { lo, hi } => {
+                    f(lo);
+                    f(hi);
+                }
+            }
+        }
+        if let Some(ev) = &mut self.event {
+            match ev {
+                super::stmt::EventControl::HierIdentifier(e) => f(e),
+                super::stmt::EventControl::EventExpr(list) => {
+                    for ee in list {
+                        f(&mut ee.expr);
+                        if let Some(g) = &mut ee.iff {
+                            f(g);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+        for it in &mut self.items {
+            match it {
+                CovergroupItem::Coverpoint(cp) => {
+                    f(&mut cp.expr);
+                    if let Some(g) = &mut cp.iff_guard {
+                        f(g);
+                    }
+                    for b in &mut cp.bins {
+                        for r in &mut b.values {
+                            range(r, f);
+                        }
+                        for chain in &mut b.transitions {
+                            for r in chain {
+                                range(r, f);
+                            }
+                        }
+                    }
+                    for (_, v) in &mut cp.options {
+                        f(v);
+                    }
+                }
+                CovergroupItem::Cross(cr) => {
+                    if let Some(g) = &mut cr.iff_guard {
+                        f(g);
+                    }
+                    for b in &mut cr.bins {
+                        for r in &mut b.ranges {
+                            range(r, f);
+                        }
+                    }
+                }
+                CovergroupItem::Option { val, .. } | CovergroupItem::TypeOption { val, .. } => {
+                    f(val)
+                }
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub enum CovergroupItem {
@@ -1178,4 +1245,8 @@ pub enum PackageItem {
     /// delays in its classes, tasks and functions. Appended last for bincode
     /// index stability.
     TimeunitsDecl(crate::ast::decl::TimeunitsDeclaration),
+    /// §19.3 a covergroup declared in a package, or at file scope (then
+    /// carried as `Description::PackageItem`). Appended last for bincode
+    /// index stability.
+    Covergroup(CovergroupDeclaration),
 }

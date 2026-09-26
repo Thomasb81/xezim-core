@@ -3020,6 +3020,17 @@ fn register_class_covergroups(c: &ClassDeclaration, elab: &mut ElaboratedModule)
     }
 }
 
+/// §19.3: a covergroup declared in a package, under its bare name (what an
+/// importing scope's `cg c = new;` resolves; the first package wins) and
+/// under `pkg::cg`.
+fn register_package_covergroup(pkg: &str, cg: &CovergroupDeclaration, elab: &mut ElaboratedModule) {
+    elab.covergroups
+        .entry(cg.name.name.clone())
+        .or_insert_with(|| cg.clone());
+    elab.covergroups
+        .insert(format!("{}::{}", pkg, cg.name.name), cg.clone());
+}
+
 /// §35.5.4 `export "DPI-C" [c_name =] task|function sv_name;` — record the
 /// SV subroutine and the C linkage name the loaded library will call.
 fn register_dpi_export(e: &crate::ast::decl::DPIExport, elab: &mut ElaboratedModule) {
@@ -4828,6 +4839,9 @@ pub fn elaborate_module_with_defs(
                             // flagged "Undeclared identifier". Class bodies are
                             // also reachable through their package for
                             // `pkg::Class::method`.
+                            crate::ast::decl::PackageItem::Covergroup(cg) => {
+                                register_package_covergroup(&p.name.name, cg, &mut elab);
+                            }
                             crate::ast::decl::PackageItem::Class(c) => {
                                 register_class_enum_members(c, &mut elab);
                                 register_class_covergroups(c, &mut elab);
@@ -9069,6 +9083,7 @@ pub fn elaborate_module_with_defs(
                 // declared in a MODULE body (package/$unit classes already
                 // registered).
                 register_class_enum_members(cd, &mut elab);
+                register_class_covergroups(cd, &mut elab);
                 let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
                 // A module-scope class remembers its module (issue #155).
                 ec.declaring_module = Some(module.name().to_string());
@@ -23142,6 +23157,9 @@ pub fn inline_instantiations(
                 }
                 for item in &p.items {
                     match item {
+                        crate::ast::decl::PackageItem::Covergroup(cg) => {
+                            register_package_covergroup(name, cg, elab);
+                        }
                         crate::ast::decl::PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);
                             let cls = std::sync::Arc::new(elaborate_class_with_params(
@@ -30659,10 +30677,40 @@ fn inline_module_items(
                             Some(&elab),
                         )?;
                         register_class_enum_members(cd, elab);
+                        register_class_covergroups(cd, elab);
                         let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
                         ec.declaring_module = Some(sub_mod_name.clone());
                         elab.classes
                             .insert(cd.name.name.clone(), std::sync::Arc::new(ec));
+                    }
+                    // §19.3: a covergroup declared in an instantiated module or
+                    // interface is a type of THAT instance, registered as
+                    // `<inst>.cg` with its expressions rewritten into the
+                    // instance scope. The formals stay bare.
+                    if let ModuleItem::CovergroupDeclaration(cg) = sub_item {
+                        let mut cg_locals = (*prepared_sub.local_names).clone();
+                        let mut cg_ports = rewrite_port_map.clone();
+                        for p in cg.ports.iter().chain(cg.sample_ports.iter()) {
+                            cg_locals.remove(&p.name.name);
+                            cg_ports.remove(&p.name.name);
+                        }
+                        let mut new_cg = cg.clone();
+                        new_cg.for_each_expr_mut(&mut |e| {
+                            *e = rewrite_expr(
+                                e,
+                                &inst_prefix,
+                                &cg_ports,
+                                &cg_locals,
+                                &sub_interface_map,
+                            );
+                        });
+                        if let Some(EventControl::Identifier(id)) = &mut new_cg.event {
+                            if cg_locals.contains(&id.name) {
+                                id.name = format!("{}{}", inst_prefix, id.name);
+                            }
+                        }
+                        new_cg.name.name = format!("{}{}", inst_prefix, cg.name.name);
+                        elab.covergroups.insert(new_cg.name.name.clone(), new_cg);
                     }
                     if let ModuleItem::ClockingDeclaration(cd) = sub_item {
                         // §14.3 interface-scoped clocking block: register it under
