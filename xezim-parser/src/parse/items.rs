@@ -4249,6 +4249,31 @@ impl Parser {
         }
         self.expect(TokenKind::KwEndgroup);
         let endlabel = self.parse_end_label();
+        // §19.5: an unlabeled coverpoint on a variable is named after the
+        // variable; one on any other expression gets a generated name
+        // (`coverpoint#<n>`, n counting coverpoints from 1).
+        let mut n_cp = 0usize;
+        for it in &mut items {
+            if let CovergroupItem::Coverpoint(cp) = it {
+                n_cp += 1;
+                if cp.name.is_none() {
+                    let var = match &cp.expr.kind {
+                        ExprKind::Ident(h) if h.path.iter().all(|s| s.selects.is_empty()) => Some(
+                            h.path
+                                .iter()
+                                .map(|s| s.name.name.as_str())
+                                .collect::<Vec<_>>()
+                                .join("."),
+                        ),
+                        _ => None,
+                    };
+                    cp.name = Some(crate::ast::Identifier {
+                        name: var.unwrap_or_else(|| format!("coverpoint#{}", n_cp)),
+                        span: cp.expr.span,
+                    });
+                }
+            }
+        }
         CovergroupDeclaration {
             name,
             ports,
