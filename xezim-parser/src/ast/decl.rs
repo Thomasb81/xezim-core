@@ -364,15 +364,6 @@ impl CovergroupDeclaration {
     /// object (not the constructor or sample formals' defaults): coverpoint
     /// expressions and guards, bin values, options and cross guards.
     pub fn for_each_expr_mut(&mut self, f: &mut dyn FnMut(&mut Expression)) {
-        fn range(r: &mut ConstraintRange, f: &mut dyn FnMut(&mut Expression)) {
-            match r {
-                ConstraintRange::Value(e) => f(e),
-                ConstraintRange::Range { lo, hi } => {
-                    f(lo);
-                    f(hi);
-                }
-            }
-        }
         if let Some(ev) = &mut self.event {
             match ev {
                 super::stmt::EventControl::HierIdentifier(e) => f(e),
@@ -396,11 +387,20 @@ impl CovergroupDeclaration {
                     }
                     for b in &mut cp.bins {
                         for r in &mut b.values {
-                            range(r, f);
+                            r.for_each_expr_mut(f);
                         }
-                        for chain in &mut b.transitions {
-                            for r in chain {
-                                range(r, f);
+                        if let Some(n) = &mut b.array_size {
+                            f(n);
+                        }
+                        for step in b.transitions.iter_mut().flatten() {
+                            for r in &mut step.values {
+                                r.for_each_expr_mut(f);
+                            }
+                            if let Some(rep) = &mut step.repeat {
+                                f(&mut rep.lo);
+                                if let Some(h) = &mut rep.hi {
+                                    f(h);
+                                }
                             }
                         }
                     }
@@ -413,9 +413,13 @@ impl CovergroupDeclaration {
                         f(g);
                     }
                     for b in &mut cr.bins {
-                        for r in &mut b.ranges {
-                            range(r, f);
+                        b.select.for_each_expr_mut(f);
+                        if let Some(g) = &mut b.iff_guard {
+                            f(g);
                         }
+                    }
+                    for (_, v) in &mut cr.options {
+                        f(v);
                     }
                 }
                 CovergroupItem::Option { val, .. } | CovergroupItem::TypeOption { val, .. } => {
@@ -461,44 +465,62 @@ pub struct Coverpoint {
     pub span: Span,
 }
 
-/// LRM §19.5 bin declaration.
-///
-/// Minimum-viable shape: one of
-/// - `bins name = { v1, v2, [lo:hi] };`            → `kind = Bins`
-/// - `ignore_bins name = { ... };`                  → `kind = Ignore`
-/// - `illegal_bins name = { ... };`                 → `kind = Illegal`
-///
-/// Not yet covered: `bins name[N] = …` (auto array of N bins),
-/// `bins name = ( a => b );` transition bins, `default`, `wildcard`.
-/// Those parse-skip and are silently absent from the coverage DB.
+/// LRM §19.5 bin declaration: `bins`, `ignore_bins`, `illegal_bins` or a
+/// `default` bin, over a value list, a wildcard pattern list or a list of
+/// transitions.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CoverBin {
     pub name: Identifier,
     pub kind: CoverBinKind,
     pub values: Vec<ConstraintRange>,
-    /// LRM §19.5 `bins name[]` or `bins name[N]` — the auto-array form
-    /// creates one sub-bin per distinct matched value (or N evenly-spread
-    /// sub-bins). Sampler records hits under `name[<value>]` keys instead
-    /// of one aggregate counter. Today we honor only the `[]` shape;
-    /// `[N]` is treated the same. `None` means scalar (single bin).
+    /// LRM §19.5.1 `bins name[]` (one bin per value) or `bins name[N]`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub array_form: bool,
+    /// The `N` of `bins name[N]`: the values are spread over N bins.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub array_size: Option<Expression>,
     /// LRM §19.5 `wildcard bins name = { pattern };` — bit-wise match
     /// where `x`/`z`/`?` bits in `pattern` are don't-cares. Sampler
     /// switches to per-bit compare honoring the value's xz_bits mask.
     #[cfg_attr(feature = "serde", serde(default))]
     pub is_wildcard: bool,
-    /// LRM §19.5 transition bins `bins name = (prev => cur);` or longer
-    /// chains `(a => b => c)`. Each step in the chain may be a single
-    /// value or a range (`[lo:hi]`) — stored as a `ConstraintRange` so
-    /// the chain can encode `([0:3] => [4:7])` etc. Sampler tracks the
-    /// last N samples per coverpoint (N = the longest declared chain)
-    /// and increments this bin when the trailing window membership-
-    /// matches the chain.
+    /// LRM §19.5.2 transition bins, one entry per parenthesized
+    /// `trans_set` of the list (`(1 => 2), (5 => 6)`); each is the chain
+    /// of its `=>` steps.
     #[cfg_attr(feature = "serde", serde(default))]
-    pub transitions: Vec<Vec<ConstraintRange>>,
+    pub transitions: Vec<Vec<TransStep>>,
     pub span: Span,
+}
+
+/// One step of a §19.5.2 transition: a value set (`1, [3:4]`) with an
+/// optional repetition (`[* n]`, `[-> n]`, `[= n]`, or an `n:m` range).
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TransStep {
+    pub values: Vec<ConstraintRange>,
+    pub repeat: Option<TransRepeat>,
+}
+
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub struct TransRepeat {
+    pub kind: TransRepeatKind,
+    pub lo: Expression,
+    /// The upper bound of `n:m` (`$` is unbounded); `None` repeats exactly `lo`.
+    pub hi: Option<Expression>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum TransRepeatKind {
+    /// `[* n]`: n consecutive matching samples.
+    Consecutive,
+    /// `[-> n]`: n matching samples, not necessarily consecutive, the last
+    /// one ending the step.
+    Goto,
+    /// `[= n]`: like goto, but any non-matching samples may follow.
+    NonConsecutive,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -519,24 +541,66 @@ pub struct Cross {
     /// guard is false. Mirrors `Coverpoint.iff_guard`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub iff_guard: Option<Expression>,
-    /// LRM §19.6 cross body bin filters
-    ///     `bins NAME = binsof(CP) intersect { ranges };`
-    /// Each entry binds a NAME to a coverpoint-reference plus a constant
-    /// range list. At sample time, the cross-tuple's component matching
-    /// the referenced coverpoint is checked against the ranges; in-range
-    /// samples bump that bin's hit count.
+    /// LRM §19.6.1 bins, ignore_bins and illegal_bins of the cross body.
     #[cfg_attr(feature = "serde", serde(default))]
     pub bins: Vec<CrossBin>,
+    /// §19.7 cross-level `option.NAME = expr;` items.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub options: Vec<(String, Expression)>,
     pub span: Span,
 }
 
+/// LRM §19.6.1 `bins NAME = select_expression [iff (expr)];` in a cross body.
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct CrossBin {
     pub name: Identifier,
-    /// The coverpoint identifier referenced by `binsof(<cp>)`.
-    pub cp_ref: Identifier,
-    pub ranges: Vec<ConstraintRange>,
+    pub kind: CoverBinKind,
+    pub select: CrossSelect,
+    pub iff_guard: Option<Expression>,
+}
+
+/// LRM §19.6.1 select_expression: a set of the cross's product bins.
+#[derive(Debug, Clone)]
+#[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
+pub enum CrossSelect {
+    /// `binsof(cp)` or `binsof(cp.bin)`, optionally `intersect {ranges}`:
+    /// the product bins whose `cp` bin is that bin, or has a value in the
+    /// ranges.
+    Binsof {
+        cp: Identifier,
+        bin: Option<Identifier>,
+        intersect: Option<Vec<ConstraintRange>>,
+    },
+    Not(Box<CrossSelect>),
+    And(Box<CrossSelect>, Box<CrossSelect>),
+    Or(Box<CrossSelect>, Box<CrossSelect>),
+    /// `select with (expr)`: the product bins holding a value tuple for
+    /// which `expr`, over the coverpoint names, is true.
+    With(Box<CrossSelect>, Expression),
+    /// The cross's own name: every product bin.
+    All,
+}
+
+impl CrossSelect {
+    pub fn for_each_expr_mut(&mut self, f: &mut dyn FnMut(&mut Expression)) {
+        match self {
+            CrossSelect::Binsof { intersect, .. } => {
+                for r in intersect.iter_mut().flatten() {
+                    r.for_each_expr_mut(f);
+                }
+            }
+            CrossSelect::Not(a) => a.for_each_expr_mut(f),
+            CrossSelect::And(a, b) | CrossSelect::Or(a, b) => {
+                a.for_each_expr_mut(f);
+                b.for_each_expr_mut(f);
+            }
+            // A `with` expression names the cross's coverpoints, not design
+            // objects: left out.
+            CrossSelect::With(a, _) => a.for_each_expr_mut(f),
+            CrossSelect::All => {}
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -1165,6 +1229,18 @@ pub enum ConstraintItem {
 pub enum ConstraintRange {
     Value(Expression),
     Range { lo: Expression, hi: Expression },
+}
+
+impl ConstraintRange {
+    pub fn for_each_expr_mut(&mut self, f: &mut dyn FnMut(&mut Expression)) {
+        match self {
+            ConstraintRange::Value(e) => f(e),
+            ConstraintRange::Range { lo, hi } => {
+                f(lo);
+                f(hi);
+            }
+        }
+    }
 }
 
 /// LRM §18.5.4 weight specifier in `dist { item := w, item :/ w }`.

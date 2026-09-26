@@ -4214,6 +4214,145 @@ impl Parser {
         }
     }
 
+    /// §19.5.2 trans_set: `trans_range_list { => trans_range_list }`.
+    fn parse_trans_set(&mut self) -> Vec<crate::ast::decl::TransStep> {
+        use crate::ast::decl::{TransRepeat, TransRepeatKind, TransStep};
+        let mut steps = Vec::new();
+        loop {
+            let mut values = vec![self.parse_constraint_range()];
+            while self.eat(TokenKind::Comma).is_some() {
+                values.push(self.parse_constraint_range());
+            }
+            let mut repeat = None;
+            // The expression parser folds a trailing `v [-> n]` into its SVA
+            // repetition marker; unwrap it into the step's repetition.
+            if let Some(crate::ast::decl::ConstraintRange::Value(e)) = values.last_mut() {
+                if let crate::ast::expr::ExprKind::SystemCall { name, args } = &mut e.kind {
+                    let kind = match name.as_str() {
+                        "$sva_rep_consec" => Some(TransRepeatKind::Consecutive),
+                        "$sva_rep_goto" => Some(TransRepeatKind::Goto),
+                        "$sva_rep_noncon" => Some(TransRepeatKind::NonConsecutive),
+                        _ => None,
+                    };
+                    if let (Some(kind), 3) = (kind, args.len()) {
+                        let hi = args.pop();
+                        let lo = args.pop().unwrap();
+                        let operand = args.pop().unwrap();
+                        *e = operand;
+                        repeat = Some(TransRepeat { kind, lo, hi });
+                    }
+                }
+            }
+            if repeat.is_none() && self.at(TokenKind::LBracket) {
+                self.bump();
+                let kind = match self.current_kind() {
+                    TokenKind::Star => Some(TransRepeatKind::Consecutive),
+                    TokenKind::Arrow => Some(TransRepeatKind::Goto),
+                    TokenKind::Assign => Some(TransRepeatKind::NonConsecutive),
+                    _ => None,
+                };
+                match kind {
+                    Some(kind) => {
+                        self.bump();
+                        let lo = self.parse_expression();
+                        let hi = if self.eat(TokenKind::Colon).is_some() {
+                            Some(self.parse_expression())
+                        } else {
+                            None
+                        };
+                        repeat = Some(TransRepeat { kind, lo, hi });
+                    }
+                    None => self.error("expected [*, [-> or [= in a transition"),
+                }
+                self.expect(TokenKind::RBracket);
+            }
+            steps.push(TransStep { values, repeat });
+            if self.eat(TokenKind::FatArrow).is_none() {
+                break;
+            }
+        }
+        steps
+    }
+
+    /// §19.6.1 select_expression, `||` level.
+    fn parse_cross_select_or(&mut self) -> crate::ast::decl::CrossSelect {
+        let mut l = self.parse_cross_select_and();
+        while self.eat(TokenKind::LogOr).is_some() {
+            let r = self.parse_cross_select_and();
+            l = crate::ast::decl::CrossSelect::Or(Box::new(l), Box::new(r));
+        }
+        l
+    }
+
+    fn parse_cross_select_and(&mut self) -> crate::ast::decl::CrossSelect {
+        let mut l = self.parse_cross_select_with();
+        while self.eat(TokenKind::LogAnd).is_some() {
+            let r = self.parse_cross_select_with();
+            l = crate::ast::decl::CrossSelect::And(Box::new(l), Box::new(r));
+        }
+        l
+    }
+
+    fn parse_cross_select_with(&mut self) -> crate::ast::decl::CrossSelect {
+        let mut s = self.parse_cross_select_primary();
+        while self.eat(TokenKind::KwWith).is_some() {
+            self.expect(TokenKind::LParen);
+            let e = self.parse_expression();
+            self.expect(TokenKind::RParen);
+            if self.eat(TokenKind::KwMatches).is_some() {
+                let _ = self.parse_expression();
+            }
+            s = crate::ast::decl::CrossSelect::With(Box::new(s), e);
+        }
+        s
+    }
+
+    fn parse_cross_select_primary(&mut self) -> crate::ast::decl::CrossSelect {
+        use crate::ast::decl::CrossSelect;
+        if self.eat(TokenKind::LogNot).is_some() {
+            return CrossSelect::Not(Box::new(self.parse_cross_select_primary()));
+        }
+        if self.eat(TokenKind::LParen).is_some() {
+            let s = self.parse_cross_select_or();
+            self.expect(TokenKind::RParen);
+            return s;
+        }
+        if self.eat(TokenKind::KwBinsof).is_some() {
+            self.expect(TokenKind::LParen);
+            let cp = self.parse_identifier();
+            let bin = if self.eat(TokenKind::Dot).is_some() {
+                Some(self.parse_identifier())
+            } else {
+                None
+            };
+            self.expect(TokenKind::RParen);
+            let intersect = if self.eat(TokenKind::KwIntersect).is_some() {
+                self.expect(TokenKind::LBrace);
+                let mut ranges = Vec::new();
+                while !self.at(TokenKind::RBrace) && !self.at(TokenKind::Eof) {
+                    ranges.push(self.parse_constraint_range());
+                    if self.eat(TokenKind::Comma).is_none() {
+                        break;
+                    }
+                }
+                self.expect(TokenKind::RBrace);
+                Some(ranges)
+            } else {
+                None
+            };
+            return CrossSelect::Binsof { cp, bin, intersect };
+        }
+        if self.at(TokenKind::Identifier) {
+            self.bump();
+            return CrossSelect::All;
+        }
+        self.error(format!(
+            "expected a cross bin select expression, found '{}'",
+            self.current().text
+        ));
+        CrossSelect::All
+    }
+
     pub(super) fn parse_covergroup_declaration(&mut self) -> CovergroupDeclaration {
         let start = self.current().span.start;
         self.bump();
@@ -4359,32 +4498,33 @@ impl Parser {
                             let bin_name = if self.at(TokenKind::Identifier) {
                                 self.parse_identifier()
                             } else {
-                                // unnamed — skip to next `;` (depth-aware)
-                                // and continue.
+                                // §19.5: a bin is named by an identifier; a
+                                // reserved word (`small`, `large`) is not one.
+                                self.error(format!(
+                                    "expected a bin name, found '{}'",
+                                    self.current().text
+                                ));
                                 self.skip_bin_body_to_semicolon();
                                 if self.at(TokenKind::Semicolon) {
                                     self.bump();
                                 }
                                 continue;
                             };
-                            // Optional `[]` or `[N]` array form (LRM §19.5).
-                            // Captured into `array_form` so the sampler
-                            // splits hits into per-value sub-bins.
+                            // §19.5.1 `[]` or `[N]` array form.
                             let mut is_array = false;
+                            let mut array_size = None;
                             if self.at(TokenKind::LBracket) {
                                 is_array = true;
                                 self.bump();
-                                while !self.at(TokenKind::RBracket) && !self.at(TokenKind::Eof) {
-                                    self.bump();
+                                if !self.at(TokenKind::RBracket) {
+                                    array_size = Some(self.parse_expression());
                                 }
-                                if self.at(TokenKind::RBracket) {
-                                    self.bump();
-                                }
+                                self.expect(TokenKind::RBracket);
                             }
                             // `=` then bin body.
                             if self.eat(TokenKind::Assign).is_some() {
                                 let mut values: Vec<crate::ast::decl::ConstraintRange> = Vec::new();
-                                let mut transitions: Vec<Vec<crate::ast::decl::ConstraintRange>> =
+                                let mut transitions: Vec<Vec<crate::ast::decl::TransStep>> =
                                     Vec::new();
                                 let mut bin_kind = k;
                                 if self.at(TokenKind::LBrace) {
@@ -4405,36 +4545,16 @@ impl Parser {
                                     self.bump();
                                     bin_kind = crate::ast::decl::CoverBinKind::Default;
                                 } else if self.at(TokenKind::LParen) {
-                                    // LRM §19.5 transition bins:
-                                    // `bins name = (prev => cur);` or
-                                    // `bins name = (a => b, c => d);`.
-                                    // `=>` is also parsed as a binary op
-                                    // (BinaryOp::OrFatArrow), so
-                                    // `parse_expression` slurps `a => b` as
-                                    // one Binary node — split it back here.
-                                    // Multi-step `a => b => c` only retains
-                                    // the leftmost pair for now.
-                                    self.bump(); // (
+                                    // §19.5.2 trans_list: `(set), (set), ...`.
                                     loop {
-                                        // Collect the whole chain
-                                        // `a => b => c => …` where each
-                                        // step is either a single value or
-                                        // a `[lo:hi]` range. We re-use
-                                        // `parse_constraint_range` to
-                                        // capture both forms.
-                                        let mut chain: Vec<crate::ast::decl::ConstraintRange> =
-                                            Vec::new();
-                                        chain.push(self.parse_constraint_range());
-                                        while self.eat(TokenKind::FatArrow).is_some() {
-                                            chain.push(self.parse_constraint_range());
-                                        }
-                                        transitions.push(chain);
-                                        if !self.at(TokenKind::Comma) {
+                                        self.expect(TokenKind::LParen);
+                                        transitions.push(self.parse_trans_set());
+                                        self.expect(TokenKind::RParen);
+                                        if !(self.at(TokenKind::Comma)
+                                            && self.peek_kind() == TokenKind::LParen)
+                                        {
                                             break;
                                         }
-                                        self.bump();
-                                    }
-                                    if self.at(TokenKind::RParen) {
                                         self.bump();
                                     }
                                 } else {
@@ -4447,6 +4567,7 @@ impl Parser {
                                     kind: bin_kind,
                                     values,
                                     array_form: is_array,
+                                    array_size,
                                     is_wildcard,
                                     transitions,
                                     span: self.span_from(bin_start),
@@ -4517,12 +4638,11 @@ impl Parser {
                     }
                 }
                 let mut bins: Vec<crate::ast::decl::CrossBin> = Vec::new();
+                let mut options: Vec<(String, crate::ast::expr::Expression)> = Vec::new();
                 if self.at(TokenKind::LBrace) {
                     self.bump();
-                    // Lightweight body parser: recognise
-                    //   `bins NAME = binsof(IDENT) intersect { ranges };`
-                    // Everything else is skipped depth-tracked so the
-                    // outer brace match remains balanced (legacy behavior).
+                    // §19.6.1 cross body: bins selections and options. Other
+                    // items are skipped depth-tracked.
                     loop {
                         if self.at(TokenKind::Eof) {
                             break;
@@ -4531,51 +4651,58 @@ impl Parser {
                             self.bump();
                             break;
                         }
-                        if self.current().text == "bins" {
-                            let save = self.pos;
-                            self.bump();
-                            let bin_name = self.parse_identifier();
-                            if self.eat(TokenKind::Assign).is_some()
-                                && self.current().text == "binsof"
-                            {
-                                self.bump();
-                                let _ = self.eat(TokenKind::LParen);
-                                let cp_ref = self.parse_identifier();
-                                let _ = self.eat(TokenKind::RParen);
-                                if self.current().text == "intersect" {
-                                    self.bump();
-                                    let mut ranges: Vec<crate::ast::decl::ConstraintRange> =
-                                        Vec::new();
-                                    if self.eat(TokenKind::LBrace).is_some() {
-                                        loop {
-                                            if self.at(TokenKind::RBrace) {
-                                                self.bump();
-                                                break;
-                                            }
-                                            if self.at(TokenKind::Eof) {
-                                                break;
-                                            }
-                                            // parse_constraint_range handles
-                                            // both bare values and `[lo:hi]`
-                                            // range form (mirrors bins
-                                            // value-list parsing).
-                                            ranges.push(self.parse_constraint_range());
-                                            if self.at(TokenKind::Comma) {
-                                                self.bump();
-                                            }
-                                        }
-                                    }
-                                    let _ = self.eat(TokenKind::Semicolon);
-                                    bins.push(crate::ast::decl::CrossBin {
-                                        name: bin_name,
-                                        cp_ref,
-                                        ranges,
-                                    });
-                                    continue;
-                                }
+                        let kind = match self.current_kind() {
+                            TokenKind::KwBins => Some(crate::ast::decl::CoverBinKind::Bins),
+                            TokenKind::KwIgnore_bins => {
+                                Some(crate::ast::decl::CoverBinKind::Ignore)
                             }
-                            // Not the form we recognise — restore and skip.
-                            self.pos = save;
+                            TokenKind::KwIllegal_bins => {
+                                Some(crate::ast::decl::CoverBinKind::Illegal)
+                            }
+                            _ => None,
+                        };
+                        if let Some(kind) = kind {
+                            self.bump();
+                            if !self.at(TokenKind::Identifier) {
+                                self.error(format!(
+                                    "expected a bin name, found '{}'",
+                                    self.current().text
+                                ));
+                                self.skip_bin_body_to_semicolon();
+                                let _ = self.eat(TokenKind::Semicolon);
+                                continue;
+                            }
+                            let bin_name = self.parse_identifier();
+                            self.expect(TokenKind::Assign);
+                            let select = self.parse_cross_select_or();
+                            let mut iff_guard = None;
+                            if self.eat(TokenKind::KwIff).is_some() {
+                                self.expect(TokenKind::LParen);
+                                iff_guard = Some(self.parse_expression());
+                                self.expect(TokenKind::RParen);
+                            }
+                            self.expect(TokenKind::Semicolon);
+                            bins.push(crate::ast::decl::CrossBin {
+                                name: bin_name,
+                                kind,
+                                select,
+                                iff_guard,
+                            });
+                            continue;
+                        }
+                        if self.at(TokenKind::Identifier)
+                            && (self.current().text == "option"
+                                || self.current().text == "type_option")
+                            && self.peek_kind() == TokenKind::Dot
+                        {
+                            self.bump();
+                            self.bump();
+                            let opt_name = self.parse_identifier().name;
+                            if self.eat(TokenKind::Assign).is_some() {
+                                options.push((opt_name, self.parse_expression()));
+                            }
+                            let _ = self.eat(TokenKind::Semicolon);
+                            continue;
                         }
                         // Skip one token (depth-aware for nested braces).
                         if self.at(TokenKind::LBrace) {
@@ -4601,6 +4728,7 @@ impl Parser {
                     items: ids,
                     iff_guard,
                     bins,
+                    options,
                     span: self.span_from(start),
                 })
             }
