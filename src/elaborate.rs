@@ -35239,6 +35239,7 @@ fn rewrite_stmt(
                     ))
                 }),
                 is_property: a.is_property,
+                is_sequence: a.is_sequence,
                 deferred: a.deferred,
                 label: a.label.clone(),
                 span: a.span,

@@ -64,7 +64,8 @@ pub use value::Value;
 /// Magic bytes identifying a xezim compiled artifact.
 /// Version byte: \x1f = \x1e + PackageItem::Covergroup (package and
 /// file-scope covergroups, §19.3), CoverBin.array_size, TransStep transitions,
-/// Cross.options and CrossBin selects (§19.5-§19.6);
+/// Cross.options and CrossBin selects (§19.5-§19.6),
+/// AssertionStatement.is_sequence (§16.14.3 `cover sequence`);
 /// \x1e = \x1d + `local::` kept as HierarchicalIdentifier.root
 /// and the parity round's parser/elaboration semantics changes (cached
 /// parses from \x1d or earlier carry the old results);

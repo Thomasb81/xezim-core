@@ -350,6 +350,10 @@ pub struct AssertionStatement {
     /// discarded; this field surfaces it for the executor).
     #[cfg_attr(feature = "serde", serde(default))]
     pub is_property: bool,
+    /// §16.14.3 `cover sequence (...)`: every match of the sequence counts,
+    /// not only the first of each attempt.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub is_sequence: bool,
     /// §16.4 deferred immediate assertion: `assert #0` / `assert final`.
     #[cfg_attr(feature = "serde", serde(default))]
     pub deferred: Option<DeferredAssertion>,

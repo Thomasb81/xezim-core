@@ -1959,7 +1959,10 @@ impl Parser {
                 self.bump();
             }
         }
-        let is_property = self.eat(TokenKind::KwProperty).is_some();
+        // §16.14.3 `cover sequence (...)` runs on the concurrent-cover
+        // machinery and counts every match of the sequence.
+        let is_sequence = kind == AssertionKind::Cover && self.eat(TokenKind::KwSequence).is_some();
+        let is_property = is_sequence || self.eat(TokenKind::KwProperty).is_some();
         self.expect(TokenKind::LParen);
         // LRM §16.6 property_spec grammar:
         //   [ clocking_event ] [ disable iff ( expr_or_dist ) ] property_expr
@@ -2039,6 +2042,7 @@ impl Parser {
             action,
             else_action,
             is_property,
+            is_sequence,
             deferred,
             label: None,
             span: self.span_from(start),
