@@ -150,16 +150,150 @@ fn params_insert_traced(
 /// Insert into a typedef-width table, logging the written width and the value
 /// it replaced when the key is traced. Same result as `HashMap::insert`; the
 /// untraced path is the plain insert.
+/// A table typedef widths can be recorded in: the design's own
+/// `TypedefTable` or a scratch `HashMap`.
+trait WidthTable {
+    fn insert_width(&mut self, key: String, w: u32) -> Option<u32>;
+}
+
+impl WidthTable for HashMap<String, u32> {
+    fn insert_width(&mut self, key: String, w: u32) -> Option<u32> {
+        self.insert(key, w)
+    }
+}
+
+impl WidthTable for TypedefTable {
+    fn insert_width(&mut self, key: String, w: u32) -> Option<u32> {
+        self.insert(key, w)
+    }
+}
+
+/// Process-unique identity of one `TypedefTable` value (a clone or a
+/// deserialized copy is a different table).
+#[derive(Debug)]
+struct TableIdent(u64);
+
+impl Default for TableIdent {
+    fn default() -> Self {
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        TableIdent(NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed))
+    }
+}
+
+/// A name-keyed table that remembers which keys each change touched, so a
+/// thread-local snapshot of it (`TYPEDEFS_TLS`, `FUNCS_TLS`) is brought up to
+/// date by replaying only the changes since it was taken instead of copying
+/// the whole table after every change. Reads go through `Deref` to the map;
+/// every write goes through the methods below. Serialized exactly as the
+/// plain map.
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+#[serde(transparent)]
+pub struct LoggedMap<V> {
+    map: HashMap<String, V>,
+    #[serde(skip)]
+    ident: TableIdent,
+    #[serde(skip)]
+    log: Vec<String>,
+}
+
+/// Typedef name -> width.
+pub type TypedefTable = LoggedMap<u32>;
+/// Subroutine name -> declaration.
+pub type FuncTable = LoggedMap<FunctionDeclaration>;
+
+impl<V> Default for LoggedMap<V> {
+    fn default() -> Self {
+        Self::from_map(HashMap::default())
+    }
+}
+
+impl<V: Clone> Clone for LoggedMap<V> {
+    fn clone(&self) -> Self {
+        Self::from_map(self.map.clone())
+    }
+}
+
+impl<V> std::ops::Deref for LoggedMap<V> {
+    type Target = HashMap<String, V>;
+    fn deref(&self) -> &HashMap<String, V> {
+        &self.map
+    }
+}
+
+impl<V> LoggedMap<V> {
+    pub fn from_map(map: HashMap<String, V>) -> Self {
+        Self {
+            map,
+            ident: TableIdent::default(),
+            log: Vec::new(),
+        }
+    }
+
+    pub fn as_map(&self) -> &HashMap<String, V> {
+        &self.map
+    }
+
+    /// The plain map, for bulk in-place edits (rewrap with `from_map`).
+    pub fn into_map(self) -> HashMap<String, V> {
+        self.map
+    }
+
+    pub fn insert(&mut self, key: String, value: V) -> Option<V> {
+        self.log.push(key.clone());
+        self.map.insert(key, value)
+    }
+
+    pub fn remove(&mut self, key: &str) -> Option<V> {
+        let prev = self.map.remove(key);
+        if prev.is_some() {
+            self.log.push(key.to_string());
+        }
+        prev
+    }
+
+    /// `entry(key).or_insert_with(value)`; true when it inserted.
+    pub fn insert_if_absent_with(&mut self, key: String, value: impl FnOnce() -> V) -> bool {
+        if self.map.contains_key(&key) {
+            return false;
+        }
+        self.insert(key, value());
+        true
+    }
+
+    /// `entry(key).or_insert(value)`; true when it inserted.
+    pub fn insert_if_absent(&mut self, key: String, value: V) -> bool {
+        self.insert_if_absent_with(key, || value)
+    }
+
+    /// Bring `snap` from this table's state after `seen` logged changes to
+    /// its current state (see `LoggedMap`).
+    fn replay_into(&self, snap: &mut HashMap<String, V>, seen: usize)
+    where
+        V: Clone,
+    {
+        for key in &self.log[seen..] {
+            match self.map.get(key) {
+                Some(v) => {
+                    snap.insert(key.clone(), v.clone());
+                }
+                None => {
+                    snap.remove(key);
+                }
+            }
+        }
+    }
+}
+
 fn typedefs_insert_traced(
-    map: &mut HashMap<String, u32>,
+    map: &mut impl WidthTable,
     site: &str,
     key: String,
     w: u32,
 ) -> Option<u32> {
     if !type_trace_on(&key) {
-        return map.insert(key, w);
+        return map.insert_width(key, w);
     }
-    let prev = map.insert(key.clone(), w);
+    let prev = map.insert_width(key.clone(), w);
     let prev_s = prev
         .map(|p| p.to_string())
         .unwrap_or_else(|| "<none>".into());
@@ -2154,7 +2288,7 @@ pub struct ElaboratedModule {
     pub program_initial_blocks: Vec<InitialBlock>,
     pub parameters: HashMap<String, Value>,
     /// Typedef name -> width mapping for user-defined types.
-    pub typedefs: HashMap<String, u32>,
+    pub typedefs: TypedefTable,
     /// §7.4.1: for a typedef whose target is a packed array of packed
     /// elements (`typedef u8_t [15:0] vec_t`), the ELEMENT width (8 here).
     /// Lets downstream compilers slice `local[i]` on typedef-typed locals.
@@ -2195,7 +2329,7 @@ pub struct ElaboratedModule {
     /// Covergroup definitions: name -> AST declaration.
     pub covergroups: HashMap<String, CovergroupDeclaration>,
     /// Module-level function declarations.
-    pub functions: HashMap<String, FunctionDeclaration>,
+    pub functions: FuncTable,
     /// Module-level task declarations.
     pub tasks: HashMap<String, TaskDeclaration>,
     /// Declaring scope (package name) for package-level functions/tasks, so
@@ -2757,7 +2891,7 @@ impl ElaboratedModule {
             static_init_blocks: Vec::new(),
             program_initial_blocks: Vec::new(),
             parameters: HashMap::default(),
-            typedefs: HashMap::default(),
+            typedefs: TypedefTable::default(),
             typedef_types: HashMap::default(),
             nettype_resolvers: HashMap::default(),
             arrays: HashMap::default(),
@@ -2766,7 +2900,7 @@ impl ElaboratedModule {
             assoc_index_widths: HashMap::default(),
             classes: HashMap::default(),
             covergroups: HashMap::default(),
-            functions: HashMap::default(),
+            functions: FuncTable::default(),
             tasks: HashMap::default(),
             func_decl_scope: HashMap::default(),
             class_decl_pkg: HashMap::default(),
@@ -3439,9 +3573,7 @@ pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedMo
                 if let Some(t) = prev_t {
                     elab.typedef_types.insert(td.name.name.clone(), t);
                 }
-                TYPEDEFS_TLS.with(|cell| {
-                    *cell.borrow_mut() = Some(elab.typedefs.clone());
-                });
+                sync_typedefs_tls(&elab.typedefs);
             }
         }
     }
@@ -3600,8 +3732,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 continue;
             }
             elab.functions
-                .entry(f.name.name.name.clone())
-                .or_insert_with(|| f.clone());
+                .insert_if_absent_with(f.name.name.name.clone(), || f.clone());
             elab.functions
                 .insert(format!("{}::{}", p.name.name, f.name.name.name), f.clone());
             elab.pkg_subr_owner
@@ -3767,9 +3898,7 @@ pub fn register_scoped_typedef_alias(
     // `process_typedef` refreshes the const-eval snapshot, but it runs BEFORE
     // this alias exists — so `$bits(pkg::T)` never saw the qualified key.
     type_trace_tls_refresh("scoped_alias", &elab.typedefs);
-    TYPEDEFS_TLS.with(|cell| {
-        *cell.borrow_mut() = Some(elab.typedefs.clone());
-    });
+    sync_typedefs_tls(&elab.typedefs);
 }
 
 /// Type names a typedef's own definition refers to — its base type and, for a
@@ -4136,9 +4265,7 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
     // Refresh the thread-local typedef snapshot so any subsequent
     // const-eval `$bits(typedef_name)` call sees this typedef (M2).
     type_trace_tls_refresh("process_typedef", &elab.typedefs);
-    TYPEDEFS_TLS.with(|cell| {
-        *cell.borrow_mut() = Some(elab.typedefs.clone());
-    });
+    sync_typedefs_tls(&elab.typedefs);
 }
 
 fn resolve_interface_modport_view(
@@ -4858,8 +4985,7 @@ pub fn elaborate_module_with_defs(
                                 if f.name.scope.is_none() =>
                             {
                                 elab.functions
-                                    .entry(f.name.name.name.clone())
-                                    .or_insert_with(|| f.clone());
+                                    .insert_if_absent_with(f.name.name.name.clone(), || f.clone());
                                 // §26.3: the qualified key — `pkg::f(...)` must
                                 // reach THIS package's declaration even when a
                                 // later package hoists the same bare name.
@@ -4957,8 +5083,7 @@ pub fn elaborate_module_with_defs(
     for it in module.items() {
         if let ModuleItem::FunctionDeclaration(fd) = it {
             elab.functions
-                .entry(fd.name.name.name.clone())
-                .or_insert_with(|| fd.clone());
+                .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
         }
     }
     set_funcs_tls(&elab.functions);
@@ -5428,8 +5553,7 @@ pub fn elaborate_module_with_defs(
         for item in &p.items {
             if let crate::ast::decl::PackageItem::Function(fd) = item {
                 elab.functions
-                    .entry(fd.name.name.name.clone())
-                    .or_insert_with(|| fd.clone());
+                    .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
             }
         }
         set_funcs_tls(&elab.functions);
@@ -9327,8 +9451,7 @@ pub fn elaborate_module_with_defs(
                         }
                         crate::ast::decl::PackageItem::Function(fd) if fd.name.name.name == sv => {
                             elab.functions
-                                .entry(q.clone())
-                                .or_insert_with(|| fd.clone());
+                                .insert_if_absent_with(q.clone(), || fd.clone());
                             found = true;
                         }
                         _ => {}
@@ -17306,7 +17429,7 @@ pub fn const_eval_i64_with_params(
                 if let Some(p) = params {
                     shell.parameters = p.clone();
                 }
-                shell.functions = (*funcs).clone();
+                shell.functions = FuncTable::from_map((*funcs).clone());
                 if let Some(v) = eval_const_user_function(&fd, &argv, &shell.parameters, &shell, 0)
                 {
                     return v.to_i64();
@@ -17334,10 +17457,30 @@ thread_local! {
         = const { std::cell::RefCell::new(None) };
 }
 
-fn set_funcs_tls(funcs: &HashMap<String, FunctionDeclaration>) {
+thread_local! {
+    /// The table `FUNCS_TLS` currently mirrors (identity, change-log
+    /// position), like `TYPEDEFS_TLS_MIRROR`; None after `funcs_tls_add`
+    /// merged in declarations of its own.
+    static FUNCS_TLS_MIRROR: std::cell::Cell<Option<(u64, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Make `FUNCS_TLS` hold exactly the contents of `funcs` (see
+/// `sync_typedefs_tls`).
+fn set_funcs_tls(funcs: &FuncTable) {
+    let mirror = FUNCS_TLS_MIRROR.with(|m| m.get());
     FUNCS_TLS.with(|cell| {
-        *cell.borrow_mut() = Some(std::rc::Rc::new(funcs.clone()));
+        let mut slot = cell.borrow_mut();
+        match (slot.as_mut(), mirror) {
+            (Some(rc), Some((id, seen))) if id == funcs.ident.0 && seen <= funcs.log.len() => {
+                if seen < funcs.log.len() {
+                    funcs.replay_into(std::rc::Rc::make_mut(rc), seen);
+                }
+            }
+            _ => *slot = Some(std::rc::Rc::new(funcs.map.clone())),
+        }
     });
+    FUNCS_TLS_MIRROR.with(|m| m.set(Some((funcs.ident.0, funcs.log.len()))));
 }
 
 /// Incremental FUNCS_TLS refresh for the per-instance inlining path. The full
@@ -17352,6 +17495,7 @@ fn funcs_tls_add<'a>(
     funcs: &HashMap<String, FunctionDeclaration>,
     names: impl Iterator<Item = &'a String>,
 ) {
+    FUNCS_TLS_MIRROR.with(|m| m.set(None));
     FUNCS_TLS.with(|cell| {
         let mut b = cell.borrow_mut();
         let rc = b.get_or_insert_with(|| std::rc::Rc::new(HashMap::default()));
@@ -17371,6 +17515,32 @@ fn funcs_tls_add<'a>(
 // of `const_eval_i64_with_params` at all 47 call sites. Callers that
 // have a typedef table in scope wrap their const-eval with
 // `with_typedefs(td, || const_eval_…)`; the table is restored on exit.
+thread_local! {
+    /// The table `TYPEDEFS_TLS` currently mirrors — its identity and how much
+    /// of its change log the snapshot already reflects — or None when the
+    /// snapshot holds anything else. Every writer of `TYPEDEFS_TLS` keeps
+    /// this in step.
+    static TYPEDEFS_TLS_MIRROR: std::cell::Cell<Option<(u64, usize)>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Make `TYPEDEFS_TLS` hold exactly the contents of `table`: replay the
+/// changes since the snapshot was taken when it mirrors this table, copy the
+/// whole table otherwise.
+fn sync_typedefs_tls(table: &TypedefTable) {
+    let mirror = TYPEDEFS_TLS_MIRROR.with(|m| m.get());
+    TYPEDEFS_TLS.with(|cell| {
+        let mut slot = cell.borrow_mut();
+        match (slot.as_mut(), mirror) {
+            (Some(snap), Some((id, seen))) if id == table.ident.0 && seen <= table.log.len() => {
+                table.replay_into(snap, seen)
+            }
+            _ => *slot = Some(table.map.clone()),
+        }
+    });
+    TYPEDEFS_TLS_MIRROR.with(|m| m.set(Some((table.ident.0, table.log.len()))));
+}
+
 thread_local! {
     static TYPEDEFS_TLS: std::cell::RefCell<Option<HashMap<String, u32>>>
         = const { std::cell::RefCell::new(None) };
@@ -17963,8 +18133,10 @@ pub fn with_typedefs<R>(typedefs: &HashMap<String, u32>, f: impl FnOnce() -> R) 
 fn with_typedefs_owned<R>(typedefs: HashMap<String, u32>, f: impl FnOnce() -> R) -> R {
     type_trace_tls_refresh("with_typedefs", &typedefs);
     let prev = TYPEDEFS_TLS.with(|td| (*td.borrow_mut()).replace(typedefs));
+    let prev_mirror = TYPEDEFS_TLS_MIRROR.with(|m| m.replace(None));
     let r = f();
     TYPEDEFS_TLS.with(|td| *td.borrow_mut() = prev);
+    TYPEDEFS_TLS_MIRROR.with(|m| m.set(prev_mirror));
     r
 }
 
@@ -23084,8 +23256,7 @@ pub fn inline_instantiations(
                 for item in &p.items {
                     if let crate::ast::decl::PackageItem::Function(fd) = item {
                         elab.functions
-                            .entry(fd.name.name.name.clone())
-                            .or_insert_with(|| fd.clone());
+                            .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
                     }
                 }
                 set_funcs_tls(&elab.functions);
@@ -28150,8 +28321,7 @@ fn inline_module_items(
                 for it in sub_mod.items() {
                     if let ModuleItem::FunctionDeclaration(fd) = it {
                         elab.functions
-                            .entry(fd.name.name.name.clone())
-                            .or_insert_with(|| fd.clone());
+                            .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
                     }
                 }
                 // Incremental — the full-snapshot refresh here was O(N²), see
@@ -28413,7 +28583,7 @@ fn inline_module_items(
                 for _ in 0..4 {
                     let body_items =
                         collect_effective_items_ref(sub_mod.items(), &sub_local_params);
-                    let mut local_tds = elab.typedefs.clone();
+                    let mut local_tds = elab.typedefs.as_map().clone();
                     for p_decl in sub_mod.params() {
                         if let ParameterKind::Type { assignments } = &p_decl.kind {
                             for a in assignments {
@@ -28445,6 +28615,7 @@ fn inline_module_items(
                     }
                     type_trace_tls_refresh("submodule_local", &local_tds);
                     TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(local_tds));
+                    TYPEDEFS_TLS_MIRROR.with(|m| m.set(None));
 
                     // 2. Parameters from module items
                     let snapshot = sub_local_params.clone();
@@ -35904,9 +36075,7 @@ fn rebind_imported_typedefs(
     // moved — this runs per inlined instance and the map is large.
     if changed {
         type_trace_tls_refresh("rebind_import", &elab.typedefs);
-        TYPEDEFS_TLS.with(|cell| {
-            *cell.borrow_mut() = Some(elab.typedefs.clone());
-        });
+        sync_typedefs_tls(&elab.typedefs);
     }
 }
 
@@ -36426,8 +36595,7 @@ fn process_import(
                 for pi in &pkg.items {
                     if let PackageItem::Function(fd) = pi {
                         elab.functions
-                            .entry(fd.name.name.name.clone())
-                            .or_insert_with(|| fd.clone());
+                            .insert_if_absent_with(fd.name.name.name.clone(), || fd.clone());
                     }
                 }
                 set_funcs_tls(&elab.functions);
@@ -36791,4 +36959,60 @@ fn process_import(
         }
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod logged_map_tests {
+    use super::*;
+
+    fn tls_snapshot() -> Option<HashMap<String, u32>> {
+        TYPEDEFS_TLS.with(|c| c.borrow().clone())
+    }
+
+    fn same(a: &HashMap<String, u32>, b: &HashMap<String, u32>) -> bool {
+        a.len() == b.len() && a.iter().all(|(k, v)| b.get(k) == Some(v))
+    }
+
+    /// The const-eval snapshot must equal the table after every sync, whether
+    /// it was brought up to date by replaying changes or by a full copy.
+    #[test]
+    fn typedef_snapshot_tracks_the_table() {
+        let mut t = TypedefTable::default();
+        t.insert("a".into(), 1);
+        t.insert("b".into(), 2);
+        sync_typedefs_tls(&t);
+        assert!(same(&tls_snapshot().unwrap(), t.as_map()));
+
+        // Replay: overwrite, add, remove.
+        t.insert("a".into(), 5);
+        t.insert("c".into(), 3);
+        t.remove("b");
+        assert!(!t.insert_if_absent("c".into(), 9));
+        sync_typedefs_tls(&t);
+        assert!(same(&tls_snapshot().unwrap(), t.as_map()));
+
+        // A scoped replacement is undone, and the next sync is still exact.
+        let mut foreign = HashMap::default();
+        foreign.insert("z".to_string(), 7);
+        with_typedefs_owned(foreign, || {
+            assert_eq!(tls_snapshot().unwrap().get("z"), Some(&7));
+        });
+        t.insert("d".into(), 4);
+        sync_typedefs_tls(&t);
+        assert!(same(&tls_snapshot().unwrap(), t.as_map()));
+
+        // A different table (a clone has its own identity) is copied whole.
+        let mut u = t.clone();
+        u.insert("e".into(), 6);
+        sync_typedefs_tls(&u);
+        assert!(same(&tls_snapshot().unwrap(), u.as_map()));
+        sync_typedefs_tls(&t);
+        assert!(same(&tls_snapshot().unwrap(), t.as_map()));
+
+        // A snapshot some other writer replaced is copied whole too.
+        TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(HashMap::default()));
+        TYPEDEFS_TLS_MIRROR.with(|m| m.set(None));
+        sync_typedefs_tls(&t);
+        assert!(same(&tls_snapshot().unwrap(), t.as_map()));
+    }
 }
