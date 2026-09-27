@@ -137,6 +137,33 @@ impl OriginSink {
     }
 }
 
+/// Offset of the first byte of `b` equal to one of `targets` (or, with
+/// `high`, any non-ASCII byte), eight bytes at a time; `None` when there is
+/// none. The same answer as `b.iter().position(..)` with that predicate.
+fn find_byte(b: &[u8], targets: &[u8], high: bool) -> Option<usize> {
+    const LO: u64 = 0x0101_0101_0101_0101;
+    const HI: u64 = 0x8080_8080_8080_8080;
+    let mut i = 0;
+    while i + 8 <= b.len() {
+        let x = u64::from_le_bytes(b[i..i + 8].try_into().unwrap());
+        let mut m = if high { x & HI } else { 0 };
+        for &t in targets {
+            let v = x ^ (LO * t as u64);
+            // Exact for the lowest matching byte: borrows only reach bytes
+            // above a true match.
+            m |= v.wrapping_sub(LO) & !v & HI;
+        }
+        if m != 0 {
+            return Some(i + (m.trailing_zeros() / 8) as usize);
+        }
+        i += 8;
+    }
+    b[i..]
+        .iter()
+        .position(|&c| targets.contains(&c) || (high && c >= 0x80))
+        .map(|p| i + p)
+}
+
 /// Whitespace bytes `char::is_whitespace` accepts in ASCII (note VT, which
 /// `u8::is_ascii_whitespace` does not).
 fn ascii_ws(b: u8) -> bool {
@@ -749,10 +776,7 @@ impl Preprocessor {
         while i < n {
             // Plain ASCII text is copied verbatim; only `/`, `"` and non-ASCII
             // bytes (re-encoded byte by byte below) need the careful path.
-            let run = bytes[i..]
-                .iter()
-                .position(|&c| c == b'/' || c == b'"' || c >= 0x80)
-                .unwrap_or(n - i);
+            let run = find_byte(&bytes[i..], b"/\"", true).unwrap_or(n - i);
             if run > 0 {
                 result.push_str(&source[i..i + run]);
                 i += run;
@@ -763,7 +787,7 @@ impl Preprocessor {
                     // Line comment: replace with spaces until newline to preserve line numbers
                     // BUT: keep the backslash if it's at the end of the line (continuation)
                     let start = i;
-                    i += bytes[i..].iter().position(|&c| c == b'\n').unwrap_or(n - i);
+                    i += find_byte(&bytes[i..], b"\n", false).unwrap_or(n - i);
                     // Check if the line ends with a backslash (ignoring whitespace)
                     let mut j = i;
                     while j > start && bytes[j - 1].is_ascii_whitespace() {
@@ -792,10 +816,7 @@ impl Preprocessor {
                     i += 2;
                     while i + 1 < n {
                         // One space per byte that is none of the three below.
-                        let run = bytes[i..n - 1]
-                            .iter()
-                            .position(|&c| c == b'*' || c == b'\n' || c == b'\\')
-                            .unwrap_or(n - 1 - i);
+                        let run = find_byte(&bytes[i..n - 1], b"*\n\\", false).unwrap_or(n - 1 - i);
                         if run > 0 {
                             push_spaces(&mut result, run);
                             i += run;
@@ -824,10 +845,7 @@ impl Preprocessor {
                 result.push('\"');
                 i += 1;
                 while i < n {
-                    let run = bytes[i..]
-                        .iter()
-                        .position(|&c| c == b'\\' || c == b'"' || c >= 0x80)
-                        .unwrap_or(n - i);
+                    let run = find_byte(&bytes[i..], b"\\\"", true).unwrap_or(n - i);
                     if run > 0 {
                         result.push_str(&source[i..i + run]);
                         i += run;
@@ -906,6 +924,14 @@ impl Preprocessor {
         let mut in_define_cont = false;
         for (ln, line) in source.lines().enumerate() {
             let ln = ln as u32;
+            // A line with no backtick outside a `define body passes through
+            // unchanged (the last branch below), with no need to trim it.
+            if !in_define_cont && !line.as_bytes().contains(&b'`') {
+                out.push_str(line);
+                out.push('\n');
+                pos.push((ln, 0));
+                continue;
+            }
             let trimmed = fast_trim_start(line);
             if in_define_cont || directive_word(trimmed, "`define") {
                 in_define_cont = line.trim_end().ends_with('\\');
@@ -2118,9 +2144,9 @@ impl Preprocessor {
             // Copy ordinary text in bulk: inside a string only `\\` and `"`
             // matter, outside it only `` ` `` and `"`.
             let run = if in_string {
-                bytes[i..].iter().position(|&c| c == b'\\' || c == b'"')
+                find_byte(&bytes[i..], b"\\\"", false)
             } else {
-                bytes[i..].iter().position(|&c| c == b'`' || c == b'"')
+                find_byte(&bytes[i..], b"`\"", false)
             }
             .unwrap_or(bytes.len() - i);
             if run > 0 {
@@ -2503,7 +2529,7 @@ impl Preprocessor {
         let mut in_string = false;
         // Only `"` (string state) and `(` (attribute start) matter; every
         // other byte is copied through unchanged, in bulk.
-        while let Some(off) = bytes[i..].iter().position(|&c| c == b'"' || c == b'(') {
+        while let Some(off) = find_byte(&bytes[i..], b"\"(", false) {
             i += off;
             if bytes[i] == b'\"' {
                 if i == 0 || bytes[i - 1] != b'\\' {

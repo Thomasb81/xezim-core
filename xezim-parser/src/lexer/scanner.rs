@@ -83,6 +83,10 @@ impl<'a> Lexer<'a> {
     }
 
     fn skip_whitespace(&mut self) {
+        // Blanked comments leave long runs of spaces: skip them eight at a time.
+        while self.pos + 8 <= self.input.len() && self.input[self.pos..self.pos + 8] == [b' '; 8] {
+            self.pos += 8;
+        }
         while self.pos < self.input.len() {
             let ch = self.input[self.pos];
             if ch.is_ascii_whitespace() {
