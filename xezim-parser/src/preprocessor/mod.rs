@@ -141,6 +141,45 @@ impl OriginSink {
 /// allowed to merely START with a directive keyword (`include_default_...`,
 /// `undefined_x`, `ifdef_guard_y`). Prefix matching swallowed such macro
 /// invocations as (malformed) directives, failing preprocessing outright.
+/// Whitespace bytes `char::is_whitespace` accepts in ASCII (note VT, which
+/// `u8::is_ascii_whitespace` does not).
+fn ascii_ws(b: u8) -> bool {
+    matches!(b, b' ' | b'\t' | b'\n' | b'\x0B' | b'\x0C' | b'\r')
+}
+
+/// `str::trim_start`, skipping ASCII whitespace a byte at a time (lines of
+/// blanked comments are long runs of spaces) and deferring to the Unicode
+/// definition only when a non-ASCII byte follows.
+fn fast_trim_start(s: &str) -> &str {
+    let b = s.as_bytes();
+    let start = b.iter().position(|&c| !ascii_ws(c)).unwrap_or(b.len());
+    if start < b.len() && b[start] >= 0x80 {
+        return s.trim_start();
+    }
+    &s[start..]
+}
+
+/// `str::trim` with the same ASCII fast path as `fast_trim_start`.
+fn fast_trim(s: &str) -> &str {
+    let t = fast_trim_start(s);
+    let b = t.as_bytes();
+    let end = b.iter().rposition(|&c| !ascii_ws(c)).map_or(0, |p| p + 1);
+    if end > 0 && b[end - 1] >= 0x80 {
+        return t.trim_end();
+    }
+    &t[..end]
+}
+
+/// Append `n` spaces.
+fn push_spaces(out: &mut String, mut n: usize) {
+    const SPACES: &str = "                                                                ";
+    while n > 0 {
+        let k = n.min(SPACES.len());
+        out.push_str(&SPACES[..k]);
+        n -= k;
+    }
+}
+
 fn directive_word(line: &str, kw: &str) -> bool {
     line.starts_with(kw)
         && line[kw.len()..]
@@ -429,8 +468,10 @@ impl Preprocessor {
     }
 
     fn is_directive(trimmed: &str, name: &str) -> bool {
-        let tick = format!("`{}", name);
-        if let Some(rest) = trimmed.strip_prefix(&tick) {
+        if let Some(rest) = trimmed
+            .strip_prefix('`')
+            .and_then(|rest| rest.strip_prefix(name))
+        {
             rest.is_empty() || rest.starts_with(|c: char| c.is_whitespace())
         } else {
             false
@@ -544,7 +585,7 @@ impl Preprocessor {
     /// (`module`/`macromodule`/`interface`/`program`/`package <name>`), return
     /// its name. Used to associate the active timescale with each scope.
     fn design_element_name(line: &str) -> Option<String> {
-        let t = line.trim_start();
+        let t = fast_trim_start(line);
         for kw in ["macromodule", "module", "interface", "program", "package"] {
             if let Some(rest) = t.strip_prefix(kw) {
                 if !rest.starts_with(char::is_whitespace) {
@@ -678,16 +719,26 @@ impl Preprocessor {
     fn strip_comments(&self, source: &str) -> String {
         let mut result = String::with_capacity(source.len());
         let bytes = source.as_bytes();
+        let n = bytes.len();
         let mut i = 0;
-        while i < bytes.len() {
-            if bytes[i] == b'/' && i + 1 < bytes.len() {
+        while i < n {
+            // Plain ASCII text is copied verbatim; only `/`, `"` and non-ASCII
+            // bytes (re-encoded byte by byte below) need the careful path.
+            let run = bytes[i..]
+                .iter()
+                .position(|&c| c == b'/' || c == b'"' || c >= 0x80)
+                .unwrap_or(n - i);
+            if run > 0 {
+                result.push_str(&source[i..i + run]);
+                i += run;
+                continue;
+            }
+            if bytes[i] == b'/' && i + 1 < n {
                 if bytes[i + 1] == b'/' {
                     // Line comment: replace with spaces until newline to preserve line numbers
                     // BUT: keep the backslash if it's at the end of the line (continuation)
                     let start = i;
-                    while i < bytes.len() && bytes[i] != b'\n' {
-                        i += 1;
-                    }
+                    i += bytes[i..].iter().position(|&c| c == b'\n').unwrap_or(n - i);
                     // Check if the line ends with a backslash (ignoring whitespace)
                     let mut j = i;
                     while j > start && bytes[j - 1].is_ascii_whitespace() {
@@ -695,17 +746,11 @@ impl Preprocessor {
                     }
                     if j > start && bytes[j - 1] == b'\\' {
                         // Preserve the backslash by replacing everything else with spaces
-                        for _ in start..j - 1 {
-                            result.push(' ');
-                        }
+                        push_spaces(&mut result, j - 1 - start);
                         result.push('\\');
-                        for _ in j..i {
-                            result.push(' ');
-                        }
+                        push_spaces(&mut result, i - j);
                     } else {
-                        for _ in start..i {
-                            result.push(' ');
-                        }
+                        push_spaces(&mut result, i - start);
                     }
                     continue;
                 }
@@ -720,7 +765,17 @@ impl Preprocessor {
                     result.push(' ');
                     result.push(' ');
                     i += 2;
-                    while i + 1 < bytes.len() {
+                    while i + 1 < n {
+                        // One space per byte that is none of the three below.
+                        let run = bytes[i..n - 1]
+                            .iter()
+                            .position(|&c| c == b'*' || c == b'\n' || c == b'\\')
+                            .unwrap_or(n - 1 - i);
+                        if run > 0 {
+                            push_spaces(&mut result, run);
+                            i += run;
+                            continue;
+                        }
                         if bytes[i] == b'*' && bytes[i + 1] == b'/' {
                             result.push(' ');
                             result.push(' ');
@@ -743,8 +798,17 @@ impl Preprocessor {
                 // String literal: skip until closing quote
                 result.push('\"');
                 i += 1;
-                while i < bytes.len() {
-                    if bytes[i] == b'\\' && i + 1 < bytes.len() {
+                while i < n {
+                    let run = bytes[i..]
+                        .iter()
+                        .position(|&c| c == b'\\' || c == b'"' || c >= 0x80)
+                        .unwrap_or(n - i);
+                    if run > 0 {
+                        result.push_str(&source[i..i + run]);
+                        i += run;
+                        continue;
+                    }
+                    if bytes[i] == b'\\' && i + 1 < n {
                         result.push('\\');
                         result.push(bytes[i + 1] as char);
                         i += 2;
@@ -817,7 +881,7 @@ impl Preprocessor {
         let mut in_define_cont = false;
         for (ln, line) in source.lines().enumerate() {
             let ln = ln as u32;
-            let trimmed = line.trim_start();
+            let trimmed = fast_trim_start(line);
             if in_define_cont || directive_word(trimmed, "`define") {
                 in_define_cont = line.trim_end().ends_with('\\');
                 out.push_str(line);
@@ -951,7 +1015,7 @@ impl Preprocessor {
             self.cur_line_text.clear();
             self.cur_line_text.push_str(line);
             here = fixed.unwrap_or(LineOrigin::plain(self.cur_file_idx, self.current_line, col));
-            let trimmed = line.trim();
+            let trimmed = fast_trim(line);
 
             // Strip (* ... *) attributes (IEEE 1800-2017 §5.12)
             if trimmed.starts_with("(*") && trimmed.ends_with("*)") {
@@ -1492,7 +1556,7 @@ impl Preprocessor {
                 (expanded, None)
             };
             sink.fill(&output, here);
-            if expanded.trim().is_empty() {
+            if fast_trim(&expanded).is_empty() {
                 for k in 0..joined.len() {
                     output.push('\n');
                     let o = joined_origin(self, k);
@@ -1526,9 +1590,9 @@ impl Preprocessor {
                 // element name; they take the first `timescale in effect
                 // before them, recorded once under the synthetic name "$unit".
                 if let Some(ts) = self.timescale {
-                    self.module_timescales
-                        .entry("$unit".to_string())
-                        .or_insert(ts);
+                    if !self.module_timescales.contains_key("$unit") {
+                        self.module_timescales.insert("$unit".to_string(), ts);
+                    }
                 }
                 output.push_str(&expanded);
                 output.push('\n');
@@ -1899,6 +1963,11 @@ impl Preprocessor {
     }
 
     fn expand_macros(&self, source: &str) -> String {
+        // Every expansion starts at a backtick; text without one is its own
+        // expansion.
+        if !source.contains('`') {
+            return source.to_string();
+        }
         let mut result = self.expand_macros_once(source);
         // Recursively expand up to 128 times to handle deeply nested macros.
         // C906's aq_idu_cfig.h chains 25+ DIS_VEC_* defines (DIS_VEC_WIDTH →
@@ -1971,8 +2040,13 @@ impl Preprocessor {
     }
 
     fn expand_macros_once(&self, line: &str) -> String {
-        let line_pasted = Self::apply_token_pasting(line);
-        let line = &line_pasted;
+        let line_pasted;
+        let line: &str = if line.contains("``") {
+            line_pasted = Self::apply_token_pasting(line);
+            &line_pasted
+        } else {
+            line
+        };
         let mut result = String::with_capacity(line.len());
         let bytes = line.as_bytes();
         let mut i = 0;
@@ -1989,6 +2063,19 @@ impl Preprocessor {
         // backtick handler below, so they never reach this path.
         let mut in_string = false;
         while i < bytes.len() {
+            // Copy ordinary text in bulk: inside a string only `\\` and `"`
+            // matter, outside it only `` ` `` and `"`.
+            let run = if in_string {
+                bytes[i..].iter().position(|&c| c == b'\\' || c == b'"')
+            } else {
+                bytes[i..].iter().position(|&c| c == b'`' || c == b'"')
+            }
+            .unwrap_or(bytes.len() - i);
+            if run > 0 {
+                result.push_str(&line[i..i + run]);
+                i += run;
+                continue;
+            }
             if in_string {
                 let ch = line[i..].chars().next().unwrap();
                 if ch == '\\' {
@@ -2359,12 +2446,21 @@ impl Preprocessor {
         let mut result = String::with_capacity(line.len());
         let bytes = line.as_bytes();
         let mut i = 0;
+        // Start of the text not yet copied to `result`.
+        let mut copied = 0;
         let mut in_string = false;
-        while i < bytes.len() {
-            if bytes[i] == b'\"' && (i == 0 || bytes[i - 1] != b'\\') {
-                in_string = !in_string;
+        // Only `"` (string state) and `(` (attribute start) matter; every
+        // other byte is copied through unchanged, in bulk.
+        while let Some(off) = bytes[i..].iter().position(|&c| c == b'"' || c == b'(') {
+            i += off;
+            if bytes[i] == b'\"' {
+                if i == 0 || bytes[i - 1] != b'\\' {
+                    in_string = !in_string;
+                }
+                i += 1;
+                continue;
             }
-            if !in_string && i + 1 < bytes.len() && bytes[i] == b'(' && bytes[i + 1] == b'*'
+            if !in_string && i + 1 < bytes.len() && bytes[i + 1] == b'*'
                 // `@(*)` is the implicit-sensitivity-list construct, not an
                 // attribute. Skip if the byte after `(*` is `)`. Likewise
                 // skip `(**` (e.g. an exponent inside parens) where the
@@ -2386,17 +2482,18 @@ impl Preprocessor {
                 if found {
                     // Blank the attribute out character for character, so
                     // line and column numbers after it are unchanged.
+                    result.push_str(&line[copied..i]);
                     for ch in line[i..j].chars() {
                         result.push(if ch == '\n' { '\n' } else { ' ' });
                     }
                     i = j;
+                    copied = j;
                     continue;
                 }
             }
-            let ch = line[i..].chars().next().unwrap();
-            result.push(ch);
-            i += ch.len_utf8();
+            i += 1;
         }
+        result.push_str(&line[copied..]);
         result
     }
 
@@ -2420,9 +2517,13 @@ impl Preprocessor {
     }
 
     fn contains_preprocessor_directive(text: &str) -> bool {
+        // Every directive below starts with a backtick.
+        if !text.contains('`') {
+            return false;
+        }
         text.lines().any(|line| {
             matches!(
-                line.trim_start(),
+                fast_trim_start(line),
                 trimmed if directive_word(trimmed, "`ifdef")
                     || directive_word(trimmed, "`ifndef")
                     || directive_word(trimmed, "`elsif")
