@@ -16,6 +16,26 @@
 #[global_allocator]
 static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
 
+#[cfg(feature = "mimalloc-allocator")]
+unsafe extern "C" {
+    fn mi_collect(force: bool);
+}
+
+/// Hand memory that was just freed back to the OS NOW. mimalloc keeps freed
+/// pages resident for its purge delay (1 s by default) so that a quick
+/// re-allocation finds them warm; after a phase drops a large structure (the
+/// parsed AST, the elaboration-time signal map) the next phase's big fresh
+/// allocations then land on top of it, and peak RSS carries both. Call it at
+/// such phase boundaries only — it walks every heap.
+pub fn release_free_memory() {
+    #[cfg(feature = "mimalloc-allocator")]
+    // SAFETY: `mi_collect` only reorganizes the allocator's own free lists
+    // and is safe to call at any time from any thread.
+    unsafe {
+        mi_collect(true);
+    }
+}
+
 pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
