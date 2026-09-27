@@ -274,10 +274,15 @@ pub fn write_compiled(elab: &elaborate::ElaboratedModule, path: &str) -> Result<
 
         Ok(())
     } else {
-        // Standard path without statistics
+        // Standard path without statistics. bincode writes field by field;
+        // batch those writes before they reach the compressor.
+        let mut buffered = std::io::BufWriter::with_capacity(1 << 20, enc);
         xez_bincode_options()
-            .serialize_into(&mut enc, elab)
+            .serialize_into(&mut buffered, elab)
             .map_err(|e| format!("serialize: {}", e))?;
+        let enc = buffered
+            .into_inner()
+            .map_err(|e| format!("flush '{}': {}", path, e))?;
         let mut w = enc.finish().map_err(|e| format!("zstd finish: {}", e))?;
         w.flush().map_err(|e| format!("flush '{}': {}", path, e))
     }
@@ -323,14 +328,16 @@ pub fn read_compiled(path: &str) -> Result<Option<elaborate::ElaboratedModule>, 
         .read(&mut head)
         .map_err(|e| format!("read '{}': {}", path, e))?;
     let chained = std::io::Read::chain(std::io::Cursor::new(head[..got].to_vec()), r);
+    // bincode pulls every field through `read_exact`; buffer the decoder's
+    // output so those are memory copies, not one decompression call each.
     let elab = if got == 4 && head == [0x28, 0xB5, 0x2F, 0xFD] {
         let dec = zstd::stream::Decoder::new(chained).map_err(|e| format!("zstd init: {}", e))?;
         xez_bincode_options()
-            .deserialize_from(dec)
+            .deserialize_from(std::io::BufReader::with_capacity(1 << 20, dec))
             .map_err(|e| format!("deserialize: {}", e))?
     } else {
         xez_bincode_options()
-            .deserialize_from(chained)
+            .deserialize_from(std::io::BufReader::with_capacity(1 << 16, chained))
             .map_err(|e| format!("deserialize: {}", e))?
     };
     Ok(Some(elab))
@@ -356,7 +363,7 @@ pub fn read_compiled_bytes(bytes: &[u8]) -> Result<elaborate::ElaboratedModule, 
     if body.len() >= 4 && body[..4] == [0x28, 0xB5, 0x2F, 0xFD] {
         let dec = zstd::stream::Decoder::new(body).map_err(|e| format!("zstd init: {}", e))?;
         xez_bincode_options()
-            .deserialize_from(dec)
+            .deserialize_from(std::io::BufReader::with_capacity(1 << 20, dec))
             .map_err(|e| format!("deserialize: {}", e))
     } else {
         xez_bincode_options()
