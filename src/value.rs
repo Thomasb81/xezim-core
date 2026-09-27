@@ -490,7 +490,11 @@ impl Value {
         if size.is_some() || radix != 10 {
             return None;
         }
-        let magnitude = value.replace('_', "").parse::<u128>().ok()?;
+        let magnitude = if value.contains('_') {
+            value.replace('_', "").parse::<u128>().ok()?
+        } else {
+            value.parse::<u128>().ok()?
+        };
         if magnitude < (1u128 << 31) {
             return None;
         }
@@ -5581,7 +5585,12 @@ impl Value {
 
     /// Parse from a string with given radix (2, 8, 10, 16)
     pub fn from_str_radix(s: &str, radix: u32, width: u32) -> Self {
-        let s = s.trim().replace("_", "");
+        let s = s.trim();
+        let s: std::borrow::Cow<str> = if s.contains('_') {
+            std::borrow::Cow::Owned(s.replace('_', ""))
+        } else {
+            std::borrow::Cow::Borrowed(s)
+        };
         if s.contains('x')
             || s.contains('X')
             || s.contains('z')
