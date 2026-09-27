@@ -34014,9 +34014,8 @@ fn rewrite_expr_impl(
             // variable was injected under its plain name, so drop the
             // qualifier and let the normal port-map / local-name handling
             // below bind (and prefix) it like any other reference.
-            if !local_names.contains(hier.path[0].name.name.as_str()) {
-                if let Some(bare) = crate::sv_parser::strip_unit_scope_name(&hier.path[0].name.name)
-                {
+            if let Some(bare) = crate::sv_parser::strip_unit_scope_name(&hier.path[0].name.name) {
+                if !local_names.contains(hier.path[0].name.name.as_str()) {
                     let mut new_hier = hier.clone();
                     new_hier.path[0].name.name = bare.to_string();
                     new_hier.cached_signal_id = std::cell::Cell::new(None);
