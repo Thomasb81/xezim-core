@@ -137,10 +137,6 @@ impl OriginSink {
     }
 }
 
-/// §22.5.1: a compiler directive matches as a WHOLE word — a user macro is
-/// allowed to merely START with a directive keyword (`include_default_...`,
-/// `undefined_x`, `ifdef_guard_y`). Prefix matching swallowed such macro
-/// invocations as (malformed) directives, failing preprocessing outright.
 /// Whitespace bytes `char::is_whitespace` accepts in ASCII (note VT, which
 /// `u8::is_ascii_whitespace` does not).
 fn ascii_ws(b: u8) -> bool {
@@ -152,7 +148,15 @@ fn ascii_ws(b: u8) -> bool {
 /// definition only when a non-ASCII byte follows.
 fn fast_trim_start(s: &str) -> &str {
     let b = s.as_bytes();
-    let start = b.iter().position(|&c| !ascii_ws(c)).unwrap_or(b.len());
+    // Eight spaces at a time first: a blanked comment is one long run.
+    let mut start = 0;
+    while start + 8 <= b.len() && b[start..start + 8] == [b' '; 8] {
+        start += 8;
+    }
+    start += b[start..]
+        .iter()
+        .position(|&c| !ascii_ws(c))
+        .unwrap_or(b.len() - start);
     if start < b.len() && b[start] >= 0x80 {
         return s.trim_start();
     }
@@ -163,7 +167,14 @@ fn fast_trim_start(s: &str) -> &str {
 fn fast_trim(s: &str) -> &str {
     let t = fast_trim_start(s);
     let b = t.as_bytes();
-    let end = b.iter().rposition(|&c| !ascii_ws(c)).map_or(0, |p| p + 1);
+    let mut end = b.len();
+    while end >= 8 && b[end - 8..end] == [b' '; 8] {
+        end -= 8;
+    }
+    let end = b[..end]
+        .iter()
+        .rposition(|&c| !ascii_ws(c))
+        .map_or(0, |p| p + 1);
     if end > 0 && b[end - 1] >= 0x80 {
         return t.trim_end();
     }
@@ -180,6 +191,10 @@ fn push_spaces(out: &mut String, mut n: usize) {
     }
 }
 
+/// §22.5.1: a compiler directive matches as a WHOLE word — a user macro is
+/// allowed to merely START with a directive keyword (`include_default_...`,
+/// `undefined_x`, `ifdef_guard_y`). Prefix matching swallowed such macro
+/// invocations as (malformed) directives, failing preprocessing outright.
 fn directive_word(line: &str, kw: &str) -> bool {
     line.starts_with(kw)
         && line[kw.len()..]
@@ -481,10 +496,20 @@ impl Preprocessor {
     /// Update the design-element nesting depth from one source line. Opening
     /// keywords increment; `end…` keywords decrement (floored at 0).
     fn update_design_depth(trimmed: &str, depth: &mut i32) {
-        let first = trimmed
-            .split(|c: char| !(c.is_alphanumeric() || c == '_'))
-            .next()
-            .unwrap_or("");
+        // The leading word, scanned bytewise while it stays ASCII.
+        let b = trimmed.as_bytes();
+        let n = b
+            .iter()
+            .position(|&c| !(c.is_ascii_alphanumeric() || c == b'_'))
+            .unwrap_or(b.len());
+        let first = if n < b.len() && b[n] >= 0x80 {
+            trimmed
+                .split(|c: char| !(c.is_alphanumeric() || c == '_'))
+                .next()
+                .unwrap_or("")
+        } else {
+            &trimmed[..n]
+        };
         match first {
             "module" | "macromodule" | "interface" | "package" | "program" | "primitive"
             | "checker" => *depth += 1,
@@ -1020,6 +1045,27 @@ impl Preprocessor {
             // Strip (* ... *) attributes (IEEE 1800-2017 §5.12)
             if trimmed.starts_with("(*") && trimmed.ends_with("*)") {
                 output.push('\n');
+                continue;
+            }
+
+            // A line with no backtick holds no directive and invokes no
+            // macro: it is emitted as written. This is the path below for
+            // such a line, minus the directive tests (all of which need a
+            // leading backtick) and the copies macro expansion would make.
+            if !line.as_bytes().contains(&b'`') {
+                if !ifdef_stack.iter().all(|s| s.active) {
+                    output.push('\n');
+                    continue;
+                }
+                if crate::strict_checks() {
+                    Self::update_design_depth(trimmed, &mut self.design_element_depth);
+                }
+                if !trimmed.is_empty() {
+                    self.note_design_elements(line);
+                    output.push_str(line);
+                }
+                output.push('\n');
+                sink.fill(&output, here);
                 continue;
             }
 
@@ -1563,37 +1609,7 @@ impl Preprocessor {
                     sink.fill(&output, o);
                 }
             } else {
-                // Capture the timescale in effect for any design element this
-                // (expanded) line declares, so its scope's delays can later be
-                // scaled by the right timeunit. `module foo`, `interface bar`,
-                // `program baz`, `package p` — name is the first identifier after
-                // the keyword. Standard one-declaration-per-line form (which
-                // black-parrot uses); good enough for timescale association.
-                if let Some(name) = Self::design_element_name(&expanded) {
-                    if let Some(pull1) = self.unconnected_pull {
-                        crate::record_unconnected_drive(&name, pull1);
-                    }
-                    // Only record a design element when a `\`timescale` directive
-                    // is actually ACTIVE. An entry therefore means "has an
-                    // explicit source-level timescale", which the
-                    // `--module-timescale` extension keys off. A module with no
-                    // active directive is absent from the map (and defaults to
-                    // 1 ns / 1 ns downstream, unchanged).
-                    if let Some(ts) = self.timescale {
-                        if self.current_file_ts {
-                            self.module_ts_own_file.insert(name.clone());
-                        }
-                        self.module_timescales.entry(name).or_insert(ts);
-                    }
-                }
-                // Compilation-unit ($unit) tasks and functions have no design
-                // element name; they take the first `timescale in effect
-                // before them, recorded once under the synthetic name "$unit".
-                if let Some(ts) = self.timescale {
-                    if !self.module_timescales.contains_key("$unit") {
-                        self.module_timescales.insert("$unit".to_string(), ts);
-                    }
-                }
+                self.note_design_elements(&expanded);
                 output.push_str(&expanded);
                 output.push('\n');
                 match sub_origins {
@@ -1669,6 +1685,40 @@ impl Preprocessor {
         self.cur_col_off = saved_col_off;
 
         (output, sink.origins)
+    }
+
+    /// Capture the timescale in effect for any design element this
+    /// (expanded) line declares, so its scope's delays can later be scaled
+    /// by the right timeunit. `module foo`, `interface bar`, `program baz`,
+    /// `package p` — name is the first identifier after the keyword.
+    /// Standard one-declaration-per-line form (which black-parrot uses); good
+    /// enough for timescale association.
+    fn note_design_elements(&mut self, expanded: &str) {
+        if let Some(name) = Self::design_element_name(expanded) {
+            if let Some(pull1) = self.unconnected_pull {
+                crate::record_unconnected_drive(&name, pull1);
+            }
+            // Only record a design element when a `\`timescale` directive
+            // is actually ACTIVE. An entry therefore means "has an
+            // explicit source-level timescale", which the
+            // `--module-timescale` extension keys off. A module with no
+            // active directive is absent from the map (and defaults to
+            // 1 ns / 1 ns downstream, unchanged).
+            if let Some(ts) = self.timescale {
+                if self.current_file_ts {
+                    self.module_ts_own_file.insert(name.clone());
+                }
+                self.module_timescales.entry(name).or_insert(ts);
+            }
+        }
+        // Compilation-unit ($unit) tasks and functions have no design
+        // element name; they take the first `timescale in effect
+        // before them, recorded once under the synthetic name "$unit".
+        if let Some(ts) = self.timescale {
+            if !self.module_timescales.contains_key("$unit") {
+                self.module_timescales.insert("$unit".to_string(), ts);
+            }
+        }
     }
 
     /// Report what expanding the current line collected behind `&self`:
