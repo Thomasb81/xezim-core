@@ -24679,6 +24679,42 @@ fn collect_effective_items(
     collect_effective_items_scoped(items, params, &mut gen_ordinal)
 }
 
+/// `collect_effective_items` for callers that only read the result: items
+/// outside any generate construct are borrowed instead of cloned (the
+/// per-instance parameter fixpoint expands a module body several times and
+/// looks only at its parameter and typedef declarations). Generate-produced
+/// items are the same owned values the cloning walk yields, in the same
+/// order.
+fn collect_effective_items_ref<'a>(
+    items: &'a [ModuleItem],
+    params: &HashMap<String, Value>,
+) -> Vec<std::borrow::Cow<'a, ModuleItem>> {
+    fn walk<'a>(
+        items: &'a [ModuleItem],
+        params: &HashMap<String, Value>,
+        gen_ordinal: &mut u32,
+        out: &mut Vec<std::borrow::Cow<'a, ModuleItem>>,
+    ) {
+        for item in items {
+            match item {
+                ModuleItem::GenerateRegion(gr) => walk(&gr.items, params, gen_ordinal, out),
+                ModuleItem::GenerateIf(_)
+                | ModuleItem::GenerateCase(_)
+                | ModuleItem::GenerateFor(_) => out.extend(
+                    collect_effective_items_scoped(std::slice::from_ref(item), params, gen_ordinal)
+                        .into_iter()
+                        .map(std::borrow::Cow::Owned),
+                ),
+                other => out.push(std::borrow::Cow::Borrowed(other)),
+            }
+        }
+    }
+    let mut gen_ordinal = 0u32;
+    let mut out = Vec::new();
+    walk(items, params, &mut gen_ordinal, &mut out);
+    out
+}
+
 fn collect_effective_items_scoped(
     items: &[ModuleItem],
     params: &HashMap<String, Value>,
@@ -27827,8 +27863,8 @@ fn inline_module_items(
                         for _ in 0..64 {
                             let mut changed = false;
                             let before = local_map.len();
-                            let effective_items = collect_effective_items(items, local_map);
-                            for item in &effective_items {
+                            let effective_items = collect_effective_items_ref(items, local_map);
+                            for item in effective_items.iter().map(|c| &**c) {
                                 if let ModuleItem::ParameterDeclaration(pd)
                                 | ModuleItem::LocalparamDeclaration(pd) = item
                                 {
@@ -27942,7 +27978,7 @@ fn inline_module_items(
                             // the FIRST instance's value in. Recomputed each
                             // round like the localparams above, so a member
                             // depending on a later-resolved name converges.
-                            for item in &effective_items {
+                            for item in effective_items.iter().map(|c| &**c) {
                                 if let ModuleItem::TypedefDeclaration(td) = item {
                                     if let DataType::Enum(et) = &td.data_type {
                                         let bw = et
@@ -28253,7 +28289,8 @@ fn inline_module_items(
                     }
                 }
                 for _ in 0..4 {
-                    let body_items = collect_effective_items(sub_mod.items(), &sub_local_params);
+                    let body_items =
+                        collect_effective_items_ref(sub_mod.items(), &sub_local_params);
                     let mut local_tds = elab.typedefs.clone();
                     for p_decl in sub_mod.params() {
                         if let ParameterKind::Type { assignments } = &p_decl.kind {
@@ -28273,7 +28310,7 @@ fn inline_module_items(
                         }
                     }
                     for _ in 0..3 {
-                        for it in &body_items {
+                        for it in body_items.iter().map(|c| &**c) {
                             if let ModuleItem::TypedefDeclaration(td) = it {
                                 let w = resolve_type_width(
                                     &td.data_type,
