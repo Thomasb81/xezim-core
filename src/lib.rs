@@ -884,6 +884,109 @@ pub fn render_parse_diagnostics(
     out
 }
 
+/// A design's sources preprocessed once, in parse order, together with the
+/// preprocessor state elaboration reads afterwards. Produced by
+/// `preprocess_design` so a driver that already preprocessed the sources
+/// (for its own diagnostics) can hand the result to
+/// `parse_and_elaborate_multi_preprocessed` instead of paying for a second,
+/// identical pass.
+pub struct PreprocessedSources {
+    /// The inputs the texts were produced from; a consumer checks these
+    /// before reusing the texts.
+    pub sources: Vec<String>,
+    pub source_files: Vec<String>,
+    pub include_dirs: Vec<String>,
+    pub defines: Vec<(String, Option<String>)>,
+    /// Per-file preprocessed text and line map.
+    pub texts: Vec<String>,
+    pub line_maps: Vec<Option<sv_parser::source_map::LineMap>>,
+    /// Preprocessor errors over all files (empty on success).
+    pub errors: Vec<String>,
+    /// End-of-pass preprocessor state.
+    pub macro_defines: std::collections::HashMap<String, preprocessor::MacroDef>,
+    pub module_timescales: std::collections::HashMap<String, (f64, f64)>,
+    pub module_ts_own_file: std::collections::HashSet<String>,
+    /// Thread-local directive state the pass recorded (`default_nettype
+    /// none`, `unconnected_drive`), replayed on the elaborating thread.
+    pub default_nettype_none: bool,
+    pub unconnected_drive: Vec<(String, bool)>,
+}
+
+fn new_design_preprocessor(
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+) -> preprocessor::Preprocessor {
+    let mut pp = preprocessor::Preprocessor::new();
+    for dir in include_dirs {
+        pp.add_include_dir(std::path::PathBuf::from(dir));
+    }
+    for (name, val) in defines {
+        pp.define(
+            name.clone(),
+            preprocessor::MacroDef {
+                name: name.clone(),
+                params: None,
+                body: val.clone().unwrap_or_default(),
+            },
+        );
+    }
+    pp
+}
+
+/// Preprocess every source with one preprocessor, exactly as
+/// `parse_and_elaborate_multi` does file by file, but over all files even
+/// when one reports errors (the caller decides what to do with `errors`).
+pub fn preprocess_design(
+    sources: &[String],
+    source_files: &[String],
+    include_dirs: &[String],
+    defines: &[(String, Option<String>)],
+) -> PreprocessedSources {
+    let mut pp = new_design_preprocessor(include_dirs, defines);
+    let mut texts = Vec::with_capacity(sources.len());
+    let mut line_maps = Vec::with_capacity(sources.len());
+    for (i, source) in sources.iter().enumerate() {
+        let source_path = source_files.get(i).map(std::path::PathBuf::from);
+        pp.begin_top_level_file();
+        texts.push(pp.preprocess_file(source, source_path.as_deref()));
+        line_maps.push(pp.take_line_map());
+    }
+    PreprocessedSources {
+        sources: sources.to_vec(),
+        source_files: source_files.to_vec(),
+        include_dirs: include_dirs.to_vec(),
+        defines: defines.to_vec(),
+        texts,
+        line_maps,
+        errors: pp.errors().to_vec(),
+        macro_defines: pp.snapshot_defines(),
+        module_timescales: pp.module_timescales.clone(),
+        module_ts_own_file: pp.module_ts_own_file.clone(),
+        default_nettype_none: sv_parser::default_nettype_none_seen(),
+        unconnected_drive: sv_parser::unconnected_drive_snapshot(),
+    }
+}
+
+impl PreprocessedSources {
+    /// True when this pass was produced from exactly these inputs and
+    /// finished without errors, so its texts are what a fresh pass would
+    /// produce.
+    pub fn matches(
+        &self,
+        sources: &[String],
+        source_files: &[String],
+        include_dirs: &[String],
+        defines: &[(String, Option<String>)],
+    ) -> bool {
+        self.errors.is_empty()
+            && self.texts.len() == sources.len()
+            && self.source_files == source_files
+            && self.include_dirs == include_dirs
+            && self.defines == defines
+            && self.sources == sources
+    }
+}
+
 pub fn parse_and_elaborate_multi(
     sources: &[String],
     top_module_name: Option<&str>,
@@ -897,6 +1000,48 @@ pub fn parse_and_elaborate_multi(
     ),
     String,
 > {
+    parse_and_elaborate_multi_preprocessed(
+        sources,
+        top_module_name,
+        include_dirs,
+        source_files,
+        defines,
+        None,
+    )
+}
+
+/// `parse_and_elaborate_multi` reusing an earlier `preprocess_design` pass
+/// over the same inputs (checked with `PreprocessedSources::matches`; a
+/// mismatch preprocesses afresh).
+pub fn parse_and_elaborate_multi_preprocessed(
+    sources: &[String],
+    top_module_name: Option<&str>,
+    include_dirs: &[String],
+    source_files: &[String],
+    defines: &[(String, Option<String>)],
+    pre: Option<PreprocessedSources>,
+) -> Result<
+    (
+        crate::hasher::HashMap<String, SourceDefinition>,
+        elaborate::ElaboratedModule,
+    ),
+    String,
+> {
+    let mut pre = pre.filter(|p| p.matches(sources, source_files, include_dirs, defines));
+    if let Some(p) = pre.as_ref() {
+        if p.default_nettype_none {
+            sv_parser::set_default_nettype_none_seen(true);
+        }
+        for (name, pull1) in &p.unconnected_drive {
+            sv_parser::record_unconnected_drive(name, *pull1);
+        }
+    }
+    let mut pre_files = pre.as_mut().map(|p| {
+        (
+            std::mem::take(&mut p.texts).into_iter(),
+            std::mem::take(&mut p.line_maps).into_iter(),
+        )
+    });
     let mut all_descriptions = Vec::new();
     // Preprocessed text of each source, kept in parse order. Every AST
     // `Span` is a byte offset into ITS file's preprocessed text, so these
@@ -913,20 +1058,7 @@ pub fn parse_and_elaborate_multi(
     // `ElaboratedModule::src_file_of_module` (see that field's doc).
     let mut src_file_of_module: crate::hasher::HashMap<String, u32> =
         crate::hasher::HashMap::default();
-    let mut pp = preprocessor::Preprocessor::new();
-    for dir in include_dirs {
-        pp.add_include_dir(std::path::PathBuf::from(dir));
-    }
-    for (name, val) in defines {
-        pp.define(
-            name.clone(),
-            preprocessor::MacroDef {
-                name: name.clone(),
-                params: None,
-                body: val.clone().unwrap_or_default(),
-            },
-        );
-    }
+    let mut pp = new_design_preprocessor(include_dirs, defines);
 
     for (i, source) in sources.iter().enumerate() {
         let source_path = source_files.get(i).map(std::path::PathBuf::from);
@@ -947,9 +1079,17 @@ pub fn parse_and_elaborate_multi(
         // Mark a new compilation file so a `timescale that stuck across from a
         // prior file is treated as inherited (overridable by --module-timescale)
         // rather than declared here.
-        pp.begin_top_level_file();
-        let preprocessed = pp.preprocess_file(source, source_path.as_deref());
-        let line_map = pp.take_line_map();
+        let (preprocessed, line_map) = match pre_files.as_mut() {
+            Some((texts, maps)) => (
+                texts.next().unwrap_or_default(),
+                maps.next().unwrap_or_default(),
+            ),
+            None => {
+                pp.begin_top_level_file();
+                let text = pp.preprocess_file(source, source_path.as_deref());
+                (text, pp.take_line_map())
+            }
+        };
         // Preprocessor-fatal conditions (missing/unreadable `include, include
         // recursion, strict directive violations): fail the run at the first
         // affected file. Continuing used to silently drop the include's
@@ -1062,9 +1202,14 @@ pub fn parse_and_elaborate_multi(
     // IEEE 1801 power intent: splice the generated UPF package and glue
     // processes into the parsed design before elaboration.
     upf::inject(&mut all_descriptions, top_module_name)?;
-    let lib_defines = pp.snapshot_defines();
-    let module_timescales = pp.module_timescales.clone();
-    let module_ts_own_file = pp.module_ts_own_file.clone();
+    let (lib_defines, module_timescales, module_ts_own_file) = match pre {
+        Some(p) => (p.macro_defines, p.module_timescales, p.module_ts_own_file),
+        None => (
+            pp.snapshot_defines(),
+            pp.module_timescales.clone(),
+            pp.module_ts_own_file.clone(),
+        ),
+    };
     // Publish the sources BEFORE elaborating so an error raised during
     // elaboration (e.g. a duplicate declaration) can report `file:line`;
     // `elab.source_texts` below is assigned too late for that. Moved, not
