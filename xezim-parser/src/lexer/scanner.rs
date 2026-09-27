@@ -3,6 +3,15 @@
 use super::token::{Token, TokenKind, keyword};
 use crate::ast::Span;
 
+/// `String::from_utf8_lossy(b).to_string()`, validating with the fast
+/// `str::from_utf8` first (token text is almost always valid).
+fn lossy_string(b: &[u8]) -> String {
+    match std::str::from_utf8(b) {
+        Ok(s) => s.to_owned(),
+        Err(_) => String::from_utf8_lossy(b).into_owned(),
+    }
+}
+
 pub struct Lexer<'a> {
     input: &'a [u8],
     pos: usize,
@@ -99,7 +108,7 @@ impl<'a> Lexer<'a> {
 
     fn make_token(&mut self, start: usize, kind: TokenKind) -> Token {
         self.pos += 1;
-        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        let text = lossy_string(&self.input[start..self.pos]);
         Token::new(kind, text, Span::new(start, self.pos))
     }
 
@@ -137,7 +146,7 @@ impl<'a> Lexer<'a> {
                     matches!(c, b'0' | b'1' | b'x' | b'X' | b'z' | b'Z')
                 }) {
                     self.pos += 2;
-                    let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+                    let text = lossy_string(&self.input[start..self.pos]);
                     Token::new(
                         TokenKind::UnbasedUnsizedLiteral,
                         text,
@@ -610,7 +619,7 @@ impl<'a> Lexer<'a> {
                 }
                 self.pos += 1;
             }
-            let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+            let text = lossy_string(&self.input[start..self.pos]);
             return Token::new(
                 TokenKind::TripleStringLiteral,
                 text,
@@ -630,7 +639,7 @@ impl<'a> Lexer<'a> {
             }
             self.pos += 1;
         }
-        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        let text = lossy_string(&self.input[start..self.pos]);
         Token::new(TokenKind::StringLiteral, text, Span::new(start, self.pos))
     }
 
@@ -641,7 +650,7 @@ impl<'a> Lexer<'a> {
         {
             self.pos += 1;
         }
-        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        let text = lossy_string(&self.input[start..self.pos]);
         // §22.14: track `begin_keywords "<version>"` / `end_keywords` so the
         // identifier scanner can downgrade SV-only keywords in legacy regions.
         // The version string is consumed here (not emitted as a separate token).
@@ -658,7 +667,7 @@ impl<'a> Lexer<'a> {
                 while self.pos < self.input.len() && self.input[self.pos] != b'"' {
                     self.pos += 1;
                 }
-                let ver = String::from_utf8_lossy(&self.input[vstart..self.pos]).to_string();
+                let ver = lossy_string(&self.input[vstart..self.pos]);
                 if self.pos < self.input.len() {
                     self.pos += 1;
                 } // closing quote
@@ -691,7 +700,7 @@ impl<'a> Lexer<'a> {
         {
             self.pos += 1;
         }
-        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        let text = lossy_string(&self.input[start..self.pos]);
         Token::new(
             TokenKind::SystemIdentifier,
             text,
@@ -704,7 +713,7 @@ impl<'a> Lexer<'a> {
         while self.pos < self.input.len() && !self.input[self.pos].is_ascii_whitespace() {
             self.pos += 1;
         }
-        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        let text = lossy_string(&self.input[start..self.pos]);
         Token::new(
             TokenKind::EscapedIdentifier,
             text,
@@ -720,7 +729,7 @@ impl<'a> Lexer<'a> {
         {
             self.pos += 1;
         }
-        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        let text = lossy_string(&self.input[start..self.pos]);
         let mut kind = keyword(&text).unwrap_or(TokenKind::Identifier);
         // §22.14: inside a `begin_keywords "1364-*"` region, a SystemVerilog-
         // only keyword is a legal identifier (e.g. `reg logic;` declares a reg
@@ -786,7 +795,7 @@ impl<'a> Lexer<'a> {
                 {
                     self.pos += 1;
                 }
-                let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+                let text = lossy_string(&self.input[start..self.pos]);
                 return Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos));
             }
         }
@@ -837,8 +846,7 @@ impl<'a> Lexer<'a> {
                             .map_or(false, |c| c.is_ascii_alphanumeric())
                     {
                         self.pos += suffix.len();
-                        let text =
-                            String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+                        let text = lossy_string(&self.input[start..self.pos]);
                         return Token::new(
                             TokenKind::TimeLiteral,
                             text,
@@ -847,7 +855,7 @@ impl<'a> Lexer<'a> {
                     }
                 }
             }
-            let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+            let text = lossy_string(&self.input[start..self.pos]);
             return Token::new(TokenKind::RealLiteral, text, Span::new(start, self.pos));
         }
         // Exponent without decimal point
@@ -863,7 +871,7 @@ impl<'a> Lexer<'a> {
                 {
                     self.pos += 1;
                 }
-                let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+                let text = lossy_string(&self.input[start..self.pos]);
                 return Token::new(TokenKind::RealLiteral, text, Span::new(start, self.pos));
             }
             self.pos = saved;
@@ -878,12 +886,12 @@ impl<'a> Lexer<'a> {
                         .map_or(false, |c| c.is_ascii_alphanumeric())
                 {
                     self.pos += suffix.len();
-                    let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+                    let text = lossy_string(&self.input[start..self.pos]);
                     return Token::new(TokenKind::TimeLiteral, text, Span::new(start, self.pos));
                 }
             }
         }
-        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        let text = lossy_string(&self.input[start..self.pos]);
         Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos))
     }
 
@@ -929,7 +937,7 @@ impl<'a> Lexer<'a> {
         {
             self.pos += 1;
         }
-        let text = String::from_utf8_lossy(&self.input[start..self.pos]).to_string();
+        let text = lossy_string(&self.input[start..self.pos]);
         Token::new(TokenKind::IntegerLiteral, text, Span::new(start, self.pos))
     }
 }

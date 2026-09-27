@@ -1258,9 +1258,11 @@ impl Preprocessor {
                         {
                             // Lossy decode — tolerate stray non-UTF-8 bytes in
                             // included RTL (replace with U+FFFD, don't fail).
-                            match std::fs::read(&resolved)
-                                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                            {
+                            match std::fs::read(&resolved).map(|b| {
+                                String::from_utf8(b).unwrap_or_else(|e| {
+                                    String::from_utf8_lossy(e.as_bytes()).into_owned()
+                                })
+                            }) {
                                 Ok(contents) => {
                                     self.include_depth += 1;
                                     let stripped = self.strip_comments(&contents);
