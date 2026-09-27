@@ -12265,7 +12265,7 @@ fn create_implicit_nets_for_pending(elab: &mut ElaboratedModule) {
             }
             // The bare name is a sub-module-local identifier; after rewrite
             // it becomes `<prefix>name`.
-            let prefixed = format!("{}{}", prefix, name);
+            let prefixed = cat2(&prefix, &name);
             // An unpacked ARRAY has no signal under its own name — its
             // ELEMENTS are the signals — so `assign dst = src;` between two
             // arrays inside a sub-module looked like two undeclared
@@ -17863,8 +17863,8 @@ fn bits_of_signal_expr(
                 _ => None,
             };
             if let Some(tname) = tname {
-                let is_signal = signals.contains_key(&tname)
-                    || signals.contains_key(&format!("{}{}", prefix, tname));
+                let is_signal =
+                    signals.contains_key(&tname) || signals.contains_key(&cat2(&prefix, &tname));
                 if !is_signal && let Some(&base_w) = typedefs.get(&tname) {
                     let mut total = base_w as i64;
                     for (l, r) in dims {
@@ -17896,7 +17896,7 @@ fn bits_of_signal_expr(
         if params.contains_key(&base) || !path.is_empty() {
             return None;
         }
-        let scoped = format!("{}{}", prefix, base);
+        let scoped = cat2(&prefix, &base);
         let is_unpacked = arrays.contains_key(&scoped) || arrays.contains_key(&base);
         if is_unpacked {
             // An unpacked array's ELEMENTS are the signals; the declaration
@@ -17925,7 +17925,7 @@ fn bits_of_signal_expr(
     if params.contains_key(&base) || typedefs.contains_key(&base) {
         return None;
     }
-    let scoped = format!("{}{}", prefix, base);
+    let scoped = cat2(&prefix, &base);
     let sig = signals.get(&scoped).or_else(|| signals.get(&base))?;
     if path.is_empty() {
         return Some(sig.width).filter(|w| *w > 0);
@@ -19487,7 +19487,7 @@ fn register_array_param(
                 let (o0, o1) = (outer[0], outer[outer.len() - 1]);
                 let (i0, i1) = (inner[0], inner[inner.len() - 1]);
                 elab.arrays_2d
-                    .insert(format!("{}{}", prefix, name), ((o0, o1), (i0, i1), ew));
+                    .insert(cat2(&prefix, &name), ((o0, o1), (i0, i1), ew));
             }
         }
         return true;
@@ -19542,7 +19542,7 @@ fn register_array_param(
         return false;
     }
     let signed = is_type_signed(data_type);
-    let full = format!("{}{}", prefix, name);
+    let full = cat2(&prefix, &name);
     // Needed so `A[i]` is an ELEMENT select, not a bit-select of a scalar.
     // Simulator::new seeds each element from the signal written just below.
     elab.arrays.insert(full, (0, n as i64 - 1, elem_w));
@@ -24712,6 +24712,15 @@ fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
     }
 }
 
+/// `format!("{}{}", a, b)` for two strings, without the formatting
+/// machinery (instance flattening builds one such name per identifier).
+fn cat2(a: &str, b: &str) -> String {
+    let mut s = String::with_capacity(a.len() + b.len());
+    s.push_str(a);
+    s.push_str(b);
+    s
+}
+
 fn collect_effective_items(
     items: &[ModuleItem],
     params: &HashMap<String, Value>,
@@ -26718,7 +26727,7 @@ fn scope_local_type_name(
 ) -> Option<String> {
     tn.map(|t| {
         if local_typedefs.contains(&t) {
-            format!("{}{}", inst_prefix, t)
+            cat2(&inst_prefix, &t)
         } else {
             t
         }
@@ -26743,7 +26752,7 @@ fn scope_local_typerefs(
             span,
         } if name.scope.is_none() && local_names.contains(&name.name.name) => {
             let mut nn = name.clone();
-            nn.name.name = format!("{}{}", prefix, name.name.name);
+            nn.name.name = cat2(&prefix, &name.name.name);
             DataType::TypeReference {
                 name: nn,
                 dimensions: dimensions.clone(),
@@ -26782,7 +26791,7 @@ fn qualify_sibling_conn(
     }
     let root = path.split(|c| c == '.' || c == '[').next().unwrap_or("");
     if siblings.contains(root) {
-        format!("{}{}", prefix, path)
+        cat2(&prefix, &path)
     } else {
         path
     }
@@ -26873,7 +26882,7 @@ fn register_modport_expressions(
         let empty_pm: HashMap<String, Expression> = HashMap::default();
         let empty_if: HashMap<String, String> = HashMap::default();
         for hi in &inst.instances {
-            let inst_name = format!("{}{}", prefix, hi.name.name);
+            let inst_name = cat2(&prefix, &hi.name.name);
             let inst_prefix = format!("{}.", inst_name);
             for item in &idef.items {
                 let ModuleItem::ModportDeclaration(md) = item else {
@@ -27018,7 +27027,7 @@ fn inline_module_items(
                         let width = elab.typedefs.get(sub_mod_name).copied().unwrap_or(32);
                         let is_real = sub_mod_name == "real";
                         for hi in &inst.instances {
-                            let sig_name = format!("{}{}", prefix, hi.name.name);
+                            let sig_name = cat2(&prefix, &hi.name.name);
                             signals_insert_traced(
                                 &mut elab.signals,
                                 line!(),
@@ -27051,7 +27060,7 @@ fn inline_module_items(
                     if let Some(cd) = elab.checker_decls.get(sub_mod_name).cloned() {
                         let has_ports = !matches!(cd.ports, crate::ast::module::PortList::Empty);
                         for hi in &inst.instances {
-                            let sig_name = format!("{}{}", prefix, hi.name.name);
+                            let sig_name = cat2(&prefix, &hi.name.name);
                             signals_insert_traced(
                                 &mut elab.signals,
                                 line!(),
@@ -27196,7 +27205,7 @@ fn inline_module_items(
                         if sub_mod_port_names.contains(&name) {
                             continue;
                         }
-                        let scoped = format!("{}{}", inst_prefix, name);
+                        let scoped = cat2(&inst_prefix, &name);
                         // §6.10: the implicit net belongs to THIS instance, so
                         // the existence test must be SCOPED. A bare
                         // `signals.contains_key(name)` skipped creation
@@ -27354,7 +27363,7 @@ fn inline_module_items(
                                     // propagated to the real parent net and every reader
                                     // of it read z. `rewrite_expr`'s fallback IS
                                     // `prefix + name`, so the unmapped case is unchanged.
-                                    let parent_name = format!("{}{}", prefix, name.name);
+                                    let parent_name = cat2(&prefix, &name.name);
                                     let actual = rewrite_expr(
                                         &make_ident_expr(&name.name),
                                         prefix,
@@ -27395,7 +27404,7 @@ fn inline_module_items(
                                     // propagated to the real parent net and every reader
                                     // of it read z. `rewrite_expr`'s fallback IS
                                     // `prefix + name`, so the unmapped case is unchanged.
-                                    let parent_name = format!("{}{}", prefix, name);
+                                    let parent_name = cat2(&prefix, &name);
                                     let actual = rewrite_expr(
                                         &make_ident_expr(name),
                                         prefix,
@@ -28171,12 +28180,12 @@ fn inline_module_items(
                                 &elab.typedefs,
                             ) {
                                 elab.packed_signal_elem_widths
-                                    .insert(format!("{}{}", inst_prefix, assign.name.name), elem_w);
+                                    .insert(cat2(&inst_prefix, &assign.name.name), elem_w);
                                 tls_register_elem_w(&assign.name.name, elem_w);
                             }
                             if let Some(fdims) = packed_full_dims_of(data_type, &sub_local_params) {
                                 elab.packed_full_dims
-                                    .insert(format!("{}{}", inst_prefix, assign.name.name), fdims);
+                                    .insert(cat2(&inst_prefix, &assign.name.name), fdims);
                             }
                             // §6.20.2 unpacked-array parameter. This runs even when the
                             // parameter is OVERRIDDEN: the override arrives as a single
@@ -28227,8 +28236,7 @@ fn inline_module_items(
                                                 Some(&sub_local_params),
                                                 Some(&elab.typedefs),
                                             );
-                                            let arr_full =
-                                                format!("{}{}", inst_prefix, assign.name.name);
+                                            let arr_full = cat2(&inst_prefix, &assign.name.name);
                                             elab.associative_arrays.insert(arr_full.clone(), true);
                                             for it in items {
                                                 if let AssignmentPatternItem::Keyed(k, v) = it {
@@ -28488,7 +28496,7 @@ fn inline_module_items(
 
                 // Inline all resolved parameters into global map with prefix
                 for (name, val) in &sub_local_params {
-                    let full_name = format!("{}{}", inst_prefix, name);
+                    let full_name = cat2(&inst_prefix, &name);
                     params_insert_traced(
                         &mut elab.parameters,
                         line!(),
@@ -28556,7 +28564,7 @@ fn inline_module_items(
                         ) {
                             if !fields.is_empty() {
                                 for assign in assignments {
-                                    let scoped = format!("{}{}", inst_prefix, assign.name.name);
+                                    let scoped = cat2(&inst_prefix, &assign.name.name);
                                     elab.packed_struct_fields.insert(scoped, fields.clone());
                                     tls_register_struct_layout(&assign.name.name, &fields);
                                 }
@@ -28626,7 +28634,7 @@ fn inline_module_items(
                                     )
                                 })
                                 .unwrap_or(1);
-                            let sig_name = format!("{}{}", inst_prefix, port.name.name);
+                            let sig_name = cat2(&inst_prefix, &port.name.name);
                             // §6.6.7: resolve REALNESS through the typedef
                             // table — a nettype port formal (`inout rnet p`,
                             // rnet = `nettype real`) is a real signal. The
@@ -28893,7 +28901,7 @@ fn inline_module_items(
                                 );
                                 let is_signed = is_type_signed(&pd.data_type);
                                 for decl in &pd.declarators {
-                                    let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                    let sig_name = cat2(&inst_prefix, &decl.name.name);
                                     // §7.4.1: a non-ANSI PORT of a packed
                                     // multi-D / packed-struct type needs the
                                     // same shape registrations a variable
@@ -29069,7 +29077,7 @@ fn inline_module_items(
                                 // so the scoped entry wins where it matters
                                 // and the bare slot stays the design-wide
                                 // §23.6 fallback.
-                                let sc = format!("{}{}", inst_prefix, member.name.name);
+                                let sc = cat2(&inst_prefix, &member.name.name);
                                 let sv = wide_vals
                                     .as_ref()
                                     .and_then(|m| m.get(&member.name.name))
@@ -29100,10 +29108,8 @@ fn inline_module_items(
                             // Keyed by the INSTANCE-scoped typedef name (the
                             // signal's `type_name` is scoped to match); the
                             // bare key is a first-wins fallback only.
-                            elab.enum_members.insert(
-                                format!("{}{}", inst_prefix, td.name.name),
-                                inst_members.clone(),
-                            );
+                            elab.enum_members
+                                .insert(cat2(&inst_prefix, &td.name.name), inst_members.clone());
                             elab.enum_members
                                 .entry(td.name.name.clone())
                                 .or_insert(inst_members);
@@ -29134,11 +29140,11 @@ fn inline_module_items(
                             typedefs_insert_traced(
                                 &mut elab.typedefs,
                                 "insert:submodule_typedef_enum_scoped",
-                                format!("{}{}", inst_prefix, td.name.name),
+                                cat2(&inst_prefix, &td.name.name),
                                 base_width,
                             );
                             elab.typedef_types
-                                .entry(format!("{}{}", inst_prefix, td.name.name))
+                                .entry(cat2(&inst_prefix, &td.name.name))
                                 .or_insert_with(|| {
                                     scope_local_typerefs(
                                         &td.data_type,
@@ -29194,7 +29200,7 @@ fn inline_module_items(
                             typedefs_insert_traced(
                                 &mut elab.typedefs,
                                 "insert:submodule_typedef_scoped",
-                                format!("{}{}", inst_prefix, td.name.name),
+                                cat2(&inst_prefix, &td.name.name),
                                 w,
                             );
                             // Packed ELEMENT width, both keys, mirroring the
@@ -29211,7 +29217,7 @@ fn inline_module_items(
                             ) {
                                 elab.typedef_elem_widths.insert(td.name.name.clone(), ew);
                                 elab.typedef_elem_widths
-                                    .insert(format!("{}{}", inst_prefix, td.name.name), ew);
+                                    .insert(cat2(&inst_prefix, &td.name.name), ew);
                             }
                             // Register the TYPE too (not just its width) so a
                             // struct/union member access (`s.m0`) on a submodule
@@ -29226,7 +29232,7 @@ fn inline_module_items(
                             elab.typedef_types
                                 .insert(td.name.name.clone(), td.data_type.clone());
                             elab.typedef_types
-                                .entry(format!("{}{}", inst_prefix, td.name.name))
+                                .entry(cat2(&inst_prefix, &td.name.name))
                                 .or_insert_with(|| {
                                     scope_local_typerefs(
                                         &td.data_type,
@@ -29247,7 +29253,7 @@ fn inline_module_items(
                                 Some(&elab.typedefs),
                             );
                             for decl in &nd.declarators {
-                                let sig_name = format!("{}{}", inst_prefix, decl.name.name);
+                                let sig_name = cat2(&inst_prefix, &decl.name.name);
                                 let effective_dims = normalize_unpacked_dims(
                                     &decl.dimensions,
                                     &sub_merged_params,
@@ -29442,7 +29448,7 @@ fn inline_module_items(
                             ) {
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
-                                    let scoped = format!("{}{}", inst_prefix, bare);
+                                    let scoped = cat2(&inst_prefix, &bare);
                                     if elab.string_signals.insert(bare.clone()) {
                                         inst_bare_keys.push((2, bare));
                                     }
@@ -29466,7 +29472,7 @@ fn inline_module_items(
                             ) {
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
-                                    let scoped = format!("{}{}", inst_prefix, bare);
+                                    let scoped = cat2(&inst_prefix, &bare);
                                     if !elab.packed_signal_elem_widths.contains_key(&bare) {
                                         elab.packed_signal_elem_widths.insert(bare.clone(), elem_w);
                                         inst_bare_keys.push((0, bare));
@@ -29495,7 +29501,7 @@ fn inline_module_items(
                             {
                                 for decl in &dd.declarators {
                                     let bare = decl.name.name.clone();
-                                    let scoped = format!("{}{}", inst_prefix, bare);
+                                    let scoped = cat2(&inst_prefix, &bare);
                                     if !elab.packed_full_dims.contains_key(&bare) {
                                         elab.packed_full_dims.insert(bare.clone(), fdims.clone());
                                         inst_bare_keys.push((1, bare));
@@ -29533,7 +29539,7 @@ fn inline_module_items(
                                                     continue;
                                                 }
                                                 let bare = decl.name.name.clone();
-                                                let scoped = format!("{}{}", inst_prefix, bare);
+                                                let scoped = cat2(&inst_prefix, &bare);
                                                 tls_register_struct_layout(&bare, &fields);
                                                 tls_register_struct_layout(&scoped, &fields);
                                                 // First-wins on the bare key
@@ -29659,7 +29665,7 @@ fn inline_module_items(
                                 is_type_signed_resolved(&dd.data_type, &elab.typedef_types);
                             for decl in &dd.declarators {
                                 let base_name = decl.name.name.clone();
-                                let sig_name = format!("{}{}", inst_prefix, base_name);
+                                let sig_name = cat2(&inst_prefix, &base_name);
                                 // §6.18: unpacked dims may come from the
                                 // TYPEDEF (`typedef t_byte t_word [0:3];
                                 // t_word s;`), not the declarator — same gap
@@ -30203,7 +30209,7 @@ fn inline_module_items(
                     if prepared_sub.interface_ports.contains(port_name) {
                         continue;
                     }
-                    let sub_sig_name = format!("{}{}", inst_prefix, port_name);
+                    let sub_sig_name = cat2(&inst_prefix, &port_name);
                     // §6.6.8: a declared `interconnect` net is TYPELESS — it
                     // adopts the type of the port it connects. The declaration
                     // registered a 1-bit z placeholder; the first
@@ -30419,7 +30425,7 @@ fn inline_module_items(
                 for (pname, actual) in port_map.iter() {
                     let Some(formal) = elab
                         .signals
-                        .get(&format!("{}{}", inst_prefix, pname))
+                        .get(&cat2(&inst_prefix, &pname))
                         .map(|s| s.width)
                     else {
                         continue;
@@ -30442,7 +30448,7 @@ fn inline_module_items(
                     if is_input
                         && elab
                             .packed_signal_elem_widths
-                            .get(&format!("{}{}", inst_prefix, pname))
+                            .get(&cat2(&inst_prefix, &pname))
                             .is_some_and(|&w| w > 1)
                     {
                         no_subst_ports.insert(pname.clone());
@@ -30462,7 +30468,7 @@ fn inline_module_items(
                     // an element/part select of a struct array keeps its
                     // parent's layout through the select and substitutes
                     // fine; a flat vector or a concat does not.
-                    let formal_key = format!("{}{}", inst_prefix, pname);
+                    let formal_key = cat2(&inst_prefix, &pname);
                     if is_input
                         && elab.packed_struct_fields.contains_key(&formal_key)
                         && !elab.packed_signal_elem_widths.contains_key(&formal_key)
@@ -30663,7 +30669,7 @@ fn inline_module_items(
                     {
                         if name.scope.is_none() && sub_typedef_names.contains(&name.name.name) {
                             let mut nn = name.clone();
-                            nn.name.name = format!("{}{}", inst_prefix, name.name.name);
+                            nn.name.name = cat2(&inst_prefix, &name.name.name);
                             return DataType::TypeReference {
                                 name: nn,
                                 dimensions: dimensions.clone(),
@@ -30702,7 +30708,7 @@ fn inline_module_items(
                 {
                     if let ModuleItem::FunctionDeclaration(fd) = sub_item {
                         let mut new_fd = fd.clone();
-                        new_fd.name.name.name = format!("{}{}", inst_prefix, fd.name.name.name);
+                        new_fd.name.name.name = cat2(&inst_prefix, &fd.name.name.name);
                         // Return-type width can also use a module parameter.
                         new_fd.return_type = scope_local_typeref(&rewrite_data_type_genvar(
                             &new_fd.return_type,
@@ -30770,7 +30776,7 @@ fn inline_module_items(
                         _ => None,
                     };
                     if let Some((name, ports, body)) = named_sva {
-                        let key = format!("{}{}", inst_prefix, name);
+                        let key = cat2(&inst_prefix, &name);
                         elab.sequences.insert(key.clone());
                         if let Some(body) = body {
                             let mut sva_locals = (*prepared_sub.local_names).clone();
@@ -30806,7 +30812,7 @@ fn inline_module_items(
                     }
                     if let ModuleItem::TaskDeclaration(td) = sub_item {
                         let mut new_td = td.clone();
-                        new_td.name.name.name = format!("{}{}", inst_prefix, td.name.name.name);
+                        new_td.name.name.name = cat2(&inst_prefix, &td.name.name.name);
                         // Same formal-shadowing rule as functions above.
                         let mut task_locals = (*prepared_sub.local_names).clone();
                         for p in &td.ports {
@@ -30886,10 +30892,10 @@ fn inline_module_items(
                         });
                         if let Some(EventControl::Identifier(id)) = &mut new_cg.event {
                             if cg_locals.contains(&id.name) {
-                                id.name = format!("{}{}", inst_prefix, id.name);
+                                id.name = cat2(&inst_prefix, &id.name);
                             }
                         }
-                        new_cg.name.name = format!("{}{}", inst_prefix, cg.name.name);
+                        new_cg.name.name = cat2(&inst_prefix, &cg.name.name);
                         elab.covergroups.insert(new_cg.name.name.clone(), new_cg);
                     }
                     if let ModuleItem::ClockingDeclaration(cd) = sub_item {
@@ -30917,11 +30923,11 @@ fn inline_module_items(
                                     .map(|s| s.name.name.as_str())
                                     .collect::<Vec<_>>()
                                     .join("."),
-                                _ => format!("{}{}", inst_prefix, name),
+                                _ => cat2(&inst_prefix, &name),
                             }
                         };
                         let mut new_cd = cd.clone();
-                        new_cd.name.name = format!("{}{}", inst_prefix, cd.name.name);
+                        new_cd.name.name = cat2(&inst_prefix, &cd.name.name);
                         if let Some(clk) = &cd.clock_signal {
                             new_cd.clock_signal = Some(crate::ast::Identifier {
                                 name: resolve(&clk.name),
@@ -31013,7 +31019,7 @@ fn inline_module_items(
                     if matches!(sub_item, ModuleItem::NetDeclaration(_)) {
                         if let BodySource::NetInits(inits) = body_src {
                             for (decl_name, rhs_rc) in inits {
-                                let lhs_name = format!("{}{}", inst_prefix, decl_name);
+                                let lhs_name = cat2(&inst_prefix, &decl_name);
                                 let new_lhs = make_ident_expr(&lhs_name);
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::new(new_lhs),
@@ -33547,7 +33553,7 @@ fn lower_udp_instances(
                 }
             }
         }
-        let inst_path = format!("{}{}", prefix, hi.name.name);
+        let inst_path = cat2(&prefix, &hi.name.name);
         // §6.10: an undeclared identifier used in a PRIMITIVE TERMINAL gets an
         // implicit 1-bit net, exactly like one in a continuous assign. The
         // cont-assign pass never sees a net that only wires two UDPs together
@@ -34238,7 +34244,7 @@ fn rewrite_expr_impl(
             }
             if local_names.contains(name) {
                 let mut new_hier = hier.clone();
-                new_hier.path[0].name.name = format!("{}{}", prefix, name);
+                new_hier.path[0].name.name = cat2(&prefix, &name);
                 ExprKind::Ident(new_hier)
             } else {
                 expr.kind.clone()
