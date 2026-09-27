@@ -1132,15 +1132,45 @@ pub fn elaborate_class_with_params(
     }
     let mut table = typedefs_snapshot(|td| td.cloned()).unwrap_or_default();
     table.extend(type_defaults);
-    with_typedefs(&table, || elaborate_class_in_scope(c, scope_params))
+    with_typedefs_owned(table, || elaborate_class_in_scope(c, scope_params))
+}
+
+/// Whether a class binds any VALUE parameter or body `localparam` of its own
+/// — otherwise its constant scope is exactly the enclosing one.
+fn class_binds_values(c: &ClassDeclaration) -> bool {
+    c.params
+        .iter()
+        .any(|p| matches!(p.kind, crate::ast::decl::ParameterKind::Data { .. }))
+        || c.items.iter().any(|item| {
+            matches!(item, ClassItem::Parameter(pd)
+                if matches!(pd.kind, crate::ast::decl::ParameterKind::Data { .. }))
+        })
 }
 
 fn elaborate_class_in_scope(
     c: &ClassDeclaration,
     scope_params: Option<&HashMap<String, Value>>,
 ) -> ElaboratedClass {
-    let const_scope = class_const_scope(c, scope_params);
-    let class_params = Some(&const_scope);
+    // Both scopes below start from a copy of the enclosing parameters; a
+    // class that binds nothing of its own (most of them) borrows those
+    // parameters instead of copying the whole map twice.
+    let binds_values = class_binds_values(c);
+    let empty_scope: HashMap<String, Value>;
+    let enclosing: &HashMap<String, Value> = match scope_params {
+        Some(p) => p,
+        None => {
+            empty_scope = HashMap::default();
+            &empty_scope
+        }
+    };
+    let owned_const_scope: HashMap<String, Value>;
+    let const_scope: &HashMap<String, Value> = if binds_values {
+        owned_const_scope = class_const_scope(c, scope_params);
+        &owned_const_scope
+    } else {
+        enclosing
+    };
+    let class_params = Some(const_scope);
     // Scope for sizing UNPACKED dimensions (`bit [7:0] mem [N];`): the
     // enclosing scope's parameters plus class-body localparams — both fixed
     // per class. Header VALUE parameters are deliberately EXCLUDED: they can
@@ -1148,23 +1178,29 @@ fn elaborate_class_in_scope(
     // shape, so sizing from the default would give an overridden
     // specialization a wrong FIXED size. Such properties stay queue-backed
     // (indexing works; `size()`/`foreach` see the pushed elements only).
-    let unpacked_scope: HashMap<String, Value> = {
-        let mut m = scope_params.cloned().unwrap_or_default();
-        for item in &c.items {
-            if let ClassItem::Parameter(pd) = item {
-                if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
-                    for a in assignments {
-                        if let Some(init) = &a.init {
-                            let v = eval_const_expr_val(init, &m);
-                            m.insert(a.name.name.clone(), v);
+    let owned_unpacked_scope: HashMap<String, Value>;
+    let unpacked_scope: &HashMap<String, Value> = if !binds_values {
+        enclosing
+    } else {
+        owned_unpacked_scope = {
+            let mut m = scope_params.cloned().unwrap_or_default();
+            for item in &c.items {
+                if let ClassItem::Parameter(pd) = item {
+                    if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &pd.kind {
+                        for a in assignments {
+                            if let Some(init) = &a.init {
+                                let v = eval_const_expr_val(init, &m);
+                                m.insert(a.name.name.clone(), v);
+                            }
                         }
                     }
                 }
             }
-        }
-        m
+            m
+        };
+        &owned_unpacked_scope
     };
-    let unpacked_params = Some(&unpacked_scope);
+    let unpacked_params = Some(unpacked_scope);
     // Declared type of each property, retained so the runtime can re-size a
     // property whose packed range depends on a class parameter for a
     // specialization other than the default (`box#(16)` vs `box#(8)`).
@@ -1837,7 +1873,7 @@ fn elaborate_class_in_scope(
                         if let Some((lo, hi)) =
                             const_unpacked_bounds(&a.dimensions, unpacked_params)
                         {
-                            let ew = resolve_type_width(data_type, Some(&const_scope), None).max(1);
+                            let ew = resolve_type_width(data_type, Some(const_scope), None).max(1);
                             array_properties.insert(a.name.name.clone(), (lo, hi, ew));
                             if let Some(init) = &a.init {
                                 property_inits.insert(a.name.name.clone(), init.clone());
@@ -1879,10 +1915,10 @@ fn elaborate_class_in_scope(
                     let width = if implicit_no_dims {
                         a.init
                             .as_ref()
-                            .and_then(|i| untyped_param_width(i, &const_scope))
+                            .and_then(|i| untyped_param_width(i, const_scope))
                             .unwrap_or(32)
                     } else {
-                        resolve_type_width(data_type, Some(&const_scope), None)
+                        resolve_type_width(data_type, Some(const_scope), None)
                     };
                     let is_string = matches!(
                         data_type,
@@ -1894,12 +1930,12 @@ fn elaborate_class_in_scope(
                     let v = if is_string {
                         // String localparams: evaluate using the const-eval path.
                         if let Some(init) = &a.init {
-                            eval_const_expr_val(init, &const_scope)
+                            eval_const_expr_val(init, const_scope)
                         } else {
                             Value::from_string("")
                         }
                     } else if let Some(init) = &a.init {
-                        eval_init_for_width(init, &const_scope, width)
+                        eval_init_for_width(init, const_scope, width)
                     } else {
                         Value::zero(width)
                     };
@@ -17919,9 +17955,14 @@ fn bits_of_signal_expr(
 /// consulted by const-eval `$bits(typedef_name)`. The previous binding
 /// is restored on exit so nested calls compose correctly.
 pub fn with_typedefs<R>(typedefs: &HashMap<String, u32>, f: impl FnOnce() -> R) -> R {
-    type_trace_tls_refresh("with_typedefs", typedefs);
-    let snapshot = typedefs.clone();
-    let prev = TYPEDEFS_TLS.with(|td| (*td.borrow_mut()).replace(snapshot));
+    with_typedefs_owned(typedefs.clone(), f)
+}
+
+/// `with_typedefs` taking the table by value (no copy of a table the caller
+/// built just for this call).
+fn with_typedefs_owned<R>(typedefs: HashMap<String, u32>, f: impl FnOnce() -> R) -> R {
+    type_trace_tls_refresh("with_typedefs", &typedefs);
+    let prev = TYPEDEFS_TLS.with(|td| (*td.borrow_mut()).replace(typedefs));
     let r = f();
     TYPEDEFS_TLS.with(|td| *td.borrow_mut() = prev);
     r
