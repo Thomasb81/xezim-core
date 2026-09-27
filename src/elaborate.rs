@@ -5228,7 +5228,7 @@ pub fn elaborate_module_with_defs(
             for port in ports {
                 // §23.2.2: ANSI port names are unique, and the declaration is
                 // COMPLETE — a later variable of the same name is a clash too
-                // (the reference rejects both, vlog-2388). Registering the
+                // (the reference simulator rejects both). Registering the
                 // port as an incompatible typed decl routes both cases
                 // through the standard duplicate machinery.
                 if elab.typed_decls.contains_key(&port.name.name) {
