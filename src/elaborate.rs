@@ -26001,6 +26001,10 @@ fn prepare_module_items(
         driven
     };
 
+    // Every instance of this module gets a copy of these items, so parse
+    // their integer literals once, here, instead of once per instance.
+    prefill_literal_caches(&effective_items);
+
     let prepared = Rc::new(PreparedModuleItems {
         effective_items,
         body_sources,
@@ -26012,6 +26016,75 @@ fn prepare_module_items(
     });
     cache.insert(cache_key, Rc::clone(&prepared));
     prepared
+}
+
+/// Fill the value cache of every integer literal reachable from the
+/// continuous assignments and procedural blocks of `items` — the value the
+/// literal evaluators store there after their first evaluation of the node,
+/// computed the same way. A literal that draws the unsized-decimal wrap
+/// warning is left alone so the evaluator meeting it first still warns.
+fn prefill_literal_caches(items: &[ModuleItem]) {
+    fn fill(n: &NumberLiteral) {
+        let NumberLiteral::Integer {
+            size,
+            base,
+            value,
+            cached_val,
+            ..
+        } = n
+        else {
+            return;
+        };
+        if cached_val.get().is_some() {
+            return;
+        }
+        let radix = match base {
+            NumberBase::Binary => 2,
+            NumberBase::Octal => 8,
+            NumberBase::Hex => 16,
+            NumberBase::Decimal => 10,
+        };
+        if Value::unsized_decimal_wrap(*size, radix, value).is_some() {
+            return;
+        }
+        let w = match size {
+            Some(sz) => *sz,
+            None => Value::unsized_literal_width(value, radix),
+        };
+        if w > 64 {
+            return;
+        }
+        if let Some((vb, xz)) = Value::from_str_radix(value, radix, w).inline_bits() {
+            cached_val.set(Some((vb, xz, w)));
+        }
+    }
+    fn expr(e: &Expression) {
+        for_each_sub_expr(e, &mut |x| match &x.kind {
+            ExprKind::Number(n) => fill(n),
+            ExprKind::Ident(h) => {
+                for seg in &h.path {
+                    for sel in &seg.selects {
+                        expr(sel);
+                    }
+                }
+            }
+            _ => {}
+        });
+    }
+    for item in items {
+        match item {
+            ModuleItem::ContinuousAssign(ca) => {
+                for (lhs, rhs) in &ca.assignments {
+                    expr(lhs);
+                    expr(rhs);
+                }
+            }
+            ModuleItem::AlwaysConstruct(ac) => for_each_stmt_expr(&ac.stmt, &mut |e| expr(e)),
+            ModuleItem::InitialConstruct(ic) => for_each_stmt_expr(&ic.stmt, &mut |e| expr(e)),
+            ModuleItem::FinalConstruct(fc) => for_each_stmt_expr(&fc.stmt, &mut |e| expr(e)),
+            _ => {}
+        }
+    }
 }
 
 /// Best-effort self-determined width of a port-connection actual, reading
