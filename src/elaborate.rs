@@ -5492,7 +5492,14 @@ pub fn elaborate_module_with_defs(
                     type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
-                if let Some(net_type) = port.net_type {
+                if let Some(net_type) = port.net_type.or_else(|| {
+                    implicit_port_net_type(
+                        port.direction,
+                        port.var_kw,
+                        port.data_type.as_ref(),
+                        true,
+                    )
+                }) {
                     register_net_type(&mut elab, &port.name.name, net_type);
                 }
                 if port_shape.is_empty() {
@@ -6193,7 +6200,14 @@ pub fn elaborate_module_with_defs(
                         elab.port_order.push(decl.name.name.clone());
                     }
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
-                    if let Some(net_type) = pd.net_type {
+                    if let Some(net_type) = pd.net_type.or_else(|| {
+                        implicit_port_net_type(
+                            Some(pd.direction),
+                            false,
+                            Some(&pd.data_type),
+                            false,
+                        )
+                    }) {
                         register_net_type(&mut elab, &decl.name.name, net_type);
                     }
                     if let Some(view) = &port_modport_view {
@@ -13185,7 +13199,14 @@ fn elaborate_items_numbered(
                         type_name: get_type_name(&pd.data_type),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
-                    if let Some(net_type) = pd.net_type {
+                    if let Some(net_type) = pd.net_type.or_else(|| {
+                        implicit_port_net_type(
+                            Some(pd.direction),
+                            false,
+                            Some(&pd.data_type),
+                            false,
+                        )
+                    }) {
                         register_net_type(elab, &decl.name.name, net_type);
                     }
                     elab.port_order.push(decl.name.name.clone());
@@ -16617,6 +16638,42 @@ fn default_value_for_type(dt: &DataType, width: u32) -> Value {
         Value::zero(width)
     } else {
         Value::new(width)
+    }
+}
+
+/// §23.2.2.3: the net type a port with NO explicit net type still takes.
+///
+/// A port declared without a data type (`input a`, `output [3:0] y`, or a
+/// non-ANSI `input a;` that no net/variable declaration completes) is a net
+/// of the default net type, whatever its direction. An ANSI `input` /
+/// `inout` whose data type is `logic` (`input logic [3:0] a`) is a net too:
+/// the port kind defaults to net for those directions, and `logic` is a
+/// valid net data type. Other data types (`int`, `bit`, typedefs, ...) and
+/// `var` make a variable, as does an explicitly typed output. A non-ANSI
+/// `output d; reg d;` is completed to a variable by the declaration arm,
+/// which unregisters the net again.
+///
+/// Returning None for these left every such port out of `nets`, so VPI
+/// reported `vpiReg` for what the standard (and the reference simulator)
+/// call a `vpiNet`.
+fn implicit_port_net_type(
+    direction: Option<PortDirection>,
+    var_kw: bool,
+    data_type: Option<&DataType>,
+    ansi: bool,
+) -> Option<NetType> {
+    if var_kw || matches!(direction, Some(PortDirection::Ref)) {
+        return None;
+    }
+    match data_type {
+        None | Some(DataType::Implicit { .. }) => Some(NetType::Wire),
+        Some(DataType::IntegerVector {
+            kind: IntegerVectorType::Logic,
+            ..
+        }) if ansi && matches!(direction, Some(PortDirection::Input | PortDirection::Inout)) => {
+            Some(NetType::Wire)
+        }
+        _ => None,
     }
 }
 
@@ -28996,7 +29053,14 @@ fn inline_module_items(
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
                             }
-                            if let Some(net_type) = port.net_type {
+                            if let Some(net_type) = port.net_type.or_else(|| {
+                                implicit_port_net_type(
+                                    port.direction,
+                                    port.var_kw,
+                                    port.data_type.as_ref(),
+                                    true,
+                                )
+                            }) {
                                 register_net_type(elab, &sig_name, net_type);
                             }
                             if port_shape.is_empty() {
@@ -29156,7 +29220,14 @@ fn inline_module_items(
                                             ),
                                         },
                                     );
-                                    if let Some(net_type) = pd.net_type {
+                                    if let Some(net_type) = pd.net_type.or_else(|| {
+                                        implicit_port_net_type(
+                                            Some(pd.direction),
+                                            false,
+                                            Some(&pd.data_type),
+                                            false,
+                                        )
+                                    }) {
                                         register_net_type(elab, &sig_name, net_type);
                                     }
                                 }
@@ -33308,8 +33379,27 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
 }
 
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
+    // A user-written HIERARCHICAL continuous assign onto an instance PORT
+    // (`assign dut.u_mid.u_leaf.clk_i = tb_clk;` — a multi-segment path)
+    // drives the port's whole alias chain: the simulator fans it out across
+    // every collapsed level of the connection. Counting it here as a second
+    // driver beside the port's own connect assign folded the two into one
+    // `$__wres` on a single level, consuming both the connect alias and the
+    // drive, so readers bound at another level of the chain were never
+    // driven. That broke every such drive onto a port declared as a net
+    // (`input wire clk_i`, and §23.2.2.3 implicit-net ports like
+    // `input logic clk_i`); leave it to the fan-out.
+    let is_hier_port_drive = |ca: &ContinuousAssignment| -> bool {
+        matches!(&ca.lhs.kind,
+            ExprKind::Ident(h) if h.path.len() > 1 && h.path.iter().all(|s| s.selects.is_empty()))
+            && ident_flat_name(&ca.lhs)
+                .is_some_and(|n| elab.signals.get(&n).is_some_and(|s| s.direction.is_some()))
+    };
     let mut counts: HashMap<String, usize> = HashMap::default();
     for ca in &elab.continuous_assigns {
+        if is_hier_port_drive(ca) {
+            continue;
+        }
         if let Some(n) = ident_flat_name(&ca.lhs) {
             *counts.entry(n).or_insert(0) += 1;
         }
@@ -33378,6 +33468,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         }
     }
     let all = std::mem::take(&mut elab.continuous_assigns);
+    let hier_port_drive: Vec<bool> = all.iter().map(is_hier_port_drive).collect();
     // Per multi-driven net: keep the lhs/delay, and accumulate STRONG drivers
     // and WEAK (pull) drivers into separate `$__wres` chains. A pull driver's
     // rhs is `$__pull(v)`; unwrap it into the weak chain. Final rhs resolves
@@ -33394,8 +33485,8 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         matches!(&e.kind,
         ExprKind::SystemCall { name, .. } if name == "$__pull")
     };
-    for ca in all {
-        let name = ident_flat_name(&ca.lhs).filter(|n| multi.contains(n));
+    for (ca, hier) in all.into_iter().zip(hier_port_drive) {
+        let name = ident_flat_name(&ca.lhs).filter(|n| !hier && multi.contains(n));
         let Some(name) = name else {
             elab.continuous_assigns.push(ca);
             continue;
