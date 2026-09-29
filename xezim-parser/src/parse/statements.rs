@@ -1147,6 +1147,25 @@ impl Parser {
                     )
                 } else {
                     self.expect(TokenKind::Semicolon);
+                    // §13.5 / A.6.9: a statement that is only a name is a
+                    // subroutine call written without parentheses —
+                    // `t;`, `u.t;`, `a.b.t;`, `pkg::t;`, `obj.m;`. Give it the
+                    // same zero-argument `Call` shape as `t();`, so every
+                    // later stage (blocking analysis, inlining, lint) sees a
+                    // call instead of a bare read that does nothing.
+                    let expr = match &expr.kind {
+                        ExprKind::Ident(_) | ExprKind::MemberAccess { .. } => {
+                            let span = expr.span;
+                            Expression::new(
+                                ExprKind::Call {
+                                    func: Box::new(expr),
+                                    args: Vec::new(),
+                                },
+                                span,
+                            )
+                        }
+                        _ => expr,
+                    };
                     Statement::new(StatementKind::Expr(expr), self.span_from(start))
                 }
             }
