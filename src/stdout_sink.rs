@@ -17,14 +17,14 @@ use std::thread::JoinHandle;
 const BUF_CAPACITY: usize = 16 * 1024;
 const FLUSH_THRESHOLD: usize = 8 * 1024;
 
-/// Lines buffered between clock reads in the line-flush path. Reading the clock
-/// is cheap (vDSO) but not free, and 1-in-64 bounds the check's cost to noise
-/// while still catching the "simulation went quiet" case within 64 lines.
-const LINE_FLUSH_CHECK_EVERY: u32 = 64;
 /// Longest a completed line may sit in the producer buffer before it is handed
 /// to the writer thread. Bounds how stale a `$display` can look on a terminal;
 /// far below human perception, and long enough that a burst of output coalesces
-/// into whole-buffer dispatches instead of one channel send per line.
+/// into whole-buffer dispatches instead of one channel send per line. Checked
+/// on every completed line (one vDSO clock read) and, through
+/// `flush_if_stale`, whenever simulation time advances — so neither a
+/// testbench that prints rarely nor the tail of a burst followed by a quiet
+/// stretch waits for exit.
 const LINE_FLUSH_MAX_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
 
 enum Mode {
@@ -35,8 +35,6 @@ enum Mode {
         /// Emptied buffers handed back by the worker, so a dispatch does not
         /// allocate a fresh `Vec` and grow it from zero every time.
         recycle: Receiver<Vec<u8>>,
-        /// Lines written since the last clock read (see `LINE_FLUSH_CHECK_EVERY`).
-        lines_since_check: u32,
         /// When the buffer was last handed to the worker.
         last_dispatch: std::time::Instant,
         handle: Option<JoinHandle<()>>,
@@ -178,7 +176,6 @@ impl StdoutSink {
                 buf: Vec::with_capacity(BUF_CAPACITY),
                 tx: Some(tx),
                 recycle,
-                lines_since_check: 0,
                 last_dispatch: std::time::Instant::now(),
                 handle: Some(handle),
             },
@@ -248,7 +245,6 @@ impl StdoutSink {
                 buf,
                 tx: Some(tx),
                 recycle,
-                lines_since_check,
                 last_dispatch,
                 ..
             } => {
@@ -258,19 +254,11 @@ impl StdoutSink {
                 // A full buffer goes now regardless — `write_bytes` already
                 // dispatches at the threshold, so reaching here with a full
                 // buffer means this line completed it.
-                if buf.len() < FLUSH_THRESHOLD {
-                    *lines_since_check += 1;
-                    if *lines_since_check < LINE_FLUSH_CHECK_EVERY {
-                        return;
-                    }
-                    *lines_since_check = 0;
-                    if last_dispatch.elapsed() < LINE_FLUSH_MAX_DELAY {
-                        return;
-                    }
+                if buf.len() < FLUSH_THRESHOLD && last_dispatch.elapsed() < LINE_FLUSH_MAX_DELAY {
+                    return;
                 }
                 let chunk = std::mem::replace(buf, Self::fresh_buf(recycle));
                 let _ = tx.send(Msg::Chunk(chunk));
-                *lines_since_check = 0;
                 *last_dispatch = std::time::Instant::now();
             }
             _ => {}
@@ -286,7 +274,6 @@ impl StdoutSink {
                 buf,
                 tx: Some(tx),
                 recycle,
-                lines_since_check,
                 last_dispatch,
                 ..
             } => {
@@ -294,7 +281,6 @@ impl StdoutSink {
                 if buf.len() >= FLUSH_THRESHOLD {
                     let chunk = std::mem::replace(buf, Self::fresh_buf(recycle));
                     let _ = tx.send(Msg::Chunk(chunk));
-                    *lines_since_check = 0;
                     *last_dispatch = std::time::Instant::now();
                 }
             }
@@ -314,16 +300,31 @@ impl StdoutSink {
                 buf,
                 tx: Some(tx),
                 recycle,
-                lines_since_check,
                 last_dispatch,
                 ..
             } if !buf.is_empty() => {
                 let chunk = std::mem::replace(buf, Self::fresh_buf(recycle));
                 let _ = tx.send(Msg::Chunk(chunk));
-                *lines_since_check = 0;
                 *last_dispatch = std::time::Instant::now();
             }
             _ => {}
+        }
+    }
+
+    /// Hand buffered output to the writer if it has waited `LINE_FLUSH_MAX_DELAY`.
+    /// The simulator calls this when time advances: the last lines of a burst
+    /// arrive within the delay of the previous dispatch and stay buffered, and
+    /// without a later line to release them they would wait for exit. Costs a
+    /// branch while the buffer is empty.
+    #[inline]
+    pub fn flush_if_stale(&mut self) {
+        if let Mode::Threaded {
+            buf, last_dispatch, ..
+        } = &self.mode
+        {
+            if !buf.is_empty() && last_dispatch.elapsed() >= LINE_FLUSH_MAX_DELAY {
+                self.flush();
+            }
         }
     }
 
@@ -389,6 +390,36 @@ mod tests {
 
     /// A chunk that arrives with nothing behind it is flushed immediately, so a
     /// `$display` in an otherwise-idle simulation is visible right away.
+    fn buffered_len(sink: &StdoutSink) -> usize {
+        match &sink.mode {
+            Mode::Threaded { buf, .. } => buf.len(),
+            Mode::Inline(_) => 0,
+        }
+    }
+
+    /// Core #49: a testbench that prints rarely must see each line released
+    /// once it has waited the delay, not after 64 lines or at exit.
+    #[test]
+    fn sparse_lines_are_released_after_the_delay() {
+        let mut sink = StdoutSink::threaded();
+        sink.writeln_str("");
+        std::thread::sleep(LINE_FLUSH_MAX_DELAY * 2);
+        sink.writeln_str("");
+        assert_eq!(buffered_len(&sink), 0);
+    }
+
+    /// The tail of a burst has no later line to release it; the simulator's
+    /// time-advance call does.
+    #[test]
+    fn stale_output_is_released_by_flush_if_stale() {
+        let mut sink = StdoutSink::threaded();
+        sink.write_str(" ");
+        assert_eq!(buffered_len(&sink), 1);
+        std::thread::sleep(LINE_FLUSH_MAX_DELAY * 2);
+        sink.flush_if_stale();
+        assert_eq!(buffered_len(&sink), 0);
+    }
+
     #[test]
     fn lone_chunk_is_flushed_immediately() {
         let events = Arc::new(Mutex::new(Vec::new()));
