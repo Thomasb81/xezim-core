@@ -25,9 +25,27 @@ unsafe extern "C" {
 /// pages resident for its purge delay (1 s by default) so that a quick
 /// re-allocation finds them warm; after a phase drops a large structure (the
 /// parsed AST, the elaboration-time signal map) the next phase's big fresh
-/// allocations then land on top of it, and peak RSS carries both. Call it at
-/// such phase boundaries only — it walks every heap.
+/// allocations then land on top of it, and peak RSS carries both (c906
+/// CoreMark: 750 MB peak without, 599 MB with). Call it at such phase
+/// boundaries only — it walks every heap.
+///
+/// Only a large process purges. For a small one the saving is a few MB, and
+/// purging splits the huge pages later allocations would have reused: the
+/// axi4 AVIP ran 2.3% more cycles with it.
 pub fn release_free_memory() {
+    const MIN_RESIDENT_BYTES: u64 = 256 << 20;
+    let resident = std::fs::read_to_string("/proc/self/statm")
+        .ok()
+        .and_then(|s| {
+            s.split_whitespace()
+                .nth(1)
+                .and_then(|v| v.parse::<u64>().ok())
+        })
+        .map(|pages| pages * 4096)
+        .unwrap_or(0);
+    if resident < MIN_RESIDENT_BYTES {
+        return;
+    }
     #[cfg(feature = "mimalloc-allocator")]
     // SAFETY: `mi_collect` only reorganizes the allocator's own free lists
     // and is safe to call at any time from any thread.
