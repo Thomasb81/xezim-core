@@ -12765,10 +12765,13 @@ fn create_implicit_nets(
     nettype_actuals: &HashMap<String, String>,
 ) -> Result<(), String> {
     let mut implicit_names = Vec::new();
+    let mut lhs_names = Vec::new();
     for ca in &elab.continuous_assigns {
-        collect_assign_net_names(&ca.lhs, &mut implicit_names);
+        collect_assign_net_names(&ca.lhs, &mut lhs_names);
         collect_assign_net_names(&ca.rhs, &mut implicit_names);
     }
+    implicit_names.extend(lhs_names.iter().cloned());
+    let lhs_names: HashSet<String> = lhs_names.into_iter().collect();
     // §6.10 also covers an identifier that appears ONLY as an instance port
     // actual — `.out(net)` on one instance and `.in(net)` on another, with
     // `net` never declared. Those were skipped, so the name existed nowhere:
@@ -12786,15 +12789,24 @@ fn create_implicit_nets(
             // none` (GitHub xezim#106: `input wire t_word din` with
             // `typedef t_byte t_word [0:3]` was rejected as an implicit net
             // whenever `din` appeared in a continuous assign). The port-actual
-            // pass below already had these namespace checks; this pass keeps
-            // creating its placeholder signal (downstream relies on it for an
-            // array named in an assign lvalue) but neither errors nor warns.
+            // pass below has the same namespace checks.
+            //
+            // A collection that is only READ (`assign w = m[2];`) gets no
+            // placeholder signal at all: the read resolves through the
+            // elements, and the 1-bit signal this pass used to register was a
+            // phantom NET named after the array, which VPI listed under
+            // vpiNet. One named in an assign TARGET still gets it (neither
+            // error nor warning): the simulator treats `m[i][j] = …` whose
+            // root has no signal as a no-op.
             let declared_collection = elab.arrays.contains_key(&name)
                 || elab.arrays_2d.contains_key(&name)
                 || elab.arrays_nd.contains_key(&name)
                 || elab.associative_arrays.contains_key(&name)
                 || elab.dynamic_arrays.contains(&name)
                 || elab.queue_vars.contains(&name);
+            if declared_collection && !lhs_names.contains(&name) {
+                continue;
+            }
             if none_active && !declared_collection {
                 return Err(format!(
                     "Implicit net '{}' under `default_nettype none (IEEE 1800-2017 §6.10)",
@@ -12833,9 +12845,9 @@ fn create_implicit_nets(
     // ARRAY (`.a(data)` for `bit [1:0] data [0:2]`), and arrays live in their
     // own maps — without those extra namespace checks such a name looks
     // undeclared and gets a bogus 1-bit net that shadows the real array. The
-    // legacy continuous-assign pass above deliberately keeps its original,
-    // looser test: code downstream relies on the placeholder signal it creates
-    // for an array named in an assign lvalue.
+    // continuous-assign pass above still gives an array named in an assign
+    // TARGET its placeholder signal: the simulator relies on it for
+    // `m[i][j] = …`.
     let mut port_names: Vec<String> = port_conn_names.to_vec();
     port_names.sort();
     port_names.dedup();
