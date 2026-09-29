@@ -136,8 +136,8 @@ impl Parser {
                 self.parse_identifier()
             };
             // Some sources spell `endpackage : name;` with a trailing `;`
-            // (lenient over strict SV §22.4.2 grammar — accepted by VCS,
-            // Xcelium, and Verilator). Eat it here so the outer description
+            // (lenient over strict SV §22.4.2 grammar — accepted by other
+            // simulators). Eat it here so the outer description
             // loop doesn't trip on the lone semicolon.
             let _ = self.eat(TokenKind::Semicolon);
             Some(id)

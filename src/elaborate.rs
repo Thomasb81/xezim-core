@@ -12042,9 +12042,9 @@ fn validate_expr_idents(
                     | "$coverage_control" | "$coverage_get" | "$coverage_get_max"
                     | "$coverage_merge" | "$coverage_save" | "$get_coverage"
                     | "$set_coverage_db_name" | "$load_coverage_db"
-                    // Verdi/VCS waveform tasks: scope args like $dumpvars.
+                    // FSDB/VPD waveform tasks: scope args like $dumpvars.
                     | "$fsdbDumpvars" | "$fsdbDumpfile" | "$vcdpluson" | "$vcdplusoff"
-                    // Cadence/Xcelium SHM + SST2 waveform tasks: the first
+                    // SHM + SST2 waveform tasks: the first
                     // argument of $shm_probe/$recordvars/$probe is a SCOPE
                     // (`$shm_probe(testbench, "AC")`), so validating it as a
                     // value lookup failed whole-testbench elaboration with
