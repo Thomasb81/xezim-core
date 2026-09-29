@@ -31257,21 +31257,46 @@ fn inline_module_items(
                             )
                         });
                         if let BodySource::GateInst(pairs) = body_src {
+                            // §28.9/§28.11: the gate's `#d` / `#(rise, fall)`
+                            // delays travel unevaluated like an `assign #d`
+                            // delay, so a parameter they name (`and #(D)`)
+                            // resolves per instance at materialize time.
+                            // Passing None ran every inlined gate undelayed.
+                            let delay_rc = gi.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
+                            let delay_fall_rc =
+                                gi.delay_fall.as_ref().map(|d| std::rc::Rc::new(d.clone()));
                             for (lhs_rc, rhs_rc) in pairs {
+                                // §28.4: mark the driven net gate-driven, as
+                                // `gate_inst_to_assigns` does at the top level,
+                                // so a `buf` fed z drives x here too.
+                                let lhs = rewrite_expr(
+                                    lhs_rc,
+                                    &pend_ctx.prefix,
+                                    &pend_ctx.port_map,
+                                    &pend_ctx.local_names,
+                                    &pend_ctx.interface_map,
+                                );
+                                if let Some(n) = ident_flat_name(&lhs) {
+                                    elab.gate_driven_nets.insert(n);
+                                }
                                 elab.pending_cont_assign.push(PendingContAssign {
                                     lhs_source: std::rc::Rc::clone(lhs_rc),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
-                                    delay_source: None,
-                                    delay_fall_source: None,
+                                    delay_source: delay_rc.clone(),
+                                    delay_fall_source: delay_fall_rc.clone(),
                                     delay_off_source: None,
                                     origin_span: None,
                                 });
                             }
                         }
                     }
-                    if matches!(sub_item, ModuleItem::NetDeclaration(_)) {
+                    if let ModuleItem::NetDeclaration(nd) = sub_item {
                         if let BodySource::NetInits(inits) = body_src {
+                            // §10.3.1 `wire #d w = expr;` drives through the
+                            // net delay, resolved per instance like the
+                            // `assign #d` form above.
+                            let delay_rc = nd.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
                             for (decl_name, rhs_rc) in inits {
                                 let lhs_name = cat2(&inst_prefix, &decl_name);
                                 let new_lhs = make_ident_expr(&lhs_name);
@@ -31279,7 +31304,7 @@ fn inline_module_items(
                                     lhs_source: std::rc::Rc::new(new_lhs),
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
-                                    delay_source: None,
+                                    delay_source: delay_rc.clone(),
                                     delay_fall_source: None,
                                     delay_off_source: None,
                                     origin_span: Some(rhs_rc.span),
@@ -33794,6 +33819,9 @@ fn lower_udp_instances(
     let n_ports = udp.ports.len();
     // Instance delay: `#(d)` before the instance — a scalar time literal in the
     // enclosing module's time units. (Rise/fall pairs collapse to the first.)
+    // A parameter it names (`#(D)`) belongs to the enclosing INSTANCE: bring
+    // the expression into that scope first, like the terminals below, or an
+    // inlined instance's `D` missed the flattened `u.D` and the delay was 0.
     let delay: u64 = inst
         .params
         .as_ref()
@@ -33801,7 +33829,10 @@ fn lower_udp_instances(
         .and_then(|p| match p {
             crate::ast::decl::ParamConnection::Ordered(Some(
                 crate::ast::decl::ParamValue::Expr(e),
-            )) => const_eval_i64_with_params(e, Some(&elab.parameters)),
+            )) => {
+                let e = rewrite_expr(e, prefix, &HashMap::default(), local_names, interface_map);
+                const_eval_i64_with_params(&e, Some(&elab.parameters))
+            }
             _ => None,
         })
         .filter(|d| *d > 0)
