@@ -33473,6 +33473,27 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     }
     let all = std::mem::take(&mut elab.continuous_assigns);
     let hier_port_drive: Vec<bool> = all.iter().map(is_hier_port_drive).collect();
+    // §10.3.3: each continuous assignment's delay is its OWN — it delays that
+    // driver's value before the net resolves it with the others. Folding the
+    // drivers into one assign that carried the FIRST driver's delay ran every
+    // driver through it: `wor #2 w = a; assign w = b;` delayed `b` by 2 too.
+    // Where several drivers meet and any carries a delay, each delayed driver
+    // keeps its delay on a driver net of its own (`<net>$drv<k>`), and the
+    // fold reads those undelayed.
+    let mut fold_drivers: HashMap<String, (usize, bool)> = HashMap::default();
+    for (ca, &hier) in all.iter().zip(&hier_port_drive) {
+        if let Some(n) = ident_flat_name(&ca.lhs).filter(|n| !hier && multi.contains(n)) {
+            let e = fold_drivers.entry(n).or_insert((0, false));
+            e.0 += 1;
+            e.1 |= ca.delay != 0 || ca.delay_fall.is_some() || ca.delay_off.is_some();
+        }
+    }
+    let split_delays: HashSet<String> = fold_drivers
+        .into_iter()
+        .filter(|(_, (count, delayed))| *count > 1 && *delayed)
+        .map(|(n, _)| n)
+        .collect();
+    let mut split_count: HashMap<String, usize> = HashMap::default();
     // Per multi-driven net: keep the lhs/delay, and accumulate STRONG drivers
     // and WEAK (pull) drivers into separate `$__wres` chains. A pull driver's
     // rhs is `$__pull(v)`; unwrap it into the weak chain. Final rhs resolves
@@ -33480,6 +33501,8 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     struct Acc {
         lhs: Expression,
         delay: u64,
+        delay_fall: Option<u64>,
+        delay_off: Option<u64>,
         strong: Option<Expression>,
         weak: Option<Expression>,
     }
@@ -33495,6 +33518,28 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             elab.continuous_assigns.push(ca);
             continue;
         };
+        let mut ca = ca;
+        if split_delays.contains(&name)
+            && (ca.delay != 0 || ca.delay_fall.is_some() || ca.delay_off.is_some())
+        {
+            let k = split_count.entry(name.clone()).or_insert(0);
+            let drv = format!("{name}$drv{k}");
+            *k += 1;
+            if let Some(sig) = elab.signals.get(&name) {
+                let mut sig = sig.clone();
+                sig.name = drv.clone();
+                sig.direction = None;
+                elab.signals.insert(drv.clone(), sig);
+            }
+            let rhs = make_ident_expr(&drv);
+            let mut delayed = ca.clone();
+            delayed.lhs = make_ident_expr(&drv);
+            elab.continuous_assigns.push(delayed);
+            ca.rhs = Expression::new(rhs.kind, ca.rhs.span);
+            ca.delay = 0;
+            ca.delay_fall = None;
+            ca.delay_off = None;
+        }
         let span = ca.rhs.span;
         // Unwrap a $__pull marker into the raw value for the weak chain.
         let (rhs, weak) = if is_pull(&ca.rhs) {
@@ -33509,9 +33554,12 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         };
         let slot = folded.entry(name.clone()).or_insert_with(|| {
             order.push(name.clone());
+            let split = split_delays.contains(&name);
             Acc {
                 lhs: make_ident_expr(&name),
-                delay: ca.delay,
+                delay: if split { 0 } else { ca.delay },
+                delay_fall: if split { None } else { ca.delay_fall },
+                delay_off: if split { None } else { ca.delay_off },
                 strong: None,
                 weak: None,
             }
@@ -33592,8 +33640,8 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
                 rhs,
                 delay: acc.delay,
                 rhs_parent_scoped: false,
-                delay_fall: None,
-                delay_off: None,
+                delay_fall: acc.delay_fall,
+                delay_off: acc.delay_off,
             });
         }
     }
