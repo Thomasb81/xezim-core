@@ -54,6 +54,20 @@ pub fn release_free_memory() {
     }
 }
 
+/// `XEZIM_COMPILE_PHASES`: print the wall time of one elaboration pass,
+/// measured from `since`, and restart the clock.
+pub(crate) fn elab_phase(label: &str, since: &mut std::time::Instant) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("XEZIM_COMPILE_PHASES").is_some()) {
+        eprintln!(
+            "[ELAB-PHASE] {}: {:.1}ms",
+            label,
+            since.elapsed().as_secs_f64() * 1000.0
+        );
+        *since = std::time::Instant::now();
+    }
+}
+
 pub mod bits2;
 pub mod elaborate;
 pub mod packed_value;
@@ -1087,6 +1101,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
             std::mem::take(&mut p.line_maps).into_iter(),
         )
     });
+    let mut phase_t = std::time::Instant::now();
     let mut all_descriptions = Vec::new();
     // Preprocessed text of each source, kept in parse order. Every AST
     // `Span` is a byte offset into ITS file's preprocessed text, so these
@@ -1269,6 +1284,7 @@ pub fn parse_and_elaborate_multi_preprocessed(
             all_descriptions.len()
         ));
     }
+    elab_phase("parse", &mut phase_t);
     let elaborated = parse_and_elaborate(
         all_descriptions,
         top_module_name,
@@ -2859,6 +2875,7 @@ fn parse_and_elaborate(
             ));
         }
     };
+    let mut phase_t = std::time::Instant::now();
     let mut elab = elaborate::elaborate_module_with_defs(
         elab_def,
         &params,
@@ -2867,6 +2884,7 @@ fn parse_and_elaborate(
         &top_level_lets,
         &top_level_ooc_constraints,
     )?;
+    elab_phase("elaborate top", &mut phase_t);
     elab.tick_s = tick_s;
     elab.module_timescale_exp = module_timescale_exp;
     elab.modules_without_timescale = modules_without_ts;
@@ -2878,6 +2896,7 @@ fn parse_and_elaborate(
     }
 
     elaborate::inline_instantiations(&mut elab, &def_refs)?;
+    elab_phase("inline instantiations", &mut phase_t);
     // Re-register any compilation-unit-scope CLASS whose name a module
     // clobbered in `definitions`/`def_refs` (§3.13 class/module name-space
     // coexistence). `inline_instantiations` could not see it because the
@@ -2918,21 +2937,26 @@ fn parse_and_elaborate(
     // inlining — after the in-module expansion pass — so an unpacked-struct
     // port connection (`assign s = u1.o;`) arrives here whole. Expand those
     // member-wise too, or the parent never sees any member of the value.
+    elab_phase("class/typedef re-registration", &mut phase_t);
     elaborate::expand_whole_struct_continuous_assigns(&mut elab);
+    elab_phase("whole-struct assign expansion", &mut phase_t);
     // §28.8: bidirectional switches need every terminal's drivers in hand.
     elaborate::resolve_bidirectional_switches(&mut elab);
     // §6.6.7: fold user-defined nettype drivers — after inlining, so drivers
     // arriving from several instances through ports resolve together with any
     // written in the parent. Must precede the bitwise fold below.
     elaborate::resolve_user_nettype_drivers(&mut elab)?;
+    elab_phase("switches and nettype drivers", &mut phase_t);
     // §7.2.2: a whole-struct continuous assign that arrived through inlining
     // still needs splitting into per-member assigns.
     elaborate::expand_unpacked_struct_assigns(&mut elab);
+    elab_phase("unpacked-struct assign expansion", &mut phase_t);
     // §6.7.1: a net delay delays every driver of the net. Before the fold
     // below, which then resolves the drivers it moves onto a driver-side net.
     elaborate::apply_net_delays(&mut elab);
     // §6.6.1: a net with several continuous drivers resolves them all.
     elaborate::resolve_multi_driver_nets(&mut elab);
+    elab_phase("net delays and multi-driver nets", &mut phase_t);
     // Link `function ClassName::m(); ...` out-of-class bodies into their
     // classes — must run after inline_instantiations repopulates classes.
     elaborate::link_extern_methods(&mut elab, &def_refs);
@@ -3019,6 +3043,7 @@ fn parse_and_elaborate(
         try_size("classes          ", opts.serialize(&elab.classes));
         try_size("specify_delays   ", opts.serialize(&elab.specify_delays));
     }
+    elab_phase("post-inline passes", &mut phase_t);
     Ok((definitions, elab))
 }
 

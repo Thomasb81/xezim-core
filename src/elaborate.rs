@@ -37,6 +37,18 @@ fn iprof_add(k: &'static str, d: std::time::Duration) {
     }
     IPROF_SECT.with(|m| *m.borrow_mut().entry(k).or_insert(0.0) += d.as_secs_f64());
 }
+/// A section start for `iprof_since`: `None` (no clock read) unless
+/// `XEZIM_INST_PROF` is set. The per-instance sections below are entered
+/// once per instance, so unconditional clock reads cost measurable
+/// elaboration time on designs with tens of thousands of instances.
+fn iprof_now() -> Option<std::time::Instant> {
+    iprof_enabled().then(std::time::Instant::now)
+}
+fn iprof_since(k: &'static str, t: Option<std::time::Instant>) {
+    if let Some(t) = t {
+        iprof_add(k, t.elapsed());
+    }
+}
 pub fn iprof_dump() {
     IPROF_SECT.with(|m| {
         for (k, v) in m.borrow().iter() {
@@ -46,12 +58,22 @@ pub fn iprof_dump() {
 }
 
 fn elab_trace_enabled() -> bool {
-    std::env::var("XEZIM_TRACE_ELAB")
-        .map(|v| {
-            let v = v.trim();
-            !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
-        })
-        .unwrap_or(false)
+    // Read once: this is asked for every instantiation item.
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var("XEZIM_TRACE_ELAB")
+            .map(|v| {
+                let v = v.trim();
+                !v.is_empty() && v != "0" && !v.eq_ignore_ascii_case("false")
+            })
+            .unwrap_or(false)
+    })
+}
+
+/// `XEZIM_PEND_DBG`, read once (asked for every lazy block materialized).
+fn pend_dbg_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XEZIM_PEND_DBG").is_ok())
 }
 
 /// XEZIM_TRACE_TYPE=name[,name...] — trace every WRITE to the typedef-width
@@ -760,7 +782,7 @@ pub struct PendingContAssign {
 impl PendingAlways {
     /// Run the rewrite once and produce the owned AlwaysBlock. Drops self.
     pub fn materialize(self) -> AlwaysBlock {
-        if std::env::var("XEZIM_PEND_DBG").is_ok() {
+        if pend_dbg_enabled() {
             eprintln!(
                 "[PEND-MAT] prefix={:?} keys={:?}",
                 self.ctx.prefix,
@@ -9448,7 +9470,7 @@ pub fn elaborate_module_with_defs(
                 // If this always block was inside a generate block, ac.gen_scope
                 // contains the generate block's scope name and should be included
                 // in the block's scope.
-                if std::env::var("XEZIM_PEND_DBG").is_ok() {
+                if pend_dbg_enabled() {
                     eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
                 }
                 elab.always_blocks.push(AlwaysBlock {
@@ -14263,7 +14285,7 @@ fn elaborate_items_numbered(
             }
             ModuleItem::AlwaysConstruct(ac) => {
                 // §21.2.1.7: include generate block scope in the instance path for %m.
-                if std::env::var("XEZIM_PEND_DBG").is_ok() {
+                if pend_dbg_enabled() {
                     eprintln!("[PEND-DIRECT] scope={:?}", ac.gen_scope);
                 }
                 elab.always_blocks.push(AlwaysBlock {
@@ -20491,7 +20513,23 @@ fn index_expr_of(base: Expression, idx: i64) -> Expression {
 /// keeps normal dependency tracking. Note the RHS is evaluated once per
 /// member; §6.6.7 requires a resolution function to be side-effect free, so
 /// repeating the call is observationally equivalent (it costs N calls).
+/// Does any type name resolve to an UNPACKED struct or union with members?
+/// Both whole-struct assign expansions split only assigns to such a type, so
+/// a design without one (every signal a plain vector) skips their walk over
+/// every continuous assign.
+fn has_unpacked_struct_type(elab: &ElaboratedModule) -> bool {
+    elab.typedef_types.values().any(|dt| {
+        matches!(
+            resolve_typedef_chain(dt, &elab.typedef_types),
+            DataType::Struct(su) if !su.packed && !su.members.is_empty()
+        )
+    })
+}
+
 pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
+    if !has_unpacked_struct_type(elab) {
+        return;
+    }
     let mut expanded: Vec<ContinuousAssignment> = Vec::new();
     for ca in elab.continuous_assigns.drain(..) {
         let members = simple_lhs_name(&ca.lhs)
@@ -25563,6 +25601,27 @@ fn collect_effective_items(
 /// looks only at its parameter and typedef declarations). Generate-produced
 /// items are the same owned values the cloning walk yields, in the same
 /// order.
+/// Do `items`, at any generate depth and in every branch, declare a
+/// parameter, a localparam or a typedef?
+fn items_declare_params_or_typedefs(items: &[ModuleItem]) -> bool {
+    items.iter().any(|item| match item {
+        ModuleItem::ParameterDeclaration(_)
+        | ModuleItem::LocalparamDeclaration(_)
+        | ModuleItem::TypedefDeclaration(_) => true,
+        ModuleItem::GenerateRegion(gr) => items_declare_params_or_typedefs(&gr.items),
+        ModuleItem::GenerateIf(gi) => gi
+            .branches
+            .iter()
+            .any(|(_, b)| items_declare_params_or_typedefs(b)),
+        ModuleItem::GenerateCase(gc) => gc
+            .arms
+            .iter()
+            .any(|a| items_declare_params_or_typedefs(&a.items)),
+        ModuleItem::GenerateFor(gf) => items_declare_params_or_typedefs(&gf.items),
+        _ => false,
+    })
+}
+
 fn collect_effective_items_ref<'a>(
     items: &'a [ModuleItem],
     params: &HashMap<String, Value>,
@@ -27804,7 +27863,7 @@ fn inline_module_items(
         });
         if let ModuleItem::ModuleInstantiation(inst) = item {
             let sub_mod_name = &inst.module_name.name;
-            let __inst_t0 = std::time::Instant::now();
+            let __inst_t0 = iprof_now();
             if elab_trace_enabled() {
                 eprintln!(
                     "[xezim][elab] visiting prefix='{}' module='{}' instances={}",
@@ -27815,8 +27874,8 @@ fn inline_module_items(
             }
             let __inst_prof = iprof_enabled();
             let _guard = scopeguard_lite(move || {
-                if __inst_prof {
-                    eprintln!("[IPROF] {} {:?}", std::process::id(), __inst_t0.elapsed());
+                if let Some(t0) = __inst_t0.filter(|_| __inst_prof) {
+                    eprintln!("[IPROF] {} {:?}", std::process::id(), t0.elapsed());
                 }
             });
             // IEEE 1800-2017 §29: a UDP instance looks exactly like a module
@@ -27951,7 +28010,7 @@ fn inline_module_items(
             };
 
             for hi in &inst.instances {
-                let __th = std::time::Instant::now();
+                let __th = iprof_now();
                 let inst_name = &hi.name.name;
                 let inst_prefix = format!("{}{}.", prefix, inst_name);
                 // Bare-name keys this instance adds to the design-wide
@@ -28011,7 +28070,7 @@ fn inline_module_items(
                 // dropping most transitions on a fast clock. Register it here,
                 // under this instance's prefix, exactly as a declared net.
                 {
-                    let __ta = std::time::Instant::now();
+                    let __ta = iprof_now();
                     let sub_mod_port_names: std::collections::HashSet<String> =
                         match sub_mod.ports() {
                             PortList::Ansi(ps) => ps.iter().map(|p| p.name.name.clone()).collect(),
@@ -28086,10 +28145,10 @@ fn inline_module_items(
                         elab.implicit_nets.insert(scoped.clone());
                         elab.nets.insert(scoped);
                     }
-                    iprof_add("implicit_net_scan", __ta.elapsed());
+                    iprof_since("implicit_net_scan", __ta);
                 }
 
-                iprof_add("ck1_after_implnet", __th.elapsed());
+                iprof_since("ck1_after_implnet", __th);
                 // Build port map and interface map
                 let mut port_map = HashMap::default();
                 let mut sub_interface_map = HashMap::default();
@@ -28346,7 +28405,7 @@ fn inline_module_items(
                     }
                 }
 
-                iprof_add("ck2_after_portmap", __th.elapsed());
+                iprof_since("ck2_after_portmap", __th);
                 // Short-circuit: gated_clk_cell is a passthrough whose body is
                 // `assign clk_out = clk_in;` plus dead enable logic. Inlining
                 // it produces a 3-hop cont-assign chain (parent_clk_in →
@@ -28378,8 +28437,8 @@ fn inline_module_items(
 
                 // Resolve parameters for the sub-module
                 let mut sub_params = HashMap::default();
-                let dbg_param = std::env::var("XEZIM_DBG_PARAM").is_ok()
-                    && (sub_mod_name == "ram" || sub_mod_name == "f_spsram_large");
+                let dbg_param = (sub_mod_name == "ram" || sub_mod_name == "f_spsram_large")
+                    && std::env::var("XEZIM_DBG_PARAM").is_ok();
                 // Build the effective declared-parameter list for the
                 // sub-module: header `#(…)` parameters first, then
                 // ParameterDeclaration items in source order (Localparam
@@ -29204,7 +29263,7 @@ fn inline_module_items(
                 // width into everything downstream (a parameterized struct
                 // read $bits = 15 instead of 53). Alternate the two passes
                 // until neither changes.
-                let __tb = std::time::Instant::now();
+                let __tb = iprof_now();
                 // Names of `parameter type` formals overridden by this
                 // instantiation — their widths were bound by the override
                 // pass; the DEFAULTS are registered per-round below so a
@@ -29237,9 +29296,19 @@ fn inline_module_items(
                         sub_local_params.entry(k).or_insert(v);
                     }
                 }
+                // The fixpoint only reads body parameter, localparam and
+                // typedef declarations. A body with none (at any generate
+                // depth) leaves `sub_local_params` as it is after one round,
+                // so skip expanding its generate constructs, twice per
+                // instance, just to find that out; the round's typedef-width
+                // scope is still installed below.
+                let body_declares = items_declare_params_or_typedefs(sub_mod.items());
                 for _ in 0..4 {
-                    let body_items =
-                        collect_effective_items_ref(sub_mod.items(), &sub_local_params);
+                    let body_items = if body_declares {
+                        collect_effective_items_ref(sub_mod.items(), &sub_local_params)
+                    } else {
+                        Vec::new()
+                    };
                     let mut local_tds = elab.typedefs.as_map().clone();
                     for p_decl in sub_mod.params() {
                         if let ParameterKind::Type { assignments } = &p_decl.kind {
@@ -29274,6 +29343,9 @@ fn inline_module_items(
                     TYPEDEFS_TLS.with(|c| *c.borrow_mut() = Some(local_tds));
                     TYPEDEFS_TLS_MIRROR.with(|m| m.set(None));
 
+                    if !body_declares {
+                        break;
+                    }
                     // 2. Parameters from module items
                     let snapshot = sub_local_params.clone();
                     add_params_from_items(
@@ -29286,7 +29358,7 @@ fn inline_module_items(
                         break;
                     }
                 }
-                iprof_add("param_typedef_fixpoint", __tb.elapsed());
+                iprof_since("param_typedef_fixpoint", __tb);
 
                 // §23.2.2.4: a port default is a constant expression of the
                 // CHILD's scope (`input logic i = F` reads the child's own
@@ -29312,7 +29384,7 @@ fn inline_module_items(
                     port_map.insert(name, actual);
                 }
 
-                let __tp = std::time::Instant::now();
+                let __tp = iprof_now();
                 let prepared_sub = prepare_module_items(
                     sub_mod,
                     definitions,
@@ -29320,7 +29392,7 @@ fn inline_module_items(
                     &elab.typedefs,
                     cache,
                 );
-                iprof_add("prepare_module_items", __tp.elapsed());
+                iprof_since("prepare_module_items", __tp);
 
                 // Inline all resolved parameters into global map with prefix
                 for (name, val) in &sub_local_params {
@@ -29811,9 +29883,9 @@ fn inline_module_items(
                     PortList::Empty => {}
                 }
 
-                iprof_add("ck3_after_hdrparams", __th.elapsed());
+                iprof_since("ck3_after_hdrparams", __th);
                 // sub_merged_params already built above for port declarations.
-                iprof_add("ck4_before_loopB", __th.elapsed());
+                iprof_since("ck4_before_loopB", __th);
                 for sub_item in &prepared_sub.effective_items {
                     if let ModuleItem::TypedefDeclaration(td) = sub_item {
                         if let DataType::Enum(et) = &td.data_type {
@@ -30071,7 +30143,7 @@ fn inline_module_items(
                         }
                     }
                 }
-                iprof_add("ck5_before_loopC", __th.elapsed());
+                iprof_since("ck5_before_loopC", __th);
                 for sub_item in &prepared_sub.effective_items {
                     match sub_item {
                         ModuleItem::NetDeclaration(nd) => {
@@ -31675,8 +31747,8 @@ fn inline_module_items(
                     );
                 };
                 // Inline the sub-module's continuous assigns
-                iprof_add("ck6_before_fntask", __th.elapsed());
-                let __td = std::time::Instant::now();
+                iprof_since("ck6_before_fntask", __th);
+                let __td = iprof_now();
                 // Function/task bodies are copied PER INSTANCE below through
                 // `rewrite_stmt`, so this instance's type-parameter widths
                 // must be live for `$bits(T)` to fold inside them too.
@@ -32170,9 +32242,9 @@ fn inline_module_items(
                 items_end = items_end.max(hi.span.start.max(item_floor) + 1);
 
                 // Recurse into sub-module instantiations
-                iprof_add("subitem_loop", __td.elapsed());
-                iprof_add("per_hi_prelude", __th.elapsed());
-                let __te = std::time::Instant::now();
+                iprof_since("subitem_loop", __td);
+                iprof_since("per_hi_prelude", __th);
+                let __te = iprof_now();
                 // §23.10/§27: a recursive instantiation whose terminating
                 // generate branch never fires expands the hierarchy forever —
                 // ivtest pr2728812b reached 37 GB RSS before the kernel killed
@@ -32224,7 +32296,7 @@ fn inline_module_items(
                     &rewrite_port_map,
                     &sub_defparams,
                 )?;
-                iprof_add("recursion", __te.elapsed());
+                iprof_since("recursion", __te);
 
                 // Restore typedef entries shadowed by this instance's TYPE
                 // parameter overrides.
@@ -33726,6 +33798,9 @@ fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
 /// expansion for nettype nets (it has to — the resolver call only exists there);
 /// those emerge with a `MemberAccess` lhs and are left alone.
 pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
+    if !has_unpacked_struct_type(elab) {
+        return;
+    }
     // (member name, declared type, unpacked dimensions) in declaration order.
     type MemberDecl = (String, DataType, Vec<UnpackedDimension>);
     let struct_members = |elab: &ElaboratedModule, name: &str| -> Option<Vec<MemberDecl>> {
@@ -34608,12 +34683,20 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
             && ident_flat_name(&ca.lhs)
                 .is_some_and(|n| elab.signals.get(&n).is_some_and(|s| s.direction.is_some()))
     };
-    let mut counts: HashMap<String, usize> = HashMap::default();
+    // Keyed by the flat name, borrowed from a single-segment lhs (every
+    // inlined connect), so counting costs no copy per assign.
+    let mut counts: HashMap<std::borrow::Cow<'_, str>, usize> = HashMap::default();
     for ca in &elab.continuous_assigns {
         if is_hier_port_drive(ca) {
             continue;
         }
-        if let Some(n) = ident_flat_name(&ca.lhs) {
+        let n = match &ca.lhs.kind {
+            ExprKind::Ident(h) if h.path.len() == 1 && h.path[0].selects.is_empty() => {
+                Some(std::borrow::Cow::Borrowed(h.path[0].name.name.as_str()))
+            }
+            _ => ident_flat_name(&ca.lhs).map(std::borrow::Cow::Owned),
+        };
+        if let Some(n) = n {
             *counts.entry(n).or_insert(0) += 1;
         }
     }
@@ -34638,7 +34721,7 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         })
         .collect();
     for n in pending_lhs.iter().flatten() {
-        *counts.entry(n.clone()).or_insert(0) += 1;
+        *counts.entry(std::borrow::Cow::Owned(n.clone())).or_insert(0) += 1;
     }
     // A tri0/tri1 net needs the fold even with a SINGLE driver, because the
     // implicit pull is a second (weak) driver: `strong` alone would leave the
@@ -34647,22 +34730,23 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
     // initial value instead (see the net-declaration sites).
     let mut multi: HashSet<String> = counts
         .iter()
-        .filter(|(n, c)| **c > 1 && elab.nets.contains(*n))
-        .map(|(n, _)| n.clone())
+        .filter(|(n, c)| **c > 1 && elab.nets.contains(n.as_ref()))
+        .map(|(n, _)| n.to_string())
         .collect();
     for (n, c) in &counts {
         if *c >= 1
-            && elab.nets.contains(n)
+            && elab.nets.contains(n.as_ref())
             && matches!(
-                elab.resolved_net_kinds.get(n),
+                elab.resolved_net_kinds.get(n.as_ref()),
                 Some(ResolvedNetKind::Tri0)
                     | Some(ResolvedNetKind::Tri1)
                     | Some(ResolvedNetKind::ChargeStorage)
             )
         {
-            multi.insert(n.clone());
+            multi.insert(n.to_string());
         }
     }
+    drop(counts);
     if multi.is_empty() {
         return;
     }
