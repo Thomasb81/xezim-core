@@ -11193,6 +11193,20 @@ fn expr_to_arg_string(ex: &Expression) -> String {
             _ => "<unknown>".to_string(),
         },
         ExprKind::Number(NumberLiteral::Integer { value, .. }) => value.clone(),
+        // §8.25 named argument `.NAME(value)`: keep the name, so the
+        // simulator can move the value to NAME's slot in the base's list.
+        ExprKind::NamedArg {
+            name,
+            expr: Some(x),
+        } => {
+            let v = match &x.kind {
+                ExprKind::TypeLiteral(dt) => {
+                    data_type_to_spec_fragment(dt).unwrap_or_else(|| "<unknown>".to_string())
+                }
+                _ => expr_to_arg_string(x),
+            };
+            format!(".{}({})", name.name, v)
+        }
         // Nested parameterized type arg in an `extends` clause, e.g.
         // `class X extends Y#(Z#(T))`. Per-specialization keying relies on
         // the rendered arg matching the specialization text used elsewhere.
@@ -35448,6 +35462,20 @@ fn rewrite_expr_impl(
             local_names,
             interface_map,
         ))),
+        // A named class-parameter value `#(.W(N))`: `N` is scoped like any
+        // positional value.
+        ExprKind::NamedArg { name, expr: inner } => ExprKind::NamedArg {
+            name: name.clone(),
+            expr: inner.as_ref().map(|x| {
+                Box::new(rewrite_expr_impl(
+                    x,
+                    prefix,
+                    port_map,
+                    local_names,
+                    interface_map,
+                ))
+            }),
+        },
         other => other.clone(),
     };
     Expression::new(new_kind, expr.span)

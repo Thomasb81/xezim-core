@@ -986,18 +986,32 @@ impl Parser {
             if self.at(TokenKind::RParen) || self.at(TokenKind::Eof) {
                 break;
             }
-            // IEEE 1800-2023 §8.25.1 — `extends <base>#(.NAME(value), ...)` is
-            // the named form of parameter binding. We accept it here and drop
-            // the name (Elaboration matches positionally for now; recording
-            // the name would require widening `ClassExtends.args`).
+            // IEEE 1800-2017 §8.25 — `extends <base>#(.NAME(value), ...)` is
+            // the named form of parameter binding. Keep the name as a
+            // `NamedArg` (a type value as its `TypeLiteral`), so the value
+            // binds to NAME rather than to whichever parameter comes first.
             if self.eat(TokenKind::Dot).is_some() {
-                let _name = self.parse_identifier();
+                let name = self.parse_identifier();
                 self.expect(TokenKind::LParen);
                 if self.at(TokenKind::RParen) {
                     // `.NAME()` — empty binding; skip without pushing.
                     self.bump();
                 } else {
-                    args.push(self.parse_param_value());
+                    let start = self.current().span.start;
+                    let value = match self.parse_param_value() {
+                        ParamValue::Expr(e) => e,
+                        ParamValue::Type(dt) => crate::ast::expr::Expression::new(
+                            crate::ast::expr::ExprKind::TypeLiteral(Box::new(dt)),
+                            self.span_from(start),
+                        ),
+                    };
+                    args.push(ParamValue::Expr(crate::ast::expr::Expression::new(
+                        crate::ast::expr::ExprKind::NamedArg {
+                            name,
+                            expr: Some(Box::new(value)),
+                        },
+                        self.span_from(start),
+                    )));
                     self.expect(TokenKind::RParen);
                 }
             } else {

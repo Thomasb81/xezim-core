@@ -3286,6 +3286,34 @@ impl Parser {
     /// position that drops them leaves the type_args empty and the variable
     /// default-specializes (`param_obj#(bit)`), which is what broke UVM's
     /// `type_id::type_name()` for parameterized-class fields/collections.
+    /// One `#(...)` connection of a class-typed data declaration as a type
+    /// arg. A named connection (`#(.W(5))`, §8.25) keeps its name as a
+    /// `NamedArg`: dropping it bound the value to the class's FIRST
+    /// parameter, whatever the name said.
+    fn param_connection_to_type_arg(
+        &self,
+        pc: &ParamConnection,
+    ) -> Option<crate::ast::expr::Expression> {
+        match pc {
+            ParamConnection::Ordered(Some(pv)) => self.param_value_to_type_arg(pv),
+            ParamConnection::Named {
+                name,
+                value: Some(pv),
+            } => {
+                let v = self.param_value_to_type_arg(pv)?;
+                let span = v.span;
+                Some(crate::ast::expr::Expression::new(
+                    crate::ast::expr::ExprKind::NamedArg {
+                        name: name.clone(),
+                        expr: Some(Box::new(v)),
+                    },
+                    span,
+                ))
+            }
+            _ => None,
+        }
+    }
+
     fn param_value_to_type_arg(&self, pv: &ParamValue) -> Option<crate::ast::expr::Expression> {
         use crate::ast::Identifier as PIdent;
         use crate::ast::expr::{ExprKind, Expression, HierPathSegment, HierarchicalIdentifier};
@@ -3482,13 +3510,7 @@ impl Parser {
             let type_args: Vec<crate::ast::expr::Expression> = match &params {
                 Some(ps) => ps
                     .iter()
-                    .filter_map(|pc| match pc {
-                        ParamConnection::Ordered(Some(pv)) => self.param_value_to_type_arg(pv),
-                        ParamConnection::Named {
-                            value: Some(pv), ..
-                        } => self.param_value_to_type_arg(pv),
-                        _ => None,
-                    })
+                    .filter_map(|pc| self.param_connection_to_type_arg(pc))
                     .collect(),
                 None => Vec::new(),
             };
@@ -3583,13 +3605,7 @@ impl Parser {
                 let type_args: Vec<crate::ast::expr::Expression> = match &params {
                     Some(ps) => ps
                         .iter()
-                        .filter_map(|pc| match pc {
-                            ParamConnection::Ordered(Some(pv)) => self.param_value_to_type_arg(pv),
-                            ParamConnection::Named {
-                                value: Some(pv), ..
-                            } => self.param_value_to_type_arg(pv),
-                            _ => None,
-                        })
+                        .filter_map(|pc| self.param_connection_to_type_arg(pc))
                         .collect(),
                     None => Vec::new(),
                 };

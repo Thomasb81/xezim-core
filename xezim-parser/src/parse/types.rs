@@ -292,10 +292,23 @@ impl Parser {
                 if !self.at(TokenKind::RParen) {
                     loop {
                         if self.eat(TokenKind::Dot).is_some() {
-                            let _ident = self.parse_identifier();
+                            // §8.25 / A.4.1.1 named parameter assignment
+                            // `.NAME(value)`: keep the name, so the value binds
+                            // to NAME whatever its position — dropping it bound
+                            // `#(.W(5))` to whichever parameter came first.
+                            // `.NAME()` leaves NAME at its default.
+                            let pname = self.parse_identifier();
                             self.expect(TokenKind::LParen);
                             if !self.at(TokenKind::RParen) {
-                                type_args.push(self.parse_expression());
+                                let value = self.parse_expression();
+                                let sp = self.span_from(start);
+                                type_args.push(crate::ast::expr::Expression::new(
+                                    crate::ast::expr::ExprKind::NamedArg {
+                                        name: pname,
+                                        expr: Some(Box::new(value)),
+                                    },
+                                    sp,
+                                ));
                             }
                             self.expect(TokenKind::RParen);
                         } else if self.is_data_type_keyword() {
