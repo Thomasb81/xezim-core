@@ -25030,6 +25030,63 @@ fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
 
 /// `format!("{}{}", a, b)` for two strings, without the formatting
 /// machinery (instance flattening builds one such name per identifier).
+/// A class specialization argument written in an instantiated module, with
+/// every reference to that module's parameters folded to its value for THIS
+/// instance (`#(int, P)` in `sub #(9)` becomes `#(int, 9)`). A type argument
+/// or anything that does not fold is kept as written.
+fn fold_class_param_arg(arg: &Expression, params: &HashMap<String, Value>) -> Expression {
+    if let ExprKind::NamedArg {
+        name,
+        expr: Some(x),
+    } = &arg.kind
+    {
+        return Expression::new(
+            ExprKind::NamedArg {
+                name: name.clone(),
+                expr: Some(Box::new(fold_class_param_arg(x, params))),
+            },
+            arg.span,
+        );
+    }
+    let mut reads_param = false;
+    for_each_sub_expr(arg, &mut |e| {
+        if let ExprKind::Ident(h) = &e.kind {
+            if h.path.len() == 1 && params.contains_key(&h.path[0].name.name) {
+                reads_param = true;
+            }
+        }
+    });
+    if !reads_param {
+        return arg.clone();
+    }
+    match const_eval_i64_with_params(arg, Some(params)) {
+        Some(n) => {
+            let lit = Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: false,
+                    base: NumberBase::Decimal,
+                    value: n.unsigned_abs().to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                arg.span,
+            );
+            if n < 0 {
+                Expression::new(
+                    ExprKind::Unary {
+                        op: crate::ast::expr::UnaryOp::Minus,
+                        operand: Box::new(lit),
+                    },
+                    arg.span,
+                )
+            } else {
+                lit
+            }
+        }
+        None => arg.clone(),
+    }
+}
+
 fn cat2(a: &str, b: &str) -> String {
     let mut s = String::with_capacity(a.len() + b.len());
     s.push_str(a);
@@ -29678,6 +29735,27 @@ fn inline_module_items(
                             }
                         }
                         ModuleItem::DataDeclaration(dd) => {
+                            // §8.25: a class variable declared in an
+                            // INSTANTIATED module (`C #(int, P) o;`) keeps its
+                            // specialization under its instance-scoped name,
+                            // value arguments folded with THIS instance's
+                            // parameters. Only the top module's declarations
+                            // were recorded, so `o = new` in any sub-module
+                            // built the class at its defaults.
+                            if let DataType::TypeReference { type_args, .. } = &dd.data_type {
+                                if !type_args.is_empty() {
+                                    let args: Vec<Expression> = type_args
+                                        .iter()
+                                        .map(|a| fold_class_param_arg(a, &sub_merged_params))
+                                        .collect();
+                                    for decl in &dd.declarators {
+                                        elab.class_type_args.insert(
+                                            cat2(&inst_prefix, &decl.name.name),
+                                            args.clone(),
+                                        );
+                                    }
+                                }
+                            }
                             // Anonymous enum on a variable decl in a
                             // submodule's items (e.g. cv32e40p_obi_interface's
                             // state_q FSM): mirror the top-level DataDecl
