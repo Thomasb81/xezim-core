@@ -5486,20 +5486,13 @@ pub fn elaborate_module_with_defs(
                             port.data_type.as_ref(),
                             width,
                             is_real,
-                            port.net_type,
+                            ansi_port_net_type(port),
                         )
                     }),
                     type_name: port.data_type.as_ref().and_then(get_type_name),
                 };
                 elab.port_order.push(port.name.name.clone());
-                if let Some(net_type) = port.net_type.or_else(|| {
-                    implicit_port_net_type(
-                        port.direction,
-                        port.var_kw,
-                        port.data_type.as_ref(),
-                        true,
-                    )
-                }) {
+                if let Some(net_type) = ansi_port_net_type(port) {
                     register_net_type(&mut elab, &port.name.name, net_type);
                 }
                 if port_shape.is_empty() {
@@ -6192,7 +6185,7 @@ pub fn elaborate_module_with_defs(
                             Some(&pd.data_type),
                             width,
                             is_real,
-                            pd.net_type,
+                            port_decl_net_type(pd),
                         ),
                         type_name: get_type_name(&pd.data_type),
                     };
@@ -6200,14 +6193,7 @@ pub fn elaborate_module_with_defs(
                         elab.port_order.push(decl.name.name.clone());
                     }
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
-                    if let Some(net_type) = pd.net_type.or_else(|| {
-                        implicit_port_net_type(
-                            Some(pd.direction),
-                            false,
-                            Some(&pd.data_type),
-                            false,
-                        )
-                    }) {
+                    if let Some(net_type) = port_decl_net_type(pd) {
                         register_net_type(&mut elab, &decl.name.name, net_type);
                     }
                     if let Some(view) = &port_modport_view {
@@ -13193,20 +13179,13 @@ fn elaborate_items_numbered(
                             Some(&pd.data_type),
                             width,
                             is_real,
-                            pd.net_type,
+                            port_decl_net_type(pd),
                         ),
                         is_real,
                         type_name: get_type_name(&pd.data_type),
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
-                    if let Some(net_type) = pd.net_type.or_else(|| {
-                        implicit_port_net_type(
-                            Some(pd.direction),
-                            false,
-                            Some(&pd.data_type),
-                            false,
-                        )
-                    }) {
+                    if let Some(net_type) = port_decl_net_type(pd) {
                         register_net_type(elab, &decl.name.name, net_type);
                     }
                     elab.port_order.push(decl.name.name.clone());
@@ -16675,6 +16654,20 @@ fn implicit_port_net_type(
         }
         _ => None,
     }
+}
+
+/// The net type of an ANSI port: the declared one, else the §23.2.2.3
+/// implicit one (`output o` and `input logic i` are wires).
+fn ansi_port_net_type(port: &AnsiPort) -> Option<NetType> {
+    port.net_type.or_else(|| {
+        implicit_port_net_type(port.direction, port.var_kw, port.data_type.as_ref(), true)
+    })
+}
+
+/// The net type of a non-ANSI port declaration (`output o;` is a wire).
+fn port_decl_net_type(pd: &PortDeclaration) -> Option<NetType> {
+    pd.net_type
+        .or_else(|| implicit_port_net_type(Some(pd.direction), false, Some(&pd.data_type), false))
 }
 
 /// Record every semantic property carried by a built-in net type.  Keeping
@@ -29053,14 +29046,7 @@ fn inline_module_items(
                                     elab.packed_full_dims.insert(sig_name.clone(), fdims);
                                 }
                             }
-                            if let Some(net_type) = port.net_type.or_else(|| {
-                                implicit_port_net_type(
-                                    port.direction,
-                                    port.var_kw,
-                                    port.data_type.as_ref(),
-                                    true,
-                                )
-                            }) {
+                            if let Some(net_type) = ansi_port_net_type(port) {
                                 register_net_type(elab, &sig_name, net_type);
                             }
                             if port_shape.is_empty() {
@@ -29106,7 +29092,7 @@ fn inline_module_items(
                                                 port.data_type.as_ref(),
                                                 width,
                                                 is_real,
-                                                port.net_type,
+                                                ansi_port_net_type(port),
                                             )
                                         }),
                                         type_name: port.data_type.as_ref().and_then(get_type_name),
@@ -29210,7 +29196,7 @@ fn inline_module_items(
                                                 Some(&pd.data_type),
                                                 width,
                                                 port_is_real,
-                                                pd.net_type,
+                                                port_decl_net_type(pd),
                                             ),
                                             is_real: port_is_real,
                                             type_name: scope_local_type_name(
@@ -29220,14 +29206,7 @@ fn inline_module_items(
                                             ),
                                         },
                                     );
-                                    if let Some(net_type) = pd.net_type.or_else(|| {
-                                        implicit_port_net_type(
-                                            Some(pd.direction),
-                                            false,
-                                            Some(&pd.data_type),
-                                            false,
-                                        )
-                                    }) {
+                                    if let Some(net_type) = port_decl_net_type(pd) {
                                         register_net_type(elab, &sig_name, net_type);
                                     }
                                 }
