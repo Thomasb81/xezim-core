@@ -2676,6 +2676,20 @@ pub struct ElaboratedModule {
     /// root.
     #[serde(default)]
     pub port_aliases: HashMap<String, String>,
+    /// Input ports whose net was never built (see [`set_port_elision`]): the
+    /// [`elided_port_hash`] of each `<inst>.<port>` flat name, sorted. The
+    /// simulator checks a failed name lookup against it, so a reference the
+    /// elision analysis missed is reported instead of silently reading
+    /// nothing. A port whose actual is the top-level net of its own name is
+    /// not listed: a scoped lookup of it falls through to that very net.
+    #[serde(default)]
+    pub elided_port_hashes: Vec<u64>,
+    /// How many input-port nets were left out (tracked or not).
+    #[serde(default)]
+    pub elided_port_count: usize,
+    /// The distinct port names (last path segment) among the elided ports.
+    #[serde(default)]
+    pub elided_port_leaves: HashSet<String>,
     /// §10.11 `alias` net unification: (canonical, other) flat-name pairs.
     /// The simulator repoints `other`'s signal-table id at `canonical`'s so
     /// the names share ONE storage slot.
@@ -2979,6 +2993,9 @@ impl ElaboratedModule {
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
             port_aliases: HashMap::default(),
+            elided_port_hashes: Vec::new(),
+            elided_port_count: 0,
+            elided_port_leaves: HashSet::default(),
             alias_pairs: Vec::new(),
             source_texts: Vec::new(),
             source_files: Vec::new(),
@@ -4779,6 +4796,273 @@ fn relax_implicit_static() -> bool {
     }
     static ENV: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *ENV.get_or_init(|| std::env::var("XEZIM_ALLOW_IMPLICIT_STATIC").ok().as_deref() == Some("1"))
+}
+
+/// Unobserved-port elision. Inlining substitutes an input port's actual for
+/// every read inside the child (see `rewrite_port_map`), yet it still built
+/// the port's own net and the connection assign `<inst>.<port> = actual`
+/// that keeps it current. Nothing in the child reads that net any more, so
+/// in a design with nothing that can reach it BY NAME it is dead weight: on
+/// a bit-cell array it was one scattered single-bit write per cell for
+/// every change of the shared actual, and half of the signal table.
+///
+/// The elaborator cannot see every name observer alone — a waveform dump,
+/// a VPI or DPI library, an SDF file or a library caller inspecting signals
+/// after the run are decided by whoever drives it — so this is OFF unless
+/// the driver switches it on after ruling those out. What the sources
+/// themselves can reach is decided here: see `port_elision_setup` and
+/// `port_elision_blocked_by_items`.
+static PORT_ELISION: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// Allow [`inline_instantiations`] to leave out the nets of substituted input
+/// ports that nothing in the sources can reach by name. Only a driver that
+/// has ruled out every run-time name observer may turn this on: waveform
+/// dumps, VPI/DPI libraries, SDF/UPF annotation, coverage, x-warnings,
+/// artifacts written for later runs, and API callers that look signals up
+/// after the run.
+pub fn set_port_elision(on: bool) {
+    PORT_ELISION.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_port_elision`] is on.
+pub fn port_elision_requested() -> bool {
+    PORT_ELISION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// The hash recorded in `ElaboratedModule::elided_port_hashes` for a flat
+/// signal name (64-bit FNV-1a; stable across builds).
+pub fn elided_port_hash(name: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for b in name.bytes() {
+        h ^= b as u64;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+thread_local! {
+    /// Per-elaboration elision state, set by `port_elision_setup`: `None`
+    /// when elision is off for this design, else the dotted-name census
+    /// (a port whose name appears after a `.` anywhere is kept).
+    static PORT_ELISION_DOTTED: std::cell::RefCell<Option<Rc<crate::sv_parser::CensusSet>>> =
+        const { std::cell::RefCell::new(None) };
+}
+
+/// System tasks that reach nets by a string or a scope walk rather than by
+/// an expression the inliner rewrites: waveform dumps (the scope form walks
+/// every net under an instance), SDF annotation (names instance ports),
+/// signal spies and string-keyed forces, and the interactive listing tasks.
+fn systask_observes_by_name(name: &str) -> bool {
+    const PREFIXES: [&str; 9] = [
+        "$dump",
+        "$fsdb",
+        "$vcdplus",
+        "$shm_",
+        "$record",
+        "$sdf",
+        "$init_signal",
+        "$signal_",
+        "$hdl_",
+    ];
+    PREFIXES.iter().any(|p| name.starts_with(p))
+        || matches!(
+            name,
+            "$showvars" | "$showscopes" | "$list" | "$scope" | "$toggle_start" | "$toggle_report"
+        )
+}
+
+/// Decide, once per elaboration, whether port elision applies to this
+/// design, and publish the dotted-name census the per-port test uses.
+fn port_elision_setup() {
+    let state = if port_elision_requested() {
+        let census = crate::sv_parser::reference_census();
+        let blocked = census.dpi
+            || census
+                .system_names
+                .iter()
+                .any(|n| systask_observes_by_name(n));
+        (!blocked).then(|| Rc::new(census.dotted))
+    } else {
+        None
+    };
+    PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = state);
+}
+
+/// Module items that can reach a port's own net without going through the
+/// substituted actual: class bodies are not rewritten into the instance at
+/// all, a clocking block falls back to the formal's net for an expression
+/// actual, `let`/checker bodies expand late, specify blocks and SDF name the
+/// ports themselves, and `alias`/nested modules/`bind` are rare enough to
+/// keep out of the analysis. A module carrying any of them keeps every port.
+fn port_elision_blocked_by_items(items: &[ModuleItem]) -> bool {
+    items.iter().any(|it| match it {
+        ModuleItem::ClassDeclaration(_)
+        | ModuleItem::ClockingDeclaration(_)
+        | ModuleItem::CheckerDeclaration(_)
+        | ModuleItem::LetDeclaration(_)
+        | ModuleItem::SpecifyBlock(_)
+        | ModuleItem::AliasDecl(_)
+        | ModuleItem::NestedModule(_)
+        | ModuleItem::Bind(_)
+        | ModuleItem::DPIImport(_)
+        | ModuleItem::DPIExport(_)
+        | ModuleItem::NettypeDeclaration(_) => true,
+        ModuleItem::GenerateRegion(g) => port_elision_blocked_by_items(&g.items),
+        ModuleItem::GenerateIf(g) => g
+            .branches
+            .iter()
+            .any(|(_, items)| port_elision_blocked_by_items(items)),
+        ModuleItem::GenerateFor(g) => port_elision_blocked_by_items(&g.items),
+        ModuleItem::GenerateCase(g) => g
+            .arms
+            .iter()
+            .any(|a| port_elision_blocked_by_items(&a.items)),
+        _ => false,
+    })
+}
+
+/// Drop every trace of an elided port's net from the name-keyed tables its
+/// declaration and connection filled, and record it for the simulator's
+/// lookup check.
+fn forget_elided_port(elab: &mut ElaboratedModule, name: &str, leaf: &str, track: bool) {
+    elab.signals.remove(name);
+    unregister_net_type(elab, name);
+    elab.port_aliases.remove(name);
+    elab.packed_full_dims.remove(name);
+    elab.packed_signal_elem_widths.remove(name);
+    elab.var_decl_types.remove(name);
+    elab.two_state_signals.remove(name);
+    elab.z_init_signals.remove(name);
+    elab.decl_sites.remove(name);
+    elab.net_strengths.remove(name);
+    elab.elided_port_count += 1;
+    if track {
+        elab.elided_port_hashes.push(elided_port_hash(name));
+    }
+    if !elab.elided_port_leaves.contains(leaf) {
+        elab.elided_port_leaves.insert(leaf.to_string());
+    }
+}
+
+/// Port `pname` of `sub_mod` is declared as a plain scalar, vector or real
+/// net/variable: no struct, enum, typedef or interface type, no unpacked or
+/// multi-dimensional packed shape, no default, and a plain-wire net kind.
+/// Only such a port's net carries nothing but the value the connection
+/// copies into it, which is what makes leaving it out invisible.
+fn port_decl_is_plain(sub_mod: &Definition, items: &[ModuleItem], pname: &str) -> bool {
+    fn plain_type(dt: Option<&DataType>) -> bool {
+        match dt {
+            None => true,
+            Some(DataType::IntegerVector { dimensions, .. })
+            | Some(DataType::Implicit { dimensions, .. }) => dimensions.len() <= 1,
+            Some(DataType::IntegerAtom { .. }) | Some(DataType::Real { .. }) => true,
+            _ => false,
+        }
+    }
+    fn plain_net(nt: Option<NetType>) -> bool {
+        matches!(
+            nt,
+            None | Some(NetType::Wire | NetType::Tri | NetType::Uwire)
+        )
+    }
+    match sub_mod.ports() {
+        PortList::Ansi(ps) => ps.iter().find(|p| p.name.name == pname).is_some_and(|p| {
+            p.dimensions.is_empty()
+                && p.default.is_none()
+                && plain_net(p.net_type)
+                && plain_type(p.data_type.as_ref())
+        }),
+        PortList::NonAnsi(_) => {
+            let mut declared = false;
+            for it in items {
+                match it {
+                    ModuleItem::PortDeclaration(pd) => {
+                        for d in pd.declarators.iter().filter(|d| d.name.name == pname) {
+                            if !d.dimensions.is_empty()
+                                || d.init.is_some()
+                                || !plain_net(pd.net_type)
+                                || !plain_type(Some(&pd.data_type))
+                            {
+                                return false;
+                            }
+                            declared = true;
+                        }
+                    }
+                    ModuleItem::NetDeclaration(nd) => {
+                        if nd.declarators.iter().any(|d| {
+                            d.name.name == pname
+                                && (!d.dimensions.is_empty()
+                                    || d.init.is_some()
+                                    || nd.delay.is_some()
+                                    || nd.strength.is_some()
+                                    || !plain_net(Some(nd.net_type))
+                                    || !plain_type(Some(&nd.data_type)))
+                        }) {
+                            return false;
+                        }
+                    }
+                    ModuleItem::DataDeclaration(dd) => {
+                        if dd.declarators.iter().any(|d| {
+                            d.name.name == pname
+                                && (!d.dimensions.is_empty()
+                                    || d.init.is_some()
+                                    || !plain_type(Some(&dd.data_type)))
+                        }) {
+                            return false;
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            declared
+        }
+        PortList::Empty => false,
+    }
+}
+
+/// Lever-2 experiment switch: substitute only simple port actuals.
+fn port_subst_simple_only() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("XEZIM_PROTO_SIMPLE_SUBST").ok().as_deref() == Some("1"))
+}
+
+/// A port actual that only NAMES storage: a net or variable, a constant bit
+/// or part select of one, a literal, or a concatenation/replication of those.
+/// Anything that computes (an operator, a call, a select with a run-time
+/// index) is not simple.
+fn port_actual_is_simple(
+    e: &Expression,
+    params: &HashMap<String, Value>,
+    global: &HashMap<String, Value>,
+) -> bool {
+    let konst = |x: &Expression| is_const_expr(x, params) || is_const_expr(x, global);
+    match &e.kind {
+        ExprKind::Number(_) | ExprKind::StringLiteral(_) => true,
+        ExprKind::Ident(h) => h.path.iter().all(|seg| {
+            seg.selects.iter().all(|sel| match &sel.kind {
+                ExprKind::Range(l, r) => konst(l) && konst(r),
+                _ => konst(sel),
+            })
+        }),
+        ExprKind::Paren(inner) => port_actual_is_simple(inner, params, global),
+        ExprKind::Index { expr, index } => {
+            port_actual_is_simple(expr, params, global) && konst(index)
+        }
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => port_actual_is_simple(expr, params, global) && konst(left) && konst(right),
+        ExprKind::MemberAccess { expr, .. } => port_actual_is_simple(expr, params, global),
+        ExprKind::Concatenation(parts) => parts
+            .iter()
+            .all(|p| port_actual_is_simple(p, params, global)),
+        ExprKind::Replication { count, exprs } => {
+            konst(count)
+                && exprs
+                    .iter()
+                    .all(|p| port_actual_is_simple(p, params, global))
+        }
+        _ => false,
+    }
 }
 
 /// Where a §6.21 violation was found, for the diagnostic.
@@ -23504,6 +23788,18 @@ pub fn inline_instantiations(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    port_elision_setup();
+    let result = inline_instantiations_inner(elab, definitions);
+    PORT_ELISION_DOTTED.with(|d| *d.borrow_mut() = None);
+    elab.elided_port_hashes.sort_unstable();
+    elab.elided_port_hashes.dedup();
+    result
+}
+
+fn inline_instantiations_inner(
+    elab: &mut ElaboratedModule,
+    definitions: &HashMap<String, Definition>,
+) -> Result<(), String> {
     // Populate class and covergroup definitions from global scope
     for (name, def) in definitions {
         match def {
@@ -30758,6 +31054,9 @@ fn inline_module_items(
                         .collect(),
                     _ => Default::default(),
                 };
+                // Connection assigns of plain INPUT ports, by port name, for
+                // the unobserved-port elision below.
+                let mut input_connects: Vec<(String, usize)> = Vec::new();
                 for (port_name, parent_expr) in &port_map {
                     if prepared_sub.interface_ports.contains(port_name) {
                         continue;
@@ -30941,6 +31240,10 @@ fn inline_module_items(
                                     }
                                 }
                             }
+                            if !is_inout {
+                                input_connects
+                                    .push((port_name.clone(), elab.continuous_assigns.len()));
+                            }
                             elab.continuous_assigns.push(ContinuousAssignment {
                                 origin: None,
                                 lhs: sub_expr,
@@ -31008,6 +31311,21 @@ fn inline_module_items(
                     // the port-collapsing note above) is read THROUGH that
                     // delay; substituting the actual would read around it.
                     if is_input && elab.net_delays.contains_key(&cat2(&inst_prefix, &pname)) {
+                        no_subst_ports.insert(pname.clone());
+                    }
+                    // §23.3.3: a port connection is a continuous assignment.
+                    // Substituting an actual that COMPUTES something pastes
+                    // the computation into every read of the port — a decoder
+                    // term `(addr % 1024) / 128 == m` fed to 128 rows was
+                    // evaluated 128 times per address change instead of once.
+                    // Such an input reads its own net, driven once by the
+                    // connection assign; only a rename (a net, a constant
+                    // select of one, a literal, a concatenation of those) is
+                    // substituted.
+                    if is_input
+                        && port_subst_simple_only()
+                        && !port_actual_is_simple(actual, local_params, &elab.parameters)
+                    {
                         no_subst_ports.insert(pname.clone());
                     }
                     // §7.4.1: a packed multi-D formal indexes by its OWN
@@ -31110,6 +31428,81 @@ fn inline_module_items(
                     })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
+
+                // Unobserved-port elision (see `set_port_elision`): a plain
+                // input whose every read in the body was just substituted by
+                // its actual keeps its net only for name observers. With none
+                // possible — none at run time (the driver's switch), none in
+                // the sources (no dotted reference ends in or passes through
+                // this port's name, no by-name system task, no DPI) and none
+                // in the child itself (`port_elision_blocked_by_items`) — the
+                // connection assign and the net are left out altogether.
+                if !input_connects.is_empty() && matches!(sub_mod, Definition::Module(_)) {
+                    let dotted = PORT_ELISION_DOTTED.with(|d| d.borrow().clone());
+                    if let Some(dotted) = dotted {
+                        if !port_elision_blocked_by_items(&prepared_sub.effective_items) {
+                            let mut drop_idx: Vec<usize> = Vec::new();
+                            for (pname, idx) in &input_connects {
+                                let formal = cat2(&inst_prefix, pname);
+                                let elidable = rewrite_port_map.contains_key(pname.as_str())
+                                    && !dotted.contains(pname.as_str())
+                                    && !prepared_sub.body_driven_ports.contains(pname.as_str())
+                                    && !interconnect_ports.contains(pname.as_str())
+                                    && elab.signals.contains_key(&formal)
+                                    && !elab.packed_struct_fields.contains_key(&formal)
+                                    && !elab.packed_signal_elem_widths.contains_key(&formal)
+                                    // A `[0:7]` or `[8:1]` formal indexes by
+                                    // its own range, which lookups of the
+                                    // substituted actual can still consult
+                                    // under the instance scope.
+                                    && !elab.ascending_packed.contains_key(&formal)
+                                    && elab.packed_full_dims.get(&formal).is_none_or(|d| {
+                                        d.iter().all(|&(l, r)| r == 0 && l >= 0)
+                                    })
+                                    && !elab.net_delays.contains_key(&formal)
+                                    && !elab.events.contains(&formal)
+                                    && port_decl_is_plain(
+                                        &sub_mod,
+                                        &prepared_sub.effective_items,
+                                        pname,
+                                    )
+                                    && elab.continuous_assigns.get(*idx).is_some_and(|ca| {
+                                        ca.delay == 0
+                                            && ca.delay_fall.is_none()
+                                            && ca.delay_off.is_none()
+                                            && ident_flat_name(&ca.lhs).as_deref()
+                                                == Some(formal.as_str())
+                                    });
+                                if elidable {
+                                    // `.clk(clk)` from the top substitutes the
+                                    // bare `clk`, which a lookup under this
+                                    // instance's scope tries as `<inst>.clk`
+                                    // first — the net being left out — before
+                                    // the top-level `clk` it stood for. Such a
+                                    // probe is harmless, so it is not tracked.
+                                    let bare_same_name = rewrite_port_map
+                                        .get(pname.as_str())
+                                        .is_some_and(|m| match &m.kind {
+                                            ExprKind::Ident(h) => {
+                                                h.root.is_none()
+                                                    && h.path.len() == 1
+                                                    && h.path[0].selects.is_empty()
+                                                    && h.path[0].name.name == *pname
+                                            }
+                                            _ => false,
+                                        });
+                                    forget_elided_port(elab, &formal, pname, !bare_same_name);
+                                    drop_idx.push(*idx);
+                                }
+                            }
+                            // Indices ascend (pushed in order); remove from the
+                            // back so earlier ones stay valid.
+                            for idx in drop_idx.into_iter().rev() {
+                                elab.continuous_assigns.remove(idx);
+                            }
+                        }
+                    }
+                }
 
                 // Build ONE RewriteCtx for this instance, shared (via Rc) across
                 // every pending always/initial/cont-assign it produces. The

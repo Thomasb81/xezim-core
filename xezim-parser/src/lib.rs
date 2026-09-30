@@ -48,6 +48,114 @@ pub fn delay_select() -> u8 {
     DELAY_SELECT.load(std::sync::atomic::Ordering::Relaxed)
 }
 
+/// What the parsed sources can name through a path, collected from the token
+/// streams of every file parsed in this process (see [`reference_census`]).
+///
+/// The elaborator substitutes an instance's input port by its actual inside
+/// the child, so afterwards only a DOTTED reference (`u.p`, `$root.t.u.p`,
+/// `u[3].v.p`), a string-keyed lookup (VPI, a DPI backdoor, a dump) or an SDF
+/// annotation can still reach the port's own net. The census is what lets it
+/// drop a port net nobody can reach.
+#[derive(Debug, Default, Clone)]
+pub struct ReferenceCensus {
+    /// Every identifier written right after a `.` (`a.b.c` adds `b` and `c`),
+    /// except the `.name(` of a named port, parameter or argument binding.
+    /// Over-approximates on purpose: struct members, methods and interface
+    /// signals land here too.
+    pub dotted: CensusSet,
+    /// Every system task or function name spelled (`$dumpvars`).
+    pub system_names: CensusSet,
+    /// An `import "DPI…"` or `export "DPI…"` declaration was seen.
+    pub dpi: bool,
+}
+
+/// FNV-1a: the census hashes every dotted name the sources spell, where
+/// SipHash cost more than the scan itself; membership only, so no ordering
+/// or flooding concern applies.
+#[derive(Default, Clone, Copy)]
+pub struct CensusHasher(u64);
+
+impl std::hash::Hasher for CensusHasher {
+    fn finish(&self) -> u64 {
+        self.0
+    }
+    fn write(&mut self, bytes: &[u8]) {
+        let mut h = if self.0 == 0 {
+            0xcbf2_9ce4_8422_2325
+        } else {
+            self.0
+        };
+        for &b in bytes {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        self.0 = h;
+    }
+}
+
+/// A string set keyed by [`CensusHasher`].
+pub type CensusSet = std::collections::HashSet<String, std::hash::BuildHasherDefault<CensusHasher>>;
+
+static REFERENCE_CENSUS: std::sync::Mutex<Option<ReferenceCensus>> = std::sync::Mutex::new(None);
+
+/// Add one token stream to the process-wide [`ReferenceCensus`]. Called for
+/// every stream the parser is built over, so nothing parsed escapes it.
+pub fn record_reference_census(tokens: &[lexer::Token]) {
+    use lexer::token::TokenKind as K;
+    let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
+    let census = guard.get_or_insert_with(ReferenceCensus::default);
+    let bare = |t: &str| -> &str { t.strip_prefix('\\').unwrap_or(t).trim_end() };
+    for (i, tok) in tokens.iter().enumerate() {
+        match tok.kind {
+            K::Dot => {
+                let named_binding = i > 0 && matches!(tokens[i - 1].kind, K::LParen | K::Comma);
+                if named_binding {
+                    continue;
+                }
+                if let Some(next) = tokens.get(i + 1) {
+                    if matches!(next.kind, K::Identifier | K::EscapedIdentifier) {
+                        let n = bare(&next.text);
+                        if !census.dotted.contains(n) {
+                            census.dotted.insert(n.to_string());
+                        }
+                    }
+                }
+            }
+            // `\a.b ` is ONE identifier whose name holds a dot; the flat
+            // namespace cannot tell it from the path `a.b`, so count every
+            // component after a dot as dotted too.
+            K::EscapedIdentifier if tok.text.contains('.') => {
+                for part in bare(&tok.text).split('.').skip(1) {
+                    census.dotted.insert(part.to_string());
+                }
+            }
+            K::SystemIdentifier => {
+                if !census.system_names.contains(tok.text.as_str()) {
+                    census.system_names.insert(tok.text.clone());
+                }
+            }
+            K::KwImport | K::KwExport => {
+                if let Some(next) = tokens.get(i + 1) {
+                    if matches!(next.kind, K::StringLiteral) && next.text.contains("DPI") {
+                        census.dpi = true;
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// A copy of the process-wide [`ReferenceCensus`] (empty when nothing has
+/// been parsed).
+pub fn reference_census() -> ReferenceCensus {
+    REFERENCE_CENSUS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+        .unwrap_or_default()
+}
+
 /// Reserved storage name for a compilation-unit (`$unit`) declaration that a
 /// module SHADOWS with a declaration of its own (§3.12.1). The two are
 /// distinct objects, but the elaborated namespace is flat, so the $unit copy

@@ -60,6 +60,7 @@ pub struct Parser {
 
 impl Parser {
     pub fn new(tokens: Vec<Token>) -> Self {
+        crate::record_reference_census(&tokens);
         Self {
             tokens,
             pos: 0,
