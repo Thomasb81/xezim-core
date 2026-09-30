@@ -111,6 +111,13 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
     use lexer::token::TokenKind as K;
     let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
     let census = guard.get_or_insert_with(ReferenceCensus::default);
+    // A DPI declaration anywhere rules the elision out for the whole design,
+    // so nothing else the census could learn matters any more: stop
+    // scanning (a UVM testbench declares its DPI imports before its
+    // thousands of classes).
+    if census.dpi {
+        return;
+    }
     fn bare(t: &str) -> &str {
         t.strip_prefix('\\').unwrap_or(t).trim_end()
     }
@@ -216,6 +223,7 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
                 if let Some(next) = tokens.get(i + 1) {
                     if matches!(next.kind, K::StringLiteral) && next.text.contains("DPI") {
                         census.dpi = true;
+                        return;
                     }
                 }
             }
