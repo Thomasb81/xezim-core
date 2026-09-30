@@ -2928,6 +2928,9 @@ fn parse_and_elaborate(
     // §7.2.2: a whole-struct continuous assign that arrived through inlining
     // still needs splitting into per-member assigns.
     elaborate::expand_unpacked_struct_assigns(&mut elab);
+    // §6.7.1: a net delay delays every driver of the net. Before the fold
+    // below, which then resolves the drivers it moves onto a driver-side net.
+    elaborate::apply_net_delays(&mut elab);
     // §6.6.1: a net with several continuous drivers resolves them all.
     elaborate::resolve_multi_driver_nets(&mut elab);
     // Link `function ClassName::m(); ...` out-of-class bodies into their

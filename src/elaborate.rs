@@ -2635,6 +2635,13 @@ pub struct ElaboratedModule {
     pub pending_initial: Vec<PendingInitial>,
     #[serde(skip)]
     pub pending_cont_assign: Vec<PendingContAssign>,
+    /// §6.7.1 / §28.16 net delays, keyed by flat net name, as (rise, fall,
+    /// turn-off) in ticks. A net delay belongs to the NET: it delays every
+    /// driver of it, not only a declaration assignment. Recorded where each
+    /// net is declared and consumed by `apply_net_delays` before the drivers
+    /// are folded, so nothing downstream (and no cached artifact) sees it.
+    #[serde(skip)]
+    pub net_delays: HashMap<String, (u64, Option<u64>, Option<u64>)>,
     /// §6.20.6: names of `const` variables that carry a declaration-time
     /// initializer (lowered to a synthetic initial assignment). The const's
     /// single legal write is that initializer, so the const-write validator
@@ -2967,6 +2974,7 @@ impl ElaboratedModule {
             pending_always: Vec::new(),
             pending_initial: Vec::new(),
             pending_cont_assign: Vec::new(),
+            net_delays: HashMap::default(),
             const_decl_inits: HashSet::default(),
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
@@ -6209,6 +6217,9 @@ pub fn elaborate_module_with_defs(
                 let is_signed = is_type_signed(&nd.data_type);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
+                    if let Some(d) = net_delay_of(decl, nd, &elab.parameters) {
+                        elab.net_delays.insert(decl.name.name.clone(), d);
+                    }
                     if elab.parameters.contains_key(&decl.name.name) {
                         if elab.claim_local_decl_displacement(
                             &decl.name.name,
@@ -6259,14 +6270,15 @@ pub fn elaborate_module_with_defs(
                             // name was already declared as a port, leaving
                             // `output p; wire p = 1'b1;` undriven (z).
                             if let Some(init_expr) = &decl.init {
+                                let decl_dly = net_decl_assign_delay(nd, &elab.parameters);
                                 elab.continuous_assigns.push(ContinuousAssignment {
                                     origin: Some((init_expr.span, String::new())),
                                     lhs: make_ident_expr(&decl.name.name),
                                     rhs: init_expr.clone(),
-                                    delay: net_decl_delay(nd, &elab.parameters),
+                                    delay: decl_dly.0,
                                     rhs_parent_scoped: false,
-                                    delay_fall: None,
-                                    delay_off: None,
+                                    delay_fall: decl_dly.1,
+                                    delay_off: decl_dly.2,
                                 });
                             }
                             continue;
@@ -6483,14 +6495,15 @@ pub fn elaborate_module_with_defs(
                     }
                     // Wire with initializer → continuous assign (not constant eval)
                     if let Some(init_expr) = &decl.init {
+                        let decl_dly = net_decl_assign_delay(nd, &elab.parameters);
                         elab.continuous_assigns.push(ContinuousAssignment {
                             origin: Some((init_expr.span, String::new())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
-                            delay: net_decl_delay(nd, &elab.parameters),
+                            delay: decl_dly.0,
                             rhs_parent_scoped: false,
-                            delay_fall: None,
-                            delay_off: None,
+                            delay_fall: decl_dly.1,
+                            delay_off: decl_dly.2,
                         });
                     }
                 }
@@ -13202,6 +13215,9 @@ fn elaborate_items_numbered(
                 let is_signed = is_type_signed(&nd.data_type);
                 let is_real = is_type_real(&nd.data_type);
                 for decl in &nd.declarators {
+                    if let Some(d) = net_delay_of(decl, nd, &elab.parameters) {
+                        elab.net_delays.insert(decl.name.name.clone(), d);
+                    }
                     register_net_type(elab, &decl.name.name, nd.net_type);
                     let init_value = default_net_value(nd.net_type, width, is_real);
                     let sig = Signal {
@@ -13216,14 +13232,15 @@ fn elaborate_items_numbered(
                     };
                     signals_insert_traced(&mut elab.signals, line!(), decl.name.name.clone(), sig);
                     if let Some(init_expr) = &decl.init {
+                        let decl_dly = net_decl_assign_delay(nd, &elab.parameters);
                         elab.continuous_assigns.push(ContinuousAssignment {
                             origin: Some((init_expr.span, String::new())),
                             lhs: make_ident_expr(&decl.name.name),
                             rhs: init_expr.clone(),
-                            delay: net_decl_delay(nd, &elab.parameters),
+                            delay: decl_dly.0,
                             rhs_parent_scoped: false,
-                            delay_fall: None,
-                            delay_off: None,
+                            delay_fall: decl_dly.1,
+                            delay_off: decl_dly.2,
                         });
                     }
                 }
@@ -15459,7 +15476,10 @@ fn rewrite_module_item_delays(items: &mut [ModuleItem], unit_s: f64, prec_s: f64
             }
             // `wire #2 w = a;` — a net declaration delay likewise.
             ModuleItem::NetDeclaration(nd) => {
-                if let Some(d) = nd.delay.as_mut() {
+                for d in [&mut nd.delay, &mut nd.delay_fall, &mut nd.delay_off]
+                    .into_iter()
+                    .flatten()
+                {
                     rewrite_delay_expr(d, unit_s, prec_s, tick_s);
                 }
             }
@@ -15957,13 +15977,42 @@ fn rewrite_delay_expr(d: &mut Expression, unit_s: f64, prec_s: f64, tick_s: f64)
     }
 }
 
-/// §10.3.1: a net declaration assignment with a net delay (`wire #2 w = a;`)
-/// drives the net through that delay, like `assign #2 w = a;`.
-fn net_decl_delay(nd: &crate::ast::decl::NetDeclaration, params: &HashMap<String, Value>) -> u64 {
-    nd.delay
-        .as_ref()
-        .map(|d| eval_const_expr(d, params))
-        .unwrap_or(0)
+/// §10.3.1 / §10.3.3: a net declaration assignment with a delay
+/// (`wire #2 w = a;`, `wire #(1,3) w = a;`) drives the net through that
+/// delay, like `assign #2 w = a;`: (rise, fall, turn-off) ticks.
+fn net_decl_assign_delay(
+    nd: &crate::ast::decl::NetDeclaration,
+    params: &HashMap<String, Value>,
+) -> (u64, Option<u64>, Option<u64>) {
+    let ev = |d: &Option<Expression>| d.as_ref().map(|d| eval_const_expr(d, params));
+    (
+        ev(&nd.delay).unwrap_or(0),
+        ev(&nd.delay_fall),
+        ev(&nd.delay_off),
+    )
+}
+
+/// §6.7.1 / §10.3.3: the NET delay of `decl` (declared by `nd`) as (rise,
+/// fall, turn-off) ticks, evaluated in the declaring scope (`params`).
+///
+/// A net delay delays EVERY driver of the net — a separate `assign`, a port
+/// connection, a gate — so the callers record it in `net_delays` for
+/// `apply_net_delays`. §10.3.3: "when there is a continuous assignment in a
+/// declaration, the delay is part of the continuous assignment and is not a
+/// net delay", so a declarator with an initializer has none (its delay rides
+/// on that assignment; see `net_decl_assign_delay`). None as well for an
+/// all-zero delay and for an array of nets.
+fn net_delay_of(
+    decl: &crate::ast::decl::NetDeclarator,
+    nd: &crate::ast::decl::NetDeclaration,
+    params: &HashMap<String, Value>,
+) -> Option<(u64, Option<u64>, Option<u64>)> {
+    nd.delay.as_ref()?;
+    if decl.init.is_some() || !decl.dimensions.is_empty() {
+        return None;
+    }
+    let (rise, fall, off) = net_decl_assign_delay(nd, params);
+    (rise != 0 || fall.unwrap_or(0) != 0 || off.unwrap_or(0) != 0).then_some((rise, fall, off))
 }
 
 /// §9.4.5 intra-assignment delays are canonicalized pre-parse into
@@ -24230,6 +24279,16 @@ fn rename_item_decls(
             let mut new_nd = nd.clone();
             new_nd.data_type =
                 rewrite_data_type_genvar(&nd.data_type, port_map, local_names, interface_map);
+            for d in [
+                &mut new_nd.delay,
+                &mut new_nd.delay_fall,
+                &mut new_nd.delay_off,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *d = rewrite_expr(d, "", port_map, local_names, interface_map);
+            }
             for d in &mut new_nd.declarators {
                 if rename_set.contains(&d.name.name) {
                     d.name.name = rename.apply(&d.name.name);
@@ -24866,6 +24925,16 @@ fn substitute_in_module_item(
             let mut new_nd = nd.clone();
             new_nd.data_type =
                 rewrite_data_type_genvar(&nd.data_type, port_map, local_names, interface_map);
+            for d in [
+                &mut new_nd.delay,
+                &mut new_nd.delay_fall,
+                &mut new_nd.delay_off,
+            ]
+            .into_iter()
+            .flatten()
+            {
+                *d = rewrite_expr(d, "", port_map, local_names, interface_map);
+            }
             for d in new_nd.declarators.iter_mut() {
                 d.dimensions = rewrite_unpacked_dims_genvar(
                     &d.dimensions,
@@ -29487,6 +29556,9 @@ fn inline_module_items(
                             );
                             for decl in &nd.declarators {
                                 let sig_name = cat2(&inst_prefix, &decl.name.name);
+                                if let Some(d) = net_delay_of(decl, nd, &sub_merged_params) {
+                                    elab.net_delays.insert(sig_name.clone(), d);
+                                }
                                 let effective_dims = normalize_unpacked_dims(
                                     &decl.dimensions,
                                     &sub_merged_params,
@@ -30553,6 +30625,18 @@ fn inline_module_items(
                     if let Some(actual) = whole_net_ident_name(parent_expr) {
                         elab.port_aliases.insert(sub_sig_name.clone(), actual);
                     }
+                    // §23.3.3.7 port collapsing: a port bound to a NET (whole,
+                    // a select, or a concatenation of them) merges with that
+                    // net into one, and the merged net carries the EXTERNAL
+                    // net's delay — the reference drops the port's own net
+                    // delay (`output o; wire #4 o;` on `.o(w)` follows `w`).
+                    // A port on a variable or an expression, or left open,
+                    // stays a net of its own and keeps its delay.
+                    if elab.net_delays.contains_key(&sub_sig_name)
+                        && is_net_lvalue(parent_expr, &|n| elab.nets.contains(n))
+                    {
+                        elab.net_delays.remove(&sub_sig_name);
+                    }
                     let sub_expr = make_ident_expr(&sub_sig_name);
                     match prepared_sub.port_directions.get(port_name) {
                         Some(PortDirection::Input) | Some(PortDirection::Inout) => {
@@ -30672,6 +30756,12 @@ fn inline_module_items(
                         prepared_sub.port_directions.get(pname.as_str()),
                         Some(PortDirection::Input)
                     ) && !prepared_sub.body_driven_ports.contains(pname.as_str());
+                    // §6.7.1: an input port whose net keeps a net delay (see
+                    // the port-collapsing note above) is read THROUGH that
+                    // delay; substituting the actual would read around it.
+                    if is_input && elab.net_delays.contains_key(&cat2(&inst_prefix, &pname)) {
+                        no_subst_ports.insert(pname.clone());
+                    }
                     // §7.4.1: a packed multi-D formal indexes by its OWN
                     // element stride. Substituting the actual makes `p[i]`
                     // index the actual instead, so the stride silently becomes
@@ -31273,9 +31363,15 @@ fn inline_module_items(
                     if let ModuleItem::NetDeclaration(nd) = sub_item {
                         if let BodySource::NetInits(inits) = body_src {
                             // §10.3.1 `wire #d w = expr;` drives through the
-                            // net delay, resolved per instance like the
-                            // `assign #d` form above.
-                            let delay_rc = nd.delay.as_ref().map(|d| std::rc::Rc::new(d.clone()));
+                            // declaration's delay, resolved per instance like
+                            // the `assign #d` form above. With an assignment
+                            // the delay is the ASSIGNMENT's (§10.3.3), not a
+                            // net delay; see `net_delay_of`.
+                            let rc = |d: &Option<Expression>| {
+                                d.as_ref().map(|d| std::rc::Rc::new(d.clone()))
+                            };
+                            let (delay_rc, delay_fall_rc, delay_off_rc) =
+                                (rc(&nd.delay), rc(&nd.delay_fall), rc(&nd.delay_off));
                             for (decl_name, rhs_rc) in inits {
                                 let lhs_name = cat2(&inst_prefix, &decl_name);
                                 let new_lhs = make_ident_expr(&lhs_name);
@@ -31284,8 +31380,8 @@ fn inline_module_items(
                                     rhs_source: std::rc::Rc::clone(rhs_rc),
                                     ctx: std::rc::Rc::clone(&pend_ctx),
                                     delay_source: delay_rc.clone(),
-                                    delay_fall_source: None,
-                                    delay_off_source: None,
+                                    delay_fall_source: delay_fall_rc.clone(),
+                                    delay_off_source: delay_off_rc.clone(),
                                     origin_span: Some(rhs_rc.span),
                                 });
                             }
@@ -33380,6 +33476,433 @@ pub fn resolve_user_nettype_drivers(elab: &mut ElaboratedModule) -> Result<(), S
 
     elab.continuous_assigns = kept;
     Ok(())
+}
+
+/// The nets a continuous-assign target (or UDP output) writes, each with
+/// whether it writes the WHOLE net: `w` → [(w, true)], `w[3]` / `w[3:0]` /
+/// `w.m` → [(w, false)], `{w, v[1]}` → [(w, true), (v, false)].
+/// `is_net` decides whether a dotted member access names a net itself (a
+/// hierarchical `u.w`) rather than a member of its prefix.
+fn lvalue_nets(e: &Expression, is_net: &dyn Fn(&str) -> bool, out: &mut Vec<(String, bool)>) {
+    match &e.kind {
+        ExprKind::Ident(h) => {
+            let Some((last, init)) = h.path.split_last() else {
+                return;
+            };
+            if init.iter().any(|s| !s.selects.is_empty()) {
+                return;
+            }
+            let name = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            out.push((name, last.selects.is_empty()));
+        }
+        ExprKind::MemberAccess { expr, .. } => match ident_flat_name(e) {
+            Some(n) if is_net(&n) => out.push((n, true)),
+            _ => {
+                let at = out.len();
+                lvalue_nets(expr, is_net, out);
+                for t in &mut out[at..] {
+                    t.1 = false;
+                }
+            }
+        },
+        ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+            let at = out.len();
+            lvalue_nets(expr, is_net, out);
+            for t in &mut out[at..] {
+                t.1 = false;
+            }
+        }
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                lvalue_nets(p, is_net, out);
+            }
+        }
+        ExprKind::Paren(inner) => lvalue_nets(inner, is_net, out),
+        _ => {}
+    }
+}
+
+/// True when `e` is made of nets only: a net, a select of one, or a
+/// concatenation of those — the shapes a port collapses onto (§23.3.3.7).
+fn is_net_lvalue(e: &Expression, is_net: &dyn Fn(&str) -> bool) -> bool {
+    match &e.kind {
+        ExprKind::Concatenation(parts) => {
+            !parts.is_empty() && parts.iter().all(|p| is_net_lvalue(p, is_net))
+        }
+        ExprKind::Paren(inner)
+        | ExprKind::Index { expr: inner, .. }
+        | ExprKind::RangeSelect { expr: inner, .. } => is_net_lvalue(inner, is_net),
+        ExprKind::Ident(_) => {
+            let mut v = Vec::new();
+            lvalue_nets(e, is_net, &mut v);
+            v.len() == 1 && is_net(&v[0].0)
+        }
+        _ => false,
+    }
+}
+
+/// Retarget every write of net `from` inside the target `e` to net `to`,
+/// keeping any select: `w[3]` → `to[3]`. The inverse walk of `lvalue_nets`.
+fn retarget_lvalue_net(e: &mut Expression, from: &str, to: &str) {
+    if ident_flat_name(e).as_deref() == Some(from) {
+        *e = Expression::new(make_ident_expr(to).kind, e.span);
+        return;
+    }
+    match &mut e.kind {
+        ExprKind::Ident(h) => {
+            let Some((last, init)) = h.path.split_last() else {
+                return;
+            };
+            if init.iter().any(|s| !s.selects.is_empty()) {
+                return;
+            }
+            let name = h
+                .path
+                .iter()
+                .map(|s| s.name.name.as_str())
+                .collect::<Vec<_>>()
+                .join(".");
+            if name == from {
+                let selects = last.selects.clone();
+                let span = last.name.span;
+                h.path = vec![HierPathSegment {
+                    name: Identifier {
+                        name: to.to_string(),
+                        span,
+                    },
+                    selects,
+                }];
+                h.cached_signal_id = std::cell::Cell::new(None);
+                h.cached_resolved_name = std::cell::OnceCell::new();
+            }
+        }
+        ExprKind::MemberAccess { expr, .. }
+        | ExprKind::Index { expr, .. }
+        | ExprKind::RangeSelect { expr, .. }
+        | ExprKind::Paren(expr) => retarget_lvalue_net(expr, from, to),
+        ExprKind::Concatenation(parts) => {
+            for p in parts {
+                retarget_lvalue_net(p, from, to);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// A stage net that elaboration synthesized to carry delays — a delayed
+/// net's driver side `<net>$netdrv` or per-bit stage `<net>$netbit<i>`
+/// (`apply_net_delays`), a delayed driver's own net `<net>$drv<k>`
+/// (`resolve_multi_driver_nets`). Not a design object: dumps and scope
+/// listings leave it out.
+pub fn is_delay_stage_net(name: &str) -> bool {
+    let leaf = name.rsplit('.').next().unwrap_or(name);
+    let Some(at) = leaf.rfind('$') else {
+        return false;
+    };
+    let tail = &leaf[at + 1..];
+    let numbered = |p: &str| {
+        tail.strip_prefix(p)
+            .is_some_and(|d| !d.is_empty() && d.bytes().all(|b| b.is_ascii_digit()))
+    };
+    tail == "netdrv" || numbered("netbit") || numbered("drv")
+}
+
+/// §6.7.1 / §10.3.3 / §28.16: apply each recorded NET delay (`wire #2 w;`)
+/// to the net, whatever drives it.
+///
+/// A net delay delays every driver of the net — an `assign` written apart
+/// from the declaration, a port connection that brings a sub-module output
+/// in, a gate, a UDP. Only the declaration-assignment form used to see it
+/// (and that delay is the assignment's own, §10.3.3), so `wire #2 w;
+/// assign w = a;` tracked `a` undelayed, at the top and inside instances.
+///
+/// The delay acts on the net's RESOLVED value, after the drivers' own
+/// delays: `wire #2 w; assign #3 w = a;` is two inertial stages, so a
+/// 4-unit pulse on `a` survives both (a single `#5` would swallow it), and a
+/// pulse shorter than 2 on the resolved value of several drivers is
+/// swallowed even when no single driver's pulse is.
+///
+/// When a scalar net's only driver is an undelayed `assign` onto the whole
+/// net, the net delay simply becomes that driver's delay. Otherwise
+/// (several drivers, a driver with its own delay, a select or concatenation
+/// target, a UDP, a vector net) the drivers are moved onto a hidden
+/// driver-side net `<net>$netdrv` of the same kind, and the net follows it
+/// through delayed continuous assignments — one, or one per bit of a
+/// vector. Runs before `resolve_multi_driver_nets`, which resolves the
+/// hidden net's drivers.
+pub fn apply_net_delays(elab: &mut ElaboratedModule) {
+    if elab.net_delays.is_empty() {
+        return;
+    }
+    let mut delays = std::mem::take(&mut elab.net_delays);
+    // A later variable redeclaration (`output o; reg o;`) unmade the net.
+    delays.retain(|n, _| elab.nets.contains(n) && elab.signals.contains_key(n));
+    if delays.is_empty() {
+        return;
+    }
+    // §23.3.3.7 port collapsing: an OUTPUT port bound to a whole delayed net
+    // (through any depth of such ports) is that same net. Its drivers drive
+    // the delayed net, and the port reads the net's delayed value, as the
+    // reference shows it from inside the instance.
+    // An output connection is the synthesized `actual = port` assign of a
+    // port whose actual is a whole net (`port_aliases`).
+    let out_conns: Vec<(String, String)> = if elab.port_aliases.is_empty() {
+        Vec::new()
+    } else {
+        elab.continuous_assigns
+            .iter()
+            .filter(|ca| ca.origin.is_none())
+            .filter_map(|ca| {
+                let port = ident_flat_name(&ca.rhs)?;
+                let actual = ident_flat_name(&ca.lhs)?;
+                (elab.port_aliases.get(&port) == Some(&actual) && elab.nets.contains(&port))
+                    .then_some((port, actual))
+            })
+            .collect()
+    };
+    let mut merged: HashMap<String, String> = HashMap::default();
+    loop {
+        let mut grew = false;
+        for (port, actual) in &out_conns {
+            if merged.contains_key(port) || delays.contains_key(port) {
+                continue;
+            }
+            if let Some(root) = delays
+                .contains_key(actual)
+                .then(|| actual.clone())
+                .or_else(|| merged.get(actual).cloned())
+            {
+                merged.insert(port.clone(), root);
+                grew = true;
+            }
+        }
+        if !grew {
+            break;
+        }
+    }
+    let is_net = |n: &str| delays.contains_key(n) || merged.contains_key(n);
+    let targets_of = |e: &Expression| -> Vec<(String, bool)> {
+        let mut v = Vec::new();
+        lvalue_nets(e, &is_net, &mut v);
+        v
+    };
+    // Sub-module drivers may still be pending; bring in the ones that write
+    // a delayed net (one target rewrite each — the fold below does the same).
+    if !elab.pending_cont_assign.is_empty() {
+        let pending = std::mem::take(&mut elab.pending_cont_assign);
+        for p in pending {
+            let lhs = rewrite_expr(
+                &p.lhs_source,
+                &p.ctx.prefix,
+                &p.ctx.port_map,
+                &p.ctx.local_names,
+                &p.ctx.interface_map,
+            );
+            if targets_of(&lhs).iter().any(|(n, _)| is_net(n)) {
+                let ca = p.materialize(&elab.parameters);
+                elab.continuous_assigns.push(ca);
+            } else {
+                elab.pending_cont_assign.push(p);
+            }
+        }
+    }
+    if !merged.is_empty() {
+        // Drop each merged port's connection (`actual = port`), move the
+        // port's own drivers onto the delayed net, and let the port follow it.
+        let is_connection = |ca: &ContinuousAssignment| {
+            ca.origin.is_none()
+                && ident_flat_name(&ca.rhs).is_some_and(|p| {
+                    merged.contains_key(&p)
+                        && ident_flat_name(&ca.lhs).as_ref() == elab.port_aliases.get(&p)
+                })
+        };
+        let mut cas = std::mem::take(&mut elab.continuous_assigns);
+        cas.retain(|ca| !is_connection(ca));
+        for ca in cas.iter_mut() {
+            for (n, _) in targets_of(&ca.lhs) {
+                if let Some(root) = merged.get(&n) {
+                    retarget_lvalue_net(&mut ca.lhs, &n, root);
+                }
+            }
+        }
+        for u in elab.udp_instances.iter_mut() {
+            for (n, _) in targets_of(&u.output) {
+                if let Some(root) = merged.get(&n) {
+                    retarget_lvalue_net(&mut u.output, &n, root);
+                }
+            }
+        }
+        let mut members: Vec<(&String, &String)> = merged.iter().collect();
+        members.sort();
+        for (port, root) in members {
+            cas.push(ContinuousAssignment {
+                origin: None,
+                lhs: make_ident_expr(port),
+                rhs: make_ident_expr(root),
+                delay: 0,
+                rhs_parent_scoped: false,
+                delay_fall: None,
+                delay_off: None,
+            });
+        }
+        elab.continuous_assigns = cas;
+    }
+    let is_net = |n: &str| delays.contains_key(n);
+    let targets_of = |e: &Expression| -> Vec<(String, bool)> {
+        let mut v = Vec::new();
+        lvalue_nets(e, &is_net, &mut v);
+        v
+    };
+    // Per delayed net: its driving assigns, and whether some driver needs
+    // the net to be a stage of its own.
+    let mut drivers: HashMap<String, Vec<usize>> = HashMap::default();
+    let mut staged: HashSet<String> = HashSet::default();
+    for (i, ca) in elab.continuous_assigns.iter().enumerate() {
+        let ts = targets_of(&ca.lhs);
+        let own_delay = ca.delay != 0 || ca.delay_fall.is_some() || ca.delay_off.is_some();
+        for (n, whole) in ts.iter().filter(|(n, _)| is_net(n)) {
+            let ds = drivers.entry(n.clone()).or_default();
+            ds.push(i);
+            if own_delay || ts.len() > 1 || !whole || ds.len() > 1 {
+                staged.insert(n.clone());
+            }
+        }
+    }
+    for u in &elab.udp_instances {
+        for (n, _) in targets_of(&u.output) {
+            if is_net(&n) {
+                drivers.entry(n.clone()).or_default();
+                staged.insert(n);
+            }
+        }
+    }
+    let mut names: Vec<String> = drivers.keys().cloned().collect();
+    names.sort();
+    for net in names {
+        let (rise, fall, off) = delays[&net];
+        let (width, is_real) = elab
+            .signals
+            .get(&net)
+            .map_or((1, false), |s| (s.width, s.is_real));
+        // §28.16: a vector net's delay acts on each BIT — a bit that changes
+        // keeps its own schedule when another changes a tick later, and each
+        // bit's transition picks rise, fall or turn-off for itself. The
+        // simulator's delayed update is per signal, so a vector net takes the
+        // driver-net route and follows it bit by bit.
+        let per_bit = width > 1 && !is_real;
+        if !staged.contains(&net) && !per_bit {
+            // A lone undelayed driver of the whole net IS the net's value:
+            // the net delay is simply its delay.
+            let ca = &mut elab.continuous_assigns[drivers[&net][0]];
+            ca.delay = rise;
+            ca.delay_fall = fall;
+            ca.delay_off = off;
+            continue;
+        }
+        // The driver side: a copy of the net, same kind and shape.
+        let drv = format!("{net}$netdrv");
+        let mut sig = elab.signals[&net].clone();
+        sig.name = drv.clone();
+        sig.direction = None;
+        elab.signals.insert(drv.clone(), sig);
+        elab.nets.insert(drv.clone());
+        if let Some(k) = elab.resolved_net_kinds.get(&net).cloned() {
+            elab.resolved_net_kinds.insert(drv.clone(), k);
+        }
+        if let Some(v) = elab.ascending_packed.get(&net).copied() {
+            elab.ascending_packed.insert(drv.clone(), v);
+        }
+        if let Some(v) = elab.packed_full_dims.get(&net).cloned() {
+            elab.packed_full_dims.insert(drv.clone(), v);
+        }
+        if let Some(v) = elab.packed_signal_elem_widths.get(&net).copied() {
+            elab.packed_signal_elem_widths.insert(drv.clone(), v);
+        }
+        if let Some(v) = elab.packed_struct_fields.get(&net).cloned() {
+            elab.packed_struct_fields.insert(drv.clone(), v);
+        }
+        if let Some(v) = elab.var_decl_types.get(&net).cloned() {
+            elab.var_decl_types.insert(drv.clone(), v);
+        }
+        // A gate's §28.4 z→x rule and fall delay belong to its output.
+        if elab.gate_driven_nets.remove(&net) {
+            elab.gate_driven_nets.insert(drv.clone());
+        }
+        if let Some(f) = elab.gate_fall_delays.remove(&net) {
+            elab.gate_fall_delays.insert(drv.clone(), f);
+        }
+        for &i in drivers.get(&net).map(|v| v.as_slice()).unwrap_or(&[]) {
+            retarget_lvalue_net(&mut elab.continuous_assigns[i].lhs, &net, &drv);
+        }
+        for u in elab.udp_instances.iter_mut() {
+            retarget_lvalue_net(&mut u.output, &net, &drv);
+        }
+        if !per_bit {
+            elab.continuous_assigns.push(ContinuousAssignment {
+                origin: None,
+                lhs: make_ident_expr(&net),
+                rhs: make_ident_expr(&drv),
+                delay: rise,
+                rhs_parent_scoped: false,
+                delay_fall: fall,
+                delay_off: off,
+            });
+            continue;
+        }
+        // One delayed scalar stage per bit (`<net>$netbit<i>` follows physical
+        // bit i of the driver net), then the net is their concatenation.
+        let mut bits: Vec<Expression> = Vec::with_capacity(width as usize);
+        for i in 0..width {
+            let b = format!("{net}$netbit{i}");
+            elab.signals.insert(
+                b.clone(),
+                Signal {
+                    name: b.clone(),
+                    width: 1,
+                    is_signed: false,
+                    is_real: false,
+                    is_const: false,
+                    direction: None,
+                    value: Value::all_z(1),
+                    type_name: None,
+                },
+            );
+            elab.nets.insert(b.clone());
+            let bit_of_drv = Expression::new(
+                ExprKind::Binary {
+                    op: BinaryOp::ShiftRight,
+                    left: Box::new(make_ident_expr(&drv)),
+                    right: Box::new(make_udp_int_expr(i as i64)),
+                },
+                Span::dummy(),
+            );
+            elab.continuous_assigns.push(ContinuousAssignment {
+                origin: None,
+                lhs: make_ident_expr(&b),
+                rhs: bit_of_drv,
+                delay: rise,
+                rhs_parent_scoped: false,
+                delay_fall: fall,
+                delay_off: off,
+            });
+            bits.push(make_ident_expr(&b));
+        }
+        bits.reverse();
+        elab.continuous_assigns.push(ContinuousAssignment {
+            origin: None,
+            lhs: make_ident_expr(&net),
+            rhs: Expression::new(ExprKind::Concatenation(bits), Span::dummy()),
+            delay: 0,
+            rhs_parent_scoped: false,
+            delay_fall: None,
+            delay_off: None,
+        });
+    }
 }
 
 pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {

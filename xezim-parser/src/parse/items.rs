@@ -670,6 +670,8 @@ impl Parser {
                         strength: None,
                         data_type,
                         delay: None,
+                        delay_fall: None,
+                        delay_off: None,
                         declarators: vec![NetDeclarator {
                             name: v.name,
                             dimensions: v.dimensions,
@@ -2492,30 +2494,41 @@ impl Parser {
         let data_type = self.wreal_data_type(net_type, data_type, wreal_span);
         // §6.7: `net_type data_type_or_implicit [delay3] list_of_net_decl_assignments`
         // — `wire [5:0] #1 w = a + b;`.
-        if delay.is_none() {
+        if delay.0.is_none() {
             delay = self.parse_net_delay();
         }
         let declarators = self.parse_net_declarator_list();
         self.expect(TokenKind::Semicolon);
+        let (delay, delay_fall, delay_off) = delay;
         NetDeclaration {
             net_type,
             strength: None,
             data_type,
             delay,
+            delay_fall,
+            delay_off,
             declarators,
             span: self.span_from(start),
         }
     }
 
-    /// Optional `#d` / `#(rise[, fall[, turn-off]])` net delay; the rise
-    /// (typical) value is kept.
-    fn parse_net_delay(&mut self) -> Option<Expression> {
-        self.eat(TokenKind::Hash)?;
-        if self.eat(TokenKind::LParen).is_none() {
-            return Some(self.parse_delay_value());
+    /// Optional `#d` / `#(rise[, fall[, turn-off]])` net delay (§6.7.1,
+    /// §28.16), as (rise, fall, turn-off). A min:typ:max value keeps typ.
+    fn parse_net_delay(&mut self) -> (Option<Expression>, Option<Expression>, Option<Expression>) {
+        if self.eat(TokenKind::Hash).is_none() {
+            return (None, None, None);
         }
-        let first = self.parse_expression();
-        let rise = self.parse_mintypmax_rest(first);
+        if self.eat(TokenKind::LParen).is_none() {
+            return (Some(self.parse_delay_value()), None, None);
+        }
+        let mut vals: Vec<Expression> = Vec::new();
+        loop {
+            let first = self.parse_expression();
+            vals.push(self.parse_mintypmax_rest(first));
+            if vals.len() == 3 || self.eat(TokenKind::Comma).is_none() {
+                break;
+            }
+        }
         let mut depth = 1i32;
         while depth > 0 && !self.at(TokenKind::Eof) {
             match self.current_kind() {
@@ -2525,7 +2538,8 @@ impl Parser {
             }
             self.bump();
         }
-        Some(rise)
+        let mut it = vals.into_iter();
+        (it.next(), it.next(), it.next())
     }
 
     fn parse_net_declarator_list(&mut self) -> Vec<NetDeclarator> {

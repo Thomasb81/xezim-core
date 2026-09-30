@@ -748,7 +748,14 @@ pub struct NetDeclaration {
     pub net_type: NetType,
     pub strength: Option<String>,
     pub data_type: DataType,
+    /// §6.7.1 net delay: `#d` / first of `#(rise, fall[, turnoff])`.
     pub delay: Option<Expression>,
+    /// Second delay of the pair/triple form: applied to a transition to 0.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_fall: Option<Expression>,
+    /// Third delay: applied to a transition to z.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub delay_off: Option<Expression>,
     pub declarators: Vec<NetDeclarator>,
     pub span: Span,
 }
