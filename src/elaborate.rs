@@ -4898,9 +4898,11 @@ fn port_elision_setup() {
 /// substituted actual: class bodies are not rewritten into the instance at
 /// all, a clocking block falls back to the formal's net for an expression
 /// actual, `let`/checker bodies expand late, specify blocks and SDF name the
-/// ports themselves, and `alias`/nested modules/`bind` are rare enough to
+/// ports themselves, a UDP instance's terminals and a checker instance's
+/// actuals are resolved WITHOUT the port substitution (`plain_inst` says
+/// false for those), and `alias`/nested modules/`bind` are rare enough to
 /// keep out of the analysis. A module carrying any of them keeps every port.
-fn port_elision_blocked_by_items(items: &[ModuleItem]) -> bool {
+fn port_elision_blocked_by_items(items: &[ModuleItem], plain_inst: &dyn Fn(&str) -> bool) -> bool {
     items.iter().any(|it| match it {
         ModuleItem::ClassDeclaration(_)
         | ModuleItem::ClockingDeclaration(_)
@@ -4913,16 +4915,17 @@ fn port_elision_blocked_by_items(items: &[ModuleItem]) -> bool {
         | ModuleItem::DPIImport(_)
         | ModuleItem::DPIExport(_)
         | ModuleItem::NettypeDeclaration(_) => true,
-        ModuleItem::GenerateRegion(g) => port_elision_blocked_by_items(&g.items),
+        ModuleItem::ModuleInstantiation(mi) => !plain_inst(&mi.module_name.name),
+        ModuleItem::GenerateRegion(g) => port_elision_blocked_by_items(&g.items, plain_inst),
         ModuleItem::GenerateIf(g) => g
             .branches
             .iter()
-            .any(|(_, items)| port_elision_blocked_by_items(items)),
-        ModuleItem::GenerateFor(g) => port_elision_blocked_by_items(&g.items),
+            .any(|(_, items)| port_elision_blocked_by_items(items, plain_inst)),
+        ModuleItem::GenerateFor(g) => port_elision_blocked_by_items(&g.items, plain_inst),
         ModuleItem::GenerateCase(g) => g
             .arms
             .iter()
-            .any(|a| port_elision_blocked_by_items(&a.items)),
+            .any(|a| port_elision_blocked_by_items(&a.items, plain_inst)),
         _ => false,
     })
 }
@@ -31437,7 +31440,23 @@ fn inline_module_items(
                 if !input_connects.is_empty() && matches!(sub_mod, Definition::Module(_)) {
                     let dotted = PORT_ELISION_DOTTED.with(|d| d.borrow().clone());
                     if let Some(dotted) = dotted {
-                        if !port_elision_blocked_by_items(&prepared_sub.effective_items) {
+                        // A module, interface or program instance inlines
+                        // through the substitution; a UDP or checker
+                        // instance does not.
+                        let plain_inst = |name: &str| {
+                            matches!(
+                                definitions.get(name),
+                                Some(
+                                    Definition::Module(_)
+                                        | Definition::Interface(_)
+                                        | Definition::Program(_)
+                                )
+                            ) && !elab.checker_decls.contains_key(name)
+                        };
+                        if !port_elision_blocked_by_items(
+                            &prepared_sub.effective_items,
+                            &plain_inst,
+                        ) {
                             let mut drop_idx: Vec<usize> = Vec::new();
                             for (pname, idx) in &input_connects {
                                 let formal = cat2(&inst_prefix, pname);
