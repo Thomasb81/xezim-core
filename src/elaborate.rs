@@ -5020,12 +5020,6 @@ fn port_decl_is_plain(sub_mod: &Definition, items: &[ModuleItem], pname: &str) -
     }
 }
 
-/// Lever-2 experiment switch: substitute only simple port actuals.
-fn port_subst_simple_only() -> bool {
-    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ON.get_or_init(|| std::env::var("XEZIM_PROTO_SIMPLE_SUBST").ok().as_deref() == Some("1"))
-}
-
 /// A port actual that only NAMES storage: a net or variable, a constant bit
 /// or part select of one, a literal, or a concatenation/replication of those.
 /// Anything that computes (an operator, a call, a select with a run-time
@@ -31322,10 +31316,7 @@ fn inline_module_items(
                     // connection assign; only a rename (a net, a constant
                     // select of one, a literal, a concatenation of those) is
                     // substituted.
-                    if is_input
-                        && port_subst_simple_only()
-                        && !port_actual_is_simple(actual, local_params, &elab.parameters)
-                    {
+                    if is_input && !port_actual_is_simple(actual, local_params, &elab.parameters) {
                         no_subst_ports.insert(pname.clone());
                     }
                     // §7.4.1: a packed multi-D formal indexes by its OWN

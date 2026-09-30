@@ -104,7 +104,9 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
     use lexer::token::TokenKind as K;
     let mut guard = REFERENCE_CENSUS.lock().unwrap_or_else(|e| e.into_inner());
     let census = guard.get_or_insert_with(ReferenceCensus::default);
-    let bare = |t: &str| -> &str { t.strip_prefix('\\').unwrap_or(t).trim_end() };
+    fn bare(t: &str) -> &str {
+        t.strip_prefix('\\').unwrap_or(t).trim_end()
+    }
     for (i, tok) in tokens.iter().enumerate() {
         match tok.kind {
             K::Dot => {
