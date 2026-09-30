@@ -63,6 +63,13 @@ pub struct ReferenceCensus {
     /// Over-approximates on purpose: struct members, methods and interface
     /// signals land here too.
     pub dotted: CensusSet,
+    /// Every identifier spelled in code that runs in the scope of whatever
+    /// instance calls it rather than an instance of its own: class bodies,
+    /// packages, and the compilation unit outside any design unit. A bare
+    /// name there that the enclosing code does not declare resolves at run
+    /// time under the calling instance's scope, so it can reach that
+    /// instance's own port nets.
+    pub unit_idents: CensusSet,
     /// Every system task or function name spelled (`$dumpvars`).
     pub system_names: CensusSet,
     /// An `import "DPI…"` or `export "DPI…"` declaration was seen.
@@ -107,7 +114,76 @@ pub fn record_reference_census(tokens: &[lexer::Token]) {
     fn bare(t: &str) -> &str {
         t.strip_prefix('\\').unwrap_or(t).trim_end()
     }
+    // Enclosing regions for `unit_idents`: design units (module, interface,
+    // program, checker, primitive, config) versus classes and packages.
+    // Recording too much only keeps more ports, so every uncertain case
+    // leans that way: an end keyword closes EVERY open design unit, and a
+    // keyword that may not open one (`virtual interface`, `extern module`,
+    // `interface class`, a forward `typedef class`) opens nothing.
+    #[derive(Clone, Copy, PartialEq)]
+    enum Region {
+        Unit,
+        Class,
+        Package,
+    }
+    let mut regions: Vec<Region> = Vec::new();
+    fn close(regions: &mut Vec<Region>, kind: Region) {
+        if let Some(at) = regions.iter().rposition(|r| *r == kind) {
+            regions.truncate(at);
+        }
+    }
     for (i, tok) in tokens.iter().enumerate() {
+        let prev = i.checked_sub(1).map(|p| tokens[p].kind);
+        match tok.kind {
+            K::KwModule
+            | K::KwMacromodule
+            | K::KwProgram
+            | K::KwChecker
+            | K::KwPrimitive
+            | K::KwConfig => {
+                if prev != Some(K::KwExtern) {
+                    regions.push(Region::Unit);
+                }
+            }
+            K::KwInterface => {
+                let next = tokens.get(i + 1).map(|t| t.kind);
+                if !matches!(prev, Some(K::KwVirtual | K::KwExtern))
+                    && next != Some(K::KwClass)
+                    && !regions.contains(&Region::Unit)
+                {
+                    regions.push(Region::Unit);
+                }
+            }
+            K::KwClass => {
+                if prev != Some(K::KwTypedef) {
+                    regions.push(Region::Class);
+                }
+            }
+            K::KwPackage => regions.push(Region::Package),
+            K::KwEndmodule
+            | K::KwEndprogram
+            | K::KwEndinterface
+            | K::KwEndchecker
+            | K::KwEndprimitive
+            | K::KwEndconfig => {
+                if let Some(at) = regions.iter().position(|r| *r == Region::Unit) {
+                    regions.truncate(at);
+                }
+            }
+            K::KwEndclass => close(&mut regions, Region::Class),
+            K::KwEndpackage => close(&mut regions, Region::Package),
+            K::Identifier | K::EscapedIdentifier => {
+                let unit_level =
+                    regions.last() != Some(&Region::Unit) || regions.contains(&Region::Class);
+                if unit_level {
+                    let n = bare(&tok.text);
+                    if !census.unit_idents.contains(n) {
+                        census.unit_idents.insert(n.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
         match tok.kind {
             K::Dot => {
                 let named_binding = i > 0 && matches!(tokens[i - 1].kind, K::LParen | K::Comma);

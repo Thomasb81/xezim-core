@@ -4842,8 +4842,10 @@ pub fn elided_port_hash(name: &str) -> u64 {
 
 thread_local! {
     /// Per-elaboration elision state, set by `port_elision_setup`: `None`
-    /// when elision is off for this design, else the dotted-name census
-    /// (a port whose name appears after a `.` anywhere is kept).
+    /// when elision is off for this design, else the names a port must not
+    /// carry to be left out: every name written after a `.`, and every name
+    /// spelled in class, package or compilation-unit code (see
+    /// `sv_parser::ReferenceCensus`).
     static PORT_ELISION_DOTTED: std::cell::RefCell<Option<Rc<crate::sv_parser::CensusSet>>> =
         const { std::cell::RefCell::new(None) };
 }
@@ -4881,7 +4883,11 @@ fn port_elision_setup() {
                 .system_names
                 .iter()
                 .any(|n| systask_observes_by_name(n));
-        (!blocked).then(|| Rc::new(census.dotted))
+        (!blocked).then(|| {
+            let mut names = census.dotted;
+            names.extend(census.unit_idents);
+            Rc::new(names)
+        })
     } else {
         None
     };
