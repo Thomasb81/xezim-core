@@ -19920,6 +19920,7 @@ fn emit_struct_member_assigns(
     su: &crate::ast::types::StructUnionType,
     ca: &ContinuousAssignment,
     typedef_types: &HashMap<String, DataType>,
+    params: &HashMap<String, Value>,
     out: &mut Vec<ContinuousAssignment>,
     depth: u32,
 ) {
@@ -19936,12 +19937,16 @@ fn emit_struct_member_assigns(
         });
         return;
     }
-    // Flat (member, declared type) list in declaration order — the order an
-    // ORDERED assignment pattern maps onto position-wise.
-    let mut flat: Vec<(String, DataType)> = Vec::new();
+    // Flat (member, declared type, unpacked dims) list in declaration order —
+    // the order an ORDERED assignment pattern maps onto position-wise.
+    let mut flat: Vec<(String, DataType, Vec<UnpackedDimension>)> = Vec::new();
     for m in &su.members {
         for d in &m.declarators {
-            flat.push((d.name.name.clone(), m.data_type.clone()));
+            flat.push((
+                d.name.name.clone(),
+                m.data_type.clone(),
+                d.dimensions.clone(),
+            ));
         }
     }
     // An assignment pattern on the RHS is taken APART here, item by item.
@@ -19986,10 +19991,10 @@ fn emit_struct_member_assigns(
                         _ => usable = false,
                     }
                 }
-                if usable && flat.iter().all(|(m, _)| by_name.contains_key(m)) {
+                if usable && flat.iter().all(|(m, _, _)| by_name.contains_key(m)) {
                     Some(
                         flat.iter()
-                            .map(|(m, _)| by_name.remove(m).expect("checked above"))
+                            .map(|(m, _, _)| by_name.remove(m).expect("checked above"))
                             .collect(),
                     )
                 } else {
@@ -19999,7 +20004,7 @@ fn emit_struct_member_assigns(
         }
         _ => None,
     };
-    for (i, (mname, mdt)) in flat.iter().enumerate() {
+    for (i, (mname, mdt, mdims)) in flat.iter().enumerate() {
         let mident = Identifier {
             name: mname.clone(),
             span: Span::dummy(),
@@ -20009,22 +20014,172 @@ fn emit_struct_member_assigns(
             Some(items) => items[i].clone(),
             None => member_ref_expr(rhs, &mident),
         };
+        emit_member_elem_assigns(
+            mlhs,
+            mrhs,
+            pat_items.is_some(),
+            mdt,
+            mdims,
+            ca,
+            typedef_types,
+            params,
+            out,
+            depth,
+        );
+    }
+}
+
+/// IEEE 1800-2017 §7.2/§7.4.2: the continuous assigns for ONE member of an
+/// unpacked struct, `lhs = rhs`. A member with fixed unpacked dimensions has
+/// no storage of its own — every element is its own leaf — so it expands to
+/// one assign per element (`lhs[i][j] = rhs[i][j]`, or the matching item of
+/// a nested pattern when `rhs_is_item`); a member that is (an array of) an
+/// unpacked struct recurses into its own members. A whole-member assign had
+/// nowhere to land, so every array member of a struct port or a struct
+/// continuous assign read back x.
+#[allow(clippy::too_many_arguments)]
+fn emit_member_elem_assigns(
+    lhs: Expression,
+    rhs: Expression,
+    rhs_is_item: bool,
+    mdt: &DataType,
+    mdims: &[UnpackedDimension],
+    ca: &ContinuousAssignment,
+    typedef_types: &HashMap<String, DataType>,
+    params: &HashMap<String, Value>,
+    out: &mut Vec<ContinuousAssignment>,
+    depth: u32,
+) {
+    let push_leaf = |out: &mut Vec<ContinuousAssignment>, lhs: Expression, rhs: Expression| {
         match resolve_typedef_chain(mdt, typedef_types) {
             DataType::Struct(inner) if !inner.packed && !inner.members.is_empty() => {
                 let inner = inner.clone();
-                emit_struct_member_assigns(&mlhs, &mrhs, &inner, ca, typedef_types, out, depth + 1);
+                emit_struct_member_assigns(
+                    &lhs,
+                    &rhs,
+                    &inner,
+                    ca,
+                    typedef_types,
+                    params,
+                    out,
+                    depth + 1,
+                );
             }
             _ => out.push(ContinuousAssignment {
                 origin: ca.origin.clone(),
-                lhs: mlhs,
-                rhs: mrhs,
+                lhs,
+                rhs,
                 delay: ca.delay,
                 rhs_parent_scoped: ca.rhs_parent_scoped,
                 delay_fall: ca.delay_fall,
                 delay_off: ca.delay_off,
             }),
         }
+    };
+    let lists = if mdims.is_empty() {
+        None
+    } else {
+        fixed_unpacked_index_lists(mdims, params, typedef_types)
+    };
+    let Some(lists) = lists else {
+        push_leaf(out, lhs, rhs);
+        return;
+    };
+    for tup in cartesian_index_tuples(&lists) {
+        // A pattern item supplies the element through one nested ordered
+        // pattern level per dimension (§10.10), by position in declared order.
+        let rhs_e = if rhs_is_item {
+            let mut cur = Some(&rhs);
+            for (d, idx) in tup.iter().enumerate() {
+                let pos = lists[d].iter().position(|i| i == idx);
+                cur = match (cur.map(|e| &e.kind), pos) {
+                    (Some(ExprKind::AssignmentPattern(items)), Some(p)) => match items.get(p) {
+                        Some(crate::ast::expr::AssignmentPatternItem::Ordered(e)) => Some(e),
+                        _ => None,
+                    },
+                    _ => None,
+                };
+            }
+            match cur {
+                Some(e) => e.clone(),
+                // Not an ordered nested pattern: keep the whole-member form.
+                None => {
+                    push_leaf(out, lhs, rhs);
+                    return;
+                }
+            }
+        } else {
+            tup.iter().fold(rhs.clone(), |e, &i| index_expr_of(e, i))
+        };
+        let lhs_e = tup.iter().fold(lhs.clone(), |e, &i| index_expr_of(e, i));
+        push_leaf(out, lhs_e, rhs_e);
     }
+}
+
+/// Constant element indices of every FIXED unpacked dimension, outermost
+/// first, each in declared order (left bound first: `[1:0]` is `[1, 0]`).
+/// `None` when any dimension is dynamic or unresolvable, or the element
+/// count would explode.
+fn fixed_unpacked_index_lists(
+    dims: &[UnpackedDimension],
+    params: &HashMap<String, Value>,
+    typedef_types: &HashMap<String, DataType>,
+) -> Option<Vec<Vec<i64>>> {
+    let dims = normalize_unpacked_dims(dims, params, typedef_types);
+    let declared = declared_unpacked_dims(&dims, params)?;
+    let mut total: u64 = 1;
+    let mut out = Vec::with_capacity(declared.len());
+    for (l, r) in declared {
+        let n = (l - r).unsigned_abs() + 1;
+        total = total.saturating_mul(n);
+        if total > 4096 {
+            return None;
+        }
+        out.push(if l <= r {
+            (l..=r).collect()
+        } else {
+            (r..=l).rev().collect()
+        });
+    }
+    Some(out)
+}
+
+/// Every index tuple of `lists`, last dimension varying fastest.
+fn cartesian_index_tuples(lists: &[Vec<i64>]) -> Vec<Vec<i64>> {
+    let mut tuples: Vec<Vec<i64>> = vec![Vec::new()];
+    for list in lists {
+        let mut next = Vec::with_capacity(tuples.len() * list.len());
+        for t in &tuples {
+            for &i in list {
+                let mut t2 = t.clone();
+                t2.push(i);
+                next.push(t2);
+            }
+        }
+        tuples = next;
+    }
+    tuples
+}
+
+/// `base[idx]` as an expression.
+fn index_expr_of(base: Expression, idx: i64) -> Expression {
+    let span = base.span;
+    Expression::new(
+        ExprKind::Index {
+            expr: Box::new(base),
+            index: Box::new(Expression::new(
+                ExprKind::Number(NumberLiteral::Integer {
+                    size: None,
+                    signed: true,
+                    base: crate::ast::expr::NumberBase::Decimal,
+                    value: idx.to_string(),
+                    cached_val: std::cell::Cell::new(None),
+                }),
+                span,
+            )),
+        },
+        span,
+    )
 }
 
 /// §7.2.2: expand every continuous assignment whose TARGET is an UNPACKED
@@ -20090,6 +20245,7 @@ pub fn expand_whole_struct_continuous_assigns(elab: &mut ElaboratedModule) {
                     &su,
                     &ca,
                     &elab.typedef_types,
+                    &elab.parameters,
                     &mut expanded,
                     0,
                 );
@@ -33161,17 +33317,27 @@ fn declared_type_name(elab: &ElaboratedModule, name: &str) -> Option<String> {
 /// expansion for nettype nets (it has to — the resolver call only exists there);
 /// those emerge with a `MemberAccess` lhs and are left alone.
 pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
-    let struct_members = |elab: &ElaboratedModule, name: &str| -> Option<Vec<String>> {
+    // (member name, declared type, unpacked dimensions) in declaration order.
+    type MemberDecl = (String, DataType, Vec<UnpackedDimension>);
+    let struct_members = |elab: &ElaboratedModule, name: &str| -> Option<Vec<MemberDecl>> {
         declared_type_name(elab, name)
             .and_then(|tn| elab.typedef_types.get(&tn).cloned())
             .and_then(|dt| match resolve_typedef_chain(&dt, &elab.typedef_types) {
                 // A PACKED struct keeps a contiguous bit layout that a
                 // whole-value write already fills correctly.
                 DataType::Struct(su) if !su.packed => {
-                    let ms: Vec<String> = su
+                    let ms: Vec<MemberDecl> = su
                         .members
                         .iter()
-                        .flat_map(|m| m.declarators.iter().map(|d| d.name.name.clone()))
+                        .flat_map(|m| {
+                            m.declarators.iter().map(|d| {
+                                (
+                                    d.name.name.clone(),
+                                    m.data_type.clone(),
+                                    d.dimensions.clone(),
+                                )
+                            })
+                        })
                         .collect();
                     if ms.is_empty() { None } else { Some(ms) }
                 }
@@ -33203,7 +33369,7 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
                     .collect(),
                 _ => None,
             };
-            for (i, m) in ms.iter().enumerate() {
+            for (i, (m, mdt, mdims)) in ms.iter().enumerate() {
                 let mident = Identifier {
                     name: m.clone(),
                     span: Span::dummy(),
@@ -33218,15 +33384,34 @@ pub fn expand_unpacked_struct_assigns(elab: &mut ElaboratedModule) {
                         ca.rhs.span,
                     ),
                 };
+                let lhs = Expression::new(
+                    ExprKind::MemberAccess {
+                        expr: Box::new(make_ident_expr(&base)),
+                        member: mident,
+                    },
+                    ca.lhs.span,
+                );
+                // §7.4.2: an array member is stored per element — expand it
+                // here, where its declaration is in hand; the member name
+                // alone names no storage.
+                if !mdims.is_empty() {
+                    emit_member_elem_assigns(
+                        lhs,
+                        rhs,
+                        pat.is_some(),
+                        mdt,
+                        mdims,
+                        &ca,
+                        &elab.typedef_types,
+                        &elab.parameters,
+                        &mut out,
+                        0,
+                    );
+                    continue;
+                }
                 out.push(ContinuousAssignment {
                     origin: ca.origin.clone(),
-                    lhs: Expression::new(
-                        ExprKind::MemberAccess {
-                            expr: Box::new(make_ident_expr(&base)),
-                            member: mident,
-                        },
-                        ca.lhs.span,
-                    ),
+                    lhs,
                     rhs,
                     delay: ca.delay,
                     rhs_parent_scoped: ca.rhs_parent_scoped,
