@@ -3821,15 +3821,21 @@ impl Parser {
         let name = self.parse_identifier();
         let params = self.parse_parameter_port_list();
         let mut bases = Vec::new();
+        let mut unscoped_bases: Vec<Identifier> = Vec::new();
         let extends = if self.eat(TokenKind::KwExtends).is_some() {
             let ext_start = self.current().span.start;
             // §8.13: the base class may be package/class-scoped —
             // `extends pkg::Base` or `extends A::B::C`. Keep the final
             // segment as the base-class name; the scope prefix is consumed.
             let mut base_name = self.parse_identifier();
+            let mut scoped = false;
             while self.at(TokenKind::DoubleColon) {
                 self.bump();
+                scoped = true;
                 base_name = self.parse_identifier();
+            }
+            if !scoped {
+                unscoped_bases.push(base_name.clone());
             }
             let args_at = self.pos;
             let args = if self.at(TokenKind::Hash) {
@@ -3848,9 +3854,14 @@ impl Parser {
             while self.at(TokenKind::Comma) {
                 self.bump();
                 let mut other = self.parse_identifier();
+                let mut scoped = false;
                 while self.at(TokenKind::DoubleColon) {
                     self.bump();
+                    scoped = true;
                     other = self.parse_identifier();
+                }
+                if !scoped {
+                    unscoped_bases.push(other.clone());
                 }
                 let at = self.pos;
                 if self.at(TokenKind::Hash) || self.at(TokenKind::LParen) {
@@ -3866,6 +3877,29 @@ impl Parser {
         } else {
             None
         };
+        // IEEE 1800-2017 §8.26.4: an interface class shall not extend a type
+        // parameter, even one whose type is an interface class. Every base is
+        // checked, not only the first one the AST keeps.
+        if is_iface {
+            for b in &unscoped_bases {
+                let is_type_param = params.iter().any(|p| match &p.kind {
+                    ParameterKind::Type { assignments } => {
+                        assignments.iter().any(|a| a.name.name == b.name)
+                    }
+                    _ => false,
+                });
+                if is_type_param {
+                    self.diagnostics.push(crate::diagnostics::Diagnostic::error(
+                        format!(
+                            "interface class '{}' extends type parameter '{}'; an interface \
+                             class shall not extend a type parameter (IEEE 1800-2017 §8.26.4)",
+                            name.name, b.name
+                        ),
+                        b.span,
+                    ));
+                }
+            }
+        }
         let mut implements = Vec::new();
         if self.eat(TokenKind::KwImplements).is_some() {
             loop {
