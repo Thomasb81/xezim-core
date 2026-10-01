@@ -34784,7 +34784,9 @@ pub fn resolve_multi_driver_nets(elab: &mut ElaboratedModule) {
         })
         .collect();
     for n in pending_lhs.iter().flatten() {
-        *counts.entry(std::borrow::Cow::Owned(n.clone())).or_insert(0) += 1;
+        *counts
+            .entry(std::borrow::Cow::Owned(n.clone()))
+            .or_insert(0) += 1;
     }
     // A tri0/tri1 net needs the fold even with a SINGLE driver, because the
     // implicit pull is a second (weak) driver: `strong` alone would leave the
