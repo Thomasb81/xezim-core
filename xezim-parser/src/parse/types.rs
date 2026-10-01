@@ -300,7 +300,13 @@ impl Parser {
                             let pname = self.parse_identifier();
                             self.expect(TokenKind::LParen);
                             if !self.at(TokenKind::RParen) {
-                                let value = self.parse_expression();
+                                // A keyword TYPE value (`.T(bit [5:0])`) is
+                                // no expression: `parse_expression` dropped it.
+                                let value = if self.is_data_type_keyword() {
+                                    self.parse_type_keyword_arg(start)
+                                } else {
+                                    self.parse_expression()
+                                };
                                 let sp = self.span_from(start);
                                 type_args.push(crate::ast::expr::Expression::new(
                                     crate::ast::expr::ExprKind::NamedArg {
@@ -312,42 +318,8 @@ impl Parser {
                             }
                             self.expect(TokenKind::RParen);
                         } else if self.is_data_type_keyword() {
-                            // A builtin/keyword TYPE as a `#(...)` type
-                            // parameter arg (e.g. `uvm_resource#(int)`).
-                            // `parse_expression` can't represent a type
-                            // keyword — it yields an Empty expr, losing
-                            // the specialization — so capture the type's
-                            // leaf name as an Ident expression. Downstream
-                            // per-spec keying (type_bindings / current_spec)
-                            // then recovers the signature, matching the
-                            // expression-context `Specialization`'s
-                            // `type_args_text`. Class-name args already
-                            // parse as an Ident via `parse_expression`.
-                            let tok_text = self.current().text.clone();
-                            let tsp = self.current().span;
-                            let _dt = self.parse_data_type();
-                            let sp = self.span_from(start);
-                            let id = crate::ast::Identifier {
-                                name: tok_text,
-                                span: crate::ast::Span {
-                                    start: tsp.start,
-                                    end: tsp.end,
-                                },
-                            };
-                            let hier = crate::ast::expr::HierarchicalIdentifier {
-                                root: None,
-                                path: vec![crate::ast::expr::HierPathSegment {
-                                    name: id,
-                                    selects: Vec::new(),
-                                }],
-                                span: sp,
-                                cached_signal_id: std::cell::Cell::new(None),
-                                cached_resolved_name: std::cell::OnceCell::new(),
-                            };
-                            type_args.push(crate::ast::expr::Expression::new(
-                                crate::ast::expr::ExprKind::Ident(hier),
-                                sp,
-                            ));
+                            let arg = self.parse_type_keyword_arg(start);
+                            type_args.push(arg);
                         } else if self.at(TokenKind::KwVirtual)
                             && (self.peek_kind() == TokenKind::KwInterface
                                 || self.peek_kind() == TokenKind::Identifier)
@@ -420,6 +392,53 @@ impl Parser {
             }
         }
         type_args
+    }
+
+    /// A builtin/keyword TYPE as a `#(...)` type parameter argument (e.g.
+    /// `uvm_resource#(int)`). `parse_expression` can't represent a type
+    /// keyword — it yields an Empty expr, losing the specialization — so
+    /// capture the type's leaf name as an Ident expression. Downstream
+    /// per-spec keying (type_bindings / current_spec) then recovers the
+    /// signature, matching the expression-context `Specialization`'s
+    /// `type_args_text`. Class-name args already parse as an Ident via
+    /// `parse_expression`.
+    ///
+    /// A vector type with a packed range (`bit [5:0]`, §6.20.2) keeps its
+    /// whole type as a `TypeLiteral` — the form a data declaration's
+    /// `P#(bit [5:0]) x;` already produces — since the leaf keyword alone
+    /// names a 1-bit type and every property typed by the parameter came
+    /// out the default type's width.
+    fn parse_type_keyword_arg(&mut self, start: usize) -> crate::ast::expr::Expression {
+        let tok_text = self.current().text.clone();
+        let tsp = self.current().span;
+        let dt = self.parse_data_type();
+        let sp = self.span_from(start);
+        if matches!(&dt, crate::ast::types::DataType::IntegerVector { dimensions, .. }
+            if !dimensions.is_empty())
+        {
+            return crate::ast::expr::Expression::new(
+                crate::ast::expr::ExprKind::TypeLiteral(Box::new(dt)),
+                sp,
+            );
+        }
+        let id = crate::ast::Identifier {
+            name: tok_text,
+            span: crate::ast::Span {
+                start: tsp.start,
+                end: tsp.end,
+            },
+        };
+        let hier = crate::ast::expr::HierarchicalIdentifier {
+            root: None,
+            path: vec![crate::ast::expr::HierPathSegment {
+                name: id,
+                selects: Vec::new(),
+            }],
+            span: sp,
+            cached_signal_id: std::cell::Cell::new(None),
+            cached_resolved_name: std::cell::OnceCell::new(),
+        };
+        crate::ast::expr::Expression::new(crate::ast::expr::ExprKind::Ident(hier), sp)
     }
 
     pub(super) fn parse_type_name(&mut self) -> TypeName {
