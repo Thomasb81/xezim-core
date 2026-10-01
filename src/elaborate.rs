@@ -939,7 +939,9 @@ pub struct ElaboratedClass {
     /// `'{prop:value, ...}` in declaration order.
     #[serde(default)]
     pub property_order: Vec<String>,
-    pub methods: HashMap<String, ClassMethod>,
+    /// Shared: a class entry copied per specialization (the simulator's
+    /// §8.25 type-parameter-base entries) shares the method bodies.
+    pub methods: std::sync::Arc<HashMap<String, ClassMethod>>,
     /// Properties marked as 'rand' or 'randc'.
     pub random_properties: HashSet<String>,
     /// Properties declared with the `protected` qualifier (IEEE 1800 §8.2):
@@ -2198,7 +2200,7 @@ fn elaborate_class_in_scope(
         property_types,
         property_order,
         string_properties,
-        methods,
+        methods: std::sync::Arc::new(methods),
         random_properties,
         protected_properties,
         local_properties,
@@ -10091,10 +10093,11 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
             .get_mut(&class_name)
             .map(std::sync::Arc::make_mut)
         {
-            if let Some(existing) = cls.methods.get_mut(&method_name) {
+            let methods = std::sync::Arc::make_mut(&mut cls.methods);
+            if let Some(existing) = methods.get_mut(&method_name) {
                 existing.kind = kind;
             } else {
-                cls.methods.insert(
+                methods.insert(
                     method_name,
                     ClassMethod {
                         qualifiers: Vec::new(),
@@ -11217,7 +11220,7 @@ fn validate_final_method_overrides(elab: &ElaboratedModule) -> Result<(), String
             let Some(parent) = elab.classes.get(&parent_name) else {
                 break;
             };
-            for (mname, pmethod) in &parent.methods {
+            for (mname, pmethod) in parent.methods.iter() {
                 if method_is_final(pmethod) && cdef.methods.contains_key(mname) {
                     return Err(format!(
                         "Class '{}' overrides `:final` method '{}' from ancestor '{}' (IEEE 1800-2023 §8.20.5)",
@@ -11302,7 +11305,7 @@ fn method_specifier(
 fn validate_method_override_markers(elab: &ElaboratedModule) -> Result<(), String> {
     use crate::ast::decl::MethodSpecifier;
     for (cname, cdef) in &elab.classes {
-        for (mname, m) in &cdef.methods {
+        for (mname, m) in cdef.methods.iter() {
             let spec = method_specifier(m);
             if !matches!(
                 spec,
@@ -11659,7 +11662,7 @@ fn validate_class_usage(
                 Some(c) => c,
                 None => continue,
             };
-            for (mname, m) in &iface.methods {
+            for (mname, m) in iface.methods.iter() {
                 let ret = match &m.kind {
                     ClassMethodKind::Function(f)
                     | ClassMethodKind::PureVirtual(f)
