@@ -789,20 +789,19 @@ impl PendingAlways {
                 self.ctx.port_map.keys().collect::<Vec<_>>()
             );
         }
-        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
-        let stmt = rewrite_stmt(
-            &self.source,
-            &self.ctx.prefix,
-            &self.ctx.port_map,
-            &self.ctx.local_names,
-            &self.ctx.interface_map,
-        );
-        clear_type_bind_widths_tls();
-        let stmt = substitute_type_params_stmt(stmt, &self.ctx.type_binds);
-        // `ctx.prefix` is the instance path with a trailing dot ("TB.p1.");
-        // record it (dot-trimmed) as the block's scope, like PendingInitial.
-        // §21.2.1.7: if this block was inside a generate block, append the
-        // generate block scope to the instance path.
+        let stmt = self.rewrite(&self.source);
+        AlwaysBlock {
+            kind: self.kind,
+            stmt,
+            scope: self.scope(),
+        }
+    }
+
+    /// The instance scope `materialize` records: `ctx.prefix` is the
+    /// instance path with a trailing dot ("TB.p1."), recorded dot-trimmed,
+    /// like PendingInitial. §21.2.1.7: inside a generate block, the generate
+    /// block scope is appended to the instance path.
+    pub fn scope(&self) -> String {
         let mut scope = self.ctx.prefix.trim_end_matches('.').to_string();
         if !self.gen_scope.is_empty() {
             if !scope.is_empty() {
@@ -810,11 +809,42 @@ impl PendingAlways {
             }
             scope.push_str(&self.gen_scope);
         }
-        AlwaysBlock {
-            kind: self.kind,
+        scope
+    }
+
+    /// For an `@(...) body` block, its header alone, rewritten exactly as
+    /// `materialize` rewrites it (the event control is rewritten on its own,
+    /// independent of the body): `TimingControl { Event(..), Null }`.
+    /// `None` for any other shape.
+    pub fn materialize_header(&self) -> Option<Statement> {
+        let StatementKind::TimingControl {
+            control: control @ crate::ast::stmt::TimingControl::Event(_),
+            stmt: body,
+        } = &self.source.kind
+        else {
+            return None;
+        };
+        let header = Statement::new(
+            StatementKind::TimingControl {
+                control: control.clone(),
+                stmt: Box::new(Statement::new(StatementKind::Null, body.span)),
+            },
+            self.source.span,
+        );
+        Some(self.rewrite(&header))
+    }
+
+    fn rewrite(&self, stmt: &Statement) -> Statement {
+        set_type_bind_widths_tls(&self.ctx.type_bind_widths);
+        let stmt = rewrite_stmt(
             stmt,
-            scope,
-        }
+            &self.ctx.prefix,
+            &self.ctx.port_map,
+            &self.ctx.local_names,
+            &self.ctx.interface_map,
+        );
+        clear_type_bind_widths_tls();
+        substitute_type_params_stmt(stmt, &self.ctx.type_binds)
     }
 }
 
@@ -22106,7 +22136,34 @@ fn for_each_stmt_expr(stmt: &Statement, f: &mut dyn FnMut(&Expression)) {
 /// segment) are an over-approximation on purpose: a target spelled without
 /// its instance prefix inside a task body must still exclude the prefixed net.
 pub fn collect_override_target_leaves(elab: &ElaboratedModule) -> crate::hasher::HashSet<String> {
-    collect_write_targets(elab).0
+    collect_write_targets(Some(elab), &mut |_| {}).0
+}
+
+/// The two censuses of a single statement, as written (no instance rewrite
+/// applied): (override target leaves, procedurally written flat names).
+#[allow(clippy::type_complexity)]
+pub fn stmt_write_targets(
+    stmt: &Statement,
+) -> (
+    crate::hasher::HashSet<String>,
+    crate::hasher::HashSet<String>,
+) {
+    collect_write_targets(None, &mut |visit| visit(stmt))
+}
+
+/// Both write censuses in one walk: (`collect_override_target_leaves`,
+/// `collect_procedural_write_names`). `extra` hands further process bodies
+/// to the walk (each through the visitor it is given), for always blocks
+/// the caller holds outside `elab`.
+#[allow(clippy::type_complexity)]
+pub fn collect_write_target_sets(
+    elab: &ElaboratedModule,
+    extra: &mut dyn FnMut(&mut dyn FnMut(&Statement)),
+) -> (
+    crate::hasher::HashSet<String>,
+    crate::hasher::HashSet<String>,
+) {
+    collect_write_targets(Some(elab), extra)
 }
 
 /// Flat names of every variable written by a procedural assignment
@@ -22118,11 +22175,12 @@ pub fn collect_override_target_leaves(elab: &ElaboratedModule) -> crate::hasher:
 /// needs this to keep the delta step between a procedurally written variable
 /// and a net that copies it).
 pub fn collect_procedural_write_names(elab: &ElaboratedModule) -> crate::hasher::HashSet<String> {
-    collect_write_targets(elab).1
+    collect_write_targets(Some(elab), &mut |_| {}).1
 }
 
 fn collect_write_targets(
-    elab: &ElaboratedModule,
+    elab: Option<&ElaboratedModule>,
+    extra: &mut dyn FnMut(&mut dyn FnMut(&Statement)),
 ) -> (
     crate::hasher::HashSet<String>,
     crate::hasher::HashSet<String>,
@@ -22253,9 +22311,14 @@ fn collect_write_targets(
         overrides: crate::hasher::HashSet::default(),
         writes: crate::hasher::HashSet::default(),
     };
+    let Some(elab) = elab else {
+        extra(&mut |st: &Statement| walk(st, &mut out));
+        return (out.overrides, out.writes);
+    };
     for b in &elab.always_blocks {
         walk(&b.stmt, &mut out);
     }
+    extra(&mut |st: &Statement| walk(st, &mut out));
     for b in elab.initial_blocks.iter().chain(elab.final_blocks.iter()) {
         walk(&b.stmt, &mut out);
     }
@@ -30679,8 +30742,8 @@ fn inline_module_items(
                                         .insert(sig_name.clone(), dd.data_type.clone());
                                     continue;
                                 }
-                                if std::env::var("XEZIM_DBG_ARR").is_ok()
-                                    && sig_name.contains("ram0.mem")
+                                if sig_name.contains("ram0.mem")
+                                    && std::env::var("XEZIM_DBG_ARR").is_ok()
                                 {
                                     let mut p: Vec<_> = sub_merged_params.iter().collect();
                                     p.sort_by_key(|(k, _)| k.as_str());
