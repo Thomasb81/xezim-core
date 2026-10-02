@@ -1,6 +1,53 @@
 use crate::ast::{Description, decl::ModuleItem};
 use crate::parse;
 
+/// §16.10: unsupported assertion-local state must not erase an assertion's
+/// body without a diagnostic, including typedef and packed local types.
+#[test]
+fn assertion_local_declarations_are_diagnosed() {
+    for kind in ["property", "sequence"] {
+        for declaration in [
+            "time stamp;",
+            "int counter;",
+            "logic [7:0] sample;",
+            "stamp_t stamp;",
+            "scope_pkg::stamp_t stamp;",
+        ] {
+            let source = format!(
+                "module m; bit clk; typedef time stamp_t; \
+                 {kind} p; {declaration} @(posedge clk) 1'b0; end{kind} \
+                 endmodule"
+            );
+            let result = parse(&source);
+            assert!(
+                result.errors.iter().any(|e| e.message.contains(&format!(
+                    "{kind}-local variable declarations are not supported"
+                ))),
+                "{kind} {declaration}: {:?}",
+                result.errors
+            );
+        }
+    }
+}
+
+#[test]
+fn assertion_body_expressions_are_not_local_declarations() {
+    let source = r#"
+module m;
+  bit clk, a, b;
+  typedef int sample_t;
+  property p; @(posedge clk) a |=> b; endproperty
+  property with_input(input bit expected); @(posedge clk) expected |=> b; endproperty
+  sequence s; a ##1 b; endsequence
+  sequence with_output(input bit expected, local output int stamp); expected ##1 b; endsequence
+  sequence typed; sample_t'(a) == 0; endsequence
+  sequence builtin; int'(a) == 0; endsequence
+endmodule
+"#;
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+}
+
 #[test]
 fn test_function_ports_implicit_packed() {
     let source = "module m; function void f(input [7:0] a); endfunction endmodule";

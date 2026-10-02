@@ -9,6 +9,34 @@ use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
 impl Parser {
+    /// §16.10: assertion-local variables need per-attempt storage. The
+    /// current property/sequence body representation cannot retain those
+    /// declarations; do not silently skip the body and leave an inert check.
+    fn diagnose_sva_local_declaration(&mut self, kind: &str) {
+        if !self.is_type_start() && !self.at(TokenKind::KwVar) {
+            return;
+        }
+        // Distinguish a declaration from a typedef cast or an ordinary
+        // sequence expression without consuming either spelling.
+        let saved_pos = self.pos;
+        let saved_diagnostics = self.diagnostics.len();
+        self.eat(TokenKind::KwVar);
+        self.parse_data_type();
+        let declaration = self.diagnostics.len() == saved_diagnostics
+            && matches!(
+                self.current_kind(),
+                TokenKind::Identifier | TokenKind::EscapedIdentifier
+            );
+        self.pos = saved_pos;
+        self.diagnostics.truncate(saved_diagnostics);
+        if declaration {
+            self.error(format!(
+                "{kind}-local variable declarations are not supported; \
+                 assertion-local variables require per-attempt storage (IEEE 1800-2017 §16.10)"
+            ));
+        }
+    }
+
     pub(super) fn parse_module_declaration(&mut self) -> ModuleDeclaration {
         let start = self.current().span.start;
         let outer_loops = std::mem::take(&mut self.plain_loop_vars);
@@ -1757,6 +1785,7 @@ impl Parser {
                     Vec::new()
                 };
                 self.expect(TokenKind::Semicolon);
+                self.diagnose_sva_local_declaration("property");
                 // LRM §16.6 — capture the property body when it matches
                 // the common `@(<event>) <expr>;` shape. Re-uses the
                 // assertion parser's clock-event capture (an
@@ -1835,6 +1864,7 @@ impl Parser {
                     Vec::new()
                 };
                 self.expect(TokenKind::Semicolon);
+                self.diagnose_sva_local_declaration("sequence");
                 // LRM §16.5 — capture the sequence body when it matches
                 // the common `@(<event>) <expr>;` shape, mirroring the
                 // property-decl path. Other shapes (raw `##N` chains)
