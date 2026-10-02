@@ -8,6 +8,9 @@ fn assertion_local_declarations_are_diagnosed() {
     for kind in ["property", "sequence"] {
         for declaration in [
             "time stamp;",
+            "var stamp;",
+            "var stamp = 1'b0;",
+            "var [3:0] stamp;",
             "int counter;",
             "logic [7:0] sample;",
             "stamp_t stamp;",

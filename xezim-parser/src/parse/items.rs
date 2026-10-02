@@ -20,13 +20,15 @@ impl Parser {
         // sequence expression without consuming either spelling.
         let saved_pos = self.pos;
         let saved_diagnostics = self.diagnostics.len();
-        self.eat(TokenKind::KwVar);
+        let explicit_var = self.eat(TokenKind::KwVar).is_some();
         self.parse_data_type();
-        let declaration = self.diagnostics.len() == saved_diagnostics
-            && matches!(
-                self.current_kind(),
-                TokenKind::Identifier | TokenKind::EscapedIdentifier
-            );
+        // `var` also permits an implicit type, as in `var stamp;`.
+        let declaration = explicit_var
+            || (self.diagnostics.len() == saved_diagnostics
+                && matches!(
+                    self.current_kind(),
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                ));
         self.pos = saved_pos;
         self.diagnostics.truncate(saved_diagnostics);
         if declaration {
