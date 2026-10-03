@@ -24873,6 +24873,43 @@ fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleI
             Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 }),
         );
     }
+    // §23.6/§27.6: an INSTANCE declared in a nested generate block keeps its
+    // bare name here (the instance path gets each scope later, innermost
+    // first), but an enclosing iteration already rewrote references to it to
+    // `<outer>[i].u`. Map those to `<outer>[i].<this>[j].u` as well, the way
+    // a renamed declaration composes; without it a relative `u.report()` or
+    // `u.n` two generate levels deep named a nonexistent `<outer>[i].u`.
+    if let GenRename::Scope(_) = rename {
+        let mut inst_names: HashSet<String> = HashSet::default();
+        collect_instance_names_in_items(items, &mut inst_names);
+        if !inst_names.is_empty() {
+            let mut heads: HashSet<String> = HashSet::default();
+            collect_scoped_instance_heads(items, &inst_names, &mut heads);
+            for h in heads {
+                if port_map.contains_key(&h) {
+                    continue;
+                }
+                let renamed = rename.apply(&h);
+                let hier = HierarchicalIdentifier {
+                    root: None,
+                    path: vec![HierPathSegment {
+                        name: Identifier {
+                            name: renamed,
+                            span: Span { start: 0, end: 0 },
+                        },
+                        selects: Vec::new(),
+                    }],
+                    span: Span { start: 0, end: 0 },
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                port_map.insert(
+                    h,
+                    Expression::new(ExprKind::Ident(hier), Span { start: 0, end: 0 }),
+                );
+            }
+        }
+    }
     let local_names: std::collections::HashSet<String> = std::collections::HashSet::default();
     let interface_map: HashMap<String, String> = HashMap::default();
     items
@@ -24888,6 +24925,103 @@ fn rename_decls_in_iter(items: &[ModuleItem], rename: &GenRename) -> Vec<ModuleI
             )
         })
         .collect()
+}
+
+/// Every module-instance name declared in `items`, nested generate blocks
+/// included.
+fn collect_instance_names_in_items(items: &[ModuleItem], out: &mut HashSet<String>) {
+    for item in items {
+        match item {
+            ModuleItem::ModuleInstantiation(mi) => {
+                for hi in &mi.instances {
+                    out.insert(hi.name.name.clone());
+                }
+            }
+            ModuleItem::GenerateRegion(gr) => collect_instance_names_in_items(&gr.items, out),
+            ModuleItem::GenerateIf(gi) => {
+                for (_, branch) in &gi.branches {
+                    collect_instance_names_in_items(branch, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    collect_instance_names_in_items(&arm.items, out);
+                }
+            }
+            ModuleItem::GenerateFor(gf) => collect_instance_names_in_items(&gf.items, out),
+            _ => {}
+        }
+    }
+}
+
+/// The scoped reference heads `<scope>.<inst>` (`<inst>` in `insts`) that
+/// the expressions of `items` use, nested generate blocks included.
+fn collect_scoped_instance_heads(
+    items: &[ModuleItem],
+    insts: &HashSet<String>,
+    out: &mut HashSet<String>,
+) {
+    fn heads_in(e: &Expression, insts: &HashSet<String>, out: &mut HashSet<String>) {
+        for_each_sub_expr(e, &mut |x: &Expression| {
+            if let ExprKind::Ident(h) = &x.kind {
+                if let Some(head) = h.path.first().map(|s| s.name.name.as_str()) {
+                    if let Some((scope, leaf)) = head.rsplit_once('.') {
+                        if !scope.is_empty() && insts.contains(leaf) {
+                            out.insert(head.to_string());
+                        }
+                    }
+                }
+            }
+        })
+    }
+    for item in items {
+        let mut visit = |e: &Expression| heads_in(e, insts, out);
+        match item {
+            ModuleItem::AlwaysConstruct(ac) => for_each_stmt_expr(&ac.stmt, &mut visit),
+            ModuleItem::InitialConstruct(ic) => for_each_stmt_expr(&ic.stmt, &mut visit),
+            ModuleItem::FinalConstruct(fc) => for_each_stmt_expr(&fc.stmt, &mut visit),
+            ModuleItem::ContinuousAssign(ca) => {
+                for (l, r) in &ca.assignments {
+                    visit(l);
+                    visit(r);
+                }
+            }
+            ModuleItem::ModuleInstantiation(mi) => {
+                for hi in &mi.instances {
+                    for conn in &hi.connections {
+                        if let PortConnection::Named { expr: Some(e), .. }
+                        | PortConnection::Ordered(Some(e)) = conn
+                        {
+                            visit(e);
+                        }
+                    }
+                }
+            }
+            ModuleItem::FunctionDeclaration(fd) => {
+                for st in &fd.items {
+                    for_each_stmt_expr(st, &mut visit);
+                }
+            }
+            ModuleItem::TaskDeclaration(td) => {
+                for st in &td.items {
+                    for_each_stmt_expr(st, &mut visit);
+                }
+            }
+            ModuleItem::GenerateRegion(gr) => collect_scoped_instance_heads(&gr.items, insts, out),
+            ModuleItem::GenerateIf(gi) => {
+                for (_, branch) in &gi.branches {
+                    collect_scoped_instance_heads(branch, insts, out);
+                }
+            }
+            ModuleItem::GenerateCase(gc) => {
+                for arm in &gc.arms {
+                    collect_scoped_instance_heads(&arm.items, insts, out);
+                }
+            }
+            ModuleItem::GenerateFor(gf) => collect_scoped_instance_heads(&gf.items, insts, out),
+            _ => {}
+        }
+    }
 }
 
 fn rename_item_decls(
