@@ -17408,10 +17408,39 @@ pub fn const_eval_i64_with_params(
             }
         }
         ExprKind::Unary { op, operand } => {
-            // For reduction operators the bit-width matters; without a known
-            // declared width we treat the value as its i64 footprint. Good
-            // enough for typical const-expr usage (e.g. `|MASK`, `&ALL_ONES`).
-            let v = const_eval_i64_with_params(operand, params)?;
+            let scalar = const_eval_i64_with_params(operand, params);
+            // §11.4.9: reduction operands are self-determined. Reduce before
+            // narrowing to i64: high bits, narrow signed operands and literals
+            // too wide for i64 must all retain their declared width. Do not
+            // let the Value evaluator's unresolved-name default turn an
+            // incomplete parameter binding into a resolved range.
+            if matches!(
+                op,
+                UnaryOp::BitAnd
+                    | UnaryOp::BitNand
+                    | UnaryOp::BitOr
+                    | UnaryOp::BitNor
+                    | UnaryOp::BitXor
+                    | UnaryOp::BitXnor
+            ) {
+                let empty = HashMap::default();
+                let env = params.unwrap_or(&empty);
+                if scalar.is_some() || is_const_expr(operand, env) {
+                    let val = eval_const_expr_val(operand, env);
+                    if !val.is_real {
+                        let reduced = match op {
+                            UnaryOp::BitAnd => val.reduce_and(),
+                            UnaryOp::BitNand => val.reduce_and().logic_not(),
+                            UnaryOp::BitOr => val.reduce_or(),
+                            UnaryOp::BitNor => val.reduce_or().logic_not(),
+                            UnaryOp::BitXor => val.reduce_xor(),
+                            _ => val.reduce_xor().logic_not(),
+                        };
+                        return reduced.to_index();
+                    }
+                }
+            }
+            let v = scalar?;
             match op {
                 UnaryOp::Plus => Some(v),
                 UnaryOp::Minus => Some(v.wrapping_neg()),
