@@ -3779,6 +3779,22 @@ impl Value {
 
     // === Reduction ===
 
+    /// The live (value, xz) plane words of a `Wide` value, LSB word first,
+    /// with any bits at or above `nbits` in the top word cleared.
+    #[inline]
+    fn wide_words(bits: &WidePlanes) -> impl Iterator<Item = (u64, u64)> + '_ {
+        let n = WidePlanes::nwords(bits.nbits);
+        let r = bits.nbits % 64;
+        let top = if r == 0 { u64::MAX } else { (1u64 << r) - 1 };
+        (0..n).map(move |i| {
+            let m = if i + 1 == n { top } else { u64::MAX };
+            (
+                bits.val.get(i).copied().unwrap_or(0) & m,
+                bits.xz.get(i).copied().unwrap_or(0) & m,
+            )
+        })
+    }
+
     #[inline]
     pub fn reduce_and(&self) -> Value {
         // §11.4.8 (Table 11-13): a known 0 bit forces the result to 0 even in
@@ -3798,9 +3814,20 @@ impl Value {
                 }
             }
             ValueStorage::Wide(bits) => {
-                if bits.contains(&LogicBit::Zero) {
-                    Value::from_u64(0, 1)
-                } else if bits.iter().any(|b| !b.is_known()) {
+                // Word-wise over both planes: a known 0 is `!v & !x` within
+                // the live mask of each word.
+                let n = WidePlanes::nwords(bits.nbits);
+                let r = bits.nbits % 64;
+                let top = if r == 0 { u64::MAX } else { (1u64 << r) - 1 };
+                let mut any_x = false;
+                for (i, (v, x)) in Self::wide_words(bits).enumerate() {
+                    let m = if i + 1 == n { top } else { u64::MAX };
+                    if !v & !x & m != 0 {
+                        return Value::from_u64(0, 1);
+                    }
+                    any_x |= x != 0;
+                }
+                if any_x {
                     Value::new(1)
                 } else {
                     Value::from_u64(1, 1)
@@ -3823,9 +3850,14 @@ impl Value {
                 }
             }
             ValueStorage::Wide(bits) => {
-                if bits.contains(&LogicBit::One) {
-                    Value::from_u64(1, 1)
-                } else if bits.iter().any(|b| !b.is_known()) {
+                let mut any_x = false;
+                for (v, x) in Self::wide_words(bits) {
+                    if v & !x != 0 {
+                        return Value::from_u64(1, 1);
+                    }
+                    any_x |= x != 0;
+                }
+                if any_x {
                     Value::new(1)
                 } else {
                     Value::from_u64(0, 1)
@@ -3834,13 +3866,35 @@ impl Value {
         }
     }
 
+    /// §11.4.9: the parity of EVERY bit; any X/Z bit makes it x. The old
+    /// form parity-counted `to_u64()`, which a `Wide` value cannot give, so
+    /// every bit above 63 was dropped (`^(128'h1 << 64)` was 0).
     #[inline]
     pub fn reduce_xor(&self) -> Value {
-        if self.has_xz() {
-            return Value::new(1);
+        match &self.storage {
+            ValueStorage::Inline { val_bits, xz_bits } => {
+                let mask = Self::mask(self.width);
+                if *xz_bits & mask != 0 {
+                    Value::new(1)
+                } else {
+                    Value::from_u64(((*val_bits & mask).count_ones() & 1) as u64, 1)
+                }
+            }
+            ValueStorage::Wide(bits) => Self::reduce_xor_wide(bits),
         }
-        let v = self.to_u64().unwrap_or(0);
-        Value::from_u64(v.count_ones() as u64 % 2, 1)
+    }
+
+    // Keep the word loop out of callers that reduce mostly inline values.
+    #[inline(never)]
+    fn reduce_xor_wide(bits: &WidePlanes) -> Value {
+        let mut ones = 0u32;
+        for (v, x) in Self::wide_words(bits) {
+            if x != 0 {
+                return Value::new(1);
+            }
+            ones ^= v.count_ones() & 1;
+        }
+        Value::from_u64(ones as u64, 1)
     }
 
     // === Concatenation ===
@@ -4125,6 +4179,84 @@ impl fmt::Display for Value {
 
 #[cfg(test)]
 mod tests {
+    /// §11.4.9: every reduction against a bit-by-bit model, on widths that
+    /// straddle the inline/wide boundary and 4-state contents.
+    #[test]
+    fn reductions_match_a_bitwise_model() {
+        use super::*;
+        fn model(v: &Value) -> (LogicBit, LogicBit, LogicBit) {
+            let bits: Vec<LogicBit> = (0..v.width as usize).map(|i| v.get_bit(i)).collect();
+            let and = if bits.contains(&LogicBit::Zero) {
+                LogicBit::Zero
+            } else if bits.iter().any(|b| !b.is_known()) {
+                LogicBit::X
+            } else {
+                LogicBit::One
+            };
+            let or = if bits.contains(&LogicBit::One) {
+                LogicBit::One
+            } else if bits.iter().any(|b| !b.is_known()) {
+                LogicBit::X
+            } else {
+                LogicBit::Zero
+            };
+            let xor = if bits.iter().any(|b| !b.is_known()) {
+                LogicBit::X
+            } else if bits.iter().filter(|b| **b == LogicBit::One).count() % 2 == 1 {
+                LogicBit::One
+            } else {
+                LogicBit::Zero
+            };
+            (and, or, xor)
+        }
+        let states = [LogicBit::Zero, LogicBit::One, LogicBit::X, LogicBit::Z];
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        for width in [1u32, 7, 63, 64, 65, 96, 127, 128, 129, 200] {
+            for case in 0..24 {
+                let mut v = Value::zero(width);
+                for i in 0..width as usize {
+                    seed ^= seed << 13;
+                    seed ^= seed >> 7;
+                    seed ^= seed << 17;
+                    let b = match case % 4 {
+                        // mostly-ones (exercises &), sparse ones, 2-state, 4-state
+                        0 => {
+                            if seed % 31 == 0 {
+                                LogicBit::Zero
+                            } else {
+                                LogicBit::One
+                            }
+                        }
+                        1 => {
+                            if seed % 29 == 0 {
+                                LogicBit::One
+                            } else {
+                                LogicBit::Zero
+                            }
+                        }
+                        2 => {
+                            if seed & 1 == 1 {
+                                LogicBit::One
+                            } else {
+                                LogicBit::Zero
+                            }
+                        }
+                        _ => states[(seed % 4) as usize],
+                    };
+                    v.set_bit(i, b);
+                }
+                let (a, o, x) = model(&v);
+                assert_eq!(v.reduce_and().get_bit(0), a, "& width {width} case {case}");
+                assert_eq!(v.reduce_or().get_bit(0), o, "| width {width} case {case}");
+                assert_eq!(v.reduce_xor().get_bit(0), x, "^ width {width} case {case}");
+            }
+        }
+        // The reported shape: a single 1 above bit 63.
+        let mut hi = Value::zero(128);
+        hi.set_bit(64, LogicBit::One);
+        assert_eq!(hi.reduce_xor().to_u64(), Some(1));
+    }
+
     #[test]
     fn wide_unknown_merge_matches_scalar_reference() {
         use super::*;
