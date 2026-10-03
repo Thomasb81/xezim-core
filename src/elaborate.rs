@@ -1572,7 +1572,12 @@ fn elaborate_class_in_scope(
                                             ..
                                         }
                                     ) {
-                                        let kw = resolve_type_width(kdt, class_params, None);
+                                        // A typedef'd key (`k12_t`) resolves through the
+                                        // installed typedef table; without it the
+                                        // index width fell back to 32 bits.
+                                        let kw = typedefs_snapshot(|td| {
+                                            resolve_type_width(kdt, class_params, td)
+                                        });
                                         if kw > 0 {
                                             static_assoc_index_props.insert(
                                                 decl.name.name.clone(),
@@ -1659,7 +1664,12 @@ fn elaborate_class_in_scope(
                             // so the runtime narrows a wider index expression.
                             if !is_string_key {
                                 if let Some(kdt) = key_dt.as_ref() {
-                                    let kw = resolve_type_width(kdt, class_params, None);
+                                    // A typedef'd key (`k12_t`) resolves through the
+                                    // installed typedef table; without it the
+                                    // index width fell back to 32 bits.
+                                    let kw = typedefs_snapshot(|td| {
+                                        resolve_type_width(kdt, class_params, td)
+                                    });
                                     if kw > 0 {
                                         assoc_index_props.insert(
                                             decl.name.name.clone(),
@@ -7151,10 +7161,6 @@ pub fn elaborate_module_with_defs(
                         });
                         elab.associative_arrays
                             .insert(decl.name.name.clone(), is_string_key);
-                        if let Some(DataType::TypeReference { name: kt, .. }) = key_dt.as_deref() {
-                            elab.assoc_key_type_names
-                                .insert(decl.name.name.clone(), kt.name.name.clone());
-                        }
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
@@ -7175,20 +7181,17 @@ pub fn elaborate_module_with_defs(
                         // type. Record the key width + signedness so the runtime
                         // can narrow a wider index expression before keying
                         // (`int k; aa[k]` on `shortint aa[shortint]`).
-                        if !is_string_key {
-                            if let Some(kdt) = key_dt.as_ref() {
-                                let kw = crate::elaborate::resolve_type_width(
-                                    kdt,
-                                    Some(&elab.parameters),
-                                    Some(&elab.typedefs),
-                                );
-                                if kw > 0 {
-                                    elab.assoc_index_widths.insert(
-                                        decl.name.name.clone(),
-                                        (kw, crate::elaborate::is_type_signed(kdt)),
-                                    );
-                                }
-                            }
+                        let (kiw, ktn) = assoc_key_type_info(
+                            key_dt.as_deref(),
+                            &elab.parameters,
+                            &elab.typedefs,
+                            &elab.typedef_types,
+                        );
+                        if let Some(iw) = kiw {
+                            elab.assoc_index_widths.insert(decl.name.name.clone(), iw);
+                        }
+                        if let Some(tn) = ktn {
+                            elab.assoc_key_type_names.insert(decl.name.name.clone(), tn);
                         }
                         if let Some(init_expr) = &decl.init {
                             if let ExprKind::AssignmentPattern(items) = &init_expr.kind {
@@ -13747,6 +13750,18 @@ fn elaborate_items_numbered(
                         if width > 0 {
                             elab.assoc_elem_widths.insert(decl.name.name.clone(), width);
                         }
+                        let (kiw, ktn) = assoc_key_type_info(
+                            key_dt.as_deref(),
+                            &elab.parameters,
+                            &elab.typedefs,
+                            &elab.typedef_types,
+                        );
+                        if let Some(iw) = kiw {
+                            elab.assoc_index_widths.insert(decl.name.name.clone(), iw);
+                        }
+                        if let Some(tn) = ktn {
+                            elab.assoc_key_type_names.insert(decl.name.name.clone(), tn);
+                        }
                     }
                     let is_dynamic_dim = decl.dimensions.first().is_some_and(|d| {
                         matches!(
@@ -16464,6 +16479,39 @@ pub fn resolve_typedef_chain<'a>(
         }
     }
     cur
+}
+
+/// §7.8.2: what the runtime needs about an associative array's KEY type —
+/// its (width, signedness) for an integral key, and the typedef name a
+/// `TypeReference` key names (enum key rendering). A string or wildcard key
+/// has no index width.
+fn assoc_key_type_info(
+    kdt: Option<&DataType>,
+    params: &HashMap<String, Value>,
+    typedefs: &HashMap<String, u32>,
+    typedef_types: &HashMap<String, DataType>,
+) -> (Option<(u32, bool)>, Option<String>) {
+    let Some(kdt) = kdt else {
+        return (None, None);
+    };
+    let tn = match kdt {
+        DataType::TypeReference { name, .. } => Some(name.name.name.clone()),
+        _ => None,
+    };
+    if matches!(
+        resolve_typedef_chain(kdt, typedef_types),
+        DataType::Simple {
+            kind: SimpleType::String,
+            ..
+        }
+    ) {
+        return (None, tn);
+    }
+    let kw = resolve_type_width(kdt, Some(params), Some(typedefs));
+    (
+        (kw > 0).then(|| (kw, is_type_signed_resolved(kdt, typedef_types))),
+        tn,
+    )
 }
 
 /// Resolve the width of a data type.
@@ -30852,6 +30900,22 @@ fn inline_module_items(
                                         if width > 0 {
                                             elab.assoc_elem_widths.insert(sig_name.clone(), width);
                                         }
+                                        // §7.8.2: the KEY type, in this instance's parameter
+                                        // scope, exactly as the module-scope arm records it.
+                                        // Without it a `foreach` key variable over
+                                        // `mem[logic [KW-1:0]]` in a child was 32 bits wide.
+                                        let (kiw, ktn) = assoc_key_type_info(
+                                            kdt.as_deref(),
+                                            &sub_merged_params,
+                                            &elab.typedefs,
+                                            &elab.typedef_types,
+                                        );
+                                        if let Some(iw) = kiw {
+                                            elab.assoc_index_widths.insert(sig_name.clone(), iw);
+                                        }
+                                        if let Some(tn) = ktn {
+                                            elab.assoc_key_type_names.insert(sig_name.clone(), tn);
+                                        }
                                     }
                                     _ => {}
                                 }
@@ -38529,6 +38593,43 @@ fn process_import(
 #[cfg(test)]
 mod logged_map_tests {
     use super::*;
+
+    /// §7.8.2: a string key reached through typedef aliases remains unbounded;
+    /// its placeholder type width must not become an integral index width.
+    #[test]
+    fn aliased_string_key_has_no_integral_width() {
+        fn alias(name: &str) -> DataType {
+            let span = Span::new(0, 0);
+            DataType::TypeReference {
+                name: crate::ast::types::TypeName {
+                    scope: None,
+                    name: Identifier {
+                        name: name.into(),
+                        span,
+                    },
+                    span,
+                },
+                dimensions: Vec::new(),
+                type_args: Vec::new(),
+                span,
+            }
+        }
+        let mut types = HashMap::default();
+        types.insert(
+            "text_t".into(),
+            DataType::Simple {
+                kind: SimpleType::String,
+                span: Span::new(0, 0),
+            },
+        );
+        types.insert("key_t".into(), alias("text_t"));
+        let mut widths = HashMap::default();
+        widths.insert("key_t".into(), 32);
+        assert_eq!(
+            assoc_key_type_info(Some(&alias("key_t")), &HashMap::default(), &widths, &types),
+            (None, Some("key_t".into())),
+        );
+    }
 
     fn tls_snapshot() -> Option<HashMap<String, u32>> {
         TYPEDEFS_TLS.with(|c| c.borrow().clone())
