@@ -157,7 +157,8 @@ pub use value::Value;
 /// (LoadSignalRange/LoadSignalBit) in cached bytecode; \x03 =
 /// zstd-compressed varint bincode body (\x02 = uncompressed varint,
 /// \x01 = uncompressed fixint).
-pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x20";
+/// \x21 = \x20 + chained TypeName scopes and per-scope type arguments.
+pub const XEZIM_BYTECODE_MAGIC: &[u8; 8] = b"XEZIMBC\x21";
 
 /// Name of the synthetic root that instantiates every top of a multi-top
 /// design (§23.3.3), each instance named after its module. It is not part of

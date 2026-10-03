@@ -1973,7 +1973,7 @@ fn elaborate_class_in_scope(
                         cg_name.clone(),
                         DataType::TypeReference {
                             name: TypeName {
-                                scope: None,
+                                scopes: Vec::new(),
                                 name: Identifier {
                                     name: cg_name.clone(),
                                     span: cg.name.span,
@@ -3668,6 +3668,118 @@ pub fn register_class_enum_members(c: &ClassDeclaration, elab: &mut ElaboratedMo
     }
 }
 
+/// §8.23: register a class's typedefs under their CLASS-QUALIFIED keys so
+/// a chained scope reference in a type position — `pkg::Cls::td`,
+/// `Cls::td` (imported), and nested `pkg::Cls::Sub::td` — resolves.
+/// `register_class_enum_members` registers only the BARE name, so a
+/// class-scope reference had no key to hit and fell back to 32 bits (or
+/// failed to resolve at all). `pkg` is the enclosing package's name when
+/// the class lives in one; both the package-qualified and the imported
+/// (class-chain-only) spellings are registered. Widths are sized against
+/// the class's own value-parameter scope (the DEFAULT specialization);
+/// a `Cls#(args)::td` reference is resolved at its use site by
+/// `specialized_class_scope_width`.
+pub fn register_class_scoped_typedef_aliases(
+    c: &ClassDeclaration,
+    pkg: Option<&str>,
+    elab: &mut ElaboratedModule,
+) {
+    let mut prefixes: Vec<String> = Vec::new();
+    if let Some(p) = pkg {
+        prefixes.push(format!("{}::{}", p, c.name.name));
+    }
+    prefixes.push(c.name.name.clone());
+    let params = class_const_scope(c, None);
+    walk_class_typedefs(c, &prefixes, &params, elab);
+    type_trace_tls_refresh("class_scope_alias", &elab.typedefs);
+    sync_typedefs_tls(&elab.typedefs);
+}
+
+/// Recursive worker for [`register_class_scoped_typedef_aliases`]: a
+/// class's own typedefs under every prefix, then its NESTED classes under
+/// the extended chain (§8.23 `pkg::Outer::Inner::td`).
+fn walk_class_typedefs(
+    c: &ClassDeclaration,
+    prefixes: &[String],
+    params: &HashMap<String, Value>,
+    elab: &mut ElaboratedModule,
+) {
+    for item in &c.items {
+        match item {
+            ClassItem::Typedef(td) => {
+                for pfx in prefixes {
+                    let key = format!("{}::{}", pfx, td.name.name);
+                    let w = resolve_type_width(&td.data_type, Some(params), Some(&elab.typedefs));
+                    typedefs_insert_traced(
+                        &mut elab.typedefs,
+                        "insert:class_scope_alias",
+                        key.clone(),
+                        w,
+                    );
+                    elab.typedef_types.insert(key.clone(), td.data_type.clone());
+                    if !td.dimensions.is_empty() {
+                        elab.typedef_unpacked_dims
+                            .insert(key.clone(), td.dimensions.clone());
+                    }
+                }
+            }
+            ClassItem::Class(sub) => {
+                let nested: Vec<String> = prefixes
+                    .iter()
+                    .map(|p| format!("{}::{}", p, sub.name.name))
+                    .collect();
+                let mut sub_params = params.clone();
+                for p in &sub.params {
+                    if let crate::ast::decl::ParameterKind::Data { assignments, .. } = &p.kind {
+                        for a in assignments {
+                            if let Some(init) = &a.init {
+                                let v = eval_const_expr_val(init, &sub_params);
+                                sub_params.insert(a.name.name.clone(), v);
+                            }
+                        }
+                    }
+                }
+                walk_class_typedefs(sub, &nested, &sub_params, elab);
+            }
+            _ => {}
+        }
+    }
+}
+
+/// §8.25.1: the width of a `Cls#(args)::td` (or `pkg::Cls#(args)::td`)
+/// reference — a PARAMETERIZED class used as a scope prefix. The
+/// string-keyed tables hold only the DEFAULT specialization, so the class
+/// is walked from `elab.classes`, the `#(...)` args are bound to its
+/// `param_order`, and the typedef's target is sized under those bindings
+/// (`VecGen#(6)::vec_t` with `typedef logic [W-1:0] vec_t` → 6).
+pub fn specialized_class_scope_width(
+    name: &crate::ast::types::TypeName,
+    elab: &ElaboratedModule,
+) -> Option<u32> {
+    // The scope link carrying `#(...)` args names the specialized class.
+    let link = name.scopes.iter().rev().find(|s| !s.type_args.is_empty())?;
+    let cls = elab.classes.get(&link.name.name)?;
+    // Bind the class's value parameters: defaults first, then the
+    // positional `#(...)` args in `param_order` (type and value params
+    // interleaved, §6.20.2).
+    let mut params: HashMap<String, Value> = HashMap::default();
+    for (pn, init) in &cls.param_defaults {
+        if let Some(init) = init {
+            let v = eval_const_expr_val(init, &params);
+            params.insert(pn.clone(), v);
+        }
+    }
+    for (i, arg) in link.type_args.iter().enumerate() {
+        if let Some(pn) = cls.param_order.get(i) {
+            let v = eval_const_expr_val(arg, &params);
+            params.insert(pn.clone(), v);
+        }
+    }
+    let target = cls.typedef_targets.get(&name.name.name)?;
+    let w = resolve_type_width(target, Some(&params), Some(&elab.typedefs));
+    Some(w.max(1))
+}
+
 /// Evaluate every package's parameters to a fixpoint, registering each under
 /// its scoped `pkg::name` alias. Bare names are NOT registered — visibility
 /// stays with the import machinery (`import p::A` must not expose `B`).
@@ -3817,7 +3929,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
             let crate::ast::decl::PackageItem::Function(f) = item else {
                 continue;
             };
-            if f.name.scope.is_some() {
+            if f.name.has_scope() {
                 continue;
             }
             elab.functions
@@ -3861,7 +3973,7 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
                 let crate::ast::decl::PackageItem::Function(f) = item else {
                     continue;
                 };
-                if f.name.scope.is_some() {
+                if f.name.has_scope() {
                     continue;
                 }
                 let key = f.name.name.name.clone();
@@ -3990,12 +4102,73 @@ pub fn register_scoped_typedef_alias(
     sync_typedefs_tls(&elab.typedefs);
 }
 
+/// §26.3 / §8.23: look a (possibly `::`-chained) type name up in one of
+/// the elaborator's string-keyed typedef tables. The FULL chain key
+/// (`pkg::cls::td`) is tried first — package walks and class-scope
+/// registration both key it — then the bare leaf, which preserves the
+/// old single-link behavior exactly (`pkg::td` tried `pkg::td`, then
+/// `td`).
+pub fn lookup_scoped_type<'a, T>(
+    name: &crate::ast::types::TypeName,
+    table: &'a HashMap<String, T>,
+) -> Option<&'a T> {
+    if name.scopes.is_empty() {
+        return table.get(&name.name.name);
+    }
+    table
+        .get(&name.qualified())
+        .or_else(|| table.get(&name.name.name))
+}
+
+/// A (possibly nested) `MemberAccess` chain rooted at a plain identifier —
+/// the expression shape of `pkg::wide_t` / `pkg::cls::t` — flattened into
+/// (scope links, leaf name). `None` when the expression is not a pure
+/// name chain (calls, selects, arithmetic, …).
+pub fn member_access_chain_as_scopes(
+    e: &crate::ast::expr::Expression,
+) -> Option<(Vec<crate::ast::types::TypeScope>, Identifier)> {
+    let mut links: Vec<Identifier> = Vec::new();
+    let mut cur = e;
+    for _ in 0..16 {
+        match &cur.kind {
+            crate::ast::expr::ExprKind::MemberAccess { expr, member } => {
+                links.push(member.clone());
+                cur = expr;
+            }
+            crate::ast::expr::ExprKind::Ident(h)
+                if h.path.len() == 1 && h.path[0].selects.is_empty() =>
+            {
+                links.push(h.path[0].name.clone());
+                links.reverse();
+                let leaf = links.pop()?;
+                let scopes = links
+                    .into_iter()
+                    .map(|name| crate::ast::types::TypeScope {
+                        name,
+                        type_args: Vec::new(),
+                    })
+                    .collect();
+                return Some((scopes, leaf));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
 /// Type names a typedef's own definition refers to — its base type and, for a
 /// struct/union, its members' types. Used to order typedef processing so a
 /// typedef is always registered after the ones whose widths it needs.
 fn typedef_type_deps(dt: &DataType, out: &mut Vec<String>) {
     match dt {
-        DataType::TypeReference { name, .. } => out.push(name.name.name.clone()),
+        // §8.23: a scoped reference depends on its QUALIFIED key — the
+        // registration tables key class/package aliases that way, and the
+        // bare leaf would order against the wrong entry.
+        DataType::TypeReference { name, .. } => out.push(if name.scopes.is_empty() {
+            name.name.name.clone()
+        } else {
+            name.qualified()
+        }),
         DataType::Struct(su) => {
             for m in &su.members {
                 typedef_type_deps(&m.data_type, out);
@@ -5314,6 +5487,7 @@ pub fn elaborate_module_with_defs(
                     )?;
                     register_class_enum_members(c, &mut elab);
                     register_class_covergroups(c, &mut elab);
+                    register_class_scoped_typedef_aliases(c, None, &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
                         std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
@@ -5341,7 +5515,7 @@ pub fn elaborate_module_with_defs(
                     for item in &p.items {
                         match item {
                             crate::ast::decl::PackageItem::Function(f)
-                                if f.name.scope.is_none() =>
+                                if f.name.scopes.is_empty() =>
                             {
                                 elab.functions
                                     .insert_if_absent_with(f.name.name.name.clone(), || f.clone());
@@ -5356,7 +5530,7 @@ pub fn elaborate_module_with_defs(
                                     .entry(f.name.name.name.clone())
                                     .or_insert_with(|| p.name.name.clone());
                             }
-                            crate::ast::decl::PackageItem::Task(t) if t.name.scope.is_none() => {
+                            crate::ast::decl::PackageItem::Task(t) if t.name.scopes.is_empty() => {
                                 elab.tasks
                                     .entry(t.name.name.name.clone())
                                     .or_insert_with(|| t.clone());
@@ -5380,6 +5554,11 @@ pub fn elaborate_module_with_defs(
                             crate::ast::decl::PackageItem::Class(c) => {
                                 register_class_enum_members(c, &mut elab);
                                 register_class_covergroups(c, &mut elab);
+                                register_class_scoped_typedef_aliases(
+                                    c,
+                                    Some(&p.name.name),
+                                    &mut elab,
+                                );
                                 // Snapshot so the closure does not hold a borrow
                                 // of `elab` while `elab.classes` is borrowed.
                                 let params_snapshot = elab.parameters.clone();
@@ -5784,16 +5963,11 @@ pub fn elaborate_module_with_defs(
                 // width and element indexing was wrong.
                 let effective_port_dims: Vec<UnpackedDimension> = if port.dimensions.is_empty() {
                     match port.data_type.as_ref() {
-                        Some(DataType::TypeReference { name, .. }) => name
-                            .scope
-                            .as_ref()
-                            .and_then(|sc| {
-                                elab.typedef_unpacked_dims
-                                    .get(&format!("{}::{}", sc.name, name.name.name))
-                            })
-                            .or_else(|| elab.typedef_unpacked_dims.get(&name.name.name))
-                            .cloned()
-                            .unwrap_or_default(),
+                        Some(DataType::TypeReference { name, .. }) => {
+                            lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                                .cloned()
+                                .unwrap_or_default()
+                        }
                         _ => Vec::new(),
                     }
                 } else {
@@ -6034,6 +6208,7 @@ pub fn elaborate_module_with_defs(
                     validate_class_constraints(c, all_defs, Some(&elab.enum_members), Some(&elab))?;
                     register_class_enum_members(c, &mut elab);
                     register_class_covergroups(c, &mut elab);
+                    register_class_scoped_typedef_aliases(c, Some(&p.name.name), &mut elab);
                     elab.classes.insert(
                         c.name.name.clone(),
                         std::sync::Arc::new(elaborate_class_with_params(c, Some(&elab.parameters))),
@@ -6322,7 +6497,8 @@ pub fn elaborate_module_with_defs(
                     // Out-of-class method bodies (`function C::m`) are class
                     // methods — automatic lifetime (§8.6) — not package subs.
                     crate::ast::decl::PackageItem::Function(fd)
-                        if fd.lifetime != Some(Lifetime::Automatic) && fd.name.scope.is_none() =>
+                        if fd.lifetime != Some(Lifetime::Automatic)
+                            && fd.name.scopes.is_empty() =>
                     {
                         check_implicit_static_inits(
                             &fd.items,
@@ -6336,7 +6512,8 @@ pub fn elaborate_module_with_defs(
                         )?
                     }
                     crate::ast::decl::PackageItem::Task(td)
-                        if td.lifetime != Some(Lifetime::Automatic) && td.name.scope.is_none() =>
+                        if td.lifetime != Some(Lifetime::Automatic)
+                            && td.name.scopes.is_empty() =>
                     {
                         check_implicit_static_inits(
                             &td.items,
@@ -6442,13 +6619,7 @@ pub fn elaborate_module_with_defs(
                     {
                         let tdims: Vec<UnpackedDimension> = match &pd.data_type {
                             DataType::TypeReference { name, .. } if decl.dimensions.is_empty() => {
-                                name.scope
-                                    .as_ref()
-                                    .and_then(|sc| {
-                                        elab.typedef_unpacked_dims
-                                            .get(&format!("{}::{}", sc.name, name.name.name))
-                                    })
-                                    .or_else(|| elab.typedef_unpacked_dims.get(&name.name.name))
+                                lookup_scoped_type(name, &elab.typedef_unpacked_dims)
                                     .cloned()
                                     .unwrap_or_default()
                             }
@@ -6741,16 +6912,11 @@ pub fn elaborate_module_with_defs(
                     // their width — `$bits(x[0][0])` read 1. Chase the typedef
                     // exactly like the variable (DataDeclaration) arm does.
                     let nd_resolved: DataType = match &nd.data_type {
-                        DataType::TypeReference { name, .. } => name
-                            .scope
-                            .as_ref()
-                            .and_then(|sc| {
-                                elab.typedef_types
-                                    .get(&format!("{}::{}", sc.name, name.name.name))
-                            })
-                            .or_else(|| elab.typedef_types.get(&name.name.name))
-                            .cloned()
-                            .unwrap_or_else(|| nd.data_type.clone()),
+                        DataType::TypeReference { name, .. } => {
+                            lookup_scoped_type(name, &elab.typedef_types)
+                                .cloned()
+                                .unwrap_or_else(|| nd.data_type.clone())
+                        }
                         _ => nd.data_type.clone(),
                     };
                     // Packed dims written on the typedef itself
@@ -6994,11 +7160,8 @@ pub fn elaborate_module_with_defs(
                         {
                             // §26.3: a SCOPED `P::T` prefers the qualified key so
                             // a module-local `typedef ... T` cannot capture it.
-                            let scoped_w = name.scope.as_ref().and_then(|sc| {
-                                elab.typedefs
-                                    .get(&format!("{}::{}", sc.name, name.name.name))
-                                    .copied()
-                            });
+                            let scoped_w = specialized_class_scope_width(name, &elab)
+                                .or_else(|| lookup_scoped_type(name, &elab.typedefs).copied());
                             scoped_w
                                 .or_else(|| elab.typedefs.get(&name.name.name).copied())
                                 .unwrap_or_else(|| {
@@ -7434,13 +7597,7 @@ pub fn elaborate_module_with_defs(
                             if let DataType::TypeReference { name, .. } = &dd.data_type {
                                 // §26.3: scoped element type — qualified key
                                 // first so a same-named local can't capture.
-                                name.scope
-                                    .as_ref()
-                                    .and_then(|sc| {
-                                        elab.typedef_types
-                                            .get(&format!("{}::{}", sc.name, name.name.name))
-                                    })
-                                    .or_else(|| elab.typedef_types.get(&name.name.name))
+                                lookup_scoped_type(name, &elab.typedef_types)
                                     .unwrap_or(&dd.data_type)
                             } else {
                                 &dd.data_type
@@ -8041,10 +8198,7 @@ pub fn elaborate_module_with_defs(
                                 // §26.3: a SCOPED reference (`P::T`) names the
                                 // package's typedef — qualified key first, so a
                                 // same-named local typedef can't capture it.
-                                let scoped = name.scope.as_ref().and_then(|sc| {
-                                    elab.typedef_types
-                                        .get(&format!("{}::{}", sc.name, name.name.name))
-                                });
+                                let scoped = lookup_scoped_type(name, &elab.typedef_types);
                                 scoped
                                     .or_else(|| elab.typedef_types.get(&name.name.name))
                                     .cloned()
@@ -9280,7 +9434,7 @@ pub fn elaborate_module_with_defs(
                 check_non_class_null_return(fd)?;
                 if sub_default_static
                     && fd.lifetime != Some(Lifetime::Automatic)
-                    && fd.name.scope.is_none()
+                    && fd.name.scopes.is_empty()
                 {
                     let mod_name = elab.name.clone();
                     check_implicit_static_inits(
@@ -9299,14 +9453,14 @@ pub fn elaborate_module_with_defs(
                 // the module's free-function namespace. Inserting them here
                 // silently overrides same-named free functions, so a bare call
                 // dispatches the class body without `this` binding.
-                if fd.name.scope.is_none() {
+                if fd.name.scopes.is_empty() {
                     elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                 }
             }
             ModuleItem::TaskDeclaration(td) => {
                 if sub_default_static
                     && td.lifetime != Some(Lifetime::Automatic)
-                    && td.name.scope.is_none()
+                    && td.name.scopes.is_empty()
                 {
                     let mod_name = elab.name.clone();
                     check_implicit_static_inits(
@@ -9378,7 +9532,7 @@ pub fn elaborate_module_with_defs(
                 // uvm_globals.svh is replaced by `task uvm_root::run_test`),
                 // so a bare `run_test()` dispatches the class body without
                 // `this` binding and crashes.
-                if td.name.scope.is_none() {
+                if td.name.scopes.is_empty() {
                     // §3.3 one task per name per scope — the reference rejects
                     // a redefinition; silently letting the later one win made
                     // every call dispatch the wrong body.
@@ -9618,6 +9772,7 @@ pub fn elaborate_module_with_defs(
                 // registered).
                 register_class_enum_members(cd, &mut elab);
                 register_class_covergroups(cd, &mut elab);
+                register_class_scoped_typedef_aliases(cd, None, &mut elab);
                 let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
                 // A module-scope class remembers its module (issue #155).
                 ec.declaring_module = Some(module.name().to_string());
@@ -10127,8 +10282,8 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
             Definition::Package(p) => {
                 for item in &p.items {
                     match item {
-                        PackageItem::Function(f) if f.name.scope.is_some() => {
-                            let scope = f.name.scope.as_ref().unwrap();
+                        PackageItem::Function(f) if f.name.has_scope() => {
+                            let scope = &f.name.scopes[0].name;
                             attach(
                                 scope.name.clone(),
                                 f.name.name.name.clone(),
@@ -10136,8 +10291,8 @@ pub fn link_extern_methods(elab: &mut ElaboratedModule, definitions: &HashMap<St
                                 f.span,
                             );
                         }
-                        PackageItem::Task(t) if t.name.scope.is_some() => {
-                            let scope = t.name.scope.as_ref().unwrap();
+                        PackageItem::Task(t) if t.name.has_scope() => {
+                            let scope = &t.name.scopes[0].name;
                             attach(
                                 scope.name.clone(),
                                 t.name.name.name.clone(),
@@ -10169,8 +10324,8 @@ where
     use crate::ast::decl::{ClassMethodKind, ModuleItem};
     for item in items {
         match item {
-            ModuleItem::FunctionDeclaration(f) if f.name.scope.is_some() => {
-                let scope = f.name.scope.as_ref().unwrap();
+            ModuleItem::FunctionDeclaration(f) if f.name.has_scope() => {
+                let scope = &f.name.scopes[0].name;
                 attach(
                     scope.name.clone(),
                     f.name.name.name.clone(),
@@ -10178,8 +10333,8 @@ where
                     f.span,
                 );
             }
-            ModuleItem::TaskDeclaration(t) if t.name.scope.is_some() => {
-                let scope = t.name.scope.as_ref().unwrap();
+            ModuleItem::TaskDeclaration(t) if t.name.has_scope() => {
+                let scope = &t.name.scopes[0].name;
                 attach(
                     scope.name.clone(),
                     t.name.name.name.clone(),
@@ -11753,7 +11908,7 @@ fn validate_class_usage(
             if let Some(f) = func {
                 for p in &f.ports {
                     if let DataType::TypeReference { name, .. } = &p.data_type {
-                        if name.scope.is_some() {
+                        if name.has_scope() {
                             continue;
                         }
                         if iface_only_typedefs.contains(&name.name.name) {
@@ -13689,11 +13844,8 @@ fn elaborate_items_numbered(
                         {
                             // §26.3: a SCOPED `P::T` prefers the qualified key so
                             // a module-local `typedef ... T` cannot capture it.
-                            let scoped_w = name.scope.as_ref().and_then(|sc| {
-                                elab.typedefs
-                                    .get(&format!("{}::{}", sc.name, name.name.name))
-                                    .copied()
-                            });
+                            let scoped_w = specialized_class_scope_width(name, &elab)
+                                .or_else(|| lookup_scoped_type(name, &elab.typedefs).copied());
                             scoped_w
                                 .or_else(|| elab.typedefs.get(&name.name.name).copied())
                                 .unwrap_or_else(|| {
@@ -14424,6 +14576,7 @@ fn elaborate_items_numbered(
                 // declared in a MODULE body (package/$unit classes already
                 // registered).
                 register_class_enum_members(cd, elab);
+                register_class_scoped_typedef_aliases(cd, None, elab);
                 let cls =
                     std::sync::Arc::new(elaborate_class_with_params(cd, Some(&elab.parameters)));
                 elab.classes.insert(cd.name.name.clone(), cls);
@@ -14633,7 +14786,7 @@ fn elaborate_items_numbered(
                 }
                 // Same scope filter as above: out-of-class method definitions
                 // must not override free functions.
-                if fd.name.scope.is_none() {
+                if fd.name.scopes.is_empty() {
                     elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                 }
             }
@@ -14691,7 +14844,7 @@ fn elaborate_items_numbered(
                 }
                 // Same scope filter: don't let out-of-class method definitions
                 // override free tasks in the module namespace.
-                if td.name.scope.is_none() {
+                if td.name.scopes.is_empty() {
                     elab.tasks.insert(td.name.name.name.clone(), td.clone());
                 }
             }
@@ -15161,10 +15314,7 @@ fn quiet_packed_width_probe(
         DataType::TypeReference {
             name, dimensions, ..
         } => {
-            let base = name
-                .scope
-                .as_ref()
-                .and_then(|sc| typedef_widths.get(&format!("{}::{}", sc.name, name.name.name)))
+            let base = lookup_scoped_type(name, typedef_widths)
                 .copied()
                 .or_else(|| typedef_widths.get(&name.name.name).copied())
                 .unwrap_or(0) as u64;
@@ -16046,7 +16196,7 @@ fn lsdd_resolve_local_typedef(dt: &DataType, tds: &HashMap<String, DataType>) ->
         else {
             break;
         };
-        if name.scope.is_some() {
+        if name.has_scope() {
             break;
         }
         let Some(next) = tds.get(&name.name.name) else {
@@ -16469,11 +16619,8 @@ pub fn resolve_typedef_chain<'a>(
         // §26.3: a SCOPED reference (`P::T`) names the package's typedef and
         // must not be captured by a same-named local — try the qualified key
         // first (package walks register both spellings).
-        let scoped = name
-            .scope
-            .as_ref()
-            .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, name.name.name)));
-        match scoped.or_else(|| typedef_types.get(&name.name.name)) {
+        let scoped = lookup_scoped_type(name, typedef_types);
+        match scoped {
             Some(next) => cur = next,
             None => break,
         }
@@ -16598,11 +16745,7 @@ pub fn resolve_type_width(
             let mut base_width = if let Some(td) = typedefs {
                 // §26.3: prefer the package-qualified key for `P::T` so a
                 // module-local `typedef ... T` cannot capture it.
-                let scoped = name
-                    .scope
-                    .as_ref()
-                    .and_then(|sc| td.get(&format!("{}::{}", sc.name, name.name.name)))
-                    .copied();
+                let scoped = lookup_scoped_type(name, td).copied();
                 let raw = scoped.or_else(|| td.get(&name.name.name).copied());
                 if traced {
                     hit = if scoped.is_some() {
@@ -16870,11 +17013,7 @@ pub fn is_type_real_resolved(dt: &DataType, typedef_types: &HashMap<String, Data
             break;
         };
         let key = &name.name.name;
-        let inner = name
-            .scope
-            .as_ref()
-            .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, key)))
-            .or_else(|| typedef_types.get(key));
+        let inner = lookup_scoped_type(name, typedef_types);
         match inner {
             Some(next) if !matches!(next, DataType::TypeReference { name: n, .. } if &n.name.name == key) => {
                 cur = next
@@ -16903,11 +17042,7 @@ pub fn is_type_signed_resolved(dt: &DataType, typedef_types: &HashMap<String, Da
         };
         let key = &name.name.name;
         // §26.3: scoped `P::T` prefers the qualified registration.
-        let inner = name
-            .scope
-            .as_ref()
-            .and_then(|sc| typedef_types.get(&format!("{}::{}", sc.name, key)))
-            .or_else(|| typedef_types.get(key));
+        let inner = lookup_scoped_type(name, typedef_types);
         match inner {
             // Self-referential name: stop here, as before.
             Some(next) if !matches!(next, DataType::TypeReference { name: n, .. } if &n.name.name == key) => {
@@ -17662,6 +17797,30 @@ pub fn const_eval_i64_with_params(
                                 "void" => Some(0),
                                 _ => None,
                             })
+                    }
+                    // §8.23: `$bits(pkg::cls::td)` — a `::`-chained scope
+                    // NESTS member accesses; the one-level arm below only
+                    // sees `pkg::td`. Resolve the FULL chain key against
+                    // the typedef table (class-scope registration keys it);
+                    // a miss falls through to the expression-width arms
+                    // exactly as before.
+                    ExprKind::MemberAccess { expr: base, .. }
+                        if matches!(base.kind, ExprKind::MemberAccess { .. }) =>
+                    {
+                        member_access_chain_as_scopes(inner).and_then(|(scopes, leaf)| {
+                            let mut key = String::new();
+                            for l in &scopes {
+                                key.push_str(&l.name.name);
+                                key.push_str("::");
+                            }
+                            key.push_str(&leaf.name);
+                            TYPEDEFS_TLS.with(|td| {
+                                td.borrow()
+                                    .as_ref()
+                                    .and_then(|m| m.get(&key).copied())
+                                    .map(|w| w as i64)
+                            })
+                        })
                     }
                     // §26.3 package- (or class-) scoped type: `$bits(pkg::t)`.
                     // `::` lowers to the SAME `MemberAccess` node as a struct
@@ -19665,12 +19824,13 @@ fn struct_typedef_self_reference(
                 // and a scoped one is followed only via its qualified key:
                 // falling back to the bare name would resolve `P2::T` to the
                 // local `T` and re-create the same false positive.
-                if name.scope.is_none() && mn == target {
+                if name.scopes.is_empty() && mn == target {
                     return Some(String::new());
                 }
-                let key = match &name.scope {
-                    Some(sc) => format!("{}::{}", sc.name, mn),
-                    None => mn.clone(),
+                let key = if name.scopes.is_empty() {
+                    mn.clone()
+                } else {
+                    name.qualified()
                 };
                 if visited.iter().any(|v| v == &key) {
                     return None;
@@ -19692,12 +19852,13 @@ fn struct_typedef_self_reference(
             if let DataType::TypeReference { name, .. } = &member.data_type {
                 let mn = &name.name.name;
                 // Same §26.3 rule as the alias arm above.
-                if name.scope.is_none() && mn == target {
+                if name.scopes.is_empty() && mn == target {
                     return Some(field);
                 }
-                let mn = &match &name.scope {
-                    Some(sc) => format!("{}::{}", sc.name, mn),
-                    None => mn.clone(),
+                let mn = &if name.scopes.is_empty() {
+                    mn.clone()
+                } else {
+                    name.qualified()
                 };
                 if !visited.iter().any(|v| v == mn) {
                     if let Some(inner) = typedef_types.get(mn) {
@@ -20817,10 +20978,10 @@ fn scoped_type_owner(dt: &DataType, typedef_types: &HashMap<String, DataType>) -
         let DataType::TypeReference { name, .. } = cur else {
             break;
         };
-        if let Some(sc) = &name.scope {
-            let key = format!("{}::{}", sc.name, name.name.name);
+        if !name.scopes.is_empty() {
+            let key = name.qualified();
             if let Some(next) = typedef_types.get(&key) {
-                owner = Some(format!("{}", sc.name));
+                owner = Some(name.scope_prefix());
                 cur = next;
                 continue;
             }
@@ -23598,7 +23759,11 @@ struct SubroutineBody<'a> {
 
 impl<'a> SubroutineBody<'a> {
     fn task(owner: &'a str, class: &'a str, t: &'a TaskDeclaration) -> Self {
-        let class = t.name.scope.as_ref().map_or(class, |s| s.name.as_str());
+        let class = t
+            .name
+            .scopes
+            .first()
+            .map_or(class, |s| s.name.name.as_str());
         SubroutineBody {
             owner,
             class,
@@ -23609,7 +23774,11 @@ impl<'a> SubroutineBody<'a> {
     }
 
     fn function(owner: &'a str, class: &'a str, f: &'a FunctionDeclaration) -> Self {
-        let class = f.name.scope.as_ref().map_or(class, |s| s.name.as_str());
+        let class = f
+            .name
+            .scopes
+            .first()
+            .map_or(class, |s| s.name.name.as_str());
         SubroutineBody {
             owner,
             class,
@@ -23989,6 +24158,7 @@ fn inline_instantiations_inner(
         match def {
             Definition::Class(c) => {
                 register_class_enum_members(c, elab);
+                register_class_scoped_typedef_aliases(c, None, elab);
                 let cls = elaborate_class_with_params(c, Some(&elab.parameters));
                 elab.classes.insert(name.clone(), std::sync::Arc::new(cls));
                 register_nested_classes(c, name, elab);
@@ -24158,6 +24328,7 @@ fn inline_instantiations_inner(
                         }
                         crate::ast::decl::PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);
+                            register_class_scoped_typedef_aliases(c, Some(name.as_str()), elab);
                             let cls = std::sync::Arc::new(elaborate_class_with_params(
                                 c,
                                 Some(&elab.parameters),
@@ -27914,7 +28085,7 @@ fn scope_local_typerefs(
             dimensions,
             type_args,
             span,
-        } if name.scope.is_none() && local_names.contains(&name.name.name) => {
+        } if name.scopes.is_empty() && local_names.contains(&name.name.name) => {
             let mut nn = name.clone();
             nn.name.name = cat2(&prefix, &name.name.name);
             DataType::TypeReference {
@@ -28749,41 +28920,35 @@ fn inline_module_items(
                 }
                 let expr_as_type_ref = |v: &Expression| -> Option<DataType> {
                     if let ExprKind::Ident(hier) = &v.kind {
-                        if hier.path.len() == 1 && hier.path[0].selects.is_empty() {
-                            let (scope, tname) = match &hier.root {
-                                Some(r) => (
-                                    Some(Identifier {
+                        // §26.3 / §8.23: `T`, `pkg::T`, `pkg::cls::T` — the
+                        // parser never fills `hier.root` for `::`, and every
+                        // `::`/`.` segment lands in `path`. A chain of ANY
+                        // length becomes scope links + leaf (a type-param
+                        // override position only ever spells `::` chains).
+                        // Requiring len()==1/2 silently DROPPED scoped type
+                        // overrides, so `#(.T(pkg::wide_t))` left the port
+                        // at the DEFAULT type's width.
+                        if !hier.path.is_empty() && hier.path.iter().all(|s| s.selects.is_empty()) {
+                            let mut scopes: Vec<crate::ast::types::TypeScope> = Vec::new();
+                            if let Some(r) = &hier.root {
+                                scopes.push(crate::ast::types::TypeScope {
+                                    name: Identifier {
                                         name: r.clone(),
                                         span: v.span,
-                                    }),
-                                    hier.path[0].name.clone(),
-                                ),
-                                None => (None, hier.path[0].name.clone()),
-                            };
+                                    },
+                                    type_args: Vec::new(),
+                                });
+                            }
+                            for seg in &hier.path[..hier.path.len() - 1] {
+                                scopes.push(crate::ast::types::TypeScope {
+                                    name: seg.name.clone(),
+                                    type_args: Vec::new(),
+                                });
+                            }
                             return Some(DataType::TypeReference {
                                 name: TypeName {
-                                    scope,
-                                    name: tname,
-                                    span: v.span,
-                                },
-                                dimensions: Vec::new(),
-                                type_args: Vec::new(),
-                                span: v.span,
-                            });
-                        }
-                        // §26.3: `pkg::wide_t` — the parser never fills
-                        // `hier.root`; `::` produces a TWO-SEGMENT path.
-                        // Requiring len()==1 silently DROPPED every scoped
-                        // type override, so `#(.T(pkg::wide_t))` left the
-                        // port at the DEFAULT type's width.
-                        if hier.path.len() == 2 && hier.path.iter().all(|s| s.selects.is_empty()) {
-                            return Some(DataType::TypeReference {
-                                name: TypeName {
-                                    scope: Some(Identifier {
-                                        name: hier.path[0].name.name.clone(),
-                                        span: v.span,
-                                    }),
-                                    name: hier.path[1].name.clone(),
+                                    scopes,
+                                    name: hier.path[hier.path.len() - 1].name.clone(),
                                     span: v.span,
                                 },
                                 dimensions: Vec::new(),
@@ -28792,28 +28957,22 @@ fn inline_module_items(
                             });
                         }
                     }
-                    // Same scoped shape arriving as MemberAccess — expression
-                    // context lowers `pkg::wide_t` to
-                    // MemberAccess(Ident(pkg), wide_t) just as it does for
-                    // package constants.
-                    if let ExprKind::MemberAccess { expr: base, member } = &v.kind {
-                        if let ExprKind::Ident(bh) = &base.kind {
-                            if bh.path.len() == 1 && bh.path[0].selects.is_empty() {
-                                return Some(DataType::TypeReference {
-                                    name: TypeName {
-                                        scope: Some(Identifier {
-                                            name: bh.path[0].name.name.clone(),
-                                            span: v.span,
-                                        }),
-                                        name: member.clone(),
-                                        span: v.span,
-                                    },
-                                    dimensions: Vec::new(),
-                                    type_args: Vec::new(),
-                                    span: v.span,
-                                });
-                            }
-                        }
+                    // Same scoped shape arriving as (possibly nested)
+                    // MemberAccess — expression context lowers `pkg::wide_t`
+                    // to MemberAccess(Ident(pkg), wide_t) just as it does for
+                    // package constants, and `pkg::cls::t` nests one level
+                    // deeper.
+                    if let Some((scopes, leaf)) = member_access_chain_as_scopes(v) {
+                        return Some(DataType::TypeReference {
+                            name: TypeName {
+                                scopes,
+                                name: leaf,
+                                span: v.span,
+                            },
+                            dimensions: Vec::new(),
+                            type_args: Vec::new(),
+                            span: v.span,
+                        });
                     }
                     None
                 };
@@ -29834,26 +29993,19 @@ fn inline_module_items(
                             // nothing, and (under `default_nettype none`) the
                             // actual was then reported as an implicit net
                             // (GitHub xezim#106).
-                            let effective_port_dims: Vec<UnpackedDimension> = if port
-                                .dimensions
-                                .is_empty()
-                            {
-                                match port.data_type.as_ref() {
-                                    Some(DataType::TypeReference { name, .. }) => name
-                                        .scope
-                                        .as_ref()
-                                        .and_then(|sc| {
-                                            elab.typedef_unpacked_dims
-                                                .get(&format!("{}::{}", sc.name, name.name.name))
-                                        })
-                                        .or_else(|| elab.typedef_unpacked_dims.get(&name.name.name))
-                                        .cloned()
-                                        .unwrap_or_default(),
-                                    _ => Vec::new(),
-                                }
-                            } else {
-                                port.dimensions.clone()
-                            };
+                            let effective_port_dims: Vec<UnpackedDimension> =
+                                if port.dimensions.is_empty() {
+                                    match port.data_type.as_ref() {
+                                        Some(DataType::TypeReference { name, .. }) => {
+                                            lookup_scoped_type(name, &elab.typedef_unpacked_dims)
+                                                .cloned()
+                                                .unwrap_or_default()
+                                        }
+                                        _ => Vec::new(),
+                                    }
+                                } else {
+                                    port.dimensions.clone()
+                                };
                             let effective_port_dims = normalize_unpacked_dims(
                                 &effective_port_dims,
                                 &sub_merged_params,
@@ -30874,28 +31026,21 @@ fn inline_module_items(
                                 // Without this the child-local variable
                                 // registered as a scalar and the whole-array
                                 // assigns through it carried nothing.
-                                let effective_decl_dims: Vec<UnpackedDimension> =
-                                    if decl.dimensions.is_empty() {
-                                        match &dd.data_type {
-                                            DataType::TypeReference { name, .. } => name
-                                                .scope
-                                                .as_ref()
-                                                .and_then(|sc| {
-                                                    elab.typedef_unpacked_dims.get(&format!(
-                                                        "{}::{}",
-                                                        sc.name, name.name.name
-                                                    ))
-                                                })
-                                                .or_else(|| {
-                                                    elab.typedef_unpacked_dims.get(&name.name.name)
-                                                })
+                                let effective_decl_dims: Vec<UnpackedDimension> = if decl
+                                    .dimensions
+                                    .is_empty()
+                                {
+                                    match &dd.data_type {
+                                        DataType::TypeReference { name, .. } => {
+                                            lookup_scoped_type(name, &elab.typedef_unpacked_dims)
                                                 .cloned()
-                                                .unwrap_or_default(),
-                                            _ => Vec::new(),
+                                                .unwrap_or_default()
                                         }
-                                    } else {
-                                        decl.dimensions.clone()
-                                    };
+                                        _ => Vec::new(),
+                                    }
+                                } else {
+                                    decl.dimensions.clone()
+                                };
                                 let effective_decl_dims = normalize_unpacked_dims(
                                     &effective_decl_dims,
                                     &sub_merged_params,
@@ -31197,6 +31342,20 @@ fn inline_module_items(
                                     }
                                 }
                                 if let Some((lo, hi)) = array_range {
+                                    if matches!(
+                                        &dd.data_type,
+                                        DataType::Simple {
+                                            kind: SimpleType::Event,
+                                            ..
+                                        }
+                                    ) {
+                                        elab.events.insert(sig_name.clone());
+                                        if hi >= lo && (hi - lo) < 4096 {
+                                            for i in lo..=hi {
+                                                elab.events.insert(format!("{}[{}]", sig_name, i));
+                                            }
+                                        }
+                                    }
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
                                     // §6.8: a fixed array's declaration initializer is
                                     // deferred like every other instance declaration's
@@ -31358,6 +31517,15 @@ fn inline_module_items(
                                     // no aggregate to spread into and left the
                                     // members x, while the same declaration at
                                     // top level worked.
+                                    if matches!(
+                                        &dd.data_type,
+                                        DataType::Simple {
+                                            kind: SimpleType::Event,
+                                            ..
+                                        }
+                                    ) {
+                                        elab.events.insert(sig_name.clone());
+                                    }
                                     elab.var_decl_types
                                         .entry(sig_name.clone())
                                         .or_insert_with(|| dd.data_type.clone());
@@ -32012,7 +32180,7 @@ fn inline_module_items(
                         span,
                     } = dt
                     {
-                        if name.scope.is_none() && sub_typedef_names.contains(&name.name.name) {
+                        if name.scopes.is_empty() && sub_typedef_names.contains(&name.name.name) {
                             let mut nn = name.clone();
                             nn.name.name = cat2(&inst_prefix, &name.name.name);
                             return DataType::TypeReference {
@@ -32209,6 +32377,7 @@ fn inline_module_items(
                         )?;
                         register_class_enum_members(cd, elab);
                         register_class_covergroups(cd, elab);
+                        register_class_scoped_typedef_aliases(cd, None, elab);
                         let mut ec = elaborate_class_with_params(cd, Some(&elab.parameters));
                         ec.declaring_module = Some(sub_mod_name.clone());
                         elab.classes
@@ -36632,7 +36801,7 @@ fn substitute_type_params_stmt(stmt: Statement, binds: &HashMap<String, DataType
                     ..
                 } if dimensions.is_empty()
                     && type_args.is_empty()
-                    && name.scope.is_none()
+                    && name.scopes.is_empty()
                     && binds.contains_key(&name.name.name) =>
                 {
                     binds[&name.name.name].clone()
@@ -37417,13 +37586,9 @@ fn rewrite_stmt(
             nonblocking: *nonblocking,
             name: Identifier {
                 name: if let Some(mapped) = port_map.get(&name.name) {
-                    if let ExprKind::Ident(h) = &mapped.kind {
-                        h.path[0].name.name.clone()
-                    } else {
-                        name.name.clone()
-                    }
+                    whole_net_ident_name(mapped).unwrap_or_else(|| name.name.clone())
                 } else if local_names.contains(&name.name) {
-                    format!("{}.{}", prefix, name.name)
+                    cat2(prefix, &name.name)
                 } else {
                     name.name.clone()
                 },
@@ -37476,13 +37641,9 @@ fn rewrite_event_control(
     match ev {
         EventControl::Identifier(id) => {
             let name = if let Some(mapped) = port_map.get(&id.name) {
-                if let ExprKind::Ident(h) = &mapped.kind {
-                    h.path[0].name.name.clone()
-                } else {
-                    id.name.clone()
-                }
+                whole_net_ident_name(mapped).unwrap_or_else(|| id.name.clone())
             } else if local_names.contains(&id.name) {
-                format!("{}.{}", prefix, id.name)
+                cat2(prefix, &id.name)
             } else {
                 id.name.clone()
             };
@@ -38172,7 +38333,7 @@ fn process_import(
                             }
                         }
                         PackageItem::Function(fd)
-                            if &fd.name.name.name == sym_name && fd.name.scope.is_none() =>
+                            if &fd.name.name.name == sym_name && fd.name.scopes.is_empty() =>
                         {
                             elab.functions.insert(fd.name.name.name.clone(), fd.clone());
                             elab.functions
@@ -38184,7 +38345,7 @@ fn process_import(
                             found = true;
                         }
                         PackageItem::Task(td)
-                            if &td.name.name.name == sym_name && td.name.scope.is_none() =>
+                            if &td.name.name.name == sym_name && td.name.scopes.is_empty() =>
                         {
                             elab.tasks.insert(td.name.name.name.clone(), td.clone());
                             elab.tasks
@@ -38205,6 +38366,7 @@ fn process_import(
                         }
                         PackageItem::Class(c) if &c.name.name == sym_name => {
                             register_class_enum_members(c, elab);
+                            register_class_scoped_typedef_aliases(c, Some(&pkg_name), elab);
                             elab.classes.insert(
                                 c.name.name.clone(),
                                 std::sync::Arc::new(elaborate_class_with_params(
@@ -38225,11 +38387,10 @@ fn process_import(
                                     {
                                         // §26.3: a SCOPED `P::T` prefers the qualified key so
                                         // a module-local `typedef ... T` cannot capture it.
-                                        let scoped_w = name.scope.as_ref().and_then(|sc| {
-                                            elab.typedefs
-                                                .get(&format!("{}::{}", sc.name, name.name.name))
-                                                .copied()
-                                        });
+                                        let scoped_w = specialized_class_scope_width(name, &elab)
+                                            .or_else(|| {
+                                                lookup_scoped_type(name, &elab.typedefs).copied()
+                                            });
                                         scoped_w
                                             .or_else(|| elab.typedefs.get(&name.name.name).copied())
                                             .unwrap_or_else(|| {
@@ -38500,7 +38661,7 @@ fn process_import(
                         PackageItem::Typedef(td) => {
                             process_typedef(td, elab);
                         }
-                        PackageItem::Function(fd) if fd.name.scope.is_none() => {
+                        PackageItem::Function(fd) if fd.name.scopes.is_empty() => {
                             elab.func_decl_scope
                                 .insert(fd.name.name.name.clone(), pkg_name.clone());
                             elab.functions.insert(fd.name.name.name.clone(), fd.clone());
@@ -38509,7 +38670,7 @@ fn process_import(
                             elab.pkg_subr_owner
                                 .insert(fd.name.name.name.clone(), pkg_name.clone());
                         }
-                        PackageItem::Task(td) if td.name.scope.is_none() => {
+                        PackageItem::Task(td) if td.name.scopes.is_empty() => {
                             elab.func_decl_scope
                                 .insert(td.name.name.name.clone(), pkg_name.clone());
                             elab.tasks.insert(td.name.name.name.clone(), td.clone());
@@ -38526,6 +38687,7 @@ fn process_import(
                         }
                         PackageItem::Class(c) => {
                             register_class_enum_members(c, elab);
+                            register_class_scoped_typedef_aliases(c, Some(&pkg_name), elab);
                             elab.classes.insert(
                                 c.name.name.clone(),
                                 std::sync::Arc::new(elaborate_class_with_params(
@@ -38540,11 +38702,10 @@ fn process_import(
                                     {
                                         // §26.3: a SCOPED `P::T` prefers the qualified key so
                                         // a module-local `typedef ... T` cannot capture it.
-                                        let scoped_w = name.scope.as_ref().and_then(|sc| {
-                                            elab.typedefs
-                                                .get(&format!("{}::{}", sc.name, name.name.name))
-                                                .copied()
-                                        });
+                                        let scoped_w = specialized_class_scope_width(name, &elab)
+                                            .or_else(|| {
+                                                lookup_scoped_type(name, &elab.typedefs).copied()
+                                            });
                                         scoped_w
                                             .or_else(|| elab.typedefs.get(&name.name.name).copied())
                                             .unwrap_or_else(|| {
@@ -38736,7 +38897,7 @@ mod logged_map_tests {
             let span = Span::new(0, 0);
             DataType::TypeReference {
                 name: crate::ast::types::TypeName {
-                    scope: None,
+                    scopes: Vec::new(),
                     name: Identifier {
                         name: name.into(),
                         span,
