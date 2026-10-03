@@ -31197,6 +31197,20 @@ fn inline_module_items(
                                     }
                                 }
                                 if let Some((lo, hi)) = array_range {
+                                    if matches!(
+                                        &dd.data_type,
+                                        DataType::Simple {
+                                            kind: SimpleType::Event,
+                                            ..
+                                        }
+                                    ) {
+                                        elab.events.insert(sig_name.clone());
+                                        if hi >= lo && (hi - lo) < 4096 {
+                                            for i in lo..=hi {
+                                                elab.events.insert(format!("{}[{}]", sig_name, i));
+                                            }
+                                        }
+                                    }
                                     elab.arrays.insert(sig_name.clone(), (lo, hi, width));
                                     // §6.8: a fixed array's declaration initializer is
                                     // deferred like every other instance declaration's
@@ -31358,6 +31372,15 @@ fn inline_module_items(
                                     // no aggregate to spread into and left the
                                     // members x, while the same declaration at
                                     // top level worked.
+                                    if matches!(
+                                        &dd.data_type,
+                                        DataType::Simple {
+                                            kind: SimpleType::Event,
+                                            ..
+                                        }
+                                    ) {
+                                        elab.events.insert(sig_name.clone());
+                                    }
                                     elab.var_decl_types
                                         .entry(sig_name.clone())
                                         .or_insert_with(|| dd.data_type.clone());
@@ -37417,13 +37440,9 @@ fn rewrite_stmt(
             nonblocking: *nonblocking,
             name: Identifier {
                 name: if let Some(mapped) = port_map.get(&name.name) {
-                    if let ExprKind::Ident(h) = &mapped.kind {
-                        h.path[0].name.name.clone()
-                    } else {
-                        name.name.clone()
-                    }
+                    whole_net_ident_name(mapped).unwrap_or_else(|| name.name.clone())
                 } else if local_names.contains(&name.name) {
-                    format!("{}.{}", prefix, name.name)
+                    cat2(prefix, &name.name)
                 } else {
                     name.name.clone()
                 },
