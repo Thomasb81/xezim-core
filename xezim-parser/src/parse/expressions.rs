@@ -209,7 +209,7 @@ impl Parser {
             Pattern::Struct(members)
         } else {
             // Constant-expression pattern.
-            Pattern::Expr(self.parse_expr_bp(16))
+            Pattern::Expr(self.parse_expr_bp(26))
         }
     }
 
@@ -219,11 +219,11 @@ impl Parser {
 
         loop {
             // §12.6: `expr matches pattern` — a boolean conditional-pattern
-            // match. Binding power 15 (like relational). Parse-accept: consume
+            // match. Binding power 25 (like relational). Parse-accept: consume
             // the pattern and yield a placeholder boolean (the match semantics
             // are not modelled).
             if self.at(TokenKind::KwMatches) {
-                if 15 < min_bp {
+                if 25 < min_bp {
                     break;
                 }
                 self.bump();
@@ -238,9 +238,9 @@ impl Parser {
                 continue;
             }
             // inside operator: expr inside { range_list }
-            // Binding power 15 (same as relational)
+            // Binding power 25 (same as relational)
             if self.at(TokenKind::KwInside) {
-                if 15 < min_bp {
+                if 25 < min_bp {
                     break;
                 }
                 self.bump();
@@ -259,7 +259,7 @@ impl Parser {
                         // Simple operands or parenthesised expressions
                         // remain supported.
                         let center = if crate::is_sv2023() {
-                            let mut center = self.parse_expr_bp(21);
+                            let mut center = self.parse_expr_bp(31);
                             // A bare `+`/`-` here (not the start of a
                             // `+/-`/`+%-` tolerance marker) means the
                             // lower/centre bound is itself an additive
@@ -284,7 +284,7 @@ impl Parser {
                                     break;
                                 };
                                 self.bump();
-                                let rhs = self.parse_expr_bp(20);
+                                let rhs = self.parse_expr_bp(30);
                                 center = Expression::new(
                                     ExprKind::Binary {
                                         op,
@@ -1216,134 +1216,27 @@ impl Parser {
                     self.expect(TokenKind::RParen);
                     return inner;
                 }
-                let inner = if self.at_any(&[
-                    TokenKind::Assign,
-                    TokenKind::PlusAssign,
-                    TokenKind::MinusAssign,
-                    TokenKind::StarAssign,
-                    TokenKind::SlashAssign,
-                    TokenKind::PercentAssign,
-                    TokenKind::AndAssign,
-                    TokenKind::OrAssign,
-                    TokenKind::XorAssign,
-                    TokenKind::ShiftLeftAssign,
-                    TokenKind::ShiftRightAssign,
-                    TokenKind::ArithShiftLeftAssign,
-                    TokenKind::ArithShiftRightAssign,
-                ]) {
-                    let op_kind = self.current().kind.clone();
-                    self.bump();
-                    let rhs = self.parse_expression();
-                    let span = self.span_from(start);
-                    let rvalue = match op_kind {
-                        TokenKind::PlusAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::Add,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::MinusAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::Sub,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::StarAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::Mul,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::SlashAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::Div,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::PercentAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::Mod,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::AndAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::BitAnd,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::OrAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::BitOr,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::XorAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::BitXor,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::ShiftLeftAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::ShiftLeft,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::ShiftRightAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::ShiftRight,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::ArithShiftLeftAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::ArithShiftLeft,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        TokenKind::ArithShiftRightAssign => Expression::new(
-                            ExprKind::Binary {
-                                op: BinaryOp::ArithShiftRight,
-                                left: Box::new(inner.clone()),
-                                right: Box::new(rhs),
-                            },
-                            span,
-                        ),
-                        _ => rhs,
-                    };
-                    Expression::new(
-                        ExprKind::AssignExpr {
-                            lvalue: Box::new(inner),
-                            rvalue: Box::new(rvalue),
+                let inner = self.parse_paren_assign_tail(inner, start);
+                // §16.10 / §16.11 sequence match items: `(seq, v = e, f())`.
+                // Kept as `$sva_match(<seq>, <item>...)`; each item is an
+                // assignment to a local variable, an increment/decrement, or
+                // a subroutine call, run when the sequence matches.
+                if self.in_sva_seq && self.at(TokenKind::Comma) {
+                    let mut args = vec![inner];
+                    while self.eat(TokenKind::Comma).is_some() {
+                        let istart = self.current().span.start;
+                        let item = self.parse_expression();
+                        args.push(self.parse_paren_assign_tail(item, istart));
+                    }
+                    self.expect(TokenKind::RParen);
+                    return Expression::new(
+                        ExprKind::SystemCall {
+                            name: "$sva_match".to_string(),
+                            args,
                         },
-                        span,
-                    )
-                } else {
-                    inner
-                };
+                        self.span_from(start),
+                    );
+                }
                 self.expect(TokenKind::RParen);
                 Expression::new(ExprKind::Paren(Box::new(inner)), self.span_from(start))
             }
@@ -1875,7 +1768,7 @@ impl Parser {
                     self.current_kind(),
                     TokenKind::Identifier | TokenKind::KwThis | TokenKind::KwSuper
                 ) {
-                    let src = self.parse_expr_bp(30);
+                    let src = self.parse_expr_bp(40);
                     Expression::new(
                         ExprKind::ShallowCopy {
                             source: Box::new(src),
@@ -2457,6 +2350,139 @@ impl Parser {
     /// optional `: typ : max` tail. The typical value is the one used, as by
     /// the reference simulator's default. Not inside a constraint, where a
     /// parenthesized expression is never a min:typ:max triple.
+    /// An assignment-operator tail after a parenthesised operand: `(a = b)`,
+    /// `(a += 1)`; `inner` unchanged when no assignment operator follows.
+    fn parse_paren_assign_tail(&mut self, inner: Expression, start: usize) -> Expression {
+        if self.at_any(&[
+            TokenKind::Assign,
+            TokenKind::PlusAssign,
+            TokenKind::MinusAssign,
+            TokenKind::StarAssign,
+            TokenKind::SlashAssign,
+            TokenKind::PercentAssign,
+            TokenKind::AndAssign,
+            TokenKind::OrAssign,
+            TokenKind::XorAssign,
+            TokenKind::ShiftLeftAssign,
+            TokenKind::ShiftRightAssign,
+            TokenKind::ArithShiftLeftAssign,
+            TokenKind::ArithShiftRightAssign,
+        ]) {
+            let op_kind = self.current().kind.clone();
+            self.bump();
+            let rhs = self.parse_expression();
+            let span = self.span_from(start);
+            let rvalue = match op_kind {
+                TokenKind::PlusAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::Add,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::MinusAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::Sub,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::StarAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::Mul,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::SlashAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::Div,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::PercentAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::Mod,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::AndAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::BitAnd,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::OrAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::BitOr,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::XorAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::BitXor,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::ShiftLeftAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::ShiftLeft,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::ShiftRightAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::ShiftRight,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::ArithShiftLeftAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::ArithShiftLeft,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                TokenKind::ArithShiftRightAssign => Expression::new(
+                    ExprKind::Binary {
+                        op: BinaryOp::ArithShiftRight,
+                        left: Box::new(inner.clone()),
+                        right: Box::new(rhs),
+                    },
+                    span,
+                ),
+                _ => rhs,
+            };
+            Expression::new(
+                ExprKind::AssignExpr {
+                    lvalue: Box::new(inner),
+                    rvalue: Box::new(rvalue),
+                },
+                span,
+            )
+        } else {
+            inner
+        }
+    }
+
     pub(super) fn parse_mintypmax_rest(&mut self, first: Expression) -> Expression {
         if self.in_constraint || !self.at(TokenKind::Colon) {
             return first;
@@ -2765,7 +2791,12 @@ impl Parser {
         match kind {
             TokenKind::OrMinusArrow => Some((BinaryOp::OrMinusArrow, 1, 2)),
             TokenKind::OrFatArrow => Some((BinaryOp::OrFatArrow, 1, 2)),
-            TokenKind::HashHash => Some((BinaryOp::HashHash, 28, 27)), // High precedence
+            // §16.9 Table 16-3: `##` binds looser than every expression
+            // operator and tighter than the sequence `and` / `or` /
+            // `intersect` / `throughout`, so `a ##1 b == c` is
+            // `a ##1 (b == c)` and `a ##1 b and c ##1 d` joins the two
+            // concatenations. The expression operators sit at 13 and above.
+            TokenKind::HashHash => Some((BinaryOp::HashHash, 6, 7)),
             TokenKind::KwIff => Some((BinaryOp::Iff, 1, 2)),
             // LRM §16.9 sequence operators. Low precedence (just above
             // `|->`/`|=>`) so a property `a |-> (b throughout c)` parses
@@ -2786,36 +2817,36 @@ impl Parser {
             // ternary. `->` is right-associative.
             TokenKind::Arrow => Some((BinaryOp::LogImplies, 2, 1)),
             TokenKind::LogEquiv => Some((BinaryOp::LogEquiv, 1, 2)),
-            TokenKind::LogOr => Some((BinaryOp::LogOr, 3, 4)),
-            TokenKind::LogAnd => Some((BinaryOp::LogAnd, 5, 6)),
-            TokenKind::BitOr => Some((BinaryOp::BitOr, 7, 8)),
-            TokenKind::BitXor => Some((BinaryOp::BitXor, 9, 10)),
-            TokenKind::BitXnor => Some((BinaryOp::BitXnor, 9, 10)),
-            TokenKind::BitAnd => Some((BinaryOp::BitAnd, 11, 12)),
-            TokenKind::Eq => Some((BinaryOp::Eq, 13, 14)),
-            TokenKind::Neq => Some((BinaryOp::Neq, 13, 14)),
-            TokenKind::CaseEq => Some((BinaryOp::CaseEq, 13, 14)),
-            TokenKind::CaseNeq => Some((BinaryOp::CaseNeq, 13, 14)),
-            TokenKind::WildcardEq => Some((BinaryOp::WildcardEq, 13, 14)),
-            TokenKind::WildcardNeq => Some((BinaryOp::WildcardNeq, 13, 14)),
-            TokenKind::Lt => Some((BinaryOp::Lt, 15, 16)),
-            TokenKind::Gt => Some((BinaryOp::Gt, 15, 16)),
-            TokenKind::Leq => Some((BinaryOp::Leq, 15, 16)),
-            TokenKind::Geq => Some((BinaryOp::Geq, 15, 16)),
-            TokenKind::ShiftLeft => Some((BinaryOp::ShiftLeft, 17, 18)),
-            TokenKind::ShiftRight => Some((BinaryOp::ShiftRight, 17, 18)),
-            TokenKind::ArithShiftLeft => Some((BinaryOp::ArithShiftLeft, 17, 18)),
-            TokenKind::ArithShiftRight => Some((BinaryOp::ArithShiftRight, 17, 18)),
-            TokenKind::Plus => Some((BinaryOp::Add, 19, 20)),
-            TokenKind::Minus => Some((BinaryOp::Sub, 19, 20)),
-            TokenKind::Star => Some((BinaryOp::Mul, 21, 22)),
-            TokenKind::Slash => Some((BinaryOp::Div, 21, 22)),
-            TokenKind::Percent => Some((BinaryOp::Mod, 21, 22)),
+            TokenKind::LogOr => Some((BinaryOp::LogOr, 13, 14)),
+            TokenKind::LogAnd => Some((BinaryOp::LogAnd, 15, 16)),
+            TokenKind::BitOr => Some((BinaryOp::BitOr, 17, 18)),
+            TokenKind::BitXor => Some((BinaryOp::BitXor, 19, 20)),
+            TokenKind::BitXnor => Some((BinaryOp::BitXnor, 19, 20)),
+            TokenKind::BitAnd => Some((BinaryOp::BitAnd, 21, 22)),
+            TokenKind::Eq => Some((BinaryOp::Eq, 23, 24)),
+            TokenKind::Neq => Some((BinaryOp::Neq, 23, 24)),
+            TokenKind::CaseEq => Some((BinaryOp::CaseEq, 23, 24)),
+            TokenKind::CaseNeq => Some((BinaryOp::CaseNeq, 23, 24)),
+            TokenKind::WildcardEq => Some((BinaryOp::WildcardEq, 23, 24)),
+            TokenKind::WildcardNeq => Some((BinaryOp::WildcardNeq, 23, 24)),
+            TokenKind::Lt => Some((BinaryOp::Lt, 25, 26)),
+            TokenKind::Gt => Some((BinaryOp::Gt, 25, 26)),
+            TokenKind::Leq => Some((BinaryOp::Leq, 25, 26)),
+            TokenKind::Geq => Some((BinaryOp::Geq, 25, 26)),
+            TokenKind::ShiftLeft => Some((BinaryOp::ShiftLeft, 27, 28)),
+            TokenKind::ShiftRight => Some((BinaryOp::ShiftRight, 27, 28)),
+            TokenKind::ArithShiftLeft => Some((BinaryOp::ArithShiftLeft, 27, 28)),
+            TokenKind::ArithShiftRight => Some((BinaryOp::ArithShiftRight, 27, 28)),
+            TokenKind::Plus => Some((BinaryOp::Add, 29, 30)),
+            TokenKind::Minus => Some((BinaryOp::Sub, 29, 30)),
+            TokenKind::Star => Some((BinaryOp::Mul, 31, 32)),
+            TokenKind::Slash => Some((BinaryOp::Div, 31, 32)),
+            TokenKind::Percent => Some((BinaryOp::Mod, 31, 32)),
             // §11.3.2: ALL binary operators associate left to right — only
             // the conditional operator is right-associative. `2 ** 3 ** 2`
             // is (2**3)**2 = 64, unlike the right-associative `**` of most
             // general-purpose languages (which gave 512 here).
-            TokenKind::DoubleStar => Some((BinaryOp::Power, 23, 24)), // left-assoc
+            TokenKind::DoubleStar => Some((BinaryOp::Power, 33, 34)), // left-assoc
             _ => None,
         }
     }
@@ -2842,10 +2873,10 @@ impl Parser {
 }
 
 fn prefix_bp() -> u8 {
-    25
+    35
 }
 fn postfix_bp() -> (u8, ()) {
-    (27, ())
+    (37, ())
 }
 fn ternary_bp() -> (u8, u8) {
     (1, 1)

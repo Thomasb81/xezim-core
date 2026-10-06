@@ -75,34 +75,535 @@ impl Parser {
         None
     }
 
-    /// §16.10: assertion-local variables need per-attempt storage. The
-    /// current property/sequence body representation cannot retain those
-    /// declarations; do not silently skip the body and leave an inert check.
-    fn diagnose_sva_local_declaration(&mut self, kind: &str) {
-        if !self.is_type_start() && !self.at(TokenKind::KwVar) {
-            return;
-        }
-        // Distinguish a declaration from a typedef cast or an ordinary
-        // sequence expression without consuming either spelling.
-        let saved_pos = self.pos;
-        let saved_diagnostics = self.diagnostics.len();
-        let explicit_var = self.eat(TokenKind::KwVar).is_some();
-        self.parse_data_type();
-        // `var` also permits an implicit type, as in `var stamp;`.
-        let declaration = explicit_var
-            || (self.diagnostics.len() == saved_diagnostics
+    /// §16.10: the `assertion_variable_declaration`s at the head of a
+    /// property or sequence body, each kept as
+    /// `$sva_local(<type>, <name> [, <init>])` for the simulator, which gives
+    /// every evaluation attempt its own copy.
+    fn parse_sva_local_declarations(&mut self) -> Vec<Expression> {
+        let mut decls = Vec::new();
+        loop {
+            if !self.is_type_start() && !self.at(TokenKind::KwVar) {
+                return decls;
+            }
+            // Distinguish a declaration from a typedef cast or an ordinary
+            // sequence expression without consuming either spelling.
+            let saved_pos = self.pos;
+            let saved_diagnostics = self.diagnostics.len();
+            let explicit_var = self.eat(TokenKind::KwVar).is_some();
+            // `var` also permits an implicit type, as in `var stamp;`.
+            let implicit = explicit_var
                 && matches!(
                     self.current_kind(),
                     TokenKind::Identifier | TokenKind::EscapedIdentifier
+                )
+                && matches!(
+                    self.peek_kind(),
+                    TokenKind::Semicolon | TokenKind::Assign | TokenKind::Comma
+                );
+            let tstart = self.current().span.start;
+            let data_type = if implicit {
+                DataType::Implicit {
+                    signing: None,
+                    dimensions: Vec::new(),
+                    span: self.span_from(tstart),
+                }
+            } else {
+                self.parse_data_type()
+            };
+            let declaration = explicit_var
+                || (self.diagnostics.len() == saved_diagnostics
+                    && matches!(
+                        self.current_kind(),
+                        TokenKind::Identifier | TokenKind::EscapedIdentifier
+                    ));
+            if !declaration {
+                self.pos = saved_pos;
+                self.diagnostics.truncate(saved_diagnostics);
+                return decls;
+            }
+            loop {
+                let name = self.parse_identifier();
+                let span = name.span;
+                let mut args = vec![
+                    Expression::new(ExprKind::TypeLiteral(Box::new(data_type.clone())), span),
+                    Self::sva_ident(name),
+                ];
+                if self.eat(TokenKind::Assign).is_some() {
+                    args.push(self.parse_expression());
+                }
+                decls.push(Expression::new(
+                    ExprKind::SystemCall {
+                        name: "$sva_local".to_string(),
+                        args,
+                    },
+                    span,
                 ));
-        self.pos = saved_pos;
-        self.diagnostics.truncate(saved_diagnostics);
-        if declaration {
-            self.error(format!(
-                "{kind}-local variable declarations are not supported; \
-                 assertion-local variables require per-attempt storage (IEEE 1800-2017 §16.10)"
-            ));
+                if self.eat(TokenKind::Comma).is_none() {
+                    break;
+                }
+            }
+            self.expect(TokenKind::Semicolon);
         }
+    }
+
+    /// §16.8.2 local variable formal arguments (`local input int v`): the
+    /// formal is a local variable of each attempt initialised from its
+    /// actual. The body's references are renamed to a local `v$lf`, declared
+    /// with the formal (substituted by the actual at instantiation) as its
+    /// initialiser, so the attempt can assign it without touching the actual.
+    fn sva_bind_local_formals(
+        locals: &[(Identifier, DataType)],
+        decls: &mut Vec<Expression>,
+        body: &mut Expression,
+    ) {
+        for (formal, dt) in locals {
+            let local = format!("{}$lf", formal.name);
+            Self::sva_rename_ident(body, &formal.name, &local);
+            for d in decls.iter_mut() {
+                Self::sva_rename_ident(d, &formal.name, &local);
+            }
+            let span = formal.span;
+            decls.insert(
+                0,
+                Expression::new(
+                    ExprKind::SystemCall {
+                        name: "$sva_local".to_string(),
+                        args: vec![
+                            Expression::new(ExprKind::TypeLiteral(Box::new(dt.clone())), span),
+                            Self::sva_ident(Identifier { name: local, span }),
+                            Self::sva_ident(formal.clone()),
+                        ],
+                    },
+                    span,
+                ),
+            );
+        }
+    }
+
+    /// §16.14.6: the clock a procedural concurrent assertion infers from
+    /// its procedure, `always @(<edge> <expr> [iff <guard>] ...) <body>`, when
+    /// the body has no other timing control: the event expression's only
+    /// edge event, or, among several (`posedge clk or negedge rst_n`), the
+    /// only one whose expression the body does not read.
+    fn infer_procedural_assertion_clocks(stmt: &mut crate::ast::stmt::Statement) {
+        use crate::ast::stmt::{EventControl, StatementKind, TimingControl};
+        let StatementKind::TimingControl {
+            control: TimingControl::Event(EventControl::EventExpr(events)),
+            stmt: body,
+        } = &mut stmt.kind
+        else {
+            return;
+        };
+        if events.is_empty() || events.iter().any(|e| e.edge.is_none()) {
+            return;
+        }
+        if Self::stmt_has_timing(body) {
+            return;
+        }
+        let clock = if events.len() == 1 {
+            events[0].clone()
+        } else {
+            let free: Vec<_> = events
+                .iter()
+                .filter(|e| {
+                    let mut names = Vec::new();
+                    Self::expr_idents(&e.expr, &mut names);
+                    !names.iter().any(|n| Self::stmt_mentions(body, n))
+                })
+                .collect();
+            if free.len() != 1 {
+                return;
+            }
+            free[0].clone()
+        };
+        Self::set_inferred_clock(body, &clock);
+    }
+
+    /// Does the statement hold a blocking timing control (`#`, `@`, `wait`)?
+    fn stmt_has_timing(stmt: &crate::ast::stmt::Statement) -> bool {
+        use crate::ast::stmt::StatementKind as K;
+        match &stmt.kind {
+            K::TimingControl { .. } | K::Wait { .. } | K::WaitFork | K::WaitOrder { .. } => true,
+            K::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::stmt_has_timing(then_stmt)
+                    || else_stmt.as_deref().is_some_and(Self::stmt_has_timing)
+            }
+            K::Case { items, .. } => items.iter().any(|i| Self::stmt_has_timing(&i.stmt)),
+            K::For { body, .. }
+            | K::Foreach { body, .. }
+            | K::While { body, .. }
+            | K::DoWhile { body, .. }
+            | K::Repeat { body, .. }
+            | K::Forever { body } => Self::stmt_has_timing(body),
+            K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+                stmts.iter().any(Self::stmt_has_timing)
+            }
+            _ => false,
+        }
+    }
+
+    /// Give every procedural concurrent assertion in `stmt` the inferred
+    /// clock `clock`.
+    fn set_inferred_clock(
+        stmt: &mut crate::ast::stmt::Statement,
+        clock: &crate::ast::stmt::EventExpr,
+    ) {
+        use crate::ast::stmt::StatementKind as K;
+        match &mut stmt.kind {
+            K::Assertion(a) => {
+                if a.is_property && a.procedural {
+                    a.inferred_clock = Some(clock.clone());
+                }
+            }
+            K::If {
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                Self::set_inferred_clock(then_stmt, clock);
+                if let Some(e) = else_stmt {
+                    Self::set_inferred_clock(e, clock);
+                }
+            }
+            K::Case { items, .. } => {
+                for i in items {
+                    Self::set_inferred_clock(&mut i.stmt, clock);
+                }
+            }
+            K::For { body, .. }
+            | K::Foreach { body, .. }
+            | K::While { body, .. }
+            | K::DoWhile { body, .. }
+            | K::Repeat { body, .. }
+            | K::Forever { body } => Self::set_inferred_clock(body, clock),
+            K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+                for s in stmts {
+                    Self::set_inferred_clock(s, clock);
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// The bare identifiers an expression reads.
+    fn expr_idents(e: &Expression, out: &mut Vec<String>) {
+        match &e.kind {
+            ExprKind::Ident(h) => {
+                if let Some(seg) = h.path.first() {
+                    out.push(seg.name.name.clone());
+                }
+                for seg in &h.path {
+                    for sel in &seg.selects {
+                        Self::expr_idents(sel, out);
+                    }
+                }
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                Self::expr_idents(operand, out)
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::AssignExpr {
+                lvalue: left,
+                rvalue: right,
+            }
+            | ExprKind::Range(left, right) => {
+                Self::expr_idents(left, out);
+                Self::expr_idents(right, out);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::expr_idents(condition, out);
+                Self::expr_idents(then_expr, out);
+                Self::expr_idents(else_expr, out);
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::SystemCall { args, .. }
+            | ExprKind::Concatenation(args) => {
+                for a in args {
+                    Self::expr_idents(a, out);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                Self::expr_idents(expr, out);
+                Self::expr_idents(index, out);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::expr_idents(expr, out);
+                Self::expr_idents(left, out);
+                Self::expr_idents(right, out);
+            }
+            ExprKind::MemberAccess { expr, .. } => Self::expr_idents(expr, out),
+            ExprKind::SvaClocked { clock, body, .. } => {
+                Self::expr_idents(clock, out);
+                Self::expr_idents(body, out);
+            }
+            _ => {}
+        }
+    }
+
+    /// Does the statement read or write the bare name `name`?
+    fn stmt_mentions(stmt: &crate::ast::stmt::Statement, name: &str) -> bool {
+        use crate::ast::stmt::StatementKind as K;
+        let e = |x: &Expression| {
+            let mut v = Vec::new();
+            Self::expr_idents(x, &mut v);
+            v.iter().any(|n| n == name)
+        };
+        match &stmt.kind {
+            K::Expr(x) => e(x),
+            K::BlockingAssign { lvalue, rvalue } | K::NonblockingAssign { lvalue, rvalue, .. } => {
+                e(lvalue) || e(rvalue)
+            }
+            K::If {
+                condition,
+                then_stmt,
+                else_stmt,
+                ..
+            } => {
+                e(condition)
+                    || Self::stmt_mentions(then_stmt, name)
+                    || else_stmt
+                        .as_deref()
+                        .is_some_and(|s| Self::stmt_mentions(s, name))
+            }
+            K::Case { expr, items, .. } => {
+                e(expr)
+                    || items
+                        .iter()
+                        .any(|i| i.patterns.iter().any(e) || Self::stmt_mentions(&i.stmt, name))
+            }
+            K::For {
+                condition,
+                step,
+                body,
+                ..
+            } => {
+                condition.as_ref().is_some_and(e)
+                    || step.iter().any(e)
+                    || Self::stmt_mentions(body, name)
+            }
+            K::While { condition, body } | K::DoWhile { body, condition } => {
+                e(condition) || Self::stmt_mentions(body, name)
+            }
+            K::Repeat { count, body } => e(count) || Self::stmt_mentions(body, name),
+            K::Foreach { array, body, .. } => e(array) || Self::stmt_mentions(body, name),
+            K::Forever { body } => Self::stmt_mentions(body, name),
+            K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+                stmts.iter().any(|s| Self::stmt_mentions(s, name))
+            }
+            K::Assertion(a) => {
+                e(&a.expr)
+                    || a.action
+                        .as_deref()
+                        .is_some_and(|s| Self::stmt_mentions(s, name))
+                    || a.else_action
+                        .as_deref()
+                        .is_some_and(|s| Self::stmt_mentions(s, name))
+            }
+            _ => false,
+        }
+    }
+
+    /// §16.10: only a local variable can be assigned in a match item list
+    /// (`(seq, v = e)`); `locals` are the names the body may assign (its
+    /// local variables and formals).
+    pub(super) fn check_sva_match_assignments(&mut self, e: &Expression, locals: &[String]) {
+        match &e.kind {
+            ExprKind::SystemCall { name, args } if name == "$sva_match" => {
+                for item in args.iter().skip(1) {
+                    let target = match &item.kind {
+                        ExprKind::AssignExpr { lvalue, .. }
+                        | ExprKind::Binary {
+                            op: BinaryOp::Assign,
+                            left: lvalue,
+                            ..
+                        } => Some(&**lvalue),
+                        ExprKind::Unary { op, operand }
+                            if matches!(
+                                op,
+                                UnaryOp::PostIncr
+                                    | UnaryOp::PreIncr
+                                    | UnaryOp::PostDecr
+                                    | UnaryOp::PreDecr
+                            ) =>
+                        {
+                            Some(&**operand)
+                        }
+                        _ => None,
+                    };
+                    let Some(target) = target else {
+                        continue;
+                    };
+                    let mut names = Vec::new();
+                    Self::expr_idents(target, &mut names);
+                    if let Some(n) = names.first().filter(|n| !locals.contains(n)) {
+                        let msg = format!(
+                            "illegal assignment to '{n}' in a match item list: only local \
+                             variables can be assigned (IEEE 1800-2017 §16.10)"
+                        );
+                        self.diagnostics
+                            .push(crate::diagnostics::Diagnostic::error(msg, item.span));
+                    }
+                }
+                for a in args {
+                    self.check_sva_match_assignments(a, locals);
+                }
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                self.check_sva_match_assignments(operand, locals)
+            }
+            ExprKind::Binary { left, right, .. } => {
+                self.check_sva_match_assignments(left, locals);
+                self.check_sva_match_assignments(right, locals);
+            }
+            ExprKind::SystemCall { args, .. } => {
+                for a in args {
+                    self.check_sva_match_assignments(a, locals);
+                }
+            }
+            ExprKind::SvaClocked { body, .. } => self.check_sva_match_assignments(body, locals),
+            _ => {}
+        }
+    }
+
+    /// The names a property or sequence body may assign: its local
+    /// variables (`$sva_local` declarations, renamed local formals) and its
+    /// formals (a `local output` formal is one).
+    fn sva_assignable_names(decls: &[Expression], ports: &[Identifier]) -> Vec<String> {
+        let mut out: Vec<String> = ports.iter().map(|p| p.name.clone()).collect();
+        for d in decls {
+            if let ExprKind::SystemCall { args, .. } = &d.kind {
+                if let Some(ExprKind::Ident(h)) = args.get(1).map(|a| &a.kind) {
+                    if let Some(seg) = h.path.first() {
+                        out.push(seg.name.name.clone());
+                    }
+                }
+            }
+        }
+        out
+    }
+
+    /// A bare reference to `id`.
+    fn sva_ident(id: Identifier) -> Expression {
+        let span = id.span;
+        Expression::new(
+            ExprKind::Ident(HierarchicalIdentifier {
+                root: None,
+                path: vec![HierPathSegment {
+                    name: id,
+                    selects: Vec::new(),
+                }],
+                span,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            }),
+            span,
+        )
+    }
+
+    /// Rename every bare reference `from` in `e` to `to`.
+    fn sva_rename_ident(e: &mut Expression, from: &str, to: &str) {
+        match &mut e.kind {
+            ExprKind::Ident(h) => {
+                if h.root.is_none() && h.path.len() == 1 && h.path[0].name.name == from {
+                    h.path[0].name.name = to.to_string();
+                }
+                for seg in &mut h.path {
+                    for sel in &mut seg.selects {
+                        Self::sva_rename_ident(sel, from, to);
+                    }
+                }
+            }
+            ExprKind::Unary { operand, .. } | ExprKind::Paren(operand) => {
+                Self::sva_rename_ident(operand, from, to)
+            }
+            ExprKind::Binary { left, right, .. }
+            | ExprKind::AssignExpr {
+                lvalue: left,
+                rvalue: right,
+            }
+            | ExprKind::Range(left, right) => {
+                Self::sva_rename_ident(left, from, to);
+                Self::sva_rename_ident(right, from, to);
+            }
+            ExprKind::Conditional {
+                condition,
+                then_expr,
+                else_expr,
+            } => {
+                Self::sva_rename_ident(condition, from, to);
+                Self::sva_rename_ident(then_expr, from, to);
+                Self::sva_rename_ident(else_expr, from, to);
+            }
+            ExprKind::Call { args, .. }
+            | ExprKind::SystemCall { args, .. }
+            | ExprKind::Concatenation(args) => {
+                for a in args {
+                    Self::sva_rename_ident(a, from, to);
+                }
+            }
+            ExprKind::Replication { count, exprs } => {
+                Self::sva_rename_ident(count, from, to);
+                for a in exprs {
+                    Self::sva_rename_ident(a, from, to);
+                }
+            }
+            ExprKind::Index { expr, index } => {
+                Self::sva_rename_ident(expr, from, to);
+                Self::sva_rename_ident(index, from, to);
+            }
+            ExprKind::RangeSelect {
+                expr, left, right, ..
+            } => {
+                Self::sva_rename_ident(expr, from, to);
+                Self::sva_rename_ident(left, from, to);
+                Self::sva_rename_ident(right, from, to);
+            }
+            ExprKind::MemberAccess { expr, .. } => Self::sva_rename_ident(expr, from, to),
+            ExprKind::Inside { expr, ranges } => {
+                Self::sva_rename_ident(expr, from, to);
+                for r in ranges {
+                    Self::sva_rename_ident(r, from, to);
+                }
+            }
+            ExprKind::SvaClocked {
+                clock, iff, body, ..
+            } => {
+                Self::sva_rename_ident(clock, from, to);
+                if let Some(g) = iff {
+                    Self::sva_rename_ident(g, from, to);
+                }
+                Self::sva_rename_ident(body, from, to);
+            }
+            _ => {}
+        }
+    }
+
+    /// Wrap a property or sequence body in its local variable declarations
+    /// (`$sva_locals(<decl>..., <body>)`), if it has any.
+    fn sva_wrap_locals(decls: Vec<Expression>, body: Expression) -> Expression {
+        if decls.is_empty() {
+            return body;
+        }
+        let span = body.span;
+        let mut args = decls;
+        args.push(body);
+        Expression::new(
+            ExprKind::SystemCall {
+                name: "$sva_locals".to_string(),
+                args,
+            },
+            span,
+        )
     }
 
     pub(super) fn parse_module_declaration(&mut self) -> ModuleDeclaration {
@@ -240,13 +741,66 @@ impl Parser {
     /// segment may carry `local`/direction keywords, a type, and a default
     /// (`= expr`); the port name is the last identifier before the default
     /// (or before the segment end). Called with the cursor ON the `(`.
-    fn parse_sva_port_names(&mut self) -> Vec<Identifier> {
+    /// The formal port names of a property or sequence declaration, and its
+    /// §16.8.2 `local [input]` formals with their types.
+    fn parse_sva_port_names(&mut self) -> (Vec<Identifier>, Vec<(Identifier, DataType)>) {
         let mut ports: Vec<Identifier> = Vec::new();
+        let mut local_ports: Vec<(Identifier, DataType)> = Vec::new();
         self.bump(); // (
         let mut depth: i32 = 1;
         let mut last_ident: Option<Identifier> = None;
         let mut in_default = false;
+        let mut port_start = true;
+        // The type of the current formal when it is a `local [input]` one.
+        let mut local_type: Option<DataType> = None;
+        let finish = |last: &mut Option<Identifier>,
+                      local: &mut Option<DataType>,
+                      ports: &mut Vec<Identifier>,
+                      local_ports: &mut Vec<(Identifier, DataType)>| {
+            if let Some(id) = last.take() {
+                if let Some(dt) = local.take() {
+                    local_ports.push((id.clone(), dt));
+                }
+                ports.push(id);
+            }
+            *local = None;
+        };
         while depth > 0 && !self.at(TokenKind::Eof) {
+            if port_start && depth == 1 && self.at(TokenKind::KwLocal) {
+                self.bump();
+                let input = match self.current_kind() {
+                    TokenKind::KwInput => {
+                        self.bump();
+                        true
+                    }
+                    TokenKind::KwOutput | TokenKind::KwInout => {
+                        self.bump();
+                        false
+                    }
+                    _ => true,
+                };
+                let tstart = self.current().span.start;
+                let named_now = matches!(
+                    self.current_kind(),
+                    TokenKind::Identifier | TokenKind::EscapedIdentifier
+                ) && matches!(
+                    self.peek_kind(),
+                    TokenKind::Comma | TokenKind::RParen | TokenKind::Assign
+                );
+                let dt = if named_now || !self.is_type_start() {
+                    DataType::Implicit {
+                        signing: None,
+                        dimensions: Vec::new(),
+                        span: self.span_from(tstart),
+                    }
+                } else {
+                    self.parse_data_type()
+                };
+                // `local output` / `local inout` formals stay plain
+                // substitutions (not modelled as locals).
+                local_type = input.then_some(dt);
+            }
+            port_start = false;
             match self.current_kind() {
                 TokenKind::LParen | TokenKind::LBracket => {
                     depth += 1;
@@ -255,17 +809,24 @@ impl Parser {
                 TokenKind::RParen | TokenKind::RBracket => {
                     depth -= 1;
                     if depth == 0 {
-                        if let Some(id) = last_ident.take() {
-                            ports.push(id);
-                        }
+                        finish(
+                            &mut last_ident,
+                            &mut local_type,
+                            &mut ports,
+                            &mut local_ports,
+                        );
                     }
                     self.bump();
                 }
                 TokenKind::Comma if depth == 1 => {
-                    if let Some(id) = last_ident.take() {
-                        ports.push(id);
-                    }
+                    finish(
+                        &mut last_ident,
+                        &mut local_type,
+                        &mut ports,
+                        &mut local_ports,
+                    );
                     in_default = false;
+                    port_start = true;
                     self.bump();
                 }
                 TokenKind::Assign if depth == 1 => {
@@ -286,7 +847,7 @@ impl Parser {
                 }
             }
         }
-        ports
+        (ports, local_ports)
     }
 
     pub(super) fn parse_package_declaration(&mut self) -> PackageDeclaration {
@@ -1294,7 +1855,10 @@ impl Parser {
                 // `always_*` and the body. The preprocessor only strips
                 // standalone-line attributes; inline ones reach the parser.
                 self.skip_optional_attribute();
-                let stmt = self.parse_statement();
+                let mut stmt = self.parse_statement();
+                if matches!(kind, AlwaysKind::Always | AlwaysKind::AlwaysFf) {
+                    Self::infer_procedural_assertion_clocks(&mut stmt);
+                }
                 Some(ModuleItem::AlwaysConstruct(AlwaysConstruct {
                     kind,
                     stmt,
@@ -1822,63 +2386,89 @@ impl Parser {
                 let start = self.current().span.start;
                 self.bump();
                 let name = self.parse_identifier();
-                let ports = if self.at(TokenKind::LParen) {
+                let (ports, local_ports) = if self.at(TokenKind::LParen) {
                     self.parse_sva_port_names()
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
                 self.expect(TokenKind::Semicolon);
-                self.diagnose_sva_local_declaration("property");
+                // §16.10: assertion-local variable declarations.
+                let mut decls = self.parse_sva_local_declarations();
                 // LRM §16.6 — capture the property body when it matches
-                // the common `@(<event>) <expr>;` shape. Re-uses the
-                // assertion parser's clock-event capture (an
-                // `SvaClocked { clock, body }` wrapper). Properties
-                // not matching this shape fall back to the legacy
-                // token-skip path so the parser stays resilient.
-                let body_expr = if self.at(TokenKind::At) {
-                    let bstart = self.current().span.start;
+                // the common `[@(<event>)] [disable iff (<expr>)] <expr>;`
+                // shape. Re-uses the assertion parser's clock-event capture
+                // (an `SvaClocked { clock, body }` wrapper). Properties not
+                // matching this shape fall back to the legacy token-skip
+                // path so the parser stays resilient.
+                let bstart = self.current().span.start;
+                let save_pos = self.pos;
+                let save_diag = self.diagnostics.len();
+                let clocked = self.at(TokenKind::At);
+                let clock = if clocked {
                     self.bump(); // @
-                    let (clk, clk_edge, clk_iff) = self.parse_sva_clock_event();
-                    // §16.12: optional `disable iff (<expr>)` after the
-                    // clocking event, before the property expression; kept
-                    // as `Binary{SvaDisableIff, guard, body}`.
-                    let disable_guard =
-                        if self.at(TokenKind::KwDisable) && self.peek_kind() == TokenKind::KwIff {
-                            self.bump(); // disable
-                            self.bump(); // iff
-                            let _ = self.eat(TokenKind::LParen);
-                            let g = self.parse_expression();
-                            let _ = self.eat(TokenKind::RParen);
-                            Some(g)
-                        } else {
-                            None
-                        };
-                    self.in_sva_seq = true;
-                    let body = self.parse_expression();
-                    self.in_sva_seq = false;
-                    let body = if let Some(g) = disable_guard {
-                        let span = body.span;
-                        crate::ast::expr::Expression::new(
-                            crate::ast::expr::ExprKind::Binary {
-                                op: crate::ast::expr::BinaryOp::SvaDisableIff,
-                                left: Box::new(g),
-                                right: Box::new(body),
-                            },
-                            span,
-                        )
+                    Some(self.parse_sva_clock_event())
+                } else {
+                    None
+                };
+                // §16.12: optional `disable iff (<expr>)` after the clocking
+                // event, before the property expression; kept as
+                // `Binary{SvaDisableIff, guard, body}`.
+                let disable_guard =
+                    if self.at(TokenKind::KwDisable) && self.peek_kind() == TokenKind::KwIff {
+                        self.bump(); // disable
+                        self.bump(); // iff
+                        let _ = self.eat(TokenKind::LParen);
+                        let g = self.parse_expression();
+                        let _ = self.eat(TokenKind::RParen);
+                        Some(g)
                     } else {
-                        body
+                        None
                     };
-                    let _ = self.eat(TokenKind::Semicolon);
-                    Some(crate::ast::expr::Expression::new(
-                        crate::ast::expr::ExprKind::SvaClocked {
-                            clock: Box::new(clk),
-                            edge: clk_edge,
-                            iff: clk_iff.map(Box::new),
-                            body: Box::new(body),
-                        },
-                        self.span_from(bstart),
-                    ))
+                let body_expr = if clocked || !self.at(TokenKind::KwEndproperty) {
+                    self.in_sva_seq = true;
+                    let mut body = self.parse_expression();
+                    self.in_sva_seq = false;
+                    // An unclocked body is taken only when it parses cleanly
+                    // (a default clocking or an inferred clock supplies the
+                    // clock); otherwise the token-skip path below runs.
+                    if !clocked
+                        && !(self.diagnostics.len() == save_diag && self.at(TokenKind::Semicolon))
+                    {
+                        self.diagnostics.truncate(save_diag);
+                        self.pos = save_pos;
+                        None
+                    } else {
+                        let _ = self.eat(TokenKind::Semicolon);
+                        Self::sva_bind_local_formals(&local_ports, &mut decls, &mut body);
+                        let assignable = Self::sva_assignable_names(&decls, &ports);
+                        self.check_sva_match_assignments(&body, &assignable);
+                        let body = Self::sva_wrap_locals(std::mem::take(&mut decls), body);
+                        let body = if let Some(g) = disable_guard {
+                            let span = body.span;
+                            Expression::new(
+                                ExprKind::Binary {
+                                    op: BinaryOp::SvaDisableIff,
+                                    left: Box::new(g),
+                                    right: Box::new(body),
+                                },
+                                span,
+                            )
+                        } else {
+                            body
+                        };
+                        Some(match clock {
+                            Some((clk, clk_edge, clk_iff)) => Expression::new(
+                                ExprKind::SvaClocked {
+                                    clock: Box::new(clk),
+                                    edge: clk_edge,
+                                    iff: clk_iff.map(Box::new),
+                                    body: Box::new(body),
+                                },
+                                self.span_from(bstart),
+                            ),
+                            None => body,
+                        })
+                    }
                 } else {
                     None
                 };
@@ -1901,13 +2491,14 @@ impl Parser {
                 let start = self.current().span.start;
                 self.bump();
                 let name = self.parse_identifier();
-                let ports = if self.at(TokenKind::LParen) {
+                let (ports, local_ports) = if self.at(TokenKind::LParen) {
                     self.parse_sva_port_names()
                 } else {
-                    Vec::new()
+                    (Vec::new(), Vec::new())
                 };
                 self.expect(TokenKind::Semicolon);
-                self.diagnose_sva_local_declaration("sequence");
+                // §16.10: assertion-local variable declarations.
+                let mut decls = self.parse_sva_local_declarations();
                 // LRM §16.5 — capture the sequence body when it matches
                 // the common `@(<event>) <expr>;` shape, mirroring the
                 // property-decl path. Other shapes (raw `##N` chains)
@@ -1917,11 +2508,15 @@ impl Parser {
                     self.bump();
                     let (clk, clk_edge, clk_iff) = self.parse_sva_clock_event();
                     self.in_sva_seq = true;
-                    let body = self.parse_expression();
+                    let mut body = self.parse_expression();
                     self.in_sva_seq = false;
                     let _ = self.eat(TokenKind::Semicolon);
-                    Some(crate::ast::expr::Expression::new(
-                        crate::ast::expr::ExprKind::SvaClocked {
+                    Self::sva_bind_local_formals(&local_ports, &mut decls, &mut body);
+                    let assignable = Self::sva_assignable_names(&decls, &ports);
+                    self.check_sva_match_assignments(&body, &assignable);
+                    let body = Self::sva_wrap_locals(std::mem::take(&mut decls), body);
+                    Some(Expression::new(
+                        ExprKind::SvaClocked {
                             clock: Box::new(clk),
                             edge: clk_edge,
                             iff: clk_iff.map(Box::new),
@@ -1938,11 +2533,14 @@ impl Parser {
                     let save_pos = self.pos;
                     let save_diag = self.diagnostics.len();
                     self.in_sva_seq = true;
-                    let body = self.parse_expression();
+                    let mut body = self.parse_expression();
                     self.in_sva_seq = false;
                     if self.diagnostics.len() == save_diag && self.at(TokenKind::Semicolon) {
                         self.bump();
-                        Some(body)
+                        Self::sva_bind_local_formals(&local_ports, &mut decls, &mut body);
+                        let assignable = Self::sva_assignable_names(&decls, &ports);
+                        self.check_sva_match_assignments(&body, &assignable);
+                        Some(Self::sva_wrap_locals(std::mem::take(&mut decls), body))
                     } else {
                         self.diagnostics.truncate(save_diag);
                         self.pos = save_pos;
@@ -2080,33 +2678,38 @@ impl Parser {
                     }
                     item
                 } else if self.at(TokenKind::KwDisable) {
-                    // IEEE 1800-2023 §16.4.2: `default disable iff <expr>;`
-                    // is a default for all concurrent assertions in scope.
-                    // Skip-parse (we don't model SVA semantics yet).
+                    // §16.15 `default disable iff <expr>;`: the default
+                    // disable condition of every concurrent assertion in this
+                    // module, interface or generate scope that has no
+                    // `disable iff` of its own. Kept as a marker assertion
+                    // item, `$sva_default_disable(<expr>)`, which reaches the
+                    // simulator in the same scope as the scope's assertions.
                     self.bump(); // disable
                     let _ = self.eat(TokenKind::KwIff);
-                    // Consume balanced expression up to the next ';' at depth 0.
-                    let mut d = 0i32;
-                    while !self.at(TokenKind::Eof) {
-                        match self.current_kind() {
-                            TokenKind::LParen => {
-                                d += 1;
-                                self.bump();
-                            }
-                            TokenKind::RParen => {
-                                d -= 1;
-                                self.bump();
-                            }
-                            TokenKind::Semicolon if d == 0 => {
-                                self.bump();
-                                break;
-                            }
-                            _ => {
-                                self.bump();
-                            }
-                        }
-                    }
-                    Some(ModuleItem::Null)
+                    let guard = self.parse_expression();
+                    self.expect(TokenKind::Semicolon);
+                    let span = self.span_from(start);
+                    Some(ModuleItem::AssertionItem(
+                        crate::ast::stmt::AssertionStatement {
+                            kind: crate::ast::stmt::AssertionKind::Assert,
+                            expr: Expression::new(
+                                ExprKind::SystemCall {
+                                    name: "$sva_default_disable".to_string(),
+                                    args: vec![guard],
+                                },
+                                span,
+                            ),
+                            action: None,
+                            else_action: None,
+                            is_property: true,
+                            is_sequence: false,
+                            deferred: None,
+                            label: None,
+                            procedural: false,
+                            inferred_clock: None,
+                            span,
+                        },
+                    ))
                 } else {
                     None
                 }

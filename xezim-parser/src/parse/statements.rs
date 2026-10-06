@@ -341,10 +341,11 @@ impl Parser {
                     None => Statement::new(StatementKind::Assertion(a), span),
                 }
             }
-            TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => Statement::new(
-                StatementKind::Assertion(self.parse_assertion_statement()),
-                self.span_from(start),
-            ),
+            TokenKind::KwAssert | TokenKind::KwAssume | TokenKind::KwCover => {
+                let mut a = self.parse_assertion_statement();
+                a.procedural = true;
+                Statement::new(StatementKind::Assertion(a), self.span_from(start))
+            }
             TokenKind::KwAssign => {
                 self.bump();
                 let lv = self.parse_expression();
@@ -2014,6 +2015,8 @@ impl Parser {
         self.in_sva_seq = true;
         let body_inner = self.parse_expression();
         self.in_sva_seq = prev_sva;
+        // §16.10: an assertion's own property declares no local variables.
+        self.check_sva_match_assignments(&body_inner, &[]);
         let body = if let Some(g) = disable_guard {
             let span = body_inner.span;
             Expression::new(
@@ -2064,6 +2067,8 @@ impl Parser {
             is_sequence,
             deferred,
             label: None,
+            procedural: false,
+            inferred_clock: None,
             span: self.span_from(start),
         }
     }
@@ -2391,9 +2396,9 @@ impl Parser {
             let weight = if self.eat(TokenKind::ColonAssign).is_some() {
                 // §18.17.1: `|` separates ALTERNATIVES here, so the weight must
                 // not be parsed as a bitwise-OR expression — bind tighter than
-                // `|` (bp 7/8) so `a := 0 | b := 1` yields two alternatives
+                // `|` (bp 17/18) so `a := 0 | b := 1` yields two alternatives
                 // rather than one weight of `0 | b`.
-                Some(self.parse_expr_bp(9))
+                Some(self.parse_expr_bp(19))
             } else {
                 None
             };

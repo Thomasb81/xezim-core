@@ -1,10 +1,10 @@
 use crate::ast::{Description, decl::ModuleItem};
 use crate::parse;
 
-/// §16.10: unsupported assertion-local state must not erase an assertion's
-/// body without a diagnostic, including typedef and packed local types.
+/// §16.10: assertion-local variable declarations, including typedef and
+/// packed local types, are kept with the body as `$sva_local` declarations.
 #[test]
-fn assertion_local_declarations_are_diagnosed() {
+fn assertion_local_declarations_are_kept() {
     for kind in ["property", "sequence"] {
         for declaration in [
             "time stamp;",
@@ -15,6 +15,7 @@ fn assertion_local_declarations_are_diagnosed() {
             "logic [7:0] sample;",
             "stamp_t stamp;",
             "scope_pkg::stamp_t stamp;",
+            "int a, b = 2;",
         ] {
             let source = format!(
                 "module m; bit clk; typedef time stamp_t; \
@@ -23,14 +24,47 @@ fn assertion_local_declarations_are_diagnosed() {
             );
             let result = parse(&source);
             assert!(
-                result.errors.iter().any(|e| e.message.contains(&format!(
-                    "{kind}-local variable declarations are not supported"
-                ))),
+                result.errors.is_empty(),
                 "{kind} {declaration}: {:?}",
                 result.errors
             );
+            let Some(Description::Module(m)) = result.source.descriptions.first() else {
+                panic!("not a module");
+            };
+            let body = m
+                .items
+                .iter()
+                .find_map(|i| match i {
+                    ModuleItem::PropertyDeclaration(p) => p.body.clone(),
+                    ModuleItem::SequenceDeclaration(s) => s.body.clone(),
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{kind} {declaration}: body dropped"));
+            let text = format!("{body:?}");
+            assert!(
+                text.contains("$sva_locals") && text.contains("$sva_local\""),
+                "{kind} {declaration}: {text}"
+            );
         }
     }
+}
+
+/// §16.10 / §16.11: sequence match items parse as `$sva_match`.
+#[test]
+fn sequence_match_items_parse() {
+    let source = r#"
+module m;
+  bit clk, a, b; int d;
+  function void note(); endfunction
+  property p; int x; @(posedge clk) (a, x = d, x += 1, x++) ##1 (b, note()) |-> d == x; endproperty
+  sequence s(local input int v); (a, v = v + 1) ##1 d == v; endsequence
+endmodule
+"#;
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let text = format!("{:?}", result.source.descriptions);
+    assert!(text.contains("$sva_match"), "{text}");
+    assert!(text.contains("v$lf"), "{text}");
 }
 
 #[test]
@@ -315,4 +349,49 @@ fn test_specify_timing_checks() {
         tc[2].args[1].as_ref().unwrap().edges,
         Some(timing_edge_bit(0, 1) | timing_edge_bit(2, 1))
     );
+}
+
+/// §16.10: a match item can assign only a local variable.
+#[test]
+fn match_item_assignment_needs_a_local() {
+    for body in [
+        "property p; @(posedge clk) (a, d = 1) |-> b; endproperty",
+        "sequence s; int v; (a, d++) ##1 b; endsequence",
+        "ap: assert property (@(posedge clk) (a, d = 1) |-> b);",
+    ] {
+        let source = format!("module m; bit clk, a, b; int d; {body} endmodule");
+        let result = parse(&source);
+        assert!(
+            result.errors.iter().any(|e| e
+                .message
+                .contains("illegal assignment to 'd' in a match item list")),
+            "{body}: {:?}",
+            result.errors
+        );
+    }
+}
+
+/// §16.9 Table 16-3: `##` binds looser than the expression operators and
+/// tighter than the sequence `and` / `or`.
+#[test]
+fn cycle_delay_binds_looser_than_expression_operators() {
+    let source = r#"
+module m;
+  bit clk, a, b, c, d;
+  ap: assert property (@(posedge clk) a ##1 b == c);
+  aq: assert property (@(posedge clk) a && b ##1 c || d);
+  ar: assert property (@(posedge clk) a ##1 b and c ##1 d);
+endmodule
+"#;
+    let result = parse(source);
+    assert!(result.errors.is_empty(), "{:?}", result.errors);
+    let text = format!("{:?}", result.source.descriptions);
+    // `a ##1 (b == c)`: the equality is the delayed operand.
+    let eq = text.find("op: Eq").expect("no equality");
+    let hh = text.find("op: HashHash").expect("no delay");
+    assert!(hh < eq, "`==` parsed outside the `##` operand: {text}");
+    // `(a && b) ##1 (c || d)`: the conjunction is the left operand.
+    let and = text.find("op: LogAnd").expect("no &&");
+    let or = text.find("op: LogOr").expect("no ||");
+    assert!(and < or, "{text}");
 }

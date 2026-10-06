@@ -15055,6 +15055,7 @@ fn stamp_gen_scope(items: &mut [ModuleItem], scope: &str) {
         match item {
             ModuleItem::AlwaysConstruct(ac) => stamp(&mut ac.gen_scope),
             ModuleItem::InitialConstruct(ic) => stamp(&mut ic.gen_scope),
+            ModuleItem::AssertionItem(_) => assertion_item_in_gen_scope(item, scope),
             ModuleItem::GenerateRegion(gr) => stamp_gen_scope(&mut gr.items, scope),
             ModuleItem::GenerateIf(gi) => {
                 for (_, branch) in &mut gi.branches {
@@ -26076,8 +26077,30 @@ fn prefix_gen_scope(items: &mut [ModuleItem], scope: &str) {
                     format!("{}.{}", scope, ic.gen_scope)
                 };
             }
+            ModuleItem::AssertionItem(_) => assertion_item_in_gen_scope(item, scope),
             _ => {}
         }
+    }
+}
+
+/// §16.14 / §27: a concurrent assertion item of a generate block is a
+/// process of that block's scope, like its `initial` and `always`
+/// constructs: each generated copy (`lp[0]`, `lp[1]`) is its own assertion,
+/// `%m` names the block, and a `default disable iff` of the block (§16.15)
+/// applies. Hoisted here as an `initial` of the block, the form the
+/// elaborator gives every module-level assertion item.
+fn assertion_item_in_gen_scope(item: &mut ModuleItem, scope: &str) {
+    if let ModuleItem::AssertionItem(a) = item {
+        let span = a.span;
+        let stmt = crate::ast::stmt::Statement::new(
+            crate::ast::stmt::StatementKind::Assertion(a.clone()),
+            span,
+        );
+        *item = ModuleItem::InitialConstruct(crate::ast::decl::InitialConstruct {
+            stmt,
+            span,
+            gen_scope: scope.to_string(),
+        });
     }
 }
 
@@ -37665,6 +37688,19 @@ fn rewrite_stmt(
                 is_sequence: a.is_sequence,
                 deferred: a.deferred,
                 label: a.label.clone(),
+                procedural: a.procedural,
+                inferred_clock: a
+                    .inferred_clock
+                    .as_ref()
+                    .map(|ev| crate::ast::stmt::EventExpr {
+                        edge: ev.edge,
+                        expr: rewrite_expr(&ev.expr, prefix, port_map, local_names, interface_map),
+                        iff: ev
+                            .iff
+                            .as_ref()
+                            .map(|g| rewrite_expr(g, prefix, port_map, local_names, interface_map)),
+                        span: ev.span,
+                    }),
                 span: a.span,
             })
         }

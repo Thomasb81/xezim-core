@@ -362,6 +362,17 @@ pub struct AssertionStatement {
     /// labelled procedural assertion is wrapped in a named block instead.
     #[cfg_attr(feature = "serde", serde(default))]
     pub label: Option<Identifier>,
+    /// §16.14.6: a concurrent assertion written as a statement in procedural
+    /// code (not a module item). Its attempts start only when the procedure
+    /// reaches the statement, and an `always` procedure's event control can
+    /// supply its clock.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub procedural: bool,
+    /// §16.14.6: the clock a procedural concurrent assertion infers from
+    /// its `always` procedure's event control, used when the property has
+    /// no clock of its own.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub inferred_clock: Option<EventExpr>,
     pub span: Span,
 }
 
