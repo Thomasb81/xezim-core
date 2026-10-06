@@ -2798,6 +2798,13 @@ pub struct ElaboratedModule {
     /// root.
     #[serde(default)]
     pub port_aliases: HashMap<String, String>,
+    /// IEEE 1800-2023 §23.3.3: `(instance path, actual)` of every input port
+    /// whose reads in the instance body were renamed to its actual. The port
+    /// is a continuous assignment from the actual, so its time-0 value is an
+    /// update event in the instance — the simulator replays it for the
+    /// level-sensitive blocks there.
+    #[serde(default)]
+    pub input_port_actuals: Vec<(String, Expression)>,
     /// Input ports whose net was never built (see [`set_port_elision`]): the
     /// [`elided_port_hash`] of each `<inst>.<port>` flat name, sorted. The
     /// simulator checks a failed name lookup against it, so a reference the
@@ -3118,6 +3125,7 @@ impl ElaboratedModule {
             forward_typedef_names: HashSet::default(),
             events: HashSet::default(),
             port_aliases: HashMap::default(),
+            input_port_actuals: Vec::new(),
             elided_port_hashes: Vec::new(),
             elided_port_count: 0,
             elided_port_leaves: HashSet::default(),
@@ -32065,6 +32073,17 @@ fn inline_module_items(
                     })
                     .map(|(k, v)| (k.clone(), v.clone()))
                     .collect();
+                for (pname, actual) in &rewrite_port_map {
+                    if matches!(
+                        prepared_sub.port_directions.get(pname.as_str()),
+                        Some(PortDirection::Input)
+                    ) {
+                        elab.input_port_actuals.push((
+                            inst_prefix.trim_end_matches('.').to_string(),
+                            actual.clone(),
+                        ));
+                    }
+                }
 
                 // Unobserved-port elision (see `set_port_elision`): a plain
                 // input whose every read in the body was just substituted by

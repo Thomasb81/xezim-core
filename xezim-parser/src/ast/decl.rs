@@ -326,6 +326,11 @@ pub struct ClockingDeclaration {
     pub span: Span,
 }
 
+/// IEEE 1800-2023 §14.4: a `#1step` clocking skew is carried as an
+/// identifier expression with this name (no real identifier starts with a
+/// digit), so it stays distinct from an absent skew and from `#1`.
+pub const CLOCKING_ONE_STEP: &str = "1step";
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ClockingSignal {

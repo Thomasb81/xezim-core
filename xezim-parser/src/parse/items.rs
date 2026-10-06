@@ -9,6 +9,72 @@ use crate::ast::types::*;
 use crate::lexer::token::TokenKind;
 
 impl Parser {
+    /// IEEE 1800-2023 §14.4 clocking skew value after the `#`: `1step`, a
+    /// number or time literal, a parameter name, or a parenthesized
+    /// expression. `1step` lexes as the integer `1` followed by the
+    /// identifier `step` with no space between; it used to be read as `#1`
+    /// and the rest of the `default` item (`output #2`) was skipped.
+    fn parse_clocking_skew_value(&mut self) -> Option<crate::ast::expr::Expression> {
+        if self.at(TokenKind::IntegerLiteral)
+            && self.current().text == "1"
+            && self.peek_kind() == TokenKind::Identifier
+        {
+            let one = self.current().span;
+            let step = self.tokens[self.pos + 1].span;
+            if self.tokens[self.pos + 1].text == "step" && step.start == one.end {
+                self.bump();
+                self.bump();
+                let sp = crate::ast::Span {
+                    start: one.start,
+                    end: step.end,
+                };
+                let hier = HierarchicalIdentifier {
+                    root: None,
+                    path: vec![HierPathSegment {
+                        name: Identifier {
+                            name: crate::ast::decl::CLOCKING_ONE_STEP.to_string(),
+                            span: sp,
+                        },
+                        selects: Vec::new(),
+                    }],
+                    span: sp,
+                    cached_signal_id: std::cell::Cell::new(None),
+                    cached_resolved_name: std::cell::OnceCell::new(),
+                };
+                return Some(Expression::new(ExprKind::Ident(hier), sp));
+            }
+        }
+        if self.at(TokenKind::LParen) {
+            self.bump();
+            let e = self.parse_expression();
+            self.expect(TokenKind::RParen);
+            return Some(e);
+        }
+        if matches!(
+            self.current_kind(),
+            TokenKind::IntegerLiteral | TokenKind::TimeLiteral | TokenKind::RealLiteral
+        ) {
+            return Some(self.parse_expr_bp(3));
+        }
+        if self.at(TokenKind::Identifier) {
+            let id = self.parse_identifier();
+            let sp = id.span;
+            let hier = HierarchicalIdentifier {
+                root: None,
+                path: vec![HierPathSegment {
+                    name: id,
+                    selects: Vec::new(),
+                }],
+                span: sp,
+                cached_signal_id: std::cell::Cell::new(None),
+                cached_resolved_name: std::cell::OnceCell::new(),
+            };
+            return Some(Expression::new(ExprKind::Ident(hier), sp));
+        }
+        self.bump();
+        None
+    }
+
     /// §16.10: assertion-local variables need per-attempt storage. The
     /// current property/sequence body representation cannot retain those
     /// declarations; do not silently skip the body and leave an inert check.
@@ -1628,9 +1694,7 @@ impl Parser {
                 while !self.at(TokenKind::KwEndclocking) && !self.at(TokenKind::Eof) {
                     // `default input #d output #d;` (§14.4) — capture the skew
                     // expressions; anything unrecognized is skipped to the `;`
-                    // so the signal-list pass below stays in sync. `#1step`
-                    // (the LRM default) is left as None — the simulator's
-                    // preponed sampling IS the 1step behavior.
+                    // so the signal-list pass below stays in sync.
                     if self.at(TokenKind::KwDefault) {
                         self.bump();
                         loop {
@@ -1640,26 +1704,16 @@ impl Parser {
                                 break;
                             }
                             self.bump();
+                            // `clocking_skew ::= edge_identifier [delay_control]`
+                            if matches!(
+                                self.current_kind(),
+                                TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge
+                            ) {
+                                self.bump();
+                            }
                             if self.at(TokenKind::Hash) {
                                 self.bump();
-                                let skew = if self.at(TokenKind::LParen) {
-                                    self.bump();
-                                    let e = self.parse_expression();
-                                    self.expect(TokenKind::RParen);
-                                    Some(e)
-                                } else if matches!(
-                                    self.current_kind(),
-                                    TokenKind::IntegerLiteral
-                                        | TokenKind::TimeLiteral
-                                        | TokenKind::RealLiteral
-                                ) {
-                                    Some(self.parse_expr_bp(3))
-                                } else {
-                                    // `#1step` or other non-literal — treat as
-                                    // the default (None) and skip the token.
-                                    self.bump();
-                                    None
-                                };
+                                let skew = self.parse_clocking_skew_value();
                                 if dir_in {
                                     default_input_skew = skew;
                                 } else {
@@ -1687,29 +1741,16 @@ impl Parser {
                             // Optional `#delay` skew specifier (§14.4) —
                             // captured per-signal; `#1step`/opaque forms → None.
                             let mut sig_skew: Option<crate::ast::expr::Expression> = None;
-                            if self.at(TokenKind::Hash) {
-                                self.bump();
-                                if self.at(TokenKind::LParen) {
-                                    self.bump();
-                                    sig_skew = Some(self.parse_expression());
-                                    self.expect(TokenKind::RParen);
-                                } else if matches!(
-                                    self.current_kind(),
-                                    TokenKind::IntegerLiteral
-                                        | TokenKind::TimeLiteral
-                                        | TokenKind::RealLiteral
-                                ) {
-                                    sig_skew = Some(self.parse_expr_bp(3));
-                                } else {
-                                    self.bump(); // `1step`, identifier, etc.
-                                }
-                            }
-                            // Optional `negedge`/`posedge`/`edge` skew kw.
+                            // `clocking_skew ::= edge_identifier [delay_control]`
                             if matches!(
                                 self.current_kind(),
                                 TokenKind::KwNegedge | TokenKind::KwPosedge | TokenKind::KwEdge
                             ) {
                                 self.bump();
+                            }
+                            if self.at(TokenKind::Hash) {
+                                self.bump();
+                                sig_skew = self.parse_clocking_skew_value();
                             }
                             if self.is_data_type_keyword()
                                 || (self.at(TokenKind::Identifier)
