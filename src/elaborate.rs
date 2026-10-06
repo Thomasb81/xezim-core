@@ -3385,6 +3385,25 @@ fn register_dpi_export(e: &crate::ast::decl::DPIExport, elab: &mut ElaboratedMod
     elab.dpi_export_c_names.push(c_name);
 }
 
+/// `register_dpi_export` for an export inside an instantiated module: the SV
+/// subroutine is the instance's (`u_a.sv_fn`, as the instance's subroutines
+/// are registered), the C linkage name stays the declared one, so several
+/// entries can share a C name — one per instance.
+fn register_instance_dpi_export(
+    e: &crate::ast::decl::DPIExport,
+    inst_prefix: &str,
+    elab: &mut ElaboratedModule,
+) {
+    let sv = dpi_proto_sv_name(&e.proto);
+    let name = cat2(inst_prefix, &sv);
+    if elab.dpi_exports.contains(&name) {
+        return;
+    }
+    let c_name = e.c_name.clone().unwrap_or(sv);
+    elab.dpi_exports.push(name);
+    elab.dpi_export_c_names.push(c_name);
+}
+
 fn register_dpi_import(di: &DPIImport, elab: &mut ElaboratedModule) -> Result<(), String> {
     let sv_name = dpi_proto_sv_name(&di.proto);
     let c_name = di.c_name.clone().unwrap_or_else(|| sv_name.clone());
@@ -32468,6 +32487,14 @@ fn inline_module_items(
                     // instance prefix applies.
                     if let ModuleItem::DPIImport(di) = sub_item {
                         register_dpi_import(di, elab)?;
+                    }
+                    // §35.5.3, §35.11: an export declared in an INSTANTIATED
+                    // module names THIS instance's copy of the subroutine.
+                    // Every instance shares the one C symbol; a call from C
+                    // runs the copy whose instance is the current DPI scope
+                    // (the calling context import's, or svSetScope's).
+                    if let ModuleItem::DPIExport(e) = sub_item {
+                        register_instance_dpi_export(e, &inst_prefix, elab);
                     }
                     if let ModuleItem::TaskDeclaration(td) = sub_item {
                         let mut new_td = td.clone();
