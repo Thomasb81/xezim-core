@@ -1158,6 +1158,13 @@ pub struct ElaboratedClass {
     /// `queue_properties` since the size isn't known at class-elaboration time.
     #[serde(default)]
     pub array_properties: HashMap<String, (i64, i64, u32)>,
+    /// §8.25: fixed-size unpacked-array members sized by a class VALUE
+    /// parameter (`int items[N]`, `int md[N][2]`): name -> the declared
+    /// unpacked dimensions. `array_properties` / `array_nd_properties` hold
+    /// their shape at the DEFAULT parameter values; the runtime re-sizes each
+    /// object's storage from the parameters it was built with.
+    #[serde(default)]
+    pub param_sized_props: HashMap<String, Vec<UnpackedDimension>>,
     /// MULTI-dimensional fixed-size unpacked-array members whose every
     /// dimension has compile-time-constant bounds (`test_t foo[0:3][0:7]`):
     /// name -> (per-dimension (lo, hi) shape, element width). Registered
@@ -1411,6 +1418,7 @@ fn elaborate_class_in_scope(
     let mut assoc_index_props: HashMap<String, (u32, bool)> = HashMap::default();
     let mut queue_properties: HashMap<String, (u32, Option<u32>)> = HashMap::default();
     let mut array_properties: HashMap<String, (i64, i64, u32)> = HashMap::default();
+    let mut param_sized_props: HashMap<String, Vec<UnpackedDimension>> = HashMap::default();
     let mut array_nd_properties: HashMap<String, (Vec<(i64, i64)>, u32)> = HashMap::default();
     let mut array_of_coll_properties: HashMap<String, (Vec<(i64, i64)>, u32, CollDimKind)> =
         HashMap::default();
@@ -1503,7 +1511,11 @@ fn elaborate_class_in_scope(
                                     let is_type = typedefs_snapshot(|td| {
                                         td.is_some_and(|t| t.contains_key(&n))
                                     });
-                                    if !is_type && unpacked_scope.contains_key(&n) {
+                                    // §8.25: a header VALUE parameter (`int
+                                    // items[N]` in `class C #(int N)`) sizes a
+                                    // fixed dimension too; see
+                                    // `param_sized_props`.
+                                    if !is_type && const_scope.contains_key(&n) {
                                         return UnpackedDimension::Expression {
                                             expr: Box::new(make_ident_expr(&n)),
                                             span,
@@ -1638,6 +1650,35 @@ fn elaborate_class_in_scope(
                         }
                     }
                     if !is_static {
+                        // §8.25: a fixed array sized by a header VALUE
+                        // parameter (`int items[N]`) is a fixed array in every
+                        // specialization, just of a different size. Classify
+                        // it at the default values and record its dimensions
+                        // so each object is re-sized from its own bindings;
+                        // it used to stay queue-backed (`'{}`, `$size` 1).
+                        let dims_fixed = |p: Option<&HashMap<String, Value>>| {
+                            !effective_dims.is_empty()
+                                && effective_dims.iter().all(|d| match d {
+                                    UnpackedDimension::Range { left, right, .. } => {
+                                        const_eval_i64_with_params(left, p).is_some()
+                                            && const_eval_i64_with_params(right, p).is_some()
+                                    }
+                                    UnpackedDimension::Expression { expr, .. } => {
+                                        const_eval_i64_with_params(expr, p).is_some_and(|n| n > 0)
+                                    }
+                                    _ => false,
+                                })
+                        };
+                        let unpacked_params = if binds_values
+                            && !dims_fixed(unpacked_params)
+                            && dims_fixed(class_params)
+                        {
+                            param_sized_props
+                                .insert(decl.name.name.clone(), effective_dims.clone());
+                            class_params
+                        } else {
+                            unpacked_params
+                        };
                         if let Some(UnpackedDimension::Associative {
                             data_type: key_dt, ..
                         }) = effective_dims.first()
@@ -2266,6 +2307,7 @@ fn elaborate_class_in_scope(
         static_assoc_index_props,
         static_fixed_arrays,
         array_properties,
+        param_sized_props,
         array_nd_properties,
         array_of_coll_properties,
     }
@@ -2504,6 +2546,22 @@ pub struct ElaboratedModule {
     /// inside a package subroutine in ITS package when two packages contest
     /// the name.
     pub pkg_subr_owner: HashMap<String, String>,
+    /// §26.3: every scalar package variable under its QUALIFIED name
+    /// (`pkg::name`), with its declared type and initial value. Package
+    /// variables are hoisted into `signals` under their bare name, which two
+    /// packages declaring the same name — or a module-scope declaration of
+    /// it — share; the runtime gives each contested name its own
+    /// per-package storage from this table.
+    #[serde(default)]
+    pub pkg_var_decls: HashMap<String, Signal>,
+    /// §26.3: `static_init_blocks` entries that initialize a scalar package
+    /// variable from a call (`int x = f();`): (block index, `pkg::name`).
+    #[serde(default)]
+    pub pkg_var_init_blocks: Vec<(usize, String)>,
+    /// §26.3: the package imports of every module / interface / program
+    /// definition: (package, explicitly imported item or `None` for `*`).
+    #[serde(default)]
+    pub def_pkg_imports: HashMap<String, Vec<(String, Option<String>)>>,
     /// Names of declared sequences and properties (so `@name` event control resolves).
     pub sequences: HashSet<String>,
     /// Packed struct bit-field layout: container_name -> Vec<(member_name, lsb_offset, width)>.
@@ -3014,6 +3072,9 @@ impl ElaboratedModule {
             arrays_2d: HashMap::default(),
             packages: HashSet::default(),
             pkg_subr_owner: HashMap::default(),
+            pkg_var_decls: HashMap::default(),
+            pkg_var_init_blocks: Vec::new(),
+            def_pkg_imports: HashMap::default(),
             sequences: HashSet::default(),
             packed_struct_fields: HashMap::default(),
             var_decl_types: HashMap::default(),
@@ -24153,6 +24214,31 @@ fn inline_instantiations_inner(
     elab: &mut ElaboratedModule,
     definitions: &HashMap<String, Definition>,
 ) -> Result<(), String> {
+    // §26.3: each design unit's package imports, for the runtime's
+    // resolution of a contested package-variable name (see
+    // `pkg_var_decls`).
+    for (name, def) in definitions {
+        if !matches!(
+            def,
+            Definition::Module(_) | Definition::Interface(_) | Definition::Program(_)
+        ) {
+            continue;
+        }
+        let mut imports: Vec<(String, Option<String>)> = Vec::new();
+        for item in def.items() {
+            if let ModuleItem::ImportDeclaration(imp) = item {
+                for ii in &imp.items {
+                    imports.push((
+                        ii.package.name.clone(),
+                        ii.item.as_ref().map(|i| i.name.clone()),
+                    ));
+                }
+            }
+        }
+        if !imports.is_empty() {
+            elab.def_pkg_imports.insert(name.clone(), imports);
+        }
+    }
     // Populate class and covergroup definitions from global scope
     for (name, def) in definitions {
         match def {
@@ -24614,6 +24700,10 @@ fn inline_instantiations_inner(
                                     });
                                     if init_has_call {
                                         if let Some(init_expr) = &decl.init {
+                                            elab.pkg_var_init_blocks.push((
+                                                elab.static_init_blocks.len(),
+                                                format!("{}::{}", name, decl.name.name),
+                                            ));
                                             elab.static_init_blocks.push(InitialBlock {
                                                 stmt: Statement::new(
                                                     StatementKind::BlockingAssign {
@@ -24677,6 +24767,20 @@ fn inline_instantiations_inner(
                                     ) {
                                         elab.string_signals.insert(decl.name.name.clone());
                                     }
+                                    let qualified = format!("{}::{}", name, decl.name.name);
+                                    elab.pkg_var_decls.insert(
+                                        qualified.clone(),
+                                        Signal {
+                                            is_const: false,
+                                            name: qualified,
+                                            width: w,
+                                            is_signed,
+                                            is_real,
+                                            direction: None,
+                                            value: v.clone(),
+                                            type_name: tn.clone(),
+                                        },
+                                    );
                                     elab.signals
                                         .entry(decl.name.name.clone())
                                         .or_insert(Signal {
