@@ -431,10 +431,17 @@ use std::rc::Rc;
 /// `global` applies to every module with no explicit source-level timescale;
 /// `named` applies to the listed modules likewise. Exponents are powers of ten
 /// in seconds (e.g. `1ns` = -9). Never overrides an explicit timescale.
+///
+/// `force` (`-override_timescale`) is the exception: when set, it is the
+/// timescale of EVERY design element, package and compilation-unit scope.
+/// `\`timescale` directives, `timeunit`/`timeprecision` declarations and the
+/// other fields are ignored. Time literals with a unit (`#3ns`) keep their
+/// absolute value.
 #[derive(Clone, Default)]
 pub struct ModuleTimescaleCli {
     pub global: Option<(i32, i32)>,
     pub named: std::collections::HashMap<String, (i32, i32)>,
+    pub force: Option<(i32, i32)>,
 }
 
 /// Library-search configuration from the CLI (`-v <file>`, `-y <dir>`,
@@ -1579,6 +1586,10 @@ fn parse_and_elaborate(
     // 1 ns / 1 ns default. The command-line forms never override an explicit
     // source-level timescale (a local decl OR an active directive).
     let cli = module_timescale_cli();
+    // `-override_timescale`: one timescale for everything, in seconds.
+    let forced_secs: Option<(f64, f64)> = cli
+        .force
+        .map(|(u, p)| (elaborate::exp_to_secs(u), elaborate::exp_to_secs(p)));
     let mut eff_ts: std::collections::HashMap<String, (f64, f64)> =
         std::collections::HashMap::new();
     let mut named_matched: std::collections::HashSet<String> = std::collections::HashSet::new();
@@ -1647,20 +1658,26 @@ fn parse_and_elaborate(
             if named.is_some() {
                 named_matched.insert(name.clone());
             }
-            if own_explicit {
+            if cli.force.is_some() {
+                // Uniform by construction: nothing to warn about.
+            } else if own_explicit {
                 any_explicit_ts = true;
             } else if directive.is_none() && cli_ts.is_none() {
                 // Genuinely no timescale anywhere (own or inherited) and no CLI.
                 modules_without_ts.push(name.clone());
             }
 
-            let eff_exp: Option<(i32, i32)> = if own_explicit {
+            let eff_exp: Option<(i32, i32)> = if let Some(f) = cli.force {
+                // `-override_timescale` replaces every source-level and
+                // command-line timescale.
+                Some(f)
+            } else if own_explicit {
                 // A local decl overrides the (own-file) directive field by field;
                 // a missing field falls back to the directive, then to 1 ns.
                 let (du, dp) = directive.unwrap_or((-9, -9));
                 let u = local_u.unwrap_or(du);
                 let p = local_p.unwrap_or(dp);
-                if named.is_some() {
+                if named.is_some() && cli.force.is_none() {
                     eprintln!(
                         "[warn] --module-timescale for module '{}' ignored; it has an explicit source-level timescale",
                         name
@@ -1798,7 +1815,9 @@ fn parse_and_elaborate(
                 cu_ts_defs.1 = Some(elaborate::time_literal_to_exp(p));
             }
         }
-        let cu_scope_ts: Option<(i32, i32)> = if cu_ts_defs.0.is_some() || cu_ts_defs.1.is_some() {
+        let cu_scope_ts: Option<(i32, i32)> = if let Some(f) = cli.force {
+            Some(f)
+        } else if cu_ts_defs.0.is_some() || cu_ts_defs.1.is_some() {
             let u = cu_ts_defs.0.unwrap_or(-9);
             let p = cu_ts_defs.1.unwrap_or(u);
             Some((u, p))
@@ -1910,10 +1929,12 @@ fn parse_and_elaborate(
                 }
                 // A compilation-unit class scales its method delays by the
                 // unit's `timescale, like a package's classes.
-                let (unit_s, prec_s) = module_timescales
-                    .get("$unit")
-                    .copied()
-                    .unwrap_or((tick_s, tick_s));
+                let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                    module_timescales
+                        .get("$unit")
+                        .copied()
+                        .unwrap_or((tick_s, tick_s))
+                });
                 elaborate::rewrite_class_delays_pub(&mut c, unit_s, prec_s, tick_s);
                 let name = c.name.name.clone();
                 let rc = Rc::new(c);
@@ -1959,14 +1980,17 @@ fn parse_and_elaborate(
                 // Packages are not in `eff_ts` (that walk covers instantiable
                 // elements); the preprocessor records the directive in effect
                 // at the package, else the compilation unit's first one.
-                let (mut unit_s, mut prec_s) = module_timescales
-                    .get(&name)
-                    .or_else(|| module_timescales.get("$unit"))
-                    .copied()
-                    .unwrap_or((tick_s, tick_s));
+                let (mut unit_s, mut prec_s) = forced_secs.unwrap_or_else(|| {
+                    module_timescales
+                        .get(&name)
+                        .or_else(|| module_timescales.get("$unit"))
+                        .copied()
+                        .unwrap_or((tick_s, tick_s))
+                });
                 // A `timeunit`/`timeprecision` declared IN the package wins
-                // over the directive (LRM §3.14.2.2).
-                for item in &p.items {
+                // over the directive (LRM §3.14.2.2), but not over
+                // `-override_timescale`.
+                for item in p.items.iter().filter(|_| forced_secs.is_none()) {
                     if let ast::decl::PackageItem::TimeunitsDecl(td) = item {
                         if let Some(u) = &td.unit {
                             unit_s = elaborate::exp_to_secs(elaborate::time_literal_to_exp(u));
@@ -2043,10 +2067,12 @@ fn parse_and_elaborate(
                 }
                 // A `$unit` subroutine's delays scale by the compilation
                 // unit's `timescale (recorded as "$unit"), like a module's.
-                let (unit_s, prec_s) = module_timescales
-                    .get("$unit")
-                    .copied()
-                    .unwrap_or((tick_s, tick_s));
+                let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                    module_timescales
+                        .get("$unit")
+                        .copied()
+                        .unwrap_or((tick_s, tick_s))
+                });
                 for st in f.items.iter_mut() {
                     elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
                 }
@@ -2056,10 +2082,12 @@ fn parse_and_elaborate(
                 if let Some((u, p)) = cu_scope_ts {
                     elaborate::rewrite_scope_time_semantics(&mut t.items, u, p, tick_s);
                 }
-                let (unit_s, prec_s) = module_timescales
-                    .get("$unit")
-                    .copied()
-                    .unwrap_or((tick_s, tick_s));
+                let (unit_s, prec_s) = forced_secs.unwrap_or_else(|| {
+                    module_timescales
+                        .get("$unit")
+                        .copied()
+                        .unwrap_or((tick_s, tick_s))
+                });
                 for st in t.items.iter_mut() {
                     elaborate::rewrite_stmt_delays_pub(st, unit_s, prec_s, tick_s);
                 }
@@ -2892,6 +2920,12 @@ fn parse_and_elaborate(
     // The top module's own unit/precision drives the default $time scaling and
     // $printtimescale when no per-scope entry is found.
     if let Some(&(u, p)) = elab.module_timescale_exp.get(&elab.name) {
+        elab.timeunit_exp = u;
+        elab.timeprecision_exp = p;
+    }
+    // `-override_timescale` also covers a synthetic multi-top wrapper, which
+    // has no entry of its own.
+    if let Some((u, p)) = module_timescale_cli().force {
         elab.timeunit_exp = u;
         elab.timeprecision_exp = p;
     }
