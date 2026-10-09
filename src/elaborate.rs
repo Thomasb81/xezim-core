@@ -3510,6 +3510,29 @@ fn is_const_expr(expr: &Expression, params: &HashMap<String, Value>) -> bool {
         ExprKind::Index { expr, index } => {
             is_const_expr(expr, params) && is_const_expr(index, params)
         }
+        // §20.6.2 / §20.7: `$bits` and the array queries are constant over a
+        // fixed-size TYPE or a declared fixed-size VARIABLE — the operand
+        // itself need not be constant, only its declared type
+        // (`if ($size(fx) - 5 < 0)`, §27.5). Any further argument (the
+        // dimension number) must be.
+        ExprKind::SystemCall { name, args }
+            if matches!(
+                name.as_str(),
+                "$bits"
+                    | "$size"
+                    | "$left"
+                    | "$right"
+                    | "$high"
+                    | "$low"
+                    | "$dimensions"
+                    | "$unpacked_dimensions"
+                    | "$increment"
+            ) && args
+                .first()
+                .is_some_and(|a| array_query_operand_is_type(a) || is_decl_shape_operand(a)) =>
+        {
+            args[1..].iter().all(|a| is_const_expr(a, params))
+        }
         // System constant functions used in generate conditions ($bits, $clog2…).
         ExprKind::SystemCall { args, .. } => args.iter().all(|a| is_const_expr(a, params)),
         _ => false, // Calls (new()) etc. are not constant
@@ -14980,6 +15003,17 @@ fn elaborate_items_numbered(
     Ok(())
 }
 
+/// §27.4: a generate-for genvar's start value. The initializer is a constant
+/// expression — a parameter, a negative number, `$low(a)` — folded against
+/// the enclosing parameters (outer genvars included); the parser could only
+/// fold a plain literal, so every other start silently began at 0.
+pub fn generate_for_start(gf: &GenerateFor, params: &HashMap<String, Value>) -> i64 {
+    gf.init
+        .as_ref()
+        .and_then(|e| const_eval_i64_with_params(e, Some(params)))
+        .unwrap_or(gf.init_val)
+}
+
 /// Evaluate a generate-if: pick the first branch whose condition is true (or the else branch).
 fn elaborate_generate_if(
     gi: &GenerateIf,
@@ -15221,7 +15255,7 @@ fn elaborate_generate_for(
     ordinal: u32,
 ) -> Result<(), String> {
     let var = &gf.var;
-    let mut i = gf.init_val;
+    let mut i = generate_for_start(gf, &elab.parameters);
     let trace = elab_trace_enabled();
     let mut iter_count = 0u32;
     let mut hit_cap = true;
@@ -21985,7 +22019,15 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                         NumberBase::Hex => 16,
                         NumberBase::Decimal => 10,
                     };
-                    let mut v = Value::from_str_radix(&value.replace('_', ""), r, w);
+                    // A NEGATIVE genvar substituted into a generate body
+                    // (`genvar_const_expr`, §27.4) spells its value `-2`; the
+                    // radix parse has no sign and read it as x.
+                    let mut v = match value.strip_prefix('-').map(|m| m.parse::<u64>()) {
+                        Some(Ok(m)) if matches!(base, NumberBase::Decimal) && w <= 64 => {
+                            Value::from_u64(m.wrapping_neg(), w)
+                        }
+                        _ => Value::from_str_radix(&value.replace('_', ""), r, w),
+                    };
                     v.is_signed = *signed;
                     warn_unsized_decimal_wrap(*size, base, value);
                     v
@@ -26242,6 +26284,10 @@ fn rename_item_decls(
             // Inner generate-for: rewrite expression refs but leave its body
             // alone (its own iteration loop will handle further renaming).
             let mut new_gf = gf.clone();
+            new_gf.init = gf
+                .init
+                .as_ref()
+                .map(|e| rewrite_expr(e, "", port_map, local_names, interface_map));
             new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
             new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
             new_gf.items = gf
@@ -26613,6 +26659,10 @@ fn substitute_in_module_item(
         }
         ModuleItem::GenerateFor(gf) => {
             let mut new_gf = gf.clone();
+            new_gf.init = gf
+                .init
+                .as_ref()
+                .map(|e| rewrite_expr(e, "", port_map, local_names, interface_map));
             new_gf.cond = rewrite_expr(&gf.cond, "", port_map, local_names, interface_map);
             new_gf.incr = rewrite_expr(&gf.incr, "", port_map, local_names, interface_map);
             new_gf.items = gf
@@ -27020,7 +27070,7 @@ fn collect_effective_items_scoped(
                 // fifo_entry_vld stuck at X and the AXI request path
                 // permanently stalled — see openc910 hello_world bringup.
                 let mut local_params = params.clone();
-                let mut i = gf.init_val;
+                let mut i = generate_for_start(gf, &local_params);
                 let limit = 10000;
                 let mut iters = 0;
                 while iters < limit {

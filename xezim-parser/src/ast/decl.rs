@@ -992,8 +992,13 @@ pub struct GenerateCase {
 pub struct GenerateFor {
     /// Genvar name
     pub var: String,
-    /// Initial value
+    /// Initial value — the literal fold of `init` only (0 for any other
+    /// initializer); elaboration folds `init` itself.
     pub init_val: i64,
+    /// §27.4: the genvar initializer, a constant expression (`i = P`,
+    /// `i = -2`, `i = $low(a)`).
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub init: Option<super::expr::Expression>,
     /// Condition expression
     pub cond: super::expr::Expression,
     /// Increment expression (genvar update)

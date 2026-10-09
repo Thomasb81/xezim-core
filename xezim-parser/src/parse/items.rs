@@ -2959,6 +2959,7 @@ impl Parser {
                 Some(ModuleItem::GenerateFor(GenerateFor {
                     var: var_name,
                     init_val,
+                    init: Some(init_expr),
                     cond,
                     incr,
                     items,
