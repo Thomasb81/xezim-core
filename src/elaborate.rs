@@ -21980,6 +21980,48 @@ pub fn warn_unsized_decimal_wrap(size: Option<u32>, base: &NumberBase, value: &s
 }
 
 /// Evaluate a constant expression, returning a full Value (preserving width/sign).
+/// §11.8.2: a constant integral operand that takes REAL type from its context
+/// (the other side of a relational operator, the other arm of `?:`). The real
+/// type reaches its top operator, whose own operands are self-determined and
+/// converted; anything else is converted whole (§6.12.2).
+fn const_eval_in_real_context(e: &Expression, params: &HashMap<String, Value>) -> Value {
+    let real = |e: &Expression| {
+        let v = eval_const_expr_val(e, params);
+        if v.is_real {
+            v
+        } else {
+            Value::from_f64(v.to_f64())
+        }
+    };
+    match &e.kind {
+        ExprKind::Paren(x) => const_eval_in_real_context(x, params),
+        ExprKind::Binary { op, left, right }
+            if matches!(
+                op,
+                BinaryOp::Add | BinaryOp::Sub | BinaryOp::Mul | BinaryOp::Div | BinaryOp::Power
+            ) =>
+        {
+            let (l, r) = (real(left), real(right));
+            match op {
+                BinaryOp::Add => l.add(&r),
+                BinaryOp::Sub => l.sub(&r),
+                BinaryOp::Mul => l.mul(&r),
+                BinaryOp::Div => l.div(&r),
+                _ => l.power(&r),
+            }
+        }
+        ExprKind::Unary {
+            op: UnaryOp::Minus,
+            operand,
+        } => real(operand).negate(),
+        ExprKind::Unary {
+            op: UnaryOp::Plus,
+            operand,
+        } => real(operand),
+        _ => real(e),
+    }
+}
+
 fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Value {
     let res = match &expr.kind {
         // §25.5: a parameter reached through an interface PORT formal
@@ -22104,8 +22146,30 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 })
         }
         ExprKind::Binary { op, left, right } => {
-            let l = eval_const_expr_val(left, params);
-            let r = eval_const_expr_val(right, params);
+            let mut l = eval_const_expr_val(left, params);
+            let mut r = eval_const_expr_val(right, params);
+            // §11.8.2: a relational or equality operator's operands take REAL
+            // type from each other, and the real type propagates one operator
+            // into the integral side: `(UP - 2) > 1.0` compares -1.0. (An
+            // arithmetic operator's integral operand is converted from its
+            // self-determined value, which is what `l`/`r` already hold.)
+            if l.is_real != r.is_real
+                && matches!(
+                    op,
+                    BinaryOp::Eq
+                        | BinaryOp::Neq
+                        | BinaryOp::Lt
+                        | BinaryOp::Leq
+                        | BinaryOp::Gt
+                        | BinaryOp::Geq
+                )
+            {
+                if l.is_real {
+                    r = const_eval_in_real_context(right, params);
+                } else {
+                    l = const_eval_in_real_context(left, params);
+                }
+            }
             match op {
                 BinaryOp::Add => l.add(&r),
                 BinaryOp::Sub => l.sub(&r),
@@ -22682,10 +22746,18 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             else_expr,
         } => {
             let c = eval_const_expr_val(condition, params);
-            if c.is_true() {
-                eval_const_expr_val(then_expr, params)
+            let (taken, other) = if c.is_true() {
+                (then_expr, else_expr)
             } else {
-                eval_const_expr_val(else_expr, params)
+                (else_expr, then_expr)
+            };
+            let v = eval_const_expr_val(taken, params);
+            // §11.4.11/§11.8.2: a REAL other arm makes the result real, and
+            // the real type propagates into this integral arm.
+            if !v.is_real && eval_const_expr_val(other, params).is_real {
+                const_eval_in_real_context(taken, params)
+            } else {
+                v
             }
         }
         ExprKind::Concatenation(parts) => {
