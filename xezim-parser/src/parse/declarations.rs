@@ -489,40 +489,7 @@ impl Parser {
         self.expect(TokenKind::KwFunction);
         let specifier = self.parse_optional_method_specifier();
         let lifetime = self.parse_optional_lifetime();
-        // §25.9: `virtual` at the RETURN-TYPE position can only start a
-        // virtual-interface type (`function automatic virtual bus_if #(4).drv
-        // get(...)`) — a virtual METHOD's keyword sits BEFORE `function` and
-        // was consumed above.
-        let return_type = if self.is_data_type_keyword()
-            || self.at(TokenKind::KwVoid)
-            || self.at(TokenKind::KwVirtual)
-            || (self.at(TokenKind::Identifier)
-                && (self.peek_kind() == TokenKind::Identifier ||
-                                (self.peek_kind() == TokenKind::DoubleColon
-                                    && self.peek_kind_n(2) != TokenKind::KwNew
-                                    && !self.scoped_name_is_the_method_name()) ||
-                                self.peek_kind() == TokenKind::Hash ||
-                                // `function automatic typedef_t [7:0] name(...)` — packed
-                                // dimension on a typedef-named return type.
-                                self.peek_kind() == TokenKind::LBracket))
-        {
-            self.parse_data_type()
-        } else if self.at(TokenKind::LBracket) {
-            // `function automatic [PtrW-1:0] name(...)` — implicit type
-            // (just packed dimensions, no leading type name).
-            let dims = self.parse_packed_dimensions();
-            DataType::Implicit {
-                signing: None,
-                dimensions: dims,
-                span: self.span_from(start),
-            }
-        } else {
-            DataType::Implicit {
-                signing: None,
-                dimensions: Vec::new(),
-                span: self.span_from(start),
-            }
-        };
+        let return_type = self.parse_function_return_type(start);
         // Name can be 'new', a regular identifier, or class::method
         let name = self.parse_method_name();
         let mut ports = self.parse_function_ports();
@@ -868,6 +835,51 @@ impl Parser {
             }
         }
     }
+    /// The return type of a function declaration or prototype: an explicit
+    /// `data_type_or_void`, an implicit type (`[7:0]` alone), or nothing.
+    /// IEEE 1800-2023 A.2.2.1: `data_type ::= ... | [ class_scope |
+    /// package_scope ] type_identifier { packed_dimension }`, so a
+    /// typedef-named return type may carry packed dimensions (`M [1:0]`).
+    /// Declarations and prototypes (`extern`, `pure virtual`, DPI imports and
+    /// exports) share this, so a return type accepted on a body-ful function
+    /// is accepted on its prototype too (#284).
+    fn parse_function_return_type(&mut self, start: usize) -> DataType {
+        // §25.9: `virtual` at the RETURN-TYPE position can only start a
+        // virtual-interface type (`function automatic virtual bus_if #(4).drv
+        // get(...)`) — a virtual METHOD's keyword sits BEFORE `function` and
+        // was consumed by the caller.
+        if self.is_data_type_keyword()
+            || self.at(TokenKind::KwVoid)
+            || self.at(TokenKind::KwVirtual)
+            || (self.at(TokenKind::Identifier)
+                && (self.peek_kind() == TokenKind::Identifier
+                    || (self.peek_kind() == TokenKind::DoubleColon
+                        && self.peek_kind_n(2) != TokenKind::KwNew
+                        && !self.scoped_name_is_the_method_name())
+                    || self.peek_kind() == TokenKind::Hash
+                    // `function automatic typedef_t [7:0] name(...)` — packed
+                    // dimension on a typedef-named return type.
+                    || self.peek_kind() == TokenKind::LBracket))
+        {
+            self.parse_data_type()
+        } else if self.at(TokenKind::LBracket) {
+            // `function automatic [PtrW-1:0] name(...)` — implicit type
+            // (just packed dimensions, no leading type name).
+            let dims = self.parse_packed_dimensions();
+            DataType::Implicit {
+                signing: None,
+                dimensions: dims,
+                span: self.span_from(start),
+            }
+        } else {
+            DataType::Implicit {
+                signing: None,
+                dimensions: Vec::new(),
+                span: self.span_from(start),
+            }
+        }
+    }
+
     /// Parse a function prototype (no body, no endfunction). Used for pure virtual.
     /// Syntax: `function [lifetime] [type] name(ports);`
     pub(super) fn parse_function_prototype(&mut self) -> FunctionDeclaration {
@@ -877,23 +889,7 @@ impl Parser {
         let specifier = self.parse_optional_method_specifier();
 
         let lifetime = self.parse_optional_lifetime();
-        let return_type = if self.is_data_type_keyword()
-            || self.at(TokenKind::KwVoid)
-            || (self.at(TokenKind::Identifier)
-                && (self.peek_kind() == TokenKind::Identifier
-                    || (self.peek_kind() == TokenKind::DoubleColon
-                        && self.peek_kind_n(2) != TokenKind::KwNew
-                        && !self.scoped_name_is_the_method_name())
-                    || self.peek_kind() == TokenKind::Hash))
-        {
-            self.parse_data_type()
-        } else {
-            DataType::Implicit {
-                signing: None,
-                dimensions: Vec::new(),
-                span: self.span_from(start),
-            }
-        };
+        let return_type = self.parse_function_return_type(start);
         let name = self.parse_method_name();
         let ports = self.parse_function_ports();
         self.expect(TokenKind::Semicolon);
