@@ -634,6 +634,7 @@ impl Parser {
             items = prefixed;
         }
         self.lower_port_expressions(&ports, &mut items, port_exprs);
+        default_subroutine_lifetime(&mut items, lifetime);
 
         self.expect(TokenKind::KwEndmodule);
         let endlabel = self.parse_end_label_checked(&name.name);
@@ -676,6 +677,7 @@ impl Parser {
             items = prefixed;
         }
         self.lower_port_expressions(&ports, &mut items, port_exprs);
+        default_subroutine_lifetime(&mut items, lifetime);
 
         self.expect(TokenKind::KwEndinterface);
         let endlabel = self.parse_end_label();
@@ -717,6 +719,7 @@ impl Parser {
             items = prefixed;
         }
         self.lower_port_expressions(&ports, &mut items, port_exprs);
+        default_subroutine_lifetime(&mut items, lifetime);
 
         self.expect(TokenKind::KwEndprogram);
         let endlabel = self.parse_end_label();
@@ -876,6 +879,19 @@ impl Parser {
             }
         }
         self.pop_let_scope();
+        if lifetime == Some(Lifetime::Automatic) {
+            for it in &mut items {
+                match it {
+                    PackageItem::Function(fd) if fd.name.scopes.is_empty() => {
+                        fd.lifetime.get_or_insert(Lifetime::Automatic);
+                    }
+                    PackageItem::Task(td) if td.name.scopes.is_empty() => {
+                        td.lifetime.get_or_insert(Lifetime::Automatic);
+                    }
+                    _ => {}
+                }
+            }
+        }
 
         self.expect(TokenKind::KwEndpackage);
         let endlabel = self.parse_end_label();
@@ -6002,6 +6018,40 @@ impl Parser {
                     span,
                 }
             }
+        }
+    }
+}
+
+/// IEEE 1800-2023 §6.21 / §13.3 / §13.4: a module, interface or program
+/// declared `automatic` makes automatic the default lifetime of every task
+/// and function declared in it (generate blocks included). A subroutine
+/// with an explicit `static` keeps it; out-of-class method bodies
+/// (`function C::m`) are class methods, automatic anyway (§8.6).
+fn default_subroutine_lifetime(items: &mut [ModuleItem], lifetime: Option<Lifetime>) {
+    if lifetime != Some(Lifetime::Automatic) {
+        return;
+    }
+    for it in items {
+        match it {
+            ModuleItem::FunctionDeclaration(fd) if fd.name.scopes.is_empty() => {
+                fd.lifetime.get_or_insert(Lifetime::Automatic);
+            }
+            ModuleItem::TaskDeclaration(td) if td.name.scopes.is_empty() => {
+                td.lifetime.get_or_insert(Lifetime::Automatic);
+            }
+            ModuleItem::GenerateRegion(g) => default_subroutine_lifetime(&mut g.items, lifetime),
+            ModuleItem::GenerateFor(g) => default_subroutine_lifetime(&mut g.items, lifetime),
+            ModuleItem::GenerateIf(g) => {
+                for (_, b) in &mut g.branches {
+                    default_subroutine_lifetime(b, lifetime);
+                }
+            }
+            ModuleItem::GenerateCase(g) => {
+                for arm in &mut g.arms {
+                    default_subroutine_lifetime(&mut arm.items, lifetime);
+                }
+            }
+            _ => {}
         }
     }
 }
