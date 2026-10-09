@@ -3219,13 +3219,24 @@ fn expr_has_call(expr: &Expression) -> bool {
         // table at all, so deferring it only left the parameter 0 for the rest
         // of elaboration — long enough for every `logic [W-1:0]` sized from it
         // to come out as `[-1:0]`, i.e. two bits.
+        // A DECLARED fixed-size variable of the scope being elaborated is
+        // answered from its declared type (§20.7), so it need not wait either.
         ExprKind::SystemCall { name, args }
             if matches!(
                 name.as_str(),
-                "$size" | "$left" | "$right" | "$high" | "$low" | "$dimensions"
+                "$size"
+                    | "$left"
+                    | "$right"
+                    | "$high"
+                    | "$low"
+                    | "$dimensions"
+                    | "$unpacked_dimensions"
+                    | "$increment"
             ) =>
         {
-            !args.first().is_some_and(array_query_operand_is_type)
+            !args
+                .first()
+                .is_some_and(|a| array_query_operand_is_type(a) || is_decl_shape_operand(a))
         }
         ExprKind::Binary { left, right, .. } => expr_has_call(left) || expr_has_call(right),
         ExprKind::Unary { operand, .. } => expr_has_call(operand),
@@ -4612,6 +4623,11 @@ pub fn process_typedef(td: &TypedefDeclaration, elab: &mut ElaboratedModule) {
         elab.typedef_unpacked_dims
             .insert(td.name.name.clone(), td.dimensions.clone());
     }
+    // §20.6.2/§20.7: const-eval sizes `$bits(arr_t)` / `$dimensions(v)` from
+    // the full definition, not just the element width.
+    if let Some(dt) = elab.typedef_types.get(&td.name.name) {
+        tls_register_typedef_shape(&td.name.name, dt, &td.dimensions);
+    }
     // Refresh the thread-local typedef snapshot so any subsequent
     // const-eval `$bits(typedef_name)` call sees this typedef (M2).
     type_trace_tls_refresh("process_typedef", &elab.typedefs);
@@ -5489,6 +5505,10 @@ pub fn elaborate_module_with_defs(
     seed_ooc_constraints: &[(String, String, Vec<crate::ast::decl::ConstraintItem>)],
 ) -> Result<ElaboratedModule, String> {
     let mut elab = ElaboratedModule::new(module.name().to_string());
+    // §20.6.2/§20.7: the module's declarations answer `$bits` and the array
+    // queries in its constant expressions for the whole elaboration.
+    DECL_SHAPES_CACHE.with(|c| c.borrow_mut().clear());
+    let _decl_shapes = install_decl_shapes(module);
 
     // §24.3: a program block shall not contain module declarations —
     // reject before elaboration runs the nested module's items (ivtest
@@ -17868,6 +17888,13 @@ pub fn const_eval_i64_with_params(
                         params
                             .and_then(|p| p.get(name))
                             .map(|v| v.width as i64)
+                            // §20.6.2: a declared variable of this scope, sized
+                            // from its declared type (every unpacked dimension
+                            // included), then a typedef with unpacked dimensions.
+                            .or_else(|| {
+                                decl_var_query("$bits", std::slice::from_ref(inner), params)
+                            })
+                            .or_else(|| typedef_unpacked_bits(name, params))
                             // Then fall through to the thread-local typedef
                             // table (set by callers that have one available).
                             .or_else(|| {
@@ -18119,6 +18146,14 @@ pub fn const_eval_i64_with_params(
             | "$dimensions"
             | "$unpacked_dimensions" => {
                 let arg = args.first()?;
+                // §20.7: a declared fixed-size variable answers from its
+                // declared type — every dimension, in declared order.
+                if let Some(v) = decl_var_query(name, args, params) {
+                    return Some(v);
+                }
+                if let ExprKind::TypeLiteral(dt) = &arg.kind {
+                    return type_literal_query(name, dt, args, params);
+                }
                 let arr_name = match &arg.kind {
                     ExprKind::Ident(hier) => hier.path.last().map(|s| s.name.name.clone())?,
                     _ => return None,
@@ -18146,14 +18181,19 @@ pub fn const_eval_i64_with_params(
                     // a vector width const-folded to nothing and the vector
                     // elaborated one bit wide.
                     .or_else(|| {
+                        // The full typedef definitions (TYPEDEF_SHAPES_TLS)
+                        // count an unpacked typedef's dimensions too.
                         let q = TYPEDEFS_TLS.with(|td| {
-                            type_query_dims_by_name(
-                                &arr_name,
-                                params,
-                                td.borrow().as_ref(),
-                                None,
-                                None,
-                            )
+                            TYPEDEF_SHAPES_TLS.with(|sh| {
+                                let sh = sh.borrow();
+                                type_query_dims_by_name(
+                                    &arr_name,
+                                    params,
+                                    td.borrow().as_ref(),
+                                    Some(&sh.0),
+                                    Some(&sh.1),
+                                )
+                            })
                         })?;
                         // Width-only typedef knowledge cannot count dimensions;
                         // leave those to the runtime rather than answer wrongly.
@@ -18552,14 +18592,21 @@ fn prebind_bits_from_declared_types(
     let mut out = e.clone();
     if let ExprKind::SystemCall { name, args } = &e.kind {
         if name == "$bits" && args.len() == 1 {
-            if let Some(w) = bits_from_declared_types(
-                &args[0],
-                decls,
-                elem_decls,
-                params,
-                typedefs,
-                typedef_types,
-            ) {
+            // §20.6.2: the installed declared shapes know a type parameter's
+            // instance binding and every unpacked dimension.
+            let from_shape = decl_var_query("$bits", args, Some(params))
+                .and_then(|b| u32::try_from(b).ok())
+                .filter(|w| *w > 0);
+            if let Some(w) = from_shape.or_else(|| {
+                bits_from_declared_types(
+                    &args[0],
+                    decls,
+                    elem_decls,
+                    params,
+                    typedefs,
+                    typedef_types,
+                )
+            }) {
                 out.kind = ExprKind::Number(NumberLiteral::Integer {
                     size: None,
                     signed: false,
@@ -18897,6 +18944,15 @@ fn bits_of_signal_expr(
     if params.contains_key(&base) || typedefs.contains_key(&base) {
         return None;
     }
+    // §20.6.2: a declared variable is sized from its declared type — every
+    // unpacked dimension included, a typedef's too (`arr_t ta;`). Its signal
+    // only records one element.
+    if path.is_empty()
+        && decl_has_unpacked_dims(arg)
+        && let Some(b) = decl_var_query("$bits", std::slice::from_ref(arg), Some(params))
+    {
+        return u32::try_from(b).ok().filter(|w| *w > 0);
+    }
     let scoped = cat2(&prefix, &base);
     let sig = signals.get(&scoped).or_else(|| signals.get(&base))?;
     if path.is_empty() {
@@ -18950,6 +19006,442 @@ pub fn with_arrays<R>(arrays: &HashMap<String, (i64, i64, u32)>, f: impl FnOnce(
     let r = f();
     ARRAYS_TLS.with(|ar| *ar.borrow_mut() = prev);
     r
+}
+
+/// IEEE 1800-2023 §20.6.2 / §20.7: the DECLARED shape of one variable, net or
+/// port — its data type plus the unpacked dimensions written on the
+/// declarator. `$bits` and the array query functions are constant functions
+/// of that declared type when it is fixed-size, so a `localparam`, a packed
+/// width, a parameter override or a generate condition may use them.
+#[derive(Debug, Clone)]
+pub struct DeclShape {
+    pub data_type: DataType,
+    pub unpacked: Vec<UnpackedDimension>,
+    /// Typed by one of the module's own TYPE parameters: only the instance's
+    /// width binding (TYPEDEFS_TLS) describes it, never a same-named typedef.
+    pub by_type_param: bool,
+}
+
+thread_local! {
+    /// Declared shapes of the module (or instance) whose body is being
+    /// elaborated, keyed by bare name. Installed by `DeclShapesGuard` for that
+    /// scope only and restored afterwards, so a name never answers from
+    /// another module's declarations, and nothing is installed at run time.
+    static DECL_SHAPES_TLS: std::cell::RefCell<Option<std::rc::Rc<HashMap<String, DeclShape>>>>
+        = const { std::cell::RefCell::new(None) };
+    /// Built declared-shape tables, keyed by definition (name and source
+    /// identity) — see `install_decl_shapes`.
+    static DECL_SHAPES_CACHE: std::cell::RefCell<HashMap<(String, usize, usize), std::rc::Rc<HashMap<String, DeclShape>>>>
+        = std::cell::RefCell::new(HashMap::default());
+    /// Full definitions of the typedefs seen so far (data type and unpacked
+    /// dimensions), mirroring `typedef_types` / `typedef_unpacked_dims` for
+    /// const-eval, which otherwise only knows a typedef's width.
+    static TYPEDEF_SHAPES_TLS: std::cell::RefCell<(HashMap<String, DataType>, HashMap<String, Vec<UnpackedDimension>>)>
+        = std::cell::RefCell::new((HashMap::default(), HashMap::default()));
+}
+
+/// Record a typedef's full definition for const-eval (see TYPEDEF_SHAPES_TLS).
+/// Called whenever a typedef is (re-)registered, so a later same-named typedef
+/// replaces the earlier one exactly as it does in `typedef_types`.
+fn tls_register_typedef_shape(name: &str, dt: &DataType, unpacked: &[UnpackedDimension]) {
+    TYPEDEF_SHAPES_TLS.with(|c| {
+        let mut c = c.borrow_mut();
+        c.0.insert(name.to_string(), dt.clone());
+        if unpacked.is_empty() {
+            c.1.remove(name);
+        } else {
+            c.1.insert(name.to_string(), unpacked.to_vec());
+        }
+    });
+}
+
+/// Restores the previously installed declared-shape table on drop.
+pub struct DeclShapesGuard(Option<std::rc::Rc<HashMap<String, DeclShape>>>);
+
+impl Drop for DeclShapesGuard {
+    fn drop(&mut self) {
+        let prev = self.0.take();
+        DECL_SHAPES_TLS.with(|c| *c.borrow_mut() = prev);
+    }
+}
+
+/// `arr[N]` with `N` a parameter parses as an associative dimension keyed by a
+/// type named `N` (see `normalize_unpacked_dims`). The name, when the
+/// dimension has that shape; whether it really is a size is decided against
+/// the parameters and typedefs in scope.
+fn size_param_of_dim(d: &UnpackedDimension) -> Option<&str> {
+    match d {
+        UnpackedDimension::Associative {
+            data_type: Some(dt),
+            ..
+        } => match dt.as_ref() {
+            DataType::TypeReference {
+                name, dimensions, ..
+            } if name.scopes.is_empty() && dimensions.is_empty() => Some(&name.name.name),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// Only a FIXED-SIZE integral or real declaration has a constant shape
+/// (§20.7): a dynamic, queue or associative dimension, a string, chandle or
+/// event, and an interface port are left to the run-time queries.
+fn decl_shape_is_fixed(dt: &DataType, dims: &[UnpackedDimension]) -> bool {
+    dims.iter().all(|d| {
+        matches!(
+            d,
+            UnpackedDimension::Range { .. } | UnpackedDimension::Expression { .. }
+        ) || size_param_of_dim(d).is_some()
+    }) && matches!(
+        dt,
+        DataType::IntegerVector { .. }
+            | DataType::IntegerAtom { .. }
+            | DataType::Real { .. }
+            | DataType::Struct(_)
+            | DataType::Enum(_)
+            | DataType::TypeReference { .. }
+            | DataType::Implicit { .. }
+    )
+}
+
+/// Install the declared shapes of a module's ports and body declarations for
+/// the lifetime of the returned guard. The table depends only on the
+/// definition's source, so it is built once per definition per design (the
+/// cache is cleared when a design's elaboration starts).
+pub fn install_decl_shapes(def: Definition) -> DeclShapesGuard {
+    let items = def.items();
+    let key = (def.name().to_string(), items.as_ptr() as usize, items.len());
+    let m = match DECL_SHAPES_CACHE.with(|c| c.borrow().get(&key).cloned()) {
+        Some(m) => m,
+        None => {
+            let m = std::rc::Rc::new(collect_decl_shapes(def.ports(), items, def.params()));
+            DECL_SHAPES_CACHE.with(|c| c.borrow_mut().insert(key, m.clone()));
+            m
+        }
+    };
+    let prev = DECL_SHAPES_TLS.with(|c| c.borrow_mut().replace(m));
+    DeclShapesGuard(prev)
+}
+
+fn collect_decl_shapes(
+    ports: &PortList,
+    items: &[ModuleItem],
+    header_params: &[ParameterDeclaration],
+) -> HashMap<String, DeclShape> {
+    // A variable typed by one of the module's own TYPE parameters takes the
+    // instance's binding; it is sized from that width alone, never from a
+    // same-named typedef elsewhere.
+    let mut type_params: HashSet<&str> = HashSet::default();
+    let body_params = items.iter().filter_map(|it| match it {
+        ModuleItem::ParameterDeclaration(pd) | ModuleItem::LocalparamDeclaration(pd) => Some(pd),
+        _ => None,
+    });
+    for pd in header_params.iter().chain(body_params) {
+        if let ParameterKind::Type { assignments } = &pd.kind {
+            type_params.extend(assignments.iter().map(|a| a.name.name.as_str()));
+        }
+    }
+    let by_type_param = |dt: &DataType| {
+        matches!(dt, DataType::TypeReference { name, .. }
+            if name.scopes.is_empty() && type_params.contains(name.name.name.as_str()))
+    };
+    let mut m: HashMap<String, DeclShape> = HashMap::default();
+    if let PortList::Ansi(ps) = ports {
+        for p in ps {
+            if let Some(dt) = &p.data_type
+                && decl_shape_is_fixed(dt, &p.dimensions)
+            {
+                m.entry(p.name.name.clone()).or_insert_with(|| DeclShape {
+                    data_type: dt.clone(),
+                    unpacked: p.dimensions.clone(),
+                    by_type_param: by_type_param(dt),
+                });
+            }
+        }
+    }
+    for item in items {
+        let (dt, decls): (&DataType, Vec<(&Identifier, &Vec<UnpackedDimension>)>) = match item {
+            ModuleItem::DataDeclaration(dd) => (
+                &dd.data_type,
+                dd.declarators
+                    .iter()
+                    .map(|d| (&d.name, &d.dimensions))
+                    .collect(),
+            ),
+            ModuleItem::NetDeclaration(nd) => (
+                &nd.data_type,
+                nd.declarators
+                    .iter()
+                    .map(|d| (&d.name, &d.dimensions))
+                    .collect(),
+            ),
+            ModuleItem::PortDeclaration(pd) => (
+                &pd.data_type,
+                pd.declarators
+                    .iter()
+                    .map(|d| (&d.name, &d.dimensions))
+                    .collect(),
+            ),
+            _ => continue,
+        };
+        for (name, dims) in decls {
+            // A non-ANSI port is declared twice (direction, then type); the
+            // first spelling that carries the shape wins.
+            if !decl_shape_is_fixed(dt, dims) {
+                continue;
+            }
+            m.entry(name.name.clone()).or_insert_with(|| DeclShape {
+                data_type: dt.clone(),
+                unpacked: dims.clone(),
+                by_type_param: by_type_param(dt),
+            });
+        }
+    }
+    m
+}
+
+/// `[l:r]` / `[n]` bounds of fixed unpacked dimensions, declared order. None
+/// for a dynamic, queue or associative dimension (not a constant shape) or a
+/// bound that does not fold.
+fn fixed_unpacked_bounds(
+    dims: &[UnpackedDimension],
+    params: Option<&HashMap<String, Value>>,
+) -> Option<Vec<(i64, i64)>> {
+    let mut out = Vec::with_capacity(dims.len());
+    for d in dims {
+        match d {
+            UnpackedDimension::Range { left, right, .. } => out.push((
+                const_eval_i64_with_params(left, params)?,
+                const_eval_i64_with_params(right, params)?,
+            )),
+            UnpackedDimension::Expression { expr, .. } => {
+                let n = const_eval_i64_with_params(expr, params)?;
+                if n <= 0 {
+                    return None;
+                }
+                out.push((0, n - 1));
+            }
+            // `[N]` with `N` a parameter, not a type.
+            _ => {
+                let pn = size_param_of_dim(d)?;
+                if TYPEDEF_SHAPES_TLS.with(|c| c.borrow().0.contains_key(pn)) {
+                    return None;
+                }
+                let n = params?.get(pn)?.to_i64()?;
+                if n <= 0 {
+                    return None;
+                }
+                out.push((0, n - 1));
+            }
+        }
+    }
+    Some(out)
+}
+
+/// §20.7 dimensions and §20.6.2 bit count of a declared fixed-size VARIABLE
+/// named `name` in the scope being elaborated. Unpacked dimensions come first
+/// (§7.4.5: the declarator's, then a typedef's), then the packed ones.
+fn decl_shape_query(
+    name: &str,
+    params: Option<&HashMap<String, Value>>,
+) -> Option<(TypeQueryDims, Option<i64>)> {
+    if params.is_some_and(|p| p.contains_key(name)) {
+        return None;
+    }
+    let shape = DECL_SHAPES_TLS.with(|c| c.borrow().as_ref().and_then(|m| m.get(name).cloned()))?;
+    let mut q = TypeQueryDims {
+        dims: fixed_unpacked_bounds(&shape.unpacked, params)?,
+        unpacked: shape.unpacked.len(),
+        whole: None,
+    };
+    let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
+    let elem_w = resolve_type_width(&shape.data_type, params, td.as_ref()) as i64;
+    let inner = TYPEDEF_SHAPES_TLS.with(|c| {
+        let c = c.borrow();
+        match &shape.data_type {
+            // A type parameter is known by the instance's width alone.
+            DataType::TypeReference {
+                name: tn,
+                dimensions,
+                ..
+            } if dimensions.is_empty() && shape.by_type_param => {
+                type_query_dims_by_name(&tn.name.name, params, td.as_ref(), None, None)
+            }
+            // A typedef'd element type contributes its own unpacked dimensions
+            // (`typedef int arr_t [3:0][1:5]; arr_t ta;`) and its packed shape.
+            DataType::TypeReference {
+                name: tn,
+                dimensions,
+                ..
+            } if dimensions.is_empty() => {
+                type_query_dims_by_name(&tn.name.name, params, td.as_ref(), Some(&c.0), Some(&c.1))
+            }
+            dt => Some(type_query_dims_of(dt, params, td.as_ref(), Some(&c.0))),
+        }
+    })?;
+    // `elem_w` is one element of the typedef's own unpacked dimensions too,
+    // so every unpacked dimension multiplies it.
+    q.dims.extend(inner.dims);
+    q.unpacked += inner.unpacked;
+    q.whole = inner.whole;
+    // `real` is not a bit-stream type (§6.24.3), so an array of it has no
+    // constant `$bits`; the reference simulator folds it to 0.
+    let mut bits =
+        (elem_w > 0 && !matches!(shape.data_type, DataType::Real { .. })).then_some(elem_w);
+    for &(l, r) in &q.dims[..q.unpacked] {
+        bits = bits.and_then(|b| b.checked_mul((l - r).abs() + 1));
+    }
+    Some((q, bits))
+}
+
+/// §20.6.2 `$bits` and the §20.7 array queries over a declared variable of the
+/// scope being elaborated: `$bits(fx)`, `$size(fx2, 2)`, `$increment(pu)`.
+/// None when the operand is not such a variable (a parameter or a type keeps
+/// its own resolution) or the queried dimension does not exist.
+fn decl_var_query(
+    fname: &str,
+    args: &[Expression],
+    params: Option<&HashMap<String, Value>>,
+) -> Option<i64> {
+    let arg = args.first()?;
+    if !is_decl_shape_operand(arg) {
+        return None;
+    }
+    let ExprKind::Ident(h) = &arg.kind else {
+        return None;
+    };
+    let (q, bits) = decl_shape_query(&h.path[0].name.name, params)?;
+    if fname == "$bits" {
+        return bits;
+    }
+    let dim = match args.get(1) {
+        Some(d) => const_eval_i64_with_params(d, params)?,
+        None => 1,
+    };
+    if dim < 1 {
+        return None;
+    }
+    type_query_bound(fname, &q, dim as usize)
+}
+
+/// §20.7 array query over an explicit type operand (`$size(logic [7:0])`,
+/// `$left(bit [3:0][7:0], 2)`). None when the dimension does not exist.
+fn type_literal_query(
+    fname: &str,
+    dt: &DataType,
+    args: &[Expression],
+    params: Option<&HashMap<String, Value>>,
+) -> Option<i64> {
+    let td = TYPEDEFS_TLS.with(|t| t.borrow().clone());
+    let q = TYPEDEF_SHAPES_TLS
+        .with(|c| type_query_dims_of(dt, params, td.as_ref(), Some(&c.borrow().0)));
+    let dim = match args.get(1) {
+        Some(d) => const_eval_i64_with_params(d, params)?,
+        None => 1,
+    };
+    if dim < 1 {
+        return None;
+    }
+    type_query_bound(fname, &q, dim as usize)
+}
+
+/// §20.6.2 `$bits` of a typedef carrying UNPACKED dimensions
+/// (`typedef int arr_t [3:0][1:5]`): the width table records one element, so
+/// multiply in every unpacked dimension. None for any other name.
+fn typedef_unpacked_bits(name: &str, params: Option<&HashMap<String, Value>>) -> Option<i64> {
+    let dims = TYPEDEF_SHAPES_TLS.with(|c| c.borrow().1.get(name).cloned())?;
+    let bounds = fixed_unpacked_bounds(&dims, params)?;
+    let elem =
+        TYPEDEFS_TLS.with(|t| t.borrow().as_ref().and_then(|m| m.get(name).copied()))? as i64;
+    let mut bits = elem;
+    for (l, r) in bounds {
+        bits = bits.checked_mul((l - r).abs() + 1)?;
+    }
+    Some(bits)
+}
+
+/// Does the declared variable `arg` carry UNPACKED dimensions, on its
+/// declarator or through its typedef? Only those are mis-sized by the signal
+/// table, which records one element.
+fn decl_has_unpacked_dims(arg: &Expression) -> bool {
+    let ExprKind::Ident(h) = &arg.kind else {
+        return false;
+    };
+    let Some(shape) = DECL_SHAPES_TLS.with(|c| {
+        c.borrow()
+            .as_ref()
+            .and_then(|m| m.get(&h.path.last()?.name.name).cloned())
+    }) else {
+        return false;
+    };
+    !shape.unpacked.is_empty()
+        || (!shape.by_type_param
+            && matches!(&shape.data_type, DataType::TypeReference { name, .. }
+                if TYPEDEF_SHAPES_TLS.with(|c| c.borrow().1.contains_key(&name.name.name))))
+}
+
+/// Is `arg` a declared variable of the scope being elaborated whose shape the
+/// array queries can answer at elaboration time?
+fn is_decl_shape_operand(arg: &Expression) -> bool {
+    match &arg.kind {
+        ExprKind::Ident(h)
+            if h.path.len() == 1 && h.path[0].selects.is_empty() && h.root.is_none() =>
+        {
+            let Some(shape) = DECL_SHAPES_TLS.with(|c| {
+                c.borrow()
+                    .as_ref()
+                    .and_then(|m| m.get(&h.path[0].name.name).cloned())
+            }) else {
+                return false;
+            };
+            // `[K]` naming a TYPE is a real associative dimension.
+            if shape
+                .unpacked
+                .iter()
+                .filter_map(size_param_of_dim)
+                .any(|n| {
+                    TYPEDEF_SHAPES_TLS.with(|c| c.borrow().0.contains_key(n))
+                        || TYPEDEFS_TLS
+                            .with(|t| t.borrow().as_ref().is_some_and(|m| m.contains_key(n)))
+                })
+            {
+                return false;
+            }
+            // A named element type must be a known typedef whose own
+            // unpacked dimensions are fixed too. An instance's local typedefs
+            // are known by width only while its parameters resolve.
+            match &shape.data_type {
+                DataType::TypeReference { name, .. } if shape.by_type_param => {
+                    TYPEDEFS_TLS.with(|t| {
+                        t.borrow()
+                            .as_ref()
+                            .is_some_and(|m| m.contains_key(&name.name.name))
+                    })
+                }
+                DataType::TypeReference { name, .. } => TYPEDEF_SHAPES_TLS.with(|c| {
+                    let c = c.borrow();
+                    (c.0.contains_key(&name.name.name)
+                        || TYPEDEFS_TLS.with(|t| {
+                            t.borrow()
+                                .as_ref()
+                                .is_some_and(|m| m.contains_key(&name.name.name))
+                        }))
+                        && c.1.get(&name.name.name).is_none_or(|d| {
+                            d.iter().all(|d| {
+                                matches!(
+                                    d,
+                                    UnpackedDimension::Range { .. }
+                                        | UnpackedDimension::Expression { .. }
+                                )
+                            })
+                        })
+                }),
+                _ => true,
+            }
+        }
+        _ => false,
+    }
 }
 
 /// Extract array range from unpacked dimensions. Returns Some((lo, hi)) for
@@ -21676,6 +22168,18 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                     params
                         .get(n)
                         .map(|v| v.width)
+                        // §20.6.2: a declared variable of this scope, then a
+                        // typedef with unpacked dimensions — see the matching
+                        // arm in `const_eval_i64_with_params`.
+                        .or_else(|| {
+                            decl_var_query("$bits", std::slice::from_ref(inner), Some(params))
+                                .or_else(|| {
+                                    (hier.path.len() == 1)
+                                        .then(|| typedef_unpacked_bits(n, Some(params)))
+                                        .flatten()
+                                })
+                                .and_then(|b| u32::try_from(b).ok())
+                        })
                         .or_else(|| {
                             TYPEDEFS_TLS.with(|td| {
                                 let b = td.borrow();
@@ -22020,6 +22524,35 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
             };
             Value::from_u64(result, w)
         }
+        // §20.7 over an explicit type (`$size(logic [7:0])`).
+        ExprKind::SystemCall { name, args }
+            if matches!(
+                name.as_str(),
+                "$size"
+                    | "$left"
+                    | "$right"
+                    | "$high"
+                    | "$low"
+                    | "$increment"
+                    | "$dimensions"
+                    | "$unpacked_dimensions"
+            ) && matches!(
+                args.first().map(|a| &a.kind),
+                Some(ExprKind::TypeLiteral(_))
+            ) =>
+        {
+            let Some(ExprKind::TypeLiteral(dt)) = args.first().map(|a| &a.kind) else {
+                unreachable!()
+            };
+            match type_literal_query(name, dt, args, Some(params)) {
+                Some(v) => {
+                    let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
+                    out.is_signed = true;
+                    out
+                }
+                None => Value::new(32),
+            }
+        }
         // LRM §20.7 array-introspection on an array-name ident: consults
         // ARRAYS_TLS (populated at end of elaborate_module_with_defs and
         // via runtime path before deferred-param eval).
@@ -22039,6 +22572,13 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 .map(|a| matches!(a.kind, ExprKind::Ident(_)))
                 .unwrap_or(false) =>
         {
+            // §20.7: a declared fixed-size variable answers from its declared
+            // type (see `decl_var_query`); the result is an `integer`.
+            if let Some(v) = decl_var_query(name, args, Some(params)) {
+                let mut out = Value::from_u64((v as u64) & 0xFFFF_FFFF, 32);
+                out.is_signed = true;
+                return out;
+            }
             let arg = args.first().unwrap();
             let arr_name = if let ExprKind::Ident(hier) = &arg.kind {
                 hier.path
@@ -22063,13 +22603,16 @@ fn eval_const_expr_val(expr: &Expression, params: &HashMap<String, Value>) -> Va
                 Value::from_u64(v as u64, 32)
             } else if let Some(v) = TYPEDEFS_TLS
                 .with(|td| {
-                    type_query_dims_by_name(
-                        &arr_name,
-                        Some(params),
-                        td.borrow().as_ref(),
-                        None,
-                        None,
-                    )
+                    TYPEDEF_SHAPES_TLS.with(|sh| {
+                        let sh = sh.borrow();
+                        type_query_dims_by_name(
+                            &arr_name,
+                            Some(params),
+                            td.borrow().as_ref(),
+                            Some(&sh.0),
+                            Some(&sh.1),
+                        )
+                    })
                 })
                 .and_then(|q| {
                     // §20.7 accepts a TYPE as the operand: `$size(int)` is 32,
@@ -28544,6 +29087,10 @@ fn inline_module_items(
     // imports at all, so an unqualified `T [1:0] s;` in a sub-module silently
     // took whichever package last hoisted that bare name.
     rebind_imported_typedefs(elab, source_def.items(), definitions);
+    // §20.6.2/§20.7: this body's declarations answer `$bits` and the array
+    // queries in its own constant expressions (generate conditions, widths,
+    // the parameter overrides it passes to its children).
+    let _decl_shapes = install_decl_shapes(source_def);
     let prepared_source =
         prepare_module_items(source_def, definitions, local_params, &elab.typedefs, cache);
     // §23.10: names of THIS module's own sub-instances. A port connection
@@ -29588,6 +30135,12 @@ fn inline_module_items(
                 // is bound lets the loop expand and its body localparams resolve.
                 // Declared types of the sub-module's own ports and variables,
                 // so a body localparam can size `$bits` of them (§20.7).
+                // §20.6.2/§20.7: from here on — the child's body parameters,
+                // generate conditions and declaration widths — constant
+                // expressions are the CHILD's, so its declarations answer
+                // `$bits(v)` / `$size(v)`. The parameter overrides above were
+                // the parent's.
+                let _child_shapes = install_decl_shapes(sub_mod);
                 let (sub_decl_types, sub_decl_elem_types) = {
                     let mut m = HashMap::default();
                     let mut e = HashMap::default();
