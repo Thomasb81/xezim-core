@@ -182,6 +182,272 @@ pub struct LetDeclaration {
     pub span: Span,
 }
 
+impl LetDeclaration {
+    /// The formal arguments: name, declared type (None when untyped) and
+    /// default actual.
+    pub fn formals(&self) -> Vec<(&Identifier, Option<&DataType>, Option<&Expression>)> {
+        use super::module::PortList;
+        match &self.ports {
+            PortList::Empty => Vec::new(),
+            PortList::NonAnsi(names) => names.iter().map(|n| (n, None, None)).collect(),
+            PortList::Ansi(ports) => ports
+                .iter()
+                .map(|p| {
+                    // `untyped` and a bare name leave the formal untyped.
+                    let ty = p.data_type.as_ref().filter(|dt| {
+                        !matches!(dt, DataType::Implicit { signing: None, dimensions, .. }
+                            if dimensions.is_empty())
+                    });
+                    (&p.name, ty, p.default.as_ref())
+                })
+                .collect(),
+        }
+    }
+
+    /// IEEE 1800-2023 §11.13: expand one let instance `name(args)`. The let
+    /// body is the instance: each formal is replaced by its actual argument
+    /// (positional or `.name(expr)`, a default when omitted), parenthesized
+    /// so it binds as one operand. A typed formal casts its actual to the
+    /// formal's type first. The whole body is parenthesized too, so it takes
+    /// part in the context-determined width of the expression around the
+    /// instance (a let instance is a primary). `span` is the instance's.
+    pub fn expand(&self, args: &[Expression], span: Span) -> Result<Expression, String> {
+        use super::expr::ExprKind;
+        let formals = self.formals();
+        let lname = &self.name.name;
+        let mut bound: Vec<Option<Expression>> = vec![None; formals.len()];
+        let mut pos = 0usize;
+        for a in args {
+            match &a.kind {
+                ExprKind::NamedArg { name, expr } => {
+                    let Some(i) = formals.iter().position(|f| f.0.name == name.name) else {
+                        return Err(format!(
+                            "let '{}' has no formal argument '{}'",
+                            lname, name.name
+                        ));
+                    };
+                    bound[i] = expr.as_deref().cloned();
+                }
+                // `f(a, , c)`: an empty positional actual takes the default.
+                ExprKind::Empty => pos += 1,
+                _ => {
+                    if pos >= formals.len() {
+                        return Err(format!(
+                            "too many arguments to let '{}' ({} formal{})",
+                            lname,
+                            formals.len(),
+                            if formals.len() == 1 { "" } else { "s" }
+                        ));
+                    }
+                    bound[pos] = Some(a.clone());
+                    pos += 1;
+                }
+            }
+        }
+        let mut map: std::collections::HashMap<String, Expression> =
+            std::collections::HashMap::new();
+        for (i, (name, ty, default)) in formals.iter().enumerate() {
+            let Some(actual) = bound[i].take().or_else(|| default.cloned()) else {
+                return Err(format!(
+                    "missing argument for formal '{}' of let '{}'",
+                    name.name, lname
+                ));
+            };
+            let aspan = actual.span;
+            let mut actual = Expression::new(ExprKind::Paren(Box::new(actual)), aspan);
+            if let Some(dt) = ty {
+                actual = Expression::new(
+                    ExprKind::SystemCall {
+                        name: "$__xz_type_cast".to_string(),
+                        args: vec![
+                            Expression::new(ExprKind::TypeLiteral(Box::new((*dt).clone())), aspan),
+                            actual,
+                        ],
+                    },
+                    aspan,
+                );
+            }
+            map.insert(name.name.clone(), actual);
+        }
+        let mut body = self.expr.clone();
+        if !map.is_empty() {
+            let_subst(&mut body, &map);
+        }
+        Ok(Expression::new(ExprKind::Paren(Box::new(body)), span))
+    }
+}
+
+/// Replace every reference to a let formal in `e` with its actual (§11.13).
+/// A formal used with selects or member names (`a[3]`, `a.f`) keeps them,
+/// applied to the actual.
+fn let_subst(e: &mut Expression, map: &std::collections::HashMap<String, Expression>) {
+    use super::expr::{AssignmentPatternItem, ExprKind};
+    let span = e.span;
+    match &mut e.kind {
+        ExprKind::Ident(h) => {
+            let hit = h.root.is_none()
+                && h.path
+                    .first()
+                    .is_some_and(|s| map.contains_key(&s.name.name));
+            if hit {
+                let path = std::mem::take(&mut h.path);
+                let mut out: Option<Expression> = None;
+                for seg in path {
+                    let mut cur = match out {
+                        None => map[&seg.name.name].clone(),
+                        Some(base) => Expression::new(
+                            ExprKind::MemberAccess {
+                                expr: Box::new(base),
+                                member: seg.name,
+                            },
+                            span,
+                        ),
+                    };
+                    for mut sel in seg.selects {
+                        let_subst(&mut sel, map);
+                        cur = match sel.kind {
+                            ExprKind::Range(l, r) => Expression::new(
+                                ExprKind::RangeSelect {
+                                    expr: Box::new(cur),
+                                    kind: super::expr::RangeKind::Constant,
+                                    left: l,
+                                    right: r,
+                                },
+                                span,
+                            ),
+                            _ => Expression::new(
+                                ExprKind::Index {
+                                    expr: Box::new(cur),
+                                    index: Box::new(sel),
+                                },
+                                span,
+                            ),
+                        };
+                    }
+                    out = Some(cur);
+                }
+                if let Some(o) = out {
+                    *e = o;
+                }
+                return;
+            }
+            for seg in &mut h.path {
+                for sel in &mut seg.selects {
+                    let_subst(sel, map);
+                }
+            }
+        }
+        ExprKind::Unary { operand, .. } => let_subst(operand, map),
+        ExprKind::Binary { left, right, .. } => {
+            let_subst(left, map);
+            let_subst(right, map);
+        }
+        ExprKind::Conditional {
+            condition,
+            then_expr,
+            else_expr,
+        } => {
+            let_subst(condition, map);
+            let_subst(then_expr, map);
+            let_subst(else_expr, map);
+        }
+        ExprKind::Concatenation(parts) => parts.iter_mut().for_each(|p| let_subst(p, map)),
+        ExprKind::Replication { count, exprs } => {
+            let_subst(count, map);
+            exprs.iter_mut().for_each(|p| let_subst(p, map));
+        }
+        ExprKind::AssignmentPattern(items) => {
+            for it in items {
+                match it {
+                    AssignmentPatternItem::Ordered(x)
+                    | AssignmentPatternItem::Named(_, x)
+                    | AssignmentPatternItem::Typed(_, x)
+                    | AssignmentPatternItem::Default(x) => let_subst(x, map),
+                    AssignmentPatternItem::Keyed(k, x) => {
+                        let_subst(k, map);
+                        let_subst(x, map);
+                    }
+                }
+            }
+        }
+        ExprKind::Call { func, args } => {
+            // A plain callee name is a subroutine, not a formal.
+            if !matches!(&func.kind, ExprKind::Ident(h) if h.path.len() == 1) {
+                let_subst(func, map);
+            }
+            args.iter_mut().for_each(|a| let_subst(a, map));
+        }
+        ExprKind::SystemCall { args, .. } => args.iter_mut().for_each(|a| let_subst(a, map)),
+        ExprKind::NamedArg { expr, .. } => {
+            if let Some(x) = expr {
+                let_subst(x, map);
+            }
+        }
+        ExprKind::Inside { expr, ranges } => {
+            let_subst(expr, map);
+            ranges.iter_mut().for_each(|r| let_subst(r, map));
+        }
+        ExprKind::Matches { expr, .. } => let_subst(expr, map),
+        ExprKind::MemberAccess { expr, .. } => let_subst(expr, map),
+        ExprKind::Specialization { base, .. } => let_subst(base, map),
+        ExprKind::Index { expr, index } => {
+            let_subst(expr, map);
+            let_subst(index, map);
+        }
+        ExprKind::RangeSelect {
+            expr, left, right, ..
+        } => {
+            let_subst(expr, map);
+            let_subst(left, map);
+            let_subst(right, map);
+        }
+        ExprKind::Range(l, r) => {
+            let_subst(l, map);
+            let_subst(r, map);
+        }
+        ExprKind::Paren(inner) => let_subst(inner, map),
+        ExprKind::WithClause { expr, filter } => {
+            let_subst(expr, map);
+            let_subst(filter, map);
+        }
+        ExprKind::RandomizeWith { call, .. } => let_subst(call, map),
+        ExprKind::AssignExpr { lvalue, rvalue } => {
+            let_subst(lvalue, map);
+            let_subst(rvalue, map);
+        }
+        ExprKind::StreamOp {
+            slice_size, exprs, ..
+        } => {
+            if let Some(s) = slice_size {
+                let_subst(s, map);
+            }
+            exprs.iter_mut().for_each(|x| let_subst(x, map));
+        }
+        ExprKind::Tagged { inner, .. } => {
+            if let Some(x) = inner {
+                let_subst(x, map);
+            }
+        }
+        ExprKind::SvaClocked {
+            clock, iff, body, ..
+        } => {
+            let_subst(clock, map);
+            if let Some(x) = iff {
+                let_subst(x, map);
+            }
+            let_subst(body, map);
+        }
+        ExprKind::ShallowCopy { source } => let_subst(source, map),
+        ExprKind::Number(_)
+        | ExprKind::StringLiteral(_)
+        | ExprKind::TypeLiteral(_)
+        | ExprKind::Dollar
+        | ExprKind::Null
+        | ExprKind::This
+        | ExprKind::Empty => {}
+    }
+}
+
 #[derive(Debug, Clone)]
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct NettypeDeclaration {

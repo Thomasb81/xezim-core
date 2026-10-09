@@ -74,6 +74,12 @@ impl Parser {
             }
             TokenKind::KwBegin => self.parse_seq_block(),
             TokenKind::KwFork => self.parse_par_block(),
+            // §11.13: a let declaration is a block item. The block loops take
+            // it before reaching here; this covers any other statement list.
+            TokenKind::KwLet => {
+                self.parse_let_declaration();
+                Statement::new(StatementKind::Null, self.span_from(start))
+            }
             TokenKind::KwIf
             | TokenKind::KwUnique
             | TokenKind::KwUnique0
@@ -158,8 +164,19 @@ impl Parser {
             }
             TokenKind::KwRandcase => self.parse_randcase(),
             TokenKind::KwRandsequence => self.parse_randsequence(),
-            TokenKind::KwFor => self.parse_for_statement(),
-            TokenKind::KwForeach => self.parse_foreach_statement(),
+            // A loop that declares its variables is a scope for them (§12.7).
+            TokenKind::KwFor => {
+                self.push_let_scope();
+                let st = self.parse_for_statement();
+                self.pop_let_scope();
+                st
+            }
+            TokenKind::KwForeach => {
+                self.push_let_scope();
+                let st = self.parse_foreach_statement();
+                self.pop_let_scope();
+                st
+            }
             TokenKind::KwWhile => self.parse_while_statement(),
             TokenKind::KwDo => self.parse_do_while_statement(),
             TokenKind::KwRepeat => self.parse_repeat_statement(),
@@ -1173,6 +1190,21 @@ impl Parser {
         }
     }
 
+    /// One block item or statement of a sequential/parallel block or a
+    /// subroutine body. IEEE 1800-2023 §11.13: a `let` may be declared in
+    /// any of those (`block_item_declaration ::= ... | let_declaration`,
+    /// A.2.8); it adds no statement (in a fork it must not become a
+    /// process), it is expanded where it is used.
+    pub(super) fn parse_block_item(&mut self, stmts: &mut Vec<Statement>) {
+        if self.at(TokenKind::KwLet) {
+            self.parse_let_declaration();
+            return;
+        }
+        let st = self.parse_statement();
+        self.hide_let_names_of_stmt(&st);
+        stmts.push(st);
+    }
+
     fn parse_seq_block(&mut self) -> Statement {
         let start = self.current().span.start;
         let prefixed = self.after_block_label();
@@ -1183,9 +1215,11 @@ impl Parser {
             None
         };
         let mut stmts = Vec::new();
+        self.push_let_scope();
         while !self.at(TokenKind::KwEnd) && !self.at(TokenKind::Eof) {
-            stmts.push(self.parse_statement());
+            self.parse_block_item(&mut stmts);
         }
+        self.pop_let_scope();
         self.expect(TokenKind::KwEnd);
         // §9.3.4: an end label must match the block name (if any).
         match name {
@@ -1216,14 +1250,16 @@ impl Parser {
             None
         };
         let mut stmts = Vec::new();
+        self.push_let_scope();
         while !self.at_any(&[
             TokenKind::KwJoin,
             TokenKind::KwJoin_any,
             TokenKind::KwJoin_none,
             TokenKind::Eof,
         ]) {
-            stmts.push(self.parse_statement());
+            self.parse_block_item(&mut stmts);
         }
+        self.pop_let_scope();
         let join_type = match self.current_kind() {
             TokenKind::KwJoin_any => {
                 self.bump();
@@ -1586,6 +1622,12 @@ impl Parser {
             }
         }
         self.expect(TokenKind::Semicolon);
+        for it in &init {
+            if let ForInit::VarDecl { name, .. } = it {
+                let n = name.name.clone();
+                self.hide_let_name(&n);
+            }
+        }
         let condition = if !self.at(TokenKind::Semicolon) {
             Some(self.parse_expression())
         } else {
@@ -1774,6 +1816,10 @@ impl Parser {
         self.expect(TokenKind::RBracket);
 
         self.expect(TokenKind::RParen);
+        for v in vars.iter().flatten() {
+            let n = v.name.clone();
+            self.hide_let_name(&n);
+        }
         let body = self.parse_statement();
         Statement::new(
             StatementKind::Foreach {

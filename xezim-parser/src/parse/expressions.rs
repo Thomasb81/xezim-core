@@ -1500,6 +1500,18 @@ impl Parser {
             // Identifier (possibly followed by function call or class scope)
             TokenKind::Identifier | TokenKind::EscapedIdentifier => {
                 let id = self.parse_identifier();
+                // §11.13: an instance of a let visible here is replaced by
+                // the let body with its actuals substituted.
+                if self.let_live > 0
+                    && !matches!(
+                        self.current_kind(),
+                        TokenKind::Hash | TokenKind::DoubleColon | TokenKind::Dot
+                    )
+                    && self.current().text != "'"
+                    && let Some(ld) = self.visible_let(&id.name)
+                {
+                    return self.parse_let_instance(&ld, &id, start);
+                }
                 // Optional parameterized type list #(...) for class scope.
                 // Capture the canonical param text so a `Specialization` node
                 // can key per-specialization statics (PURE_SV_LRM); shape is

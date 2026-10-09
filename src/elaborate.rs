@@ -4046,6 +4046,16 @@ fn hoist_package_params(defs: &HashMap<String, Definition>, elab: &mut Elaborate
             }
         }
     }
+    // §11.13 / §26.3: a package let is reachable as `pkg::name` without an
+    // import; register it under that key (an import adds the bare name).
+    for p in &pkgs {
+        for item in &p.items {
+            if let crate::ast::decl::PackageItem::Let(l) = item {
+                elab.lets
+                    .insert(format!("{}::{}", p.name.name, l.name.name), l.clone());
+            }
+        }
+    }
     for p in &pkgs {
         for item in &p.items {
             let crate::ast::decl::PackageItem::Function(f) = item else {
@@ -39614,6 +39624,12 @@ fn process_import(
                         }
                         PackageItem::DPIExport(e) if &dpi_proto_sv_name(&e.proto) == sym_name => {
                             register_dpi_export(e, elab);
+                            found = true;
+                        }
+                        // §26.3 / §11.13: a let is a package item, so
+                        // `import P::my_let;` names it.
+                        PackageItem::Let(l) if &l.name.name == sym_name => {
+                            elab.lets.insert(l.name.name.clone(), l.clone());
                             found = true;
                         }
                         PackageItem::Class(c) if &c.name.name == sym_name => {

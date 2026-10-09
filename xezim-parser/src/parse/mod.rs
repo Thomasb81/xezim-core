@@ -4,6 +4,7 @@ mod declarations;
 mod expressions;
 mod helpers;
 mod items;
+mod lets;
 mod statements;
 mod types;
 
@@ -56,6 +57,10 @@ pub struct Parser {
     /// `{a, b}`, `a[7:0]`), by position in that list. The enclosing module
     /// declaration lowers them once its body is parsed.
     pub(super) port_exprs: Vec<(usize, crate::ast::expr::Expression)>,
+    /// §11.13: the enclosing scopes and the lets each declares, innermost
+    /// last (see `lets.rs`), and how many lets they hold in all.
+    pub(super) let_scopes: Vec<lets::LetScope>,
+    pub(super) let_live: usize,
 }
 
 impl Parser {
@@ -75,6 +80,8 @@ impl Parser {
             pending_module_items: Vec::new(),
             generate_depth: 0,
             port_exprs: Vec::new(),
+            let_scopes: Vec::new(),
+            let_live: 0,
         }
     }
 

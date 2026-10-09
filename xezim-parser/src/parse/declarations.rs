@@ -497,6 +497,11 @@ impl Parser {
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
         let mut strict_body_ports = Vec::new();
+        // §11.13: a subroutine is a let scope; its ports hide outer lets.
+        self.push_let_scope();
+        for p in &ports {
+            self.hide_let_name(&p.name.name);
+        }
         while !self.at(TokenKind::KwEndfunction) && !self.at(TokenKind::Eof) {
             if matches!(
                 self.current_kind(),
@@ -504,11 +509,17 @@ impl Parser {
             ) {
                 // §13.4.2 non-ANSI body ports fill `ports` for arg binding
                 // (ANSI functions already have a non-empty `ports` here).
+                let n0 = ports.len();
                 self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
+                for i in n0..ports.len() {
+                    let n = ports[i].name.name.clone();
+                    self.hide_let_name(&n);
+                }
             } else {
-                items.push(self.parse_statement());
+                self.parse_block_item(&mut items);
             }
         }
+        self.pop_let_scope();
         self.expect(TokenKind::KwEndfunction);
         let endlabel = self.parse_end_label_checked(&name.name.name);
         self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);
@@ -657,16 +668,27 @@ impl Parser {
         self.expect(TokenKind::Semicolon);
         let mut items = Vec::new();
         let mut strict_body_ports = Vec::new();
+        // §11.13: a subroutine is a let scope; its ports hide outer lets.
+        self.push_let_scope();
+        for p in &ports {
+            self.hide_let_name(&p.name.name);
+        }
         while !self.at(TokenKind::KwEndtask) && !self.at(TokenKind::Eof) {
             if matches!(
                 self.current_kind(),
                 TokenKind::KwInput | TokenKind::KwOutput | TokenKind::KwInout | TokenKind::KwRef
             ) {
+                let n0 = ports.len();
                 self.parse_tf_body_ports(&mut ports, &mut strict_body_ports);
+                for i in n0..ports.len() {
+                    let n = ports[i].name.name.clone();
+                    self.hide_let_name(&n);
+                }
             } else {
-                items.push(self.parse_statement());
+                self.parse_block_item(&mut items);
             }
         }
+        self.pop_let_scope();
         self.expect(TokenKind::KwEndtask);
         let endlabel = self.parse_end_label();
         self.check_tf_body_redeclarations(&ports[ansi_ports..], &items);

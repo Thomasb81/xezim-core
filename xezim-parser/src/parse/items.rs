@@ -623,7 +623,10 @@ impl Parser {
         let port_exprs = std::mem::take(&mut self.port_exprs);
         self.expect(TokenKind::Semicolon);
 
+        // §11.13: a design element is a let scope.
+        self.push_let_scope();
         let mut items = self.parse_module_items();
+        self.pop_let_scope();
         if !header_imports.is_empty() {
             let mut prefixed = Vec::with_capacity(header_imports.len() + items.len());
             prefixed.extend(header_imports);
@@ -662,7 +665,10 @@ impl Parser {
         let port_exprs = std::mem::take(&mut self.port_exprs);
         self.expect(TokenKind::Semicolon);
 
+        // §11.13: a design element is a let scope.
+        self.push_let_scope();
         let mut items = self.parse_module_items();
+        self.pop_let_scope();
         if !header_imports.is_empty() {
             let mut prefixed = Vec::with_capacity(header_imports.len() + items.len());
             prefixed.extend(header_imports);
@@ -700,7 +706,10 @@ impl Parser {
         let port_exprs = std::mem::take(&mut self.port_exprs);
         self.expect(TokenKind::Semicolon);
 
+        // §11.13: a design element is a let scope.
+        self.push_let_scope();
         let mut items = self.parse_module_items();
+        self.pop_let_scope();
         if !header_imports.is_empty() {
             let mut prefixed = Vec::with_capacity(header_imports.len() + items.len());
             prefixed.extend(header_imports);
@@ -858,6 +867,7 @@ impl Parser {
         self.expect(TokenKind::Semicolon);
 
         let mut items = Vec::new();
+        self.push_let_scope();
         while !self.at(TokenKind::KwEndpackage) && !self.at(TokenKind::Eof) {
             if let Some(item) = self.parse_package_item() {
                 items.push(item);
@@ -865,6 +875,7 @@ impl Parser {
                 self.bump();
             }
         }
+        self.pop_let_scope();
 
         self.expect(TokenKind::KwEndpackage);
         let endlabel = self.parse_end_label();
@@ -1560,6 +1571,7 @@ impl Parser {
         while !self.at_any(&end_tokens) {
             let before = self.pos;
             if let Some(item) = self.parse_module_item() {
+                self.hide_let_names_of_item(&item);
                 items.push(item);
                 items.append(&mut self.pending_module_items);
             } else if self.pos == before {
@@ -2728,7 +2740,9 @@ impl Parser {
                 let name = self.parse_identifier();
                 let ports = self.parse_port_list();
                 self.expect(TokenKind::Semicolon);
+                self.push_let_scope();
                 let items = self.parse_module_items_until(TokenKind::KwEndchecker);
+                self.pop_let_scope();
                 self.expect(TokenKind::KwEndchecker);
                 let endlabel = self.parse_end_label();
                 Some(ModuleItem::CheckerDeclaration(CheckerDeclaration {
@@ -2739,21 +2753,7 @@ impl Parser {
                     span: self.span_from(start),
                 }))
             }
-            TokenKind::KwLet => {
-                let start = self.current().span.start;
-                self.bump();
-                let name = self.parse_identifier();
-                let ports = self.parse_port_list();
-                self.expect(TokenKind::Assign);
-                let expr = self.parse_expression();
-                self.expect(TokenKind::Semicolon);
-                Some(ModuleItem::LetDeclaration(LetDeclaration {
-                    name,
-                    ports,
-                    expr,
-                    span: self.span_from(start),
-                }))
-            }
+            TokenKind::KwLet => Some(ModuleItem::LetDeclaration(self.parse_let_declaration())),
             TokenKind::KwNettype => {
                 let start = self.current().span.start;
                 self.bump();
@@ -3933,6 +3933,8 @@ impl Parser {
     /// `begin : <label>` block name (needed to namespace generate-for renames).
     fn parse_generate_branch_items_named(&mut self) -> (Vec<ModuleItem>, Option<String>) {
         self.generate_depth += 1;
+        // §27.5: a generate block is a scope, for lets too (§11.13).
+        self.push_let_scope();
         let prefixed = self.after_block_label();
         let r = if self.eat(TokenKind::KwBegin).is_some() {
             let label = self.parse_end_label().map(|id| id.name);
@@ -3948,6 +3950,7 @@ impl Parser {
         } else {
             (self.parse_module_item().into_iter().collect(), None)
         };
+        self.pop_let_scope();
         self.generate_depth -= 1;
         r
     }
@@ -4533,6 +4536,7 @@ impl Parser {
         let mut items = Vec::new();
         while !self.at(end) && !self.at(TokenKind::Eof) {
             if let Some(item) = self.parse_module_item() {
+                self.hide_let_names_of_item(&item);
                 items.push(item);
                 items.append(&mut self.pending_module_items);
             } else {
@@ -4697,9 +4701,14 @@ impl Parser {
         crate::push_class_context(name.name.clone());
         let mut items = Vec::new();
         let outer_pure = std::mem::take(&mut self.pure_constraints);
+        // A class is a scope: its members hide outer lets of the same name.
+        self.push_let_scope();
         while !self.at(TokenKind::KwEndclass) && !self.at(TokenKind::Eof) {
-            items.push(self.parse_class_item());
+            let it = self.parse_class_item();
+            self.hide_let_names_of_class_item(&it);
+            items.push(it);
         }
+        self.pop_let_scope();
         let pure_constraints = std::mem::replace(&mut self.pure_constraints, outer_pure);
         crate::pop_class_context();
         {
