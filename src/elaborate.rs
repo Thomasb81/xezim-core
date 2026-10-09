@@ -16795,7 +16795,7 @@ pub fn resolve_typedef_chain<'a>(
 /// its (width, signedness) for an integral key, and the typedef name a
 /// `TypeReference` key names (enum key rendering). A string or wildcard key
 /// has no index width.
-fn assoc_key_type_info(
+pub fn assoc_key_type_info(
     kdt: Option<&DataType>,
     params: &HashMap<String, Value>,
     typedefs: &HashMap<String, u32>,
