@@ -3070,6 +3070,15 @@ pub struct ElaboratedModule {
     pub assoc_defaults: HashMap<String, Expression>,
     /// Dynamic arrays / queues (size starts at 0, not pre-allocated range).
     pub dynamic_arrays: HashSet<String>,
+    /// Declared arrays whose ELEMENT is itself an associative array, keyed by
+    /// the array's NAME and valued by whether that element's first key is a
+    /// string (`int a[2][string][string]`, `int d[][string]`). For fixed
+    /// outer dims the individual elements are also enumerated into
+    /// `associative_arrays`; for a dynamic/queue/assoc outer (variable count)
+    /// this map carries the declaration so the runtime can register each
+    /// element as an assoc array the moment it is created (`d = new[n]`).
+    #[serde(default)]
+    pub array_of_assoc_elems: HashMap<String, bool>,
     /// §10.3.1 drive strength of a continuous assign's target net, keyed by
     /// net name: (strength-when-1, strength-when-0), e.g. ("pull1", "pull0").
     /// Consumed by `%v` (§21.2.1.5); absent nets display as strong.
@@ -3652,6 +3661,7 @@ impl ElaboratedModule {
             gate_driven_nets: std::collections::HashSet::default(),
             assoc_defaults: HashMap::default(),
             dynamic_arrays: HashSet::default(),
+            array_of_assoc_elems: HashMap::default(),
             net_strengths: HashMap::default(),
             strength_drivers: HashMap::default(),
             supply_nets: HashSet::default(),
@@ -8237,11 +8247,119 @@ pub fn elaborate_module_with_defs(
                     //   `int d[3][]`       array of dynamic arrays
                     //   `int a[2][u8_t]`   array of associative arrays
                     // The leading dimensions give the (fixed) shape; the
-                    // trailing one makes every element its own collection.
-                    // Without this the trailing dimension was simply dropped and
-                    // `q[i]` was a plain scalar.
+                    // collection dimension(s) past it make every element its
+                    // own collection.
                     // A leading dynamic dim is fine too (`int qq[$][$]`): its
                     // backing buffer gives the outer shape.
+                    //
+                    // Issue #328: the ELEMENT may itself be MULTI-dimensional
+                    // collection — `int a[2][string][string]` is a fixed array
+                    // of `[string][string]` associative sub-arrays, and
+                    // `int d[][string][string]` a dynamic array of them. Split
+                    // at the FIRST collection dim: the leading FIXED dims are
+                    // the enumerable outer shape; the collection dim causes
+                    // every such element to be registered with the shape of a
+                    // standalone matching collection.
+                    if effective_dims.len() >= 2 {
+                        if let Some(ci) = effective_dims.iter().position(|d| {
+                            matches!(
+                                d,
+                                UnpackedDimension::Unsized(_)
+                                    | UnpackedDimension::Queue { .. }
+                                    | UnpackedDimension::Associative { .. }
+                            )
+                        }) {
+                            // Number of collection dims that make up the ELEMENT's
+                            // own collection type. The first collection dim is the
+                            // outer shape: for a leading collection (`int d[][]`) it
+                            // is the enumable dummy buffer / dynamic container, and
+                            // for a fixed outer (`int a[2][string]`) the dimension
+                            // being iterated; everything from the first collection
+                            // onward is the element's collection.
+                            let elem_dims = if ci == 0 {
+                                effective_dims.len() - 1
+                            } else {
+                                effective_dims.len() - ci
+                            };
+                            if elem_dims >= 2 {
+                                // Issue #328: the ELEMENT is itself a multi-dimension
+                                // collection (`int a[2][string][string]`,
+                                // `int d[][string][string]`). Record the declaration
+                                // so the runtime recognizes each freshly-created /
+                                // freshly-sized `name[i]` as an (assoc, possibly
+                                // string-keyed) sub-array.
+                                let es = if ci > 0 { ci } else { ci + 1 };
+                                let ekey = if let UnpackedDimension::Associative {
+                                    data_type: kdt,
+                                    ..
+                                } = &effective_dims[es]
+                                {
+                                    kdt.as_ref().is_some_and(|dt| {
+                                        matches!(
+                                            dt.as_ref(),
+                                            DataType::Simple {
+                                                kind: SimpleType::String,
+                                                ..
+                                            }
+                                        )
+                                    })
+                                } else {
+                                    false
+                                };
+                                if ci > 0 {
+                                    // Fixed outer shape: enumerate the (fixed) element
+                                    // indexes now so each is a registered assoc array.
+                                    let outer = &effective_dims[..ci];
+                                    let shape: Option<Vec<(i64, i64)>> = outer
+                                        .iter()
+                                        .map(|d| {
+                                            extract_array_range(
+                                                std::slice::from_ref(d),
+                                                &elab.parameters,
+                                            )
+                                        })
+                                        .collect();
+                                    if let Some(shape) = shape.filter(|sh| {
+                                        sh.iter().all(|&(lo, hi)| hi >= lo && hi - lo < 4096)
+                                    }) {
+                                        let name = decl.name.name.clone();
+                                        match shape.len() {
+                                            1 => {
+                                                elab.arrays.insert(
+                                                    name.clone(),
+                                                    (shape[0].0, shape[0].1, width),
+                                                );
+                                            }
+                                            2 => {
+                                                elab.arrays_2d.insert(
+                                                    name.clone(),
+                                                    (shape[0], shape[1], width),
+                                                );
+                                            }
+                                            _ => {
+                                                elab.arrays_nd
+                                                    .insert(name.clone(), (shape.clone(), width));
+                                            }
+                                        }
+                                        elab.array_of_assoc_elems
+                                            .insert(name.clone(), ekey);
+                                        for suffix in index_tuples(&shape) {
+                                            let en = format!("{}{}", name, suffix);
+                                            elab.associative_arrays.insert(en, ekey);
+                                        }
+                                        elab.var_decl_types.insert(name, dd.data_type.clone());
+                                        continue;
+                                    }
+                                } else {
+                                    // dynamic/queue/assoc outer: the runtime registers
+                                    // each element the moment it is created (`d = new[n]`
+                                    // -> `d[i]`), using this recorded key type.
+                                    elab.array_of_assoc_elems
+                                        .insert(decl.name.name.clone(), ekey);
+                                }
+                            }
+                            // A single-collection element (or the outer shape is not
+                            // enumable): the original array-of-collections handling.
                     if effective_dims.len() >= 2 {
                         if let Some(qd) = effective_dims.last() {
                             if matches!(
@@ -8348,6 +8466,9 @@ pub fn elaborate_module_with_defs(
                             }
                         }
                     }
+                        }
+                    }
+
                     // Helper: if the element type resolves to a packed struct,
                     // register the FLATTENED field layout (including nested
                     // dotted paths like `outer.inner.leaf`) under the array
@@ -15278,6 +15399,14 @@ fn elaborate_items_numbered(
                                         })),
                                         _ => None,
                                     };
+                                    // #328: record that this array's elements are
+                                    // (possibly string-keyed) associative arrays, so the
+                                    // runtime recognizes a not-yet-enumerated index
+                                    // `name[i]` as an assoc receiver too.
+                                    if assoc_key.is_some() {
+                                        elab.array_of_assoc_elems
+                                            .insert(name.clone(), assoc_key.unwrap_or(false));
+                                    }
                                     // A packed-struct ELEMENT type: every element
                                     // collection carries the field layout, so
                                     // `q3[i][j].f` and a locator's `item.f` slice
