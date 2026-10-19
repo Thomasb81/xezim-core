@@ -2123,6 +2123,33 @@ fn parse_and_elaborate(
             ast::Description::PackageItem(ast::decl::PackageItem::Data(d)) => {
                 top_level_vars.push(d);
             }
+            // §6.7 a NET declaration at compilation-unit scope (`wire x;`,
+            // `wire x2[2], y2[2];`). `wire x;` and `int a;` are both accepted
+            // at $unit, so a net must be accepted too, not "unexpected". Hoist
+            // it alongside $unit variables (its declarators carry the same
+            // name/dimensions), so in-module references resolve and it
+            // shadows/coexists exactly like a $unit variable would.
+            ast::Description::PackageItem(ast::decl::PackageItem::Net(n)) => {
+                use crate::ast::stmt::VarDeclarator;
+                let declarators = n
+                    .declarators
+                    .iter()
+                    .map(|nd| VarDeclarator {
+                        name: nd.name.clone(),
+                        dimensions: nd.dimensions.clone(),
+                        init: nd.init.clone(),
+                        span: nd.span,
+                    })
+                    .collect();
+                top_level_vars.push(ast::decl::DataDeclaration {
+                    const_kw: false,
+                    var_kw: false,
+                    lifetime: None,
+                    data_type: n.data_type.clone(),
+                    declarators,
+                    span: n.span,
+                });
+            }
             ast::Description::PackageItem(ast::decl::PackageItem::Covergroup(cg)) => {
                 top_level_covergroups.push(cg);
             }

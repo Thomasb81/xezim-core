@@ -1621,4 +1621,10 @@ pub enum PackageItem {
     /// carried as `Description::PackageItem`). Appended last for bincode
     /// index stability.
     Covergroup(CovergroupDeclaration),
+    /// IEEE 1800 §6.7: a net declaration at compilation-unit ($unit) / file
+    /// scope, e.g. `wire x2[2];`. Distinct from `Data` (a variable): a net's
+    /// name must enter the same hoisted symbol table so in-module references
+    /// resolve, but it is a net, not a variable. Appended last for bincode
+    /// index stability.
+    Net(NetDeclaration),
 }

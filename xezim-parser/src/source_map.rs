@@ -34,6 +34,22 @@ pub(crate) struct LineOrigin {
     /// Macro-expanded text: the output line still starts with the original
     /// text before the invocation (the first line of an expansion).
     pub mfirst: bool,
+    /// Macro-expanded text: column (relative to `col`) where the FIRST
+    /// line's substituted text ends, exclusive. Ordinary tokens that merely
+    /// FOLLOW a macro call on the same line sit at `>= mcol + mend` and are
+    /// original text, not macro text. On `mfirst == false` (continuation
+    /// lines of a multi-line expansion) every token is macro text and this
+    /// value is ignored. A value of 0 means "extent unknown": the caller
+    /// falls back to treating the whole tail of the line as macro text
+    /// (the historical behaviour).
+    pub mend: u32,
+    /// Macro-expanded text: character length of the FIRST macro invocation
+    /// (`` `NAME `` plus any balanced `(...)`) in the ORIGINAL line. When a
+    /// token after the substitution keeps its own column, the substitution
+    /// may change length (`mcall` input chars became `mend` output chars), so
+    /// the OFFSET of the following original text is shifted by `mcall - mend`.
+    /// Zero means unknown (no adjustment).
+    pub mcall: u32,
 }
 
 impl LineOrigin {
@@ -45,6 +61,8 @@ impl LineOrigin {
             mac: 0,
             mcol: 0,
             mfirst: false,
+            mend: 0,
+            mcall: 0,
         }
     }
 }
@@ -163,7 +181,19 @@ impl LineMap {
             included_from: self.include_chain(o.file),
             fallback_text: None,
         };
-        if o.mac != 0 && !(o.mfirst && out_col < o.mcol) {
+        // Canonical macro-text predicate on the expansion's first line: a
+        // token is macro text only while its column lies within the
+        // substituted run [mcol, mcol+mend). Ordinary tokens before the call
+        // (out_col < mcol) and -- crucially -- ordinary tokens that merely
+        // FOLLOW the call on the same line (out_col >= mcol+mend) are
+        // original text and keep their real column. That second bound was the
+        // defect: the old code redirected every token at/after the invocation
+        // to the macro, so `logic [`W-1:0] data;` misreported `data` (which
+        // comes after the expansion) at the invocation column.
+        let in_macro_text = o.mac != 0
+            && (!o.mfirst
+                || (out_col >= o.mcol && (o.mend == 0 || out_col < o.mcol + o.mend)));
+        if in_macro_text {
             // Macro text: point at the invocation (text left of it on the
             // expansion's first line is still the original).
             let name = self
@@ -174,8 +204,25 @@ impl LineMap {
             loc.col = o.col + o.mcol + 1;
             loc.len = name.chars().count() as u32 + 1;
             loc.macro_name = Some(name);
-        } else if o.mac == 0 {
-            loc.fallback_text = Some(text[line_start..line_end].to_string());
+        } else {
+            // Ordinary text. If this is an expansion line and the token lies
+            // AFTER the macro substitution (out_col >= mcol + mend), the
+            // expansion may have changed the line's length: the substitution
+            // replaced `mcall` input chars with `mend` output chars, so the
+            // original offset is `out_col + (mcall as i64 - mend as i64)`.
+            // Without this the token keeps its preprocessed column, which is
+            // wrong when the expansion shrank/grew (`` `W `` -> `8` moves
+            // `data` left by one). Only the FIRST expansion on the line is
+            // modelled; exotic multi-macro lines degrade to the unadjusted
+            // column, which is still far better than the old misattribute.
+            let mid = o.mcol + o.mend;
+            if o.mac != 0 && o.mfirst && o.mend != 0 && out_col >= mid && o.mcall != 0 {
+                let shift = o.mcall as i64 - o.mend as i64;
+                loc.col = (o.col as i64 + out_col as i64 + shift + 1).max(0) as u32;
+            }
+            if o.mac == 0 {
+                loc.fallback_text = Some(text[line_start..line_end].to_string());
+            }
         }
         Some(loc)
     }

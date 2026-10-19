@@ -68,3 +68,34 @@ fn unit_scope_plain_forms_still_parse() {
         );
     }
 }
+
+/// §6.7 net declarations at compilation-unit scope (`wire x;`). These are
+/// legal at $unit (like `int a;`), but the $unit dispatch guard only admitted
+/// data-type keywords, so a leading net type fell through to an "unexpected
+/// token". The issue's `wire x;` / `wire x2[2], y2[2];` died that way.
+#[test]
+fn unit_scope_net_declaration_parses() {
+    for src in [
+        "wire x;\nmodule m; endmodule\n",
+        "wire x2[2], y2[2];\nmodule m; endmodule\n",
+        "tri1 a, b;\nmodule m; endmodule\n",
+        "wire [3:0] w;\nmodule m; endmodule\n",
+        "wand b1, b2;\nmodule m; endmodule\n",
+    ] {
+        let e = errors(src);
+        assert!(
+            e.is_empty(),
+            "`{}` at $unit scope must parse, got: {:?}",
+            src.lines().next().unwrap(),
+            e
+        );
+    }
+}
+
+/// A `$unit` net next to a variable is fine and both survive to elaboration
+/// (the net is hoisted like a $unit variable so module references resolve).
+#[test]
+fn unit_scope_net_variable_mix_parses() {
+    let e = errors("wire x2[2], y2[2];\nint a;\nmodule m; endmodule\n");
+    assert!(e.is_empty(), "net+var at $unit must parse, got: {:?}", e);
+}

@@ -24,7 +24,7 @@ impl Parser {
         // Parse postfix selects: [idx], [l:r], [idx+:w], [idx-:w], .member
         loop {
             if self.at(TokenKind::LBracket) {
-                let s = self.current().span.start;
+                let s = lval.span.start; // base (IEEE-1800 postfix spans the whole lvalue, not just the operator)
                 self.bump();
                 let idx = self.parse_expression();
                 if self.eat(TokenKind::Colon).is_some() {
@@ -74,7 +74,7 @@ impl Parser {
                     );
                 }
             } else if self.at(TokenKind::Dot) {
-                let s = self.current().span.start;
+                let s = lval.span.start; // base
                 self.bump();
                 let member = if matches!(
                     self.current().kind,
@@ -103,7 +103,7 @@ impl Parser {
                     self.span_from(s),
                 );
             } else if self.at(TokenKind::DoubleColon) {
-                let s = self.current().span.start;
+                let s = lval.span.start; // base
                 self.bump();
                 let member = if self.at(TokenKind::KwNew) {
                     let tok = self.bump();

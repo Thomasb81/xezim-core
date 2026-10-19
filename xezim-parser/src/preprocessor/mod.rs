@@ -1615,22 +1615,30 @@ impl Preprocessor {
                 let (src0, _) = src_pos(joined[0]);
                 LineOrigin::plain(this.cur_file_idx, this.current_line + (src - src0), col)
             };
-            let macro_origin = |this: &mut Self, k: usize, text: &str| -> Option<LineOrigin> {
-                let base = joined_origin(this, k);
-                if fixed.is_some() {
-                    return Some(base);
-                }
-                let (mcol, name) = this.first_user_macro(text)?;
-                Some(LineOrigin {
-                    mac: this.macro_index(name),
-                    mcol,
-                    mfirst: true,
-                    ..base
-                })
-            };
+            let macro_origin =
+                |this: &mut Self, k: usize, text: &str, out_line: &str| -> Option<LineOrigin> {
+                    let base = joined_origin(this, k);
+                    if fixed.is_some() {
+                        return Some(base);
+                    }
+                    let (mcol, name) = this.first_user_macro(text)?;
+                    // Extent of the first expansion: ordinary tokens following
+                    // the call on the same line keep their own column (#398).
+                    let (mend, mcall) =
+                        this.first_macro_extent(text, out_line, mcol).unwrap_or((0, 0));
+                    Some(LineOrigin {
+                        mac: this.macro_index(name),
+                        mcol,
+                        mfirst: true,
+                        mend,
+                        mcall,
+                        ..base
+                    })
+                };
             let (expanded, sub_origins) = if Self::contains_preprocessor_directive(&expanded) {
-                let inv =
-                    macro_origin(self, 0, &logical_line).unwrap_or_else(|| joined_origin(self, 0));
+                let first_out = expanded.split('\n').next().unwrap_or("");
+                let inv = macro_origin(self, 0, &logical_line, first_out)
+                    .unwrap_or_else(|| joined_origin(self, 0));
                 let (text, origins) =
                     self.resolve_directives(&expanded, source_path, Ctx::Macro(inv));
                 (text, Some(origins))
@@ -1650,7 +1658,8 @@ impl Preprocessor {
                 output.push('\n');
                 match sub_origins {
                     Some(mut origins) => {
-                        let tail = macro_origin(self, 0, &logical_line)
+                        let tail_out = expanded.rsplit('\n').next().unwrap_or("");
+                        let tail = macro_origin(self, 0, &logical_line, tail_out)
                             .unwrap_or_else(|| joined_origin(self, 0));
                         origins.push(tail);
                         sink.extend(&output, origins);
@@ -1674,7 +1683,7 @@ impl Preprocessor {
                                 let org = if o == src {
                                     None
                                 } else {
-                                    macro_origin(self, k, src)
+                                    macro_origin(self, k, src, o)
                                 };
                                 origins.push(org.unwrap_or_else(|| joined_origin(self, k)));
                             }
@@ -1682,7 +1691,8 @@ impl Preprocessor {
                             // A multi-line body: every line maps to the
                             // invocation; only the first keeps a prefix of
                             // original text.
-                            let first = macro_origin(self, 0, &logical_line)
+                            let first_out = expanded.split('\n').next().unwrap_or("");
+                            let first = macro_origin(self, 0, &logical_line, first_out)
                                 .unwrap_or_else(|| joined_origin(self, 0));
                             origins.push(first);
                             let rest = LineOrigin {
@@ -1805,6 +1815,73 @@ impl Preprocessor {
             i += 1;
         }
         None
+    }
+
+    /// Length of a complete macro invocation in `text` starting at the
+    /// backtick at byte `i` (which `first_user_macro` reported). The call is
+    /// `` `NAME `` optionally followed by a balanced `(...)` actual list.
+    fn macro_call_len(text: &str, i: usize) -> usize {
+        let b = text.as_bytes();
+        let mut k = i + 1;
+        while k < b.len() && (b[k].is_ascii_alphanumeric() || b[k] == b'_') {
+            k += 1;
+        }
+        let mut j = k;
+        while j < b.len() && (b[j] == b' ' || b[j] == b'\t') {
+            j += 1;
+        }
+        if b.get(j) == Some(&b'(') {
+            let mut depth = 0usize;
+            while j < b.len() {
+                match b[j] {
+                    b'(' => depth += 1,
+                    b')' => {
+                        depth -= 1;
+                        if depth == 0 {
+                            k = j + 1;
+                            break;
+                        }
+                    }
+                    _ => {}
+                }
+                j += 1;
+            }
+        }
+        k - i
+    }
+
+    /// Extent and original length of the FIRST macro invocation on a line.
+    /// Returns `(mend, mcall)`:
+    /// - `mend`: column (exclusive) in `out_line` where the substitution ends;
+    ///   ordinary tokens that FOLLOW it on the same line sit at/after this and
+    ///   are original text, so the line map must not attribute them to the
+    ///   macro.
+    /// - `mcall`: character length of the invocation (`` `NAME `` plus any
+    ///   balanced `(...)`) in `in_line`.
+    /// `mcol` is the char column of the invocation's backtick in `in_line`.
+    /// Returns `None` when the extent cannot be determined (multiple/nested
+    /// macros after the first, or a call running to the line end); callers
+    /// then keep the historical whole-tail-is-macro behaviour for `mend`.
+    fn first_macro_extent(&self, in_line: &str, out_line: &str, mcol: u32) -> Option<(u32, u32)> {
+        let mbytes = in_line
+            .char_indices()
+            .nth(mcol as usize)
+            .map(|(i, _)| i)?;
+        let call_len = Self::macro_call_len(in_line, mbytes);
+        if call_len == 0 {
+            return None;
+        }
+        let after_call = &in_line[mbytes + call_len..];
+        if after_call.trim().is_empty() {
+            // The call runs to end of line: no ordinary text resumes after it.
+            return None;
+        }
+        let obytes = out_line.char_indices().nth(mcol as usize)?.0;
+        let rest = &out_line[obytes..];
+        let at = rest.find(after_call)?;
+        // mend is a count of chars from the invocation backtick to where the
+        // ordinary text resumes; mcall is the input call's char length.
+        Some((rest[..at].chars().count() as u32, in_line[mbytes..mbytes + call_len].chars().count() as u32))
     }
 
     /// Index of `name` in the line map's macro table, plus one.

@@ -143,6 +143,32 @@ fn text_before_a_macro_keeps_its_own_column() {
 }
 
 #[test]
+fn text_after_a_macro_keeps_its_own_column() {
+    // `data` merely FOLLOWS the `` `W `` expansion on the same line, so it
+    // must be located at its real (original) column, not redirected to the
+    // invocation column of the macro (issue #398 defect 3).
+    let dir = temp_dir("macro-suffix");
+    let top = write(
+        &dir,
+        "m.sv",
+        "`define W 8\nmodule t;\n  logic [`W-1:0] data;\nendmodule\n",
+    );
+    // Original line: `  logic [`W-1:0] data;`; `data` sits at col 18 in the
+    // SOURCE, but the `W -> 8 substitution shrank the line by one, so the
+    // preprocessed `data` is at col 17. The map must restore the original 18.
+    assert_eq!(locate_token(&top, "data"), format!("{top}:3:18"));
+    // A macro that GROWS the line shifts following tokens the other way.
+    let grow = write(
+        &dir,
+        "g.sv",
+        "`define BIG 127\nmodule t;\n  logic [`BIG-1:0] tail;\nendmodule\n",
+    );
+    // `tail` is at original col 20 (`BIG` at cols 11-13 of the source, but
+    // the `BIG -> 127 substitution shrinks the line so `tail` sits earlier).
+    assert_eq!(locate_token(&grow, "tail"), format!("{grow}:3:20"));
+}
+
+#[test]
 fn columns_survive_inline_conditional_split() {
     let dir = temp_dir("split");
     let top = write(

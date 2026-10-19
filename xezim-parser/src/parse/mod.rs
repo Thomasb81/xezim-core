@@ -458,6 +458,26 @@ impl Parser {
                 // it, but this guard did not admit one, so a $unit-scope
                 // `static`/`automatic` declaration — the usual way a testbench
                 // keeps a shared failure counter — died as "unexpected token".
+                //
+                // §6.7: a net TYPE keyword (wire/tri/…) heads a NET
+                // declaration, which is legal at compilation-unit scope and
+                // interplayed with the delayed cleanup that follows.
+                if self.is_net_type_keyword() {
+                    let before = self.pos;
+                    let net = self.parse_net_declaration();
+                    // Guard against a parse that made no progress (avoid a
+                    // hang): fall back to the brute-force skip.
+                    if self.pos > before {
+                        return Some(Description::PackageItem(PackageItem::Net(net)));
+                    }
+                    while !self.at(TokenKind::Eof)
+                        && !self.at(TokenKind::Semicolon)
+                    {
+                        self.bump();
+                    }
+                    self.expect(TokenKind::Semicolon);
+                    return self.parse_description();
+                }
                 if self.is_data_type_keyword()
                     || self.at(TokenKind::KwVar)
                     || self.at(TokenKind::KwConst)

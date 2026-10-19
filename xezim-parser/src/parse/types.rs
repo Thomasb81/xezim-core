@@ -38,6 +38,27 @@ impl Parser {
         self.is_data_type_keyword() || self.at(TokenKind::Identifier)
     }
 
+    /// `wire`, `tri`, `supply0`, … — a net-type keyword, which may head a
+    /// net declaration at module OR compilation-unit ($unit) scope.
+    pub(super) fn is_net_type_keyword(&self) -> bool {
+        matches!(
+            self.current_kind(),
+            TokenKind::KwWire
+                | TokenKind::KwTri
+                | TokenKind::KwWand
+                | TokenKind::KwWor
+                | TokenKind::KwTriand
+                | TokenKind::KwTrior
+                | TokenKind::KwTri0
+                | TokenKind::KwTri1
+                | TokenKind::KwTrireg
+                | TokenKind::KwSupply0
+                | TokenKind::KwSupply1
+                | TokenKind::KwUwire
+                | TokenKind::KwWreal
+        )
+    }
+
     pub(super) fn parse_data_type(&mut self) -> DataType {
         let start = self.current().span.start;
         match self.current_kind() {

@@ -3029,7 +3029,7 @@ impl Parser {
         }
     }
 
-    fn parse_net_declaration(&mut self) -> NetDeclaration {
+    pub(super) fn parse_net_declaration(&mut self) -> NetDeclaration {
         let start = self.current().span.start;
         let net_type = self.parse_optional_net_type().unwrap_or(NetType::Wire);
         // §10.3.1: optional drive_strength `(strong1, weak0)` on a net

@@ -2938,6 +2938,18 @@ impl Rw<'_> {
                     }
                 }
             }
+            PackageItem::Net(nd) => {
+                self.dtype(&mut nd.data_type);
+                for d in &mut nd.declarators {
+                    self.unpacked(&mut d.dimensions);
+                    self.opt(&mut d.init);
+                    if let Some(p) = pkg {
+                        if self.info.mangled_vars.contains(&d.name.name) {
+                            d.name.name = mangle(p, &d.name.name);
+                        }
+                    }
+                }
+            }
             PackageItem::Class(c) => {
                 if let Some(m) = renamed(&c.name.name) {
                     if let Some(l) = &mut c.endlabel {
