@@ -101,12 +101,17 @@ impl Parser {
         let mut descriptions = Vec::new();
         while !self.at(TokenKind::Eof) {
             let before = self.pos;
-            if let Some(desc) = self.parse_description() {
-                descriptions.push(desc);
-            } else if self.pos == before {
-                // No progress AND nothing produced — genuinely stuck.
+            let desc = self.parse_description();
+            if self.pos == before {
+                // No progress — genuinely stuck, whether or not it produced a
+                // Description (a Some(..) from a branch that consumed nothing
+                // would otherwise loop forever). Force progress.
                 self.error(format!("unexpected token: {:?}", self.current().text));
                 self.bump();
+                continue;
+            }
+            if let Some(desc) = desc {
+                descriptions.push(desc);
             }
             // A None that advanced (e.g. a stray top-level `;` consumed by the
             // Semicolon arm) is a clean skip, not an error.

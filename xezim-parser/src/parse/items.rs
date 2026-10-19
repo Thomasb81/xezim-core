@@ -1586,17 +1586,24 @@ impl Parser {
         let mut items = Vec::new();
         while !self.at_any(&end_tokens) {
             let before = self.pos;
-            if let Some(item) = self.parse_module_item() {
+            let item = self.parse_module_item();
+            if self.pos == before {
+                // parse_module_item returned WITHOUT consuming anything —
+                // genuinely stuck; report and force progress. This fires
+                // whether it was a None (as before) or a Some(..) from a
+                // branch that matched a token but failed to advance (e.g. a
+                // keyword misrouted to parse_identifier, which returns `<e>`
+                // without bump). A None that DID advance is a deliberate
+                // parse-accept/skip (specparam, interconnect, …) and is not
+                // flagged, since pos moved on.
+                self.error(format!("unexpected: {:?}", self.current().text));
+                self.bump();
+                continue;
+            }
+            if let Some(item) = item {
                 self.hide_let_names_of_item(&item);
                 items.push(item);
                 items.append(&mut self.pending_module_items);
-            } else if self.pos == before {
-                // parse_module_item returned None WITHOUT consuming anything —
-                // genuinely stuck; report and force progress. A None that DID
-                // advance is a deliberate parse-accept/skip (specparam,
-                // interconnect, …) and must not be flagged as an error.
-                self.error(format!("unexpected: {:?}", self.current().text));
-                self.bump();
             }
         }
         items
@@ -2094,16 +2101,19 @@ impl Parser {
                 })
             }
             TokenKind::KwVirtual => {
-                if self.peek_kind() == TokenKind::KwInterface {
-                    Some(self.parse_identifier_starting_item())
-                } else if self.peek_kind() == TokenKind::Identifier {
+                if self.peek_kind() == TokenKind::KwInterface
+                    || self.peek_kind() == TokenKind::Identifier
+                {
                     // §25.9: a MODULE-scope virtual-interface variable —
-                    // `virtual req_if #(4).driver rd;`. Bumping past `virtual`
+                    // `virtual req_if #(4).driver rd;` or the `interface`
+                    // spelling `virtual interface vif;`. Bumping past `virtual`
                     // and re-parsing (the old behavior) made `req_if #(4)`
                     // look like a parameterized INSTANTIATION, which then
-                    // choked on `.driver`. parse_data_declaration starts at
-                    // the `virtual` keyword and handles `#(...)` and
-                    // `.modport` through parse_data_type.
+                    // choked on `.driver` (and `virtual interface` looped
+                    // forever: every token stays a keyword, nothing advances).
+                    // parse_data_declaration starts at the `virtual` keyword
+                    // and handles `#(...)` and `.modport` (and the optional
+                    // `interface` keyword) through parse_data_type.
                     Some(ModuleItem::DataDeclaration(self.parse_data_declaration()))
                 } else {
                     self.bump();
@@ -4505,13 +4515,21 @@ impl Parser {
     pub(super) fn parse_module_items_until(&mut self, end: TokenKind) -> Vec<ModuleItem> {
         let mut items = Vec::new();
         while !self.at(end) && !self.at(TokenKind::Eof) {
-            if let Some(item) = self.parse_module_item() {
+            let before = self.pos;
+            let item = self.parse_module_item();
+            if self.pos == before {
+                // Same guard as parse_module_items: a Some(..) that consumed
+                // nothing would loop forever, so force progress here too (this
+                // is the loop behind generate-block bodies, so it shares the
+                // virtual-interface hazard).
+                self.error(format!("unexpected: {:?}", self.current().text));
+                self.bump();
+                continue;
+            }
+            if let Some(item) = item {
                 self.hide_let_names_of_item(&item);
                 items.push(item);
                 items.append(&mut self.pending_module_items);
-            } else {
-                self.error(format!("unexpected: {:?}", self.current().text));
-                self.bump();
             }
         }
         items

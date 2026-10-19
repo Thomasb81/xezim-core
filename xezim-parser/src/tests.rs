@@ -478,3 +478,32 @@ fn type_keyword_specialization_keeps_signing() {
         "{text}"
     );
 }
+
+/// §25.9: a module-scope `virtual interface` declaration must report a
+/// diagnostic instead of hanging. Previously `virtual interface vif;` shipped
+/// the still-keyword `virtual` into `parse_identifier_starting_item`, whose
+/// `parse_identifier()` returned `<e>` from the keyword WITHOUT bumping, and
+/// `parse_module_items`'s progress guard (which only fired on a `None`)
+/// never triggered -> the loop pushed a ModuleItem + Diagnostic per iteration
+/// until it OOM'd. Now the `interface` spelling routes through
+/// `parse_data_declaration` (like the `virtual <type> <name>;` spelling), and
+/// the no-progress guard also covers a `Some` that consumed nothing.
+#[test]
+fn module_virtual_interface_spelling_does_not_loop() {
+    // Malformed: `vif` is mistaken for the interface type, leaving no
+    // declarator for the `;`.
+    let result = parse("module top; virtual interface vif; endmodule");
+    assert!(!result.errors.is_empty(), "expected a diagnostic, not a hang");
+
+    // Valid §25.9 spellings parse clean.
+    for src in [
+        "module top; virtual bus_if vif; endmodule",
+        "module top; virtual req_if #(4).driver rd; endmodule",
+        "interface bus_if; logic [3:0] d; modport driver(output d); endinterface \
+         module top; virtual bus_if vif; endmodule",
+    ] {
+        let result = parse(src);
+        assert!(result.errors.is_empty(), "{src}: {:?}", result.errors);
+    }
+}
+
