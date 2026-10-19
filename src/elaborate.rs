@@ -6354,6 +6354,494 @@ fn check_implicit_static_inits(
     ))
 }
 
+/// IEEE 1800 §6.5/§10: within a scope, a net or variable shall be DECLARED
+/// before it is referenced in an expression, a procedural statement, or a
+/// continuous assignment. An implicit net (§6.10) is the only exemption, and
+/// it does NOT apply to a name that is in fact declared later in the same
+/// scope — the reference simulator reports the premature reference as
+/// "Undefined variable". (A plain undeclared name that never resolves is
+/// handled separately by the implicit-net machinery.)
+///
+/// This pass scans a module's items in source order and flags a module-scope
+/// net/variable referenced before its declaration. It never fires on
+/// hierarchical references (`c.x`), scoped references (`pkg::x`), parameter,
+/// type, subroutine, or genvar names — the rule is specific to nets and
+/// variables declared in this scope.
+///
+/// Returns the bare name of every identifier referenced before its
+/// declaration (for the caller to decide error vs. warning strictness).
+fn check_module_use_before_decl(module: &Definition) -> Vec<String> {
+    use crate::ast::decl::PortDeclaration;
+    use crate::ast::module::PortList;
+
+    // Shared check for one bare same-scope name: is it declared LATER than
+    // `dsf` in this module scope (and not shadowed by a local/block-local)?
+    fn probe_name(
+        name: &str,
+        declared_at: &HashMap<String, Span>,
+        dsf: &HashSet<String>,
+        locals: &HashSet<String>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        if name.starts_with('$')
+            || name.contains('.')
+            || locals.contains(name)
+            || visited.contains(name)
+            || is_builtin_bare_name(name)
+        {
+            return;
+        }
+        if declared_at.contains_key(name) && !dsf.contains(name) {
+            visited.insert(name.to_string());
+            out.push(name.to_string());
+        }
+    }
+
+    /// Extract and probe the base name of an LVALUE (write target). The
+    /// reference simulator's firm, reliable rule is that WRITING a variable
+    /// or net before its declaration in the same scope is a compile error
+    /// ("Undefined variable"); READS of a later-declared name are sometimes
+    /// tolerated (irregularly), so this pass flags only the write targets.
+    /// `bad[i]`, `bad[a][b]` are all `ExprKind::Ident` with the selects in
+    /// `path[0].selects` — so the base `path[0].name` is the write target and
+    /// the index expressions are NOT probed (they are reads).
+    fn probe_lvalue(
+        e: &Expression,
+        declared_at: &HashMap<String, Span>,
+        dsf: &HashSet<String>,
+        locals: &HashSet<String>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        // Peel subscripts / member pointers to reach the base identifier.
+        let base = match &e.kind {
+            ExprKind::Ident(h) => h,
+            ExprKind::Index { expr, .. } | ExprKind::RangeSelect { expr, .. } => {
+                // recurse to the base
+                return probe_lvalue(expr, declared_at, dsf, locals, visited, out);
+            }
+            ExprKind::AssignExpr { lvalue, .. } => {
+                return probe_lvalue(lvalue, declared_at, dsf, locals, visited, out);
+            }
+            ExprKind::Unary {
+                op:
+                    crate::ast::expr::UnaryOp::PreIncr
+                    | crate::ast::expr::UnaryOp::PreDecr
+                    | crate::ast::expr::UnaryOp::PostIncr
+                    | crate::ast::expr::UnaryOp::PostDecr,
+                operand,
+                ..
+            } => return probe_lvalue(operand, declared_at, dsf, locals, visited, out),
+            ExprKind::Concatenation(items) => {
+                for it in items {
+                    probe_lvalue(it, declared_at, dsf, locals, visited, out);
+                }
+                return;
+            }
+            ExprKind::StreamOp { exprs, .. } => {
+                for it in exprs {
+                    probe_lvalue(it, declared_at, dsf, locals, visited, out);
+                }
+                return;
+            }
+            _ => return,
+        };
+        if base.root.is_some() || base.path.len() != 1 {
+            return;
+        }
+        let raw = base.path[0].name.name.as_str();
+        let name = crate::sv_parser::strip_unit_scope_name(raw).unwrap_or(raw);
+        probe_name(name, declared_at, dsf, locals, visited, out);
+    }
+
+    /// Recursive statement walker that also tracks block-local variable
+    /// declarations (§6.21: a name declared in a block is visible throughout
+    /// that block and shadows any same-named module-scope object, so it must
+    /// NOT be measured against the module's `declared_at`).
+    fn check_stmt_uses(
+        st: &Statement,
+        declared_at: &HashMap<String, Span>,
+        dsf: &HashSet<String>,
+        locals: &HashSet<String>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        use crate::ast::stmt::StatementKind as K;
+        match &st.kind {
+            // Expression statement: may be an increment/decrement or an
+            // assignment-expression write to a later-declared name.
+            K::Expr(e) => probe_lvalue(e, declared_at, dsf, locals, visited, out),
+            K::BlockingAssign { lvalue, .. } | K::NonblockingAssign { lvalue, .. } => {
+                probe_lvalue(lvalue, declared_at, dsf, locals, visited, out);
+            }
+            K::For {
+                init,
+                condition: _,
+                step,
+                body,
+            } => {
+                let mut loop_scope = locals.clone();
+                for i in init {
+                    match i {
+                        crate::ast::stmt::ForInit::VarDecl { name, .. } => {
+                            loop_scope.insert(name.name.clone());
+                        }
+                        crate::ast::stmt::ForInit::Assign { lvalue, .. } => {
+                            probe_lvalue(lvalue, declared_at, dsf, &loop_scope, visited, out);
+                        }
+                    }
+                }
+                for sp in step {
+                    probe_lvalue(sp, declared_at, dsf, &loop_scope, visited, out);
+                }
+                check_stmt_uses(body, declared_at, dsf, &loop_scope, visited, out);
+            }
+            K::Foreach { body, vars, .. } => {
+                let mut fs = locals.clone();
+                for v in vars {
+                    if let Some(vname) = v {
+                        fs.insert(vname.name.clone());
+                    }
+                }
+                check_stmt_uses(body, declared_at, dsf, &fs, visited, out);
+            }
+            K::ForeachTail { body, .. }
+            | K::Forever { body }
+            | K::ForeverTail { body }
+            | K::RsAction { body } => {
+                check_stmt_uses(body, declared_at, dsf, locals, visited, out)
+            }
+            K::SeqBlock { stmts, .. } | K::ParBlock { stmts, .. } => {
+                // §6.21: names declared anywhere in the block are visible
+                // throughout it; publish them before checking the body.
+                let mut scoped = locals.clone();
+                for s in stmts {
+                    if let K::VarDecl { declarators, .. } = &s.kind {
+                        for d in declarators {
+                            scoped.insert(d.name.name.clone());
+                        }
+                    }
+                }
+                for s in stmts {
+                    check_stmt_uses(s, declared_at, dsf, &scoped, visited, out);
+                }
+            }
+            K::TimingControl { stmt, .. } => {
+                check_stmt_uses(stmt, declared_at, dsf, locals, visited, out)
+            }
+            K::If { then_stmt, else_stmt, .. } => {
+                check_stmt_uses(then_stmt, declared_at, dsf, locals, visited, out);
+                if let Some(el) = else_stmt {
+                    check_stmt_uses(el, declared_at, dsf, locals, visited, out);
+                }
+            }
+            K::Case { items, .. } => {
+                for it in items {
+                    check_stmt_uses(&it.stmt, declared_at, dsf, locals, visited, out);
+                }
+            }
+            K::While { body, .. }
+            | K::DoWhile { body, .. }
+            | K::Repeat { body, .. } => {
+                check_stmt_uses(body, declared_at, dsf, locals, visited, out)
+            }
+            K::Wait { stmt, .. } => {
+                check_stmt_uses(stmt, declared_at, dsf, locals, visited, out)
+            }
+            K::RandCase { items } => {
+                for (_w, s) in items {
+                    check_stmt_uses(s, declared_at, dsf, locals, visited, out);
+                }
+            }
+            K::VarDecl { .. }
+            | K::Return(..)
+            | K::Disable(..)
+            | K::Break
+            | K::Continue
+            | K::WaitFork => {}
+            _ => {}
+        }
+    }
+
+    /// Walk a sequence of statements (task/function body) as one block scope:
+    /// publish every VarDecl name in the sequence, then check the statements.
+    fn check_stmt_seq(
+        stmts: &[Statement],
+        declared_at: &HashMap<String, Span>,
+        dsf: &HashSet<String>,
+        locals: &HashSet<String>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        let mut scoped = locals.clone();
+        for s in stmts {
+            if let crate::ast::stmt::StatementKind::VarDecl { declarators, .. } = &s.kind {
+                for d in declarators {
+                    scoped.insert(d.name.name.clone());
+                }
+            }
+        }
+        for s in stmts {
+            check_stmt_uses(s, declared_at, dsf, &scoped, visited, out);
+        }
+    }
+    // Names of every module-scope net/variable (declared anywhere) → its
+    // declaration span. ANSI ports live in the header, before any body item;
+    // non-ANSI ports appear as `PortDeclaration` items below.
+    let mut declared_at: HashMap<String, Span> = HashMap::default();
+    if let Definition::Module(m) = module {
+        if let PortList::NonAnsi(names) = &m.ports {
+            for n in names {
+                declared_at.insert(n.name.clone(), n.span);
+            }
+        }
+    }
+    for item in module.items() {
+        match item {
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators {
+                    declared_at.insert(d.name.name.clone(), d.name.span);
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators {
+                    declared_at.insert(d.name.name.clone(), d.name.span);
+                }
+            }
+            ModuleItem::PortDeclaration(PortDeclaration { declarators, .. }) => {
+                for d in declarators {
+                    declared_at.insert(d.name.name.clone(), d.name.span);
+                }
+            }
+            _ => {}
+        }
+    }
+    if declared_at.is_empty() {
+        return Vec::new();
+    }
+
+    // ANSI-port names are established before any body item is elaborated.
+    let mut predecl: HashSet<String> = HashSet::default();
+    if let Definition::Module(m) = module {
+        if let PortList::Ansi(ports) = &m.ports {
+            for p in ports {
+                predecl.insert(p.name.name.clone());
+            }
+        }
+    }
+
+    let empty: HashSet<String> = HashSet::default();
+    let mut out: Vec<String> = Vec::new();
+    let mut visited: HashSet<String> = HashSet::default();
+    let mut declared_so_far: HashSet<String> = predecl.clone();
+
+    for it in module.items() {
+        // Publish this item's own declarations first, so later items can use
+        // them (and so THIS item is never matched against itself).
+        match it {
+            ModuleItem::NetDeclaration(nd) => {
+                for d in &nd.declarators {
+                    declared_so_far.insert(d.name.name.clone());
+                }
+            }
+            ModuleItem::DataDeclaration(dd) => {
+                for d in &dd.declarators {
+                    declared_so_far.insert(d.name.name.clone());
+                }
+            }
+            ModuleItem::PortDeclaration(PortDeclaration { declarators, .. }) => {
+                for d in declarators {
+                    declared_so_far.insert(d.name.name.clone());
+                }
+            }
+            _ => {}
+        }
+        // Then scan this item's procedural/continuous uses.
+        match it {
+            ModuleItem::InitialConstruct(ic) => check_stmt_uses(
+                &ic.stmt,
+                &declared_at,
+                &declared_so_far,
+                &empty,
+                &mut visited,
+                &mut out,
+            ),
+            ModuleItem::AlwaysConstruct(ac) => check_stmt_uses(
+                &ac.stmt,
+                &declared_at,
+                &declared_so_far,
+                &empty,
+                &mut visited,
+                &mut out,
+            ),
+            ModuleItem::FinalConstruct(fc) => check_stmt_uses(
+                &fc.stmt,
+                &declared_at,
+                &declared_so_far,
+                &empty,
+                &mut visited,
+                &mut out,
+            ),
+            ModuleItem::ContinuousAssign(ca) => {
+                for (lhs, _rhs) in &ca.assignments {
+                    probe_lvalue(
+                        lhs, &declared_at, &declared_so_far, &empty, &mut visited, &mut out,
+                    );
+                }
+            }
+            ModuleItem::TaskDeclaration(t) => {
+                let mut locals = HashSet::default();
+                locals.insert(t.name.name.name.clone());
+                for p in &t.ports {
+                    locals.insert(p.name.name.clone());
+                }
+                check_stmt_seq(
+                    &t.items,
+                    &declared_at,
+                    &declared_so_far,
+                    &locals,
+                    &mut visited,
+                    &mut out,
+                );
+            }
+            ModuleItem::FunctionDeclaration(f) => {
+                let mut locals = HashSet::default();
+                locals.insert(f.name.name.name.clone());
+                for p in &f.ports {
+                    locals.insert(p.name.name.clone());
+                }
+                check_stmt_seq(
+                    &f.items,
+                    &declared_at,
+                    &declared_so_far,
+                    &locals,
+                    &mut visited,
+                    &mut out,
+                );
+            }
+            _ => {}
+        }
+    }
+
+    // Recurse into generate blocks so uses inside them are also checked
+    // against the module's declaration order.
+    fn walk_items(
+        its: &[ModuleItem],
+        declared_at: &HashMap<String, Span>,
+        declared_so_far: &HashSet<String>,
+        locals: &HashSet<String>,
+        visited: &mut HashSet<String>,
+        out: &mut Vec<String>,
+    ) {
+        let mut dsf = declared_so_far.clone();
+        for it in its {
+            match it {
+                ModuleItem::NetDeclaration(nd) => {
+                    for d in &nd.declarators {
+                        dsf.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::DataDeclaration(dd) => {
+                    for d in &dd.declarators {
+                        dsf.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::PortDeclaration(PortDeclaration { declarators, .. }) => {
+                    for d in declarators {
+                        dsf.insert(d.name.name.clone());
+                    }
+                }
+                ModuleItem::InitialConstruct(ic) => {
+                    check_stmt_uses(&ic.stmt, declared_at, &dsf, locals, visited, out)
+                }
+                ModuleItem::AlwaysConstruct(ac) => {
+                    check_stmt_uses(&ac.stmt, declared_at, &dsf, locals, visited, out)
+                }
+                ModuleItem::FinalConstruct(fc) => {
+                    check_stmt_uses(&fc.stmt, declared_at, &dsf, locals, visited, out)
+                }
+                ModuleItem::ContinuousAssign(ca) => {
+                    for (lhs, _rhs) in &ca.assignments {
+                        probe_lvalue(lhs, declared_at, &dsf, locals, visited, out);
+                    }
+                }
+                ModuleItem::TaskDeclaration(t) => {
+                    let mut ll = locals.clone();
+                    ll.insert(t.name.name.name.clone());
+                    for p in &t.ports {
+                        ll.insert(p.name.name.clone());
+                    }
+                    check_stmt_seq(&t.items, declared_at, &dsf, &ll, visited, out);
+                }
+                ModuleItem::FunctionDeclaration(f) => {
+                    let mut ll = locals.clone();
+                    ll.insert(f.name.name.name.clone());
+                    for p in &f.ports {
+                        ll.insert(p.name.name.clone());
+                    }
+                    check_stmt_seq(&f.items, declared_at, &dsf, &ll, visited, out);
+                }
+                _ => {}
+            }
+            match it {
+                ModuleItem::GenerateRegion(g) => walk_items(
+                    &g.items,
+                    declared_at,
+                    &dsf,
+                    locals,
+                    visited,
+                    out,
+                ),
+                ModuleItem::GenerateIf(g) => {
+                    for (_c, items) in &g.branches {
+                        walk_items(items, declared_at, &dsf, locals, visited, out)
+                    }
+                }
+                ModuleItem::GenerateFor(g) => walk_items(
+                    &g.items,
+                    declared_at,
+                    &dsf,
+                    locals,
+                    visited,
+                    out,
+                ),
+                ModuleItem::GenerateCase(g) => {
+                    for arm in &g.arms {
+                        walk_items(&arm.items, declared_at, &dsf, locals, visited, out)
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    for gitem in module.items() {
+        match gitem {
+            ModuleItem::GenerateRegion(g) => {
+                walk_items(&g.items, &declared_at, &declared_so_far, &empty, &mut visited, &mut out)
+            }
+            ModuleItem::GenerateIf(g) => {
+                for (_c, items) in &g.branches {
+                    walk_items(items, &declared_at, &declared_so_far, &empty, &mut visited, &mut out)
+                }
+            }
+            ModuleItem::GenerateFor(g) => {
+                walk_items(&g.items, &declared_at, &declared_so_far, &empty, &mut visited, &mut out)
+            }
+            ModuleItem::GenerateCase(g) => {
+                for arm in &g.arms {
+                    walk_items(&arm.items, &declared_at, &declared_so_far, &empty, &mut visited, &mut out)
+                }
+            }
+            _ => {}
+        }
+    }
+
+    out.sort();
+    out.dedup();
+    out
+}
+
 pub fn elaborate_module_with_defs(
     module: Definition,
     param_overrides: &HashMap<String, Value>,
@@ -6363,6 +6851,19 @@ pub fn elaborate_module_with_defs(
     seed_ooc_constraints: &[(String, String, Vec<crate::ast::decl::ConstraintItem>)],
 ) -> Result<ElaboratedModule, String> {
     let mut elab = ElaboratedModule::new(module.name().to_string());
+    // §6.5/§10: within a scope a net/variable must be DECLARED before it is
+    // referenced (implicit nets §6.10 are the only exception, and they do not
+    // apply to a name declared LATER). Match the reference simulator's
+    // compile-time "Undefined variable" error.
+    if let Some(name) = check_module_use_before_decl(&module).first() {
+        return Err(format!(
+            "Undefined variable '{}': referenced before its declaration in module '{}' \
+             (IEEE 1800-2017 §6.5/§10; implicit nets §6.10 do not apply to a name \
+             declared later in the same scope).",
+            name,
+            module.name()
+        ));
+    }
     // §20.6.2/§20.7: the module's declarations answer `$bits` and the array
     // queries in its constant expressions for the whole elaboration.
     DECL_SHAPES_CACHE.with(|c| c.borrow_mut().clear());
