@@ -2477,6 +2477,24 @@ impl Preprocessor {
                     self.note_undefined_macro(macro_name);
                     result.push('`');
                     result.push_str(macro_name);
+                    // §22.5.1 recovery: if the reference is an *invocation*
+                    // (`\`NAME(...)`), its argument list is not legal call
+                    // syntax after a literal macro token, so swallow the whole
+                    // balanced `(...)` group rather than let the parser report
+                    // every comma/paren separately (issue #451).
+                    // Ignore whitespace before the `(`, as the defined-macro
+                    // variant does; but only collapse when the paren is truly
+                    // the next non-space character, so a defined-looking use
+                    // like `` `NAME ( a ) `` followed by an operator still keeps
+                    // the parenthesised expression.
+                    let mut q = i;
+                    while q < bytes.len() && (bytes[q] == b' ' || bytes[q] == b'\t') {
+                        q += 1;
+                    }
+                    if q < bytes.len() && bytes[q] == b'(' {
+                        i = q;
+                        Self::skip_macro_invocation_parens(line, &mut i);
+                    }
                 }
             } else {
                 let ch = line[i..].chars().next().unwrap();
@@ -2670,6 +2688,41 @@ impl Preprocessor {
             *i += 1;
         }
         args
+    }
+
+    /// §22.5.1 / §22.5.1.1 recovery: an UNDEFINED text macro referenced as an
+    /// *invocation* (`\`NAME(a, b)`) is left as literal text, so the parser
+    /// would otherwise see the macro name followed by an argument list that is
+    /// not legal call syntax in that position and report every comma/paren as
+    /// its own error. Collapse just the argument list: skip the balanced `(...)`
+    /// group (honoring nesting and string literals so a `)` in a string or a
+    /// nested paren does not truncate it) and leave the cursor after the
+    /// closing `)`. The whole reference then reads to the parser as a single
+    /// inert literal token, exactly like the bare undefined-macro case.
+    fn skip_macro_invocation_parens(line: &str, i: &mut usize) {
+        let bytes = line.as_bytes();
+        // Only invoked form has a `(` immediately after the name (allowing
+        // optional whitespace), and only when that `(` is balanced.
+        if *i < bytes.len() && bytes[*i] != b'(' {
+            return;
+        }
+        let mut depth = 0usize;
+        let mut in_string = false;
+        while *i < bytes.len() {
+            match bytes[*i] {
+                b'"' if *i == 0 || bytes[*i - 1] != b'\\' => in_string = !in_string,
+                b'(' if !in_string => depth += 1,
+                b')' if !in_string => {
+                    depth -= 1;
+                    *i += 1;
+                    if depth == 0 {
+                        return;
+                    }
+                }
+                _ => {}
+            }
+            *i += 1;
+        }
     }
 
     fn strip_attributes(line: &str) -> String {
