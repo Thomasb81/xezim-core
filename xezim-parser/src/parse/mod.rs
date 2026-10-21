@@ -36,6 +36,11 @@ pub struct Parser {
     pub(super) class_infos: Vec<ClassInfo>,
     /// `pure constraint` names of the class being parsed.
     pub(super) pure_constraints: Vec<String>,
+    /// §6.20.5: names of the `specparam` declarations parsed so far in the
+    /// current module. A later `parameter`/`localparam` initializer must not
+    /// reference any of these ("parameter and localparam shall not be
+    /// assigned a constant expression that includes any specify parameters").
+    pub(super) specparams: Vec<String>,
     /// True while parsing the expression of a CONSTRAINT item, so the
     /// parenthesized-primary parser accepts the nonstandard-but-tolerated
     /// `( expr dist { ... } )` form (§18.5.4; a reference simulator warns
@@ -76,6 +81,7 @@ impl Parser {
             in_sva_seq: false,
             class_infos: Vec::new(),
             pure_constraints: Vec::new(),
+            specparams: Vec::new(),
             in_constraint: false,
             pending_paren_dist: Vec::new(),
             pending_module_items: Vec::new(),

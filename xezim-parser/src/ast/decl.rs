@@ -1058,6 +1058,12 @@ pub struct DataDeclaration {
 #[cfg_attr(feature = "serde", derive(serde::Serialize, serde::Deserialize))]
 pub struct ParameterDeclaration {
     pub local: bool,
+    /// §6.20.5: true when this item is a `specparam` (parsed through the
+    /// same Codec as a localparam so it lands in the constant table). Kept
+    /// so a later `parameter`/`localparam` initializer that reads it can be
+    /// diagnosed as illegal. Defaults to false for backward compatibility.
+    #[cfg_attr(feature = "serde", serde(default))]
+    pub specparam: bool,
     pub kind: ParameterKind,
     pub span: Span,
 }

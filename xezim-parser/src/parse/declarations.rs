@@ -123,6 +123,7 @@ impl Parser {
             }
             return ParameterDeclaration {
                 local,
+                specparam: false,
                 kind: ParameterKind::Type { assignments },
                 span: self.span_from(start),
             };
@@ -224,6 +225,7 @@ impl Parser {
         }
         ParameterDeclaration {
             local,
+            specparam: false,
             kind: ParameterKind::Data {
                 data_type,
                 assignments,

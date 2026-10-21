@@ -375,6 +375,40 @@ impl Parser {
         }
     }
 
+    /// §6.20.5: "parameter and localparam shall not be assigned a constant
+    /// expression that includes any specify parameters." Check this
+    /// `parameter`/`localparam` declaration's initializers against the
+    /// module specparams seen so far and report a diagnostic for any that
+    /// read one. (The reciprocal direction — a specparam referencing a
+    /// parameter/localparam — is LEGAL and is not checked here; the
+    /// `specparam` item arm never routes through this method.)
+    fn check_param_specparams(&mut self, decl: &ParameterDeclaration) {
+        if !crate::strict_checks() || self.specparams.is_empty() {
+            return;
+        }
+        if decl.specparam {
+            return;
+        }
+        let ParameterKind::Data { assignments, .. } = &decl.kind else {
+            return;
+        };
+        for a in assignments {
+            let Some(init) = &a.init else { continue };
+            let mut ids = Vec::new();
+            Self::expr_idents(init, &mut ids);
+            if let Some(sp) = ids
+                .iter()
+                .find(|n| self.specparams.iter().any(|s| s == *n))
+            {
+                self.error(format!(
+                    "parameter/localparam '{}' may not be initialized with the \
+                     specify parameter '{}' (IEEE 1800-2017 §6.20.5)",
+                    a.name.name, sp
+                ));
+            }
+        }
+    }
+
     /// Does the statement read or write the bare name `name`?
     fn stmt_mentions(stmt: &crate::ast::stmt::Statement, name: &str) -> bool {
         use crate::ast::stmt::StatementKind as K;
@@ -1855,6 +1889,16 @@ impl Parser {
                 if self.at(TokenKind::Semicolon) && self.diagnostics.len() == diag_len {
                     self.bump(); // ;
                     decl.local = true;
+                    decl.specparam = true;
+                    // §6.20.5: record this specparam's names so a later
+                    // `parameter`/`localparam` initializer that reads one is
+                    // diagnosed. (A specparam MAY reference parameters or
+                    // other specparams.)
+                    if let ParameterKind::Data { assignments, .. } = &decl.kind {
+                        for a in assignments {
+                            self.specparams.push(a.name.name.clone());
+                        }
+                    }
                     Some(ModuleItem::LocalparamDeclaration(decl))
                 } else {
                     self.diagnostics.truncate(diag_len);
@@ -1892,12 +1936,16 @@ impl Parser {
             | TokenKind::KwAutomatic => {
                 Some(ModuleItem::DataDeclaration(self.parse_data_declaration()))
             }
-            TokenKind::KwParameter => Some(ModuleItem::ParameterDeclaration(
-                self.parse_parameter_decl_stmt(),
-            )),
-            TokenKind::KwLocalparam => Some(ModuleItem::LocalparamDeclaration(
-                self.parse_parameter_decl_stmt(),
-            )),
+            TokenKind::KwParameter => {
+                let pd = self.parse_parameter_decl_stmt();
+                self.check_param_specparams(&pd);
+                Some(ModuleItem::ParameterDeclaration(pd))
+            }
+            TokenKind::KwLocalparam => {
+                let pd = self.parse_parameter_decl_stmt();
+                self.check_param_specparams(&pd);
+                Some(ModuleItem::LocalparamDeclaration(pd))
+            }
             TokenKind::KwTypedef => Some(ModuleItem::TypedefDeclaration(
                 self.parse_typedef_declaration(),
             )),
