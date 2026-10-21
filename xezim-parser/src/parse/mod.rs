@@ -132,8 +132,9 @@ impl Parser {
         }
     }
 
-    /// §18.5.2: a non-virtual class implements every pure constraint it
-    /// inherits. A chain through a class of another file is not followed.
+    /// §18.5.2: a non-abstract class (a) declares no `pure constraint` of
+    /// its own, and (b) implements every pure constraint it inherits. A
+    /// chain through a class of another file is not followed.
     fn check_pure_constraints(&mut self) {
         let find = |n: &str| self.class_infos.iter().find(|c| c.name.name == n);
         let mut errs = Vec::new();
@@ -142,6 +143,25 @@ impl Parser {
             .iter()
             .filter(|c| !c.is_virtual && !c.is_interface)
         {
+            // (a) §18.5.2: "It shall be an error to declare a pure
+            // constraint in a non-abstract class." The pure constraint is
+            // meaningless on a concrete class, which can never be subclassed
+            // to fulfill the obligation it sets on its duties.
+            if let Some(n) = c.pure_constraints.first() {
+                errs.push(Diagnostic::error(
+                    format!(
+                        "pure constraint '{n}' must be declared in a virtual \
+                         (abstract) class, not a non-abstract class '{}' \
+                         (IEEE 1800-2017 §18.5.2)",
+                        c.name.name
+                    ),
+                    c.name.span,
+                ));
+                continue;
+            }
+            // (b) §18.5.2: "It shall be an error if a non-abstract class does
+            // not have an implementation of every pure constraint that it
+            // inherits."
             let mut pure: Vec<&str> = Vec::new();
             let mut defined: Vec<&str> = c.constraints.iter().map(|s| s.as_str()).collect();
             let mut cur = c.bases.first().map(|b| b.0.as_str());
